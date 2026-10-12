@@ -1,0 +1,91 @@
+P0: 多智能体协同开发系统搭建方案
+P1: 首期 MVP 方案 | OpenCode + WSL2
+P2: 版本：MVP 1.2（模型策略待拍板）    日期：2026-10-11    目标：在授权代码仓库验证六阶段交付闭环
+P3: 1. 决策摘要
+P4: 首期以 OpenCode 作为交互和 Agent 宿主，在 WSL2 Ubuntu 环境运行。流程决策由独立状态机负责，所有模型和工具访问经权限网关；OpenCode Skill 仅提供阶段模板、输入格式和退出清单。DSH 不进入首期，待 MVP 稳定后再评估迁移。
+P5: 首期只支持 spec → plan → build → test → review → ship。build 编码模型在 A/B/C 中拍板；当前推荐 B（GPT-6.1 Sol），待用户确认。规划/架构/终审 GPT Worker 保持只读，若选 B，另设独立凭据和受网关约束的 GPT 编码 Worker。失败保留现场，不自动修复、不自动全盘回滚。
+P6: DeepSeek 路由不是已确认的首期阻断项：官方 9 月 10 日公告称 deepseek-v4-pro 请求会路由至 V4.1-Flash；但更新日志又称 9 月 14 日后继续提供 V4 Pro API，当前价格页列出 V4-Pro-0813。两组官方资料存在冲突，不能据其推断第三方供应商实际返回；M0 对所选供应商实测请求 ID、response.model、实际服务/计费标识。无法证明底层版本时标记“供应商未验证”，由所选策略决定是否接受，不得静默切换。[7][8]
+P7: 2. MVP 范围
+P8: 
+P9: 模型策略拍板后，按角色固定请求模型 ID；关闭自动路由、自动降级和跨模型重试。OpenCode Agent 只能通过 MCP 权限网关使用文件、终端、Git 和 Playwright；显式关闭绕过网关的直接文件写入与 Shell。[2]
+P10: 模型策略拍板项（推荐 B，待用户确认）
+P11: A｜接受 DeepSeek 公共 API 路由：编码质量取决于实际返回的 V4 Pro/Flash，不能仅凭请求名推断；成本有望较低，但以天翼等供应商账单为准；接入改动最少、最利于进度；风险是映射和质量波动。接受 Flash 即继续，记录实际返回标识，不因版本名不符而自动切换。
+P12: B｜首期编码全部用 GPT-6.1 Sol：模型身份与质量基线较易统一，适合先验证流程；成本预期高于 DeepSeek Flash，须按供应商实账比较；落地难度低至中，需新增独立 GPT 编码 Worker/凭据并经网关限权；供应商可用性与费用仍须实测。此选项明确调整“GPT 只读、不编码”的原规则：规划/终审仍只读，编码使用隔离 Worker。
+P13: C｜改用 Kimi K3 编码：官方将 K3 定位用于长程编码/软件工程，但本仓库质量须实测；成本按第三方报价核算（官方直连价仅供参考）；需新增模型映射、凭据和验收，难度中等；实际路由与质量尚无本项目数据，可能增加 M0/M3 时间。[9]
+P14: 推荐 B 作为最稳妥的流程 MVP：先固定成熟主力模型建立质量基线，避免 DeepSeek/Kimi 供应商映射不透明干扰首轮验收；代价是成本可能上升并需接受 GPT 编码 Worker 的角色规则调整。若优先控制成本且愿意接受 Flash，A 是改动最小的备选；不建议首期同时接入多模型。无论选项，30% 降本均是待验证假设。
+P15: 3. 运行结构与权限边界
+P16: 
+P17: 角色权限：规划/评审可读源代码与测试证据，但不能写代码、执行任意 Shell 或提交；编码 Agent 仅可读写任务 worktree、执行白名单命令和查看 Git 状态/差异，禁止 push；测试工具只运行计划中批准的命令；ship 阶段由用户批准，网关使用短时授权执行 push。
+P18: 每次工具/API 调用记录任务 ID、Agent/角色、工具名或请求模型 ID、供应商返回 model 标识、token 用量、耗时、状态码及结果。审计不记录完整提示、密钥或代码原文；参数先脱敏。API Key 按角色独立管理，不全局共享。超时、限流按供应商 Retry-After/退避规则处理，每阶段最多重试 2 次；鉴权失败（401/403）不重试。仍失败则阶段失败阻断，不自动换模型。网关故障或审计写入失败时拒绝写操作。
+P19: 4. 六阶段流程与退出条件
+P20: 
+P21: 状态机状态建议：待执行、运行中、待人工确认、通过、失败阻断、已取消。仅允许相邻阶段转换；失败后的重跑或退回 build 需要用户确认。服务重启后从 SQLite 恢复阶段与产物，不重复执行未确认的写操作。
+P22: 5. Git、浏览器、模型与数据安全
+P23: Git：开始任务前确认基线提交并创建独立 worktree/任务分支。MVP 禁止自动执行 git checkout -- .、reset --hard、clean -fd、自动全盘回滚和自动修复。失败时冻结任务、保留 worktree、diff 和日志；人工检查后仅处置本任务确认归属的文件。
+P24: 浏览器：每任务独立临时 user-data-dir 或 Playwright isolated context；不连接个人浏览器 Profile。仅访问本地测试站点；通过最终 URL、指定 DOM、页面/控制台错误和网络失败状态判断，不以截图像素作为唯一通过条件。
+P25: 模型策略：A 接受 DeepSeek 公共 API 实际路由并继续，记录请求 ID 和供应商返回标识；B build 使用 GPT-6.1 Sol；C build 使用 Kimi K3。最终仅启用拍板组合，不自动路由或切换。记录 response.model、usage、耗时和状态码；该字段可能只是请求别名回显，必须标记“已验证/仅回显/未知”，不可据此宣称底层版本已证实。API 连续失败后阶段阻断。
+P26: 数据边界：首期按任务将所需代码上下文发送至指定外部模型，不实现敏感代码识别、屏蔽或外发审批。MCP 权限网关仍控制工具和写操作；每个 Agent 使用独立凭据，调用审计不记录密钥或完整提示内容。
+P27: WSL2：仓库、Git worktree、Node/Python 运行时和 OpenCode 配置统一在 WSL2 Linux 文件系统。不要同时从 Windows 与 WSL2 修改同一个 worktree；固定 Node、OpenCode、MCP Server 版本并提交锁文件。OpenCode 官方将 WSL2 列为 Windows 推荐体验。[1]
+P28: 6. 复用、自研与二期边界
+P29: 
+P30: 状态机与 MCP 网关是首期自研核心。其余开源组件只提供底座能力，不代表阶段状态、权限策略、持久化或合规边界已经实现。状态机与工具契约独立于 OpenCode，便于二期评估 DSH，而不把流程规则写死在某个 Harness 中。
+P31: 7. 实施顺序与交付件
+P32: M0 前置核验（策略拍板后）：对模型矩阵内每个模型做连通性、请求 ID/响应 model/供应商实际服务标识核验，并记录 token、耗时、状态码；验证供应商限流与超时行为，确认每阶段最多 2 次重试、鉴权失败不重试、失败阻断且不切模型。A 接受实测返回 V4.1 Flash；B 验证 GPT 编码 Worker 独立凭据与网关写权限；C 验证 Kimi K3 映射。截图可确认 ZCode 的天翼第三方 Provider 及其模型目录，不证明 OpenCode 兼容、实际底层版本或账单；须在 OpenCode 单独核验。另确认仓库与云端模型调用已获授权。未通过则不进入 M1。
+P33: M1 环境基线：安装 WSL2 Ubuntu、OpenCode、Git、Node/Python 和 Playwright MCP；仓库放在 WSL2 内；固定依赖版本与最小权限配置。
+P34: M2 控制与权限：实现 SQLite 状态机、阶段产物、审批入口、角色 Worker、MCP 网关、审计及模型标识记录/校验；先验证越权调用会被拒绝。
+P35: M3 试点：在独立仓库运行 10 个小到中等任务，覆盖成功、测试失败、模型不可用、评审阻断、暂停恢复和浏览器校验。
+P36: 交付件：可运行配置与锁文件、状态机/网关源码、权限矩阵、六阶段 Skill、任务日志样例、验收数据和未解决问题清单。
+P37: 8. MVP 验收标准
+P38: 
+P39: 匹配任务必须从相同基线提交创建隔离副本，使用同一验收标准和等价运行环境；失败、取消和人工补做成本单独记录。首轮 10 个任务只作为试点，不足以证明 30% 降本或长期成功率。
+P40: 9. 已知阻断项与决策规则
+P41: 模型身份与路由是 M0 风险核验项。DeepSeek 官方公告与更新日志/当前价格页对 V4 Pro 是否路由、是否继续提供服务的信息不一致；第三方供应商也可能另行映射。[7][8] 请求模型 ID、response.model 与实际底层服务不必相同。若选 A，按约定接受实际返回的 Flash 并记录；若供应商无法提供实际标识，标注“仅供应商声明/未知”，由用户决定是否接受。B/C 同样核验各自映射。任何策略都不得自动换模型。
+P42: 首期不设置敏感代码外发限制，所需代码上下文按角色发送至拍板后的第三方云端模型；工具权限、角色独立凭据和脱敏调用审计照常执行。
+P43: 参考资料
+P44: [1] OpenCode：Windows / WSL2  官方资料
+P45: [2] OpenCode：权限与工具控制  官方资料
+P46: [3] addyosmani/agent-skills：阶段 Skill 与 OpenCode 接入  官方资料
+P47: [4] Microsoft Playwright MCP：浏览器隔离与配置  官方资料
+P48: [5] OpenCode：模型 Provider 配置  官方资料
+P49: [6] OpenAI：GPT-6.1 Sol 模型与 Codex 可用性  官方资料
+P50: [7] DeepSeek API：V4.1-Flash 公告（含 V4 Pro 路由说明） https://api-docs.deepseek.com/zh-cn/news/news260910/
+P51: [8] DeepSeek API：更新日志与当前模型价格（包含 V4 Pro API 继续提供及 V4-Pro-0813 信息） https://api-docs.deepseek.com/zh-cn/updates/ ; https://api-docs.deepseek.com/zh-cn/quick_start/pricing/
+P52: [9] Kimi API：K3 模型定位与 API 价格说明 https://www.kimi.ai/help/kimi-api/api-overview ; https://www.kimi.ai/help/kimi-api/api-pricing
+P53: [10] OpenAI API：GPT-6.1 Sol 模型资料与价格 https://developers.openai.com/api/docs/models/gpt-6.1-sol
+--- TABLE 0 ---
+R0: 范围 || 首期包含 || 首期不包含
+R1: 流程 || spec、plan、build、test、review、ship 六阶段 || webperf、code-simplify、constraints、并行 Agent
+R2: 模型 || 规划/终审 GPT-6.1 Sol 只读；build 选 A DeepSeek、B GPT-6.1 Sol、C Kimi K3（待拍板） || V4.1 自动模型路由、Kimi Code、ZCode Harness；GLM 与并行 Agent
+R3: 工具 || 文件、终端、Git、Playwright 浏览器，经权限网关提供 || 数据库写入、GitHub Issue/PR 自动化、Figma、Web 搜索
+R4: 环境 || OpenCode + WSL2；仓库放在 WSL2 Linux 文件系统 || 原生 Windows 多 Shell 混跑、跨设备执行
+R5: 数据 || 经授权的测试仓库；按任务向指定模型发送所需代码上下文 || 敏感代码识别、屏蔽或外发审批机制
+--- TABLE 1 ---
+R0: 组件 || 实现方式 || 边界
+R1: 交互与 Agent || 复用 OpenCode；运行于 WSL2 Ubuntu || 固定仓库、配置和模型角色；不作为流程唯一决策源
+R2: 外部状态机 || 自研本地服务 + SQLite 持久化 || 唯一允许阶段跳转的组件；校验阶段、身份、任务分支、产物和验收证据
+R3: MCP 权限网关 || 自研网关；仅向 Agent 暴露受控 MCP 工具 || 按角色鉴权、路径/命令白名单、审批校验、审计；失败关闭
+R4: 模型 Worker || 按角色独立 Worker 与凭据 || 规划/终审 GPT 只读；build 按 A/B/C 固定模型；B 时 GPT 编码 Worker 与只读 Worker 分离；不共享 Key
+R5: 隔离与验证 || Git worktree、Git、测试脚本、Playwright MCP || 每任务独立分支和浏览器临时目录；证据写入任务记录
+--- TABLE 2 ---
+R0: 阶段 || 执行者 || 产物与退出条件
+R1: spec || GPT-6.1 Sol + 用户 || 范围、非目标、验收标准、权限要求；用户确认后进入 plan。
+R2: plan || GPT-6.1 Sol + 用户 || 依赖顺序、任务切片、目标文件、测试命令、风险和回退说明；用户确认后入 build。
+R3: build || 拍板模型 A/B/C || 按批准计划逐切片改动，仅写任务 worktree；记录请求 ID、response.model、token、耗时、状态码。A 接受实际路由；失败阻断，不自动切模。
+R4: test || 确定性测试器 + Playwright || 运行批准的构建/单测/验收命令；保存日志、退出码。浏览器校验 URL、关键 DOM、控制台错误；失败保留现场。
+R5: review || GPT-6.1 Sol（只读） || 检查计划、diff、测试证据，输出结构化问题和结论；阻断项未清零不得进入 ship。
+R6: ship || 用户 + 网关 || 用户确认后由网关生成任务分支本地提交并按批准范围 push；所有 Agent 无 push 凭据。
+--- TABLE 3 ---
+R0: 分类 || 模块
+R1: 复用开源 || OpenCode；WSL2；agent-skills 六阶段模板；Git worktree；Microsoft Playwright MCP。OpenCode 权限机制不替代自研状态机/网关；依赖锁版本并在 WSL2 核验。[1][2][3][4]
+R2: 需自研 || 外部 SQLite 状态机；MCP 权限网关与审计；按角色隔离的 Worker/凭据启动；Git worktree 生命周期；API 标识/用量采集、限流超时与阻断策略。
+R3: 二期扩展 || DSH 迁移评估；constraints、webperf、code-simplify；DeepSeek/Kimi/GLM 其他模型或自动路由；ZCode 可参考其天翼 Provider 模型目录，但不作 MVP Harness；并行 Agent 与其他 MCP。
+--- TABLE 4 ---
+R0: 指标 || 口径与门槛
+R1: 流程完整性 || 10 个试点任务均留有六阶段状态和产物；尝试跳步、缺产物或角色越权时 100% 被拒绝；重启后状态可恢复。
+R2: 交付成功率 || 成功 = 通过验收条件、测试和评审并获 ship 批准。首轮 10 个合格试点任务至少 8 个成功（≥80%）；进入日常使用前扩至 ≥30 个任务，目标 ≥90%。
+R3: 人工干预 || 单列计划审批（spec、plan、ship，最多 3 次）与非计划干预。成功任务非计划干预平均 ≤2 次；所有失败、需求澄清和权限审批仍如实计数。
+R4: 缺陷逃逸率 || ship 后 7 日内确认的缺陷 / 全部确认缺陷；30 任务评估目标 ≤10%，P0/P1 逃逸为 0。首轮样本少时同时报缺陷数，不宣称统计稳定；零缺陷时比例记 N/A。
+R5: 工具与数据安全 || 评审写入 0 次、编码 Agent push 0 次、未授权调用 0 次；所有工具调用有审计记录；日志不记录凭据或完整提示内容。
+R6: Git/浏览器 || 10 次故障注入中任务 worktree 外文件无变化；失败现场可检查。10 次浏览器任务均有独立临时目录，并记录 URL、DOM 断言和控制台错误。
+R7: Token 成本对比 || 基线：同一 30 个匹配任务全部使用 GPT-6.1 Sol；MVP 组使用拍板后的 A/B/C 组合。逐任务记录请求模型 ID、返回标识、token、耗时及第三方实际账单，比较每个验收通过任务成本并报告质量差异。
+R8: 30% 降本假设 || 成本比 = MVP 组每个验收通过任务成本 / GPT 基线对应成本。≤0.70 是待验证假设，不是上线前提；只有质量不劣且样本足够时才能报告达成。

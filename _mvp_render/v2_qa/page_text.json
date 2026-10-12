@@ -1,0 +1,37 @@
+[
+  {
+    "page": 1,
+    "characters": 1175,
+    "start": "1 \n多智能体协同开发系统搭建方案 \n多 Harness 协作优化版  2.0    2026 年 10 月 12 日 \n本版用于指导后续搭建。目标是让 Codex、DeepSeek Harness、"
+  },
+  {
+    "page": 2,
+    "characters": 1399,
+    "start": "2 \n2 开源复用与现有资产迁移 \nOmnigent 列有 Codex 和社区维护的 Kimi。M0 必须核验所选 Direct／Native TUI 路径是否运行目标 \nHarness 原生循环与工"
+  },
+  {
+    "page": 3,
+    "characters": 1232,
+    "start": "3 \n3 任务流程与交接规则 \n流程根据任务选择。只读调查执行“问题与范围 → 调查 → 证据审阅”；小改动执行“简短任务卡 → 实现 \n→ 测试 → 独立评审 → 交付”；跨模块或架构任务执行完整 "
+  },
+  {
+    "page": 4,
+    "characters": 1647,
+    "start": "4 \n4 权限与云端调用治理 \nCodex 主控负责提出调度决策；控制服务负责验证能否执行。角色身份从启动配置和独立凭据绑定，不能\n由 Agent 在工具参数中自报。审查业务代码只读；运行时可以写各自"
+  },
+  {
+    "page": 5,
+    "characters": 1267,
+    "start": "5 \n5 Git 浏览器与 Windows 落地规则 \n真实项目与 Git \n平台运行于 WSL2 Ubuntu 24.04。试点基线为 /home/mvpdev/projects/mingjing-"
+  },
+  {
+    "page": 6,
+    "characters": 1355,
+    "start": "6 \n6 实施里程碑与 M0 核验 \n各里程碑交付配置、证据和通过／失败结果；核心兼容冲突先形成最小复现及备选对比，再请用户取舍。 \nM0 验证底座与四个接入路径 \n1. 固定 Omnigent 发行"
+  },
+  {
+    "page": 7,
+    "characters": 1178,
+    "start": "7 \n7 验收标准与主要风险 \n指标 首期通过标准 \n四 Harness 实接 四者都有真实 CLI／原生运行记录、独立会话、任务输入、工具事件和可核对产物；双 \nAgent 演示不计完整交付。 \n自"
+  }
+]
