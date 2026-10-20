@@ -26,6 +26,7 @@ enum AppGroup {
 /// 的受控键（SharedConfig / ControlState）传递，且不包含句子或回复文本。
 enum DarwinSignal {
     static let roundDidFinish = "com.screenassistant.ios.roundDidFinish"
+    static let newReplyAvailable = "com.screenassistant.ios.newReply"
 
     static func post(_ name: String) {
         CFNotificationCenterPostNotification(

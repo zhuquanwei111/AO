@@ -148,8 +148,16 @@ final class SampleHandler: RPBroadcastSampleHandler {
                 defer { self.endRound() }
                 switch outcome {
                 case .ok(let reply):
-                    // 只展示本轮回复；不做本地去重或历史拼接
-                    NotificationPresenter.present(reply: reply)
+                    // 只展示本轮回复；不做本地去重或历史拼接。
+                    // 展示路径分流：PiP 活跃且主 App 心跳新鲜 → 瞬态邮箱 + Darwin
+                    // 信号（主 App 渲染进 PiP 悬浮条）；否则 → 本地通知（回退路径）。
+                    // 主 App 挂起/被杀时心跳超时，自动落到通知，保证新回复仍可展示。
+                    if ControlState.pipLivenessIsFresh() {
+                        ReplyTransportFactory.make().publish(reply: reply)
+                        DarwinSignal.post(DarwinSignal.newReplyAvailable)
+                    } else {
+                        NotificationPresenter.present(reply: reply)
+                    }
                 case .duplicate:
                     // 204：保留当前展示 → 不发新通知
                     break
@@ -214,12 +222,12 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 }
 
-/// 展示层（PRD 允许的降级：本地通知）。
+/// 展示回退层：本地通知（PRD 允许的降级路径）。
 /// 隐私边界（交付说明同步标注）：
 ///   - 通知正文包含回复文本，会经过 iOS 通知系统（横幅 + 通知中心保留），
 ///     系统可能保留/摘要通知内容——不宣称满足“零文本系统留存”。
 ///   - 用户可在系统设置关闭“显示预览”，或在本 App 设置中关闭“通知含正文”。
-private enum NotificationPresenter {
+enum NotificationPresenter {
     static func present(reply: String) {
         let center = UNUserNotificationCenter.current()
         center.getNotificationSettings { settings in
