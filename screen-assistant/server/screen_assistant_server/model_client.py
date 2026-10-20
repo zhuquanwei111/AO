@@ -7,11 +7,7 @@
 
 from __future__ import annotations
 
-import logging
-
 import httpx
-
-logger = logging.getLogger("screen_assistant.model")
 
 SYSTEM_PROMPT = (
     "你是屏幕识字助手。用户发来一句从屏幕上识别出的中文句子，"
@@ -23,9 +19,52 @@ SYSTEM_PROMPT = (
 class ModelUnavailableError(Exception):
     """模型端点不可用（网络/认证/非 200/空回复）。调用方返回 503。"""
 
+    def __init__(
+        self,
+        error_code: str,
+        *,
+        upstream_status: int | None = None,
+        finish_reason: str | None = None,
+        empty_content: bool | None = None,
+    ) -> None:
+        self.error_code = error_code
+        self.upstream_status = upstream_status
+        self.finish_reason = finish_reason
+        self.empty_content = empty_content
+
 
 class ModelTimeoutError(Exception):
     """模型请求超时。调用方返回 504。"""
+
+    def __init__(self, error_code: str = "upstream_timeout") -> None:
+        self.error_code = error_code
+
+
+_PROVIDER_ERROR_CODES = {
+    "invalid_api_key": "provider_api_key_invalid",
+    "insufficient_quota": "provider_quota_exhausted",
+    "rate_limit_exceeded": "provider_rate_limited",
+    "10011021": "provider_api_key_missing",
+    "10011022": "provider_api_key_invalid",
+    "10011023": "provider_api_key_forbidden",
+    "10011041": "provider_no_balance",
+    "10011001": "provider_rate_limited",
+}
+_FINISH_REASONS = {"stop", "length", "content_filter", "tool_calls", "function_call"}
+
+
+def _provider_error_code(resp: httpx.Response) -> str:
+    """Return only allowlisted provider codes; never log arbitrary error text."""
+    try:
+        data = resp.json()
+        error = data.get("error", {}) if isinstance(data, dict) else {}
+        raw_code = error.get("code") if isinstance(error, dict) else None
+        if raw_code is None and isinstance(data, dict):
+            raw_code = data.get("code")
+        code = str(raw_code) if raw_code is not None else ""
+    except (ValueError, TypeError):
+        code = ""
+    return _PROVIDER_ERROR_CODES.get(code, "provider_http_error")
 
 
 class TianyiChatClient:
@@ -57,24 +96,48 @@ class TianyiChatClient:
         }
         try:
             resp = await self._client.post("/chat/completions", json=payload)
-        except httpx.TimeoutException as exc:
-            raise ModelTimeoutError("model request timed out") from exc
-        except httpx.HTTPError as exc:
-            raise ModelUnavailableError(f"model request failed: {type(exc).__name__}") from exc
+        except httpx.TimeoutException:
+            raise ModelTimeoutError() from None
+        except httpx.HTTPError:
+            raise ModelUnavailableError("upstream_transport_error") from None
 
         if resp.status_code != 200:
-            logger.warning("model http status=%d", resp.status_code)
-            raise ModelUnavailableError(f"model http status={resp.status_code}")
+            raise ModelUnavailableError(
+                _provider_error_code(resp), upstream_status=resp.status_code
+            )
 
         try:
             data = resp.json()
-            content = data["choices"][0]["message"]["content"]
-        except (ValueError, KeyError, IndexError, TypeError) as exc:
-            raise ModelUnavailableError("model response malformed") from exc
+            choice = data["choices"][0]
+            message = choice["message"]
+            content = message["content"]
+        except (ValueError, KeyError, IndexError, TypeError):
+            raise ModelUnavailableError("model_response_malformed") from None
 
+        raw_finish_reason = choice.get("finish_reason")
+        finish_reason = (
+            raw_finish_reason
+            if isinstance(raw_finish_reason, str) and raw_finish_reason in _FINISH_REASONS
+            else "other"
+        )
         reply = content.strip() if isinstance(content, str) else ""
+        if finish_reason == "length":
+            raise ModelUnavailableError(
+                "model_output_truncated",
+                finish_reason=finish_reason,
+                empty_content=not bool(reply),
+            )
         if not reply:
-            raise ModelUnavailableError("model returned empty reply")
+            error_code = (
+                "provider_content_filtered"
+                if finish_reason == "content_filter"
+                else "model_empty_content"
+            )
+            raise ModelUnavailableError(
+                error_code,
+                finish_reason=finish_reason,
+                empty_content=True,
+            )
         return reply
 
     async def aclose(self) -> None:

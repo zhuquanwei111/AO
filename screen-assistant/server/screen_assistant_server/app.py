@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -76,6 +77,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="screen-assistant server", version="1.0.0", lifespan=lifespan)
 
+    @app.middleware("http")
+    async def answer_request_id(request: Request, call_next):
+        if request.url.path != "/v1/answer":
+            return await call_next(request)
+        request_id = uuid.uuid4().hex
+        request.state.request_id = request_id
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+
     @app.post("/v1/answer")
     async def answer(payload: AnswerRequest, request: Request):
         cfg: Settings = request.app.state.settings
@@ -85,27 +96,48 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if len(normalized) > cfg.max_sentence_chars:
             raise HTTPException(status_code=422, detail="sentence exceeds maximum length")
         if not cfg.tianyi_api_key:
+            logger.warning(
+                "answer failure request_id=%s stage=configuration error_code=model_credential_missing",
+                request.state.request_id,
+            )
             raise HTTPException(status_code=503, detail="model credential not configured")
 
         dedup: AnswerDeduper = request.app.state.dedup
         key = dedup.key_for(normalized)
         token = await dedup.try_acquire(key)  # Redis 失败在此抛出，经 handler 转 503
         if token is None:
-            logger.info("answer duplicate chars=%d", len(normalized))
+            logger.info(
+                "answer request_id=%s stage=dedup outcome=duplicate",
+                request.state.request_id,
+            )
             return Response(status_code=204)
 
         try:
             reply = await request.app.state.model.ask(normalized)
-        except ModelTimeoutError:
+        except ModelTimeoutError as exc:
             await dedup.release(key, token)
-            logger.info("answer timeout chars=%d", len(normalized))
+            logger.warning(
+                "answer failure request_id=%s stage=provider error_code=%s",
+                request.state.request_id,
+                exc.error_code,
+            )
             raise HTTPException(status_code=504, detail="model request timed out") from None
-        except ModelUnavailableError:
+        except ModelUnavailableError as exc:
             await dedup.release(key, token)
-            logger.info("answer model failure chars=%d", len(normalized))
+            logger.warning(
+                "answer failure request_id=%s stage=provider error_code=%s upstream_status=%s finish_reason=%s empty_content=%s",
+                request.state.request_id,
+                exc.error_code,
+                exc.upstream_status,
+                exc.finish_reason,
+                exc.empty_content,
+            )
             raise HTTPException(status_code=503, detail="model unavailable") from None
 
-        logger.info("answer ok chars=%d reply_chars=%d", len(normalized), len(reply))
+        logger.info(
+            "answer request_id=%s stage=complete outcome=success",
+            request.state.request_id,
+        )
         return {"status": "ok", "reply": reply}
 
     @app.get("/healthz")
@@ -129,7 +161,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.exception_handler(DedupStoreUnavailableError)
     async def dedup_unavailable_handler(request: Request, exc: DedupStoreUnavailableError):
-        logger.warning("dedup store unavailable: %s", exc)
+        logger.warning(
+            "answer failure request_id=%s stage=dedup error_code=dedup_store_unavailable",
+            getattr(request.state, "request_id", "unknown"),
+        )
         return _json_error(503, "dedup store unavailable")
 
     return app
