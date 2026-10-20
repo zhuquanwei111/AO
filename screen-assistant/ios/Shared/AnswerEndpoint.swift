@@ -49,7 +49,7 @@ struct AnswerEndpoint {
     /// 请求与响应体仅存在于内存，方法返回后不再持有。
     func request(sentence: String,
                  completionQueue: DispatchQueue = .global(),
-                 completion: @escaping (Outcome) -> Void) {
+                 completion: @escaping (Outcome) -> Void) -> URLSessionDataTask? {
         // 契约固定为 POST {base}/v1/answer
         let url = baseURL.appendingPathComponent("v1/answer")
 
@@ -61,7 +61,7 @@ struct AnswerEndpoint {
         // 编码失败：本轮丢弃
         guard let httpBody = try? JSONSerialization.data(withJSONObject: body) else {
             completionQueue.async { completion(.discarded) }
-            return
+            return nil
         }
         request.httpBody = httpBody
 
@@ -70,6 +70,7 @@ struct AnswerEndpoint {
             completionQueue.async { completion(outcome) }
         }
         task.resume()
+        return task
     }
 
     /// 响应映射（纯函数，便于单元测试）。

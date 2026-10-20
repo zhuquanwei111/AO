@@ -1,228 +1,77 @@
-# 屏识AI助手 iOS 客户端（任务 I）
+# 屏识AI助手 iOS
 
-iOS 15+ 跨应用屏幕中文识别 → 远端短回答 → 通知展示 的可行主链路实现。
+最低部署版本 iOS 15。工程由 XcodeGen 生成，包含主 App 和 ReplayKit Broadcast Upload Extension。App Group、Bundle ID、扩展嵌入、Info.plist 与 entitlement 配置位于 `project.yml` 和 `Config/`。
 
-- 范围：`screen-assistant/ios/`（本目录）。不含安卓/后端/根文档。
-- 采集：ReplayKit **Broadcast Upload Extension**（系统授权、状态栏提示，不规避受保护画面限制）。
-- OCR：Vision `VNRecognizeTextRequest`（accurate，zh-Hans/zh-Hant + en-US）。
-- 网络：扩展进程内 `POST /v1/answer`（契约见下）。
-- 展示：**PiP 悬浮条为主路径**（iOS 15 API 已核实恰好可用，真机未验；失败自动
-  回落通知）；**本地通知为回退**（PRD 允许的合法降级）。
+## 当前主链路
 
-## 目录结构
+1. 主 App 设置服务地址、识别间隔和归一化 ROI；ROI 只在主 App 内编辑。
+2. 用户先在前台启动 PiP，再通过系统广播选择器启动屏幕广播并授予系统权限。
+3. ReplayKit 扩展逐帧节流，在内存中转正、ROI 裁剪、降采样到最长边 640，再用 Vision 简体/繁体中文 OCR。不会缓存帧或文字历史；同一轮完成前丢弃新帧。
+4. 扩展按固定契约 POST `/v1/answer`，仅 `200` 的非空回复发送到 App Group 容器内的 Unix domain socket。帧格式为长度前缀加 UTF-8 reply；句子和回复不写文件、UserDefaults 或日志。
+5. 主 App 在 PiP 会话期间启动一个 `SAReplyChannel` listener，以 100ms 非阻塞轮询取最新回复并渲染到 sample-buffer PiP；停止/关闭 PiP 时关闭 listener、清理 socket 端点、内存槽和音频会话。
 
-```
-ios/
-├── project.yml                        # XcodeGen 工程描述（生成 ScreenAssistant.xcodeproj）
-├── Config/                            # 工程配置（不参与编译/打包）
-│   ├── App-Info.plist
-│   ├── App.entitlements               # App Group
-│   ├── Broadcast-Info.plist           # com.apple.broadcast-services-upload
-│   └── Broadcast.entitlements
-├── ScreenAssistant/                   # 主 App（SwiftUI，iOS 15+）
-│   ├── ScreenAssistantApp.swift       # 入口 + 配置模型 + 通知权限请求
-│   ├── ContentView.swift              # 设置/启停指引/状态/PiP 控制区
-│   ├── ROIEditorView.swift            # 归一化区域编辑（预设 + 拖动/缩放）
-│   ├── DarwinObserver.swift           # Darwin 通知观察（主 App 侧）
-│   └── PiPDisplayController.swift     # PiP 悬浮条：帧渲染/心跳/播放代理
-├── ScreenAssistantBroadcast/          # 广播上传扩展
-│   └── SampleHandler.swift            # 采集→方向转正→ROI内存裁剪→OCR→POST→PiP邮箱/通知分流
-└── Shared/                            # 两 target 共同编译
-    ├── AppGroup.swift                 # App Group 常量 + Darwin 通知
-    ├── SharedConfig.swift             # 配置读写（服务地址/间隔/超时/ROI/通知开关）
-    ├── ControlState.swift             # 控制开关/轮次计数/PiP 状态与 liveness 心跳
-    ├── ReplyTransport.swift           # 可替换 transport 接口 + 瞬态邮箱默认实现
-    ├── SentenceFormatter.swift        # 基础格式化（空白合并/行拼接）
-    └── AnswerEndpoint.swift           # 固定 HTTP 契约客户端
-```
+`Shared/IPC/SAReplyChannel.swift` 使用系统 AF_UNIX socket API；App 与扩展各自进程内通过 `ReplyTransportFactory` 持有单例。发送异步执行，单槽覆盖、最多三次有限重试；listener 不可达时丢弃回复。socket 文件仅是 App Group 内端点元数据，正文只在进程内存和内核 socket 缓冲中短暂存在。该实现未在本机 Windows 上编译或真机验证。
 
-## 在 Mac 上构建（需 Xcode 14+）
+## 系统行为与边界
 
-本工程以 **XcodeGen** 描述（`project.yml`），仓库不含 `.xcodeproj`（生成产物不入库）。
+- PiP 启动时设置 `AVAudioSession` `.playback` / `.moviePlayback` / `.mixWithOthers`，并激活会话；关闭时停用。主 App `Info.plist` 声明 `UIBackgroundModes=audio`。这使用 PiP 正常配置，不播放静音内容、不循环音频，也不运行伪造的后台任务。
+- PiP 及系统广播选择器必须由用户在前台操作。用户暂停/继续可使用 App 识别开关或系统广播控制；广播暂停/恢复会丢弃旧轮回调。关闭 PiP 会关闭 reply listener 并关闭识别开关；系统广播本身仍需从系统控件停止。
+- App 后台存活、扩展和 PiP 在锁屏/系统中断时的持续行为仍需真机验证。声明 audio 后台模式并不保证进程永不挂起。
+- PiP 位置没有可供 App 查询的公开 API；PiP 覆盖处不保证触摸穿透。请将 PiP 拖离 ROI，降低屏幕 OCR 识别自身回复的回声风险。
+- ROI 在主 App 内编辑，不在其他 App 上留下选择层。App 不承诺全局任意悬浮窗或完全无交互边界。
+- App 与 Broadcast Extension 的 `Info.plist` 都声明 `NSLocalNetworkUsageDescription` 和 `NSAllowsLocalNetworking`，供扩展进程连接本地开发服务。iPhone 必须能访问用户配置的服务地址；本机 loopback 地址不适用于实体 iPhone。生产部署应使用 HTTPS；不要将未鉴权开发服务直接暴露到公网。
+- `SmokeChannels/` 与 `Shared/IPC/check_sa_reply_channel.sh` 是诊断工具，不参与产品帧/回复链路。当前实现固定为扩展内 OCR、UDS 只传 reply；不依据未执行的 shm 探针重写帧传输架构。
 
-```bash
+## Mac 构建、签名与安装
+
+需要安装 Xcode（含 iOS SDK）和 XcodeGen。仓库目录为 `screen-assistant/ios/`。
+
+```sh
 brew install xcodegen
 cd screen-assistant/ios
-xcodegen generate      # 生成 ScreenAssistant.xcodeproj
+xcodegen generate
 open ScreenAssistant.xcodeproj
 ```
 
-Xcode 内：
+在 Xcode 的两个 target（`ScreenAssistant` 和 `ScreenAssistantBroadcast`）中选择同一开发团队，并为 Apple Developer 账号注册/启用 App Group `group.com.screenassistant.ios`。签名配置需同时包含：
 
-1. 选择 `ScreenAssistant` target → Signing & Capabilities → 勾选你的 Team。
-2. 在 Apple Developer 注册 App Group（**免费个人开发者账号即可使用 App Groups**，
-   R/36 核实）：Developer → Identifiers → App Groups → 注册
-   `group.com.screenassistant.ios`，并把它加入主 App 与扩展两个 App ID 的能力里
-   （或在 Xcode 中对两个 target 各添加 "App Groups" capability，值保持一致）。
-4. 真机运行（**广播扩展在模拟器不可用，必须真机**——OpenTok/AWS 官方样例一致
-   声明，R/36 核实）。
-5. 免费个人开发者账号（Personal Team）签名链（R/36 H1，真机待验）：
-   两个 App ID + App Groups 能力 + 7 天有效期描述文件（过期需重签）。
-6. 首次运行到真机后，按 App 内“使用指引”启动一次广播。
+- 主 App Bundle ID：`com.screenassistant.ios`
+- 扩展 Bundle ID：`com.screenassistant.ios.broadcast`
+- 两个 target 的 App Group entitlement：`group.com.screenassistant.ios`
 
-> Bundle ID 若需更换：同步修改 `project.yml` 两处 `PRODUCT_BUNDLE_IDENTIFIER`、
-> `Shared/AppGroup.swift` 的 `identifier`、两份 entitlements 中的 group 值，
-> 以及 Developer 后台注册。
+选择已连接 iPhone 和 `ScreenAssistant` scheme，运行并按系统提示授权屏幕广播。广播启动由用户通过系统选择器确认，不能由 App 静默启动。也可先做无签名构建检查：
 
-## 与远端的固定 HTTP 契约
+```sh
+xcodebuild -project ScreenAssistant.xcodeproj \
+  -scheme ScreenAssistant \
+  -destination 'generic/platform=iOS' \
+  CODE_SIGNING_ALLOWED=NO build
+```
 
-| 项 | 值 |
-|---|---|
-| 请求 | `POST {serverBaseURL}/v1/answer`，`Content-Type: application/json`，体 `{"sentence": "..."}` |
-| 200 | `{"status":"ok","reply":"非空"}` → 弹通知展示 reply |
-| 204 | 重复 → **不刷新**（不发新通知） |
-| 422 / 503 / 504 / 网络错误/超时 | 本轮静默丢弃，下一轮继续；不弹窗、不重试、不排队 |
+生成的无签名产物不能安装到设备；设备安装须由 Xcode 使用匹配的签名证书和 provisioning profile 完成。本交付环境为 Windows，没有 Xcode、Apple 签名身份或 iPhone，因此未生成 IPA。
 
-服务基地址在主 App 设置（如 `http://192.168.1.10:8000`）。Info.plist 已放开
-ATS（`NSAllowsArbitraryLoads`）以允许个人局域网 http 服务；如使用 https 可自行收紧。
+## 逐项交付与验证矩阵
 
-## 客户端行为约束（PRD 对齐）
-
-- 画面仅内存处理：`processSampleBuffer` 内完成方向转正、ROI 裁剪与下采样，
-  sampleBuffer 引用在方法返回后即失效（官方要求），不落盘任何截图/视频。
-- 不持久化句子/回复：App Group 仅存配置键（`config.*`）、控制状态
-  （`control.userWantsCapture`、`control.extensionRoundCounter` 计数器、
-  `control.pipActive` 与 `control.pipHeartbeatAt` 时间戳心跳），
-  无句子、回复或任何历史文本。回复在 PiP 路径经瞬态邮箱（读后即删、仅最新一条、
-  120s 过期），通知路径不落盘。
-- 不去重、不推理、不携带历史：每轮独立发送格式化后的单句。
-- 不堆积请求：轮次节流基于“上一轮完成时刻”；请求在途时后续帧直接跳过。
-- 空识别跳过；轮次间失败静默。
-- 长句保护：超过 2000 字符按无效轮次丢弃（与契约 422 客户端侧一致）。
-
-## 展示方案：PiP 悬浮条（主路径，工程已实现）+ 本地通知（回退）
-
-**PiP 主路径（本轮新增，真机行为未验证）**：
-商业线索（仅可行性，不证架构）：App Store 上架应用 PiP Screen Translate
-（id6756233631）采用同链路组合（广播+端侧 OCR+云端 HTTP+PiP，R/36 核实）。
-**afm-screen-translator 定位（R/36 第三轮更正）**：仅 4 commits、要求 iOS 26，
-是**架构参考而非成熟产品**；降 target 到 iOS 15 属 API 推断，未整链实测；
-App Store 文案不能证明内部架构；性能/内存按系统版本与机型区分验证。
-扩展收到 200 回复后，若 `pipActive` 且主 App 心跳新鲜（≤10s），回复经
-`ReplyTransport`（可替换接口，默认单槽瞬态邮箱）+ Darwin 信号传给主 App；
-主 App `PiPDisplayController` 把文本渲染为 640×360 帧并送入
-`AVSampleBufferDisplayLayer` → 系统 PiP 窗口展示。iOS 15 兼容性已核实：
-`AVPictureInPictureController.ContentSource(sampleBufferDisplayLayer:playbackDelegate:)`
-与 `init(contentSource:)` 均为 iOS 15.0 恰好可用；5 个 playbackDelegate 必需方法
-已按 live 语义实现（时间范围无限/暂停仅记状态/跳转无操作）。
-
-- **后台存活机制与授权决策（重要，如实）**：R/36 第三轮口径更正后——
-  “PiP 激活 + `UIBackgroundModes=audio` + 活跃 `.playback` 会话 = 主 App
-  后台不挂起”是 **afm 参考经验 + 官方 audio 模式语义的推断，非 Apple 明文
-  保证**（R/36 明确）；静音循环播放保活被禁止。与用户“禁止无关后台音频
-  伪保活”禁令的边界重叠，**已提请主控/用户裁决**。工程实现：
-  `PiPDisplayController.usesSilentPlaybackSessionForPiP` 常量门控，
-  **默认 false（完全遵守禁令）**；获批后改为 true 即启用（无声、不播放
-  任何内容），其余代码不变。30 分钟稳定性属真机项（R/36 H2）。
-  Info.plist 的 `UIBackgroundModes: audio` 为 Apple PiP 文档要求的能力声明。
-- 关闭 PiP 窗口 = 数秒内主 App 挂起（OCR/HTTP/展示停，如实标注“关窗即暂停”）；
-  广播停止 = 识别停止（系统限制）。均已写入界面文案。
-- **回声风险（R/36 指出）**：广播采集整个屏幕，含本 App 的 PiP 窗口——PiP
-  覆盖识别区域时 OCR 可能读到自己的回复形成回环。公开 API 无法读取 PiP
-  窗口位置，几何剔除不可行；缓解 = 界面文案要求用户把 PiP 拖离识别区域，
-  真机验收清单含“PiP 位置不遮挡 ROI”检查项。
-- PiP 层每 2s 重喂当前帧保持活性（纯渲染）；间隔是否足够需真机调参。
-  `AVSampleBufferDisplayLayer.enqueue` 自 iOS 17 标记弃用（R/36 O8），本工程
-  目标 iOS 15 使用 enqueue（15/16 唯一路径）；17+ 的
-  AVSampleBufferVideoRenderer 迁移待真机验证后处理。
-- PiP 窗口为系统窗口：用户可拖动位置；覆盖区域为系统自身交互边界，不承诺
-  完全触摸穿透（对齐“采集区域不影响前台操作”验收的 iOS 口径：区域编辑只在
-  主 App 预览内完成，跨 App 不留任何编辑层）；建议用户把 PiP 窗口拖离识别
-  区域与常用操作区。
-
-**通知回退路径（已实现）**：PiP 未启动、设备不支持 PiP、或主 App 心跳超时
-（挂起/被杀）时，扩展在进程内经 `UNUserNotificationCenter` 发本地通知。固定
-identifier 使新通知覆盖旧通知，通知中心不堆积回复历史；可在设置中关闭
-“通知含正文”。
-
-⚠️ **隐私边界（如实标注）**：
-- 通知正文经过 iOS 通知系统（横幅 + 通知中心保留），系统可能保留/摘要通知
-  内容——**不宣称满足“零文本系统留存”**。
-- PiP 路径的回复传递使用 App Group 容器内的**单槽瞬态邮箱**：覆盖写仅保留
-  最新一条（无历史），消费即删除，带 120s 过期防止旧响应回填。iOS 15 公开
-  API 不存在严格“零落盘”的扩展→主 App 通道（Darwin 通知无载荷/XPC 不适用/
-  shm 沙箱不可用），邮箱文件存在毫秒级落盘窗口；`ReplyTransport` 为可替换
-  接口，若专项调研（36）找到无文件 IPC 可直接替换默认实现，两端调用方不变。
-- 专注模式/勿扰模式下通知横幅不展示（系统行为）。
-
-## 验收状态（如实）
-
-| 层次 | 状态 |
-|---|---|
-| 代码完成 | ✅ 主 App + 广播扩展 + 共享层 + PiP 展示链路 + 可替换 transport + 工程配置 |
-| 构建通过 | ❌ 未验证——本机为 Windows，无 Xcode。需在 Mac 上 `xcodegen generate` 后构建 |
-| 真机行为 | ❌ 未验证（方向映射依据 Telegram/Cap 生产实现；OCR/通知/内存需真机确认） |
-| PiP 链路 | ⚠️ 工程已实现（iOS 15 API 已核实恰好可用），**无音频保活下的后台存活、心跳重喂间隔、playbackDelegate 交互均需真机验证**；失败自动回落通知，不阻塞主链路 |
-| 真实远端链路 | ❌ 未验证（需 server=multi-agent-build-37 起服务后联调；S 已报真实短答通过一次） |
-| 性能/30 分钟稳定 | ❌ 未测量 |
-| 采集区域不影响前台操作 | iOS 口径：区域编辑仅在主 App 预览内（跨 App 无编辑层）；PiP 系统窗口可拖动、覆盖处为系统交互边界（不承诺完全穿透）；通知无触摸影响。真机验收按计划矩阵执行（ROI 内外点击/滑动/输入/导航） |
-
-关键待真机验证点：
-1. **通道冒烟（R/36 指定的第一个切片，已随 App 交付）**：shm_open 跨进程
-   （扩展→App）、UDS 容器内 socket、shm 进程内——结果决定主通道架构
-   （见“真机验证切片 1”节）。
-2. Vision accurate OCR 在扩展内的内存峰值是否落入 ~50MB jetsam 硬上限
-   （R/36：Apple 论坛 thread/651367；扩展内 Vision 无实测估 30–50MB）。
-   若被杀且 shm/UDS 冒烟通过，切换哑扩展+通道架构（OCR 已抽为可迁移组件）。
-3. `RPVideoSampleOrientationKey` 值域在本机型上的实际取值（依据 Telegram-iOS 与
-   Cap 生产实现：直接映射 `CGImagePropertyOrientation(rawValue:)`）。
-4. PiP 三要素组合（R/36 H2，**推断非 Apple 保证**）：PiP 激活 + audio 后台
-   能力 + 活跃无声 `.playback` 会话 → 主 App 30 分钟不被系统回收（**该会话
-   默认关闭待授权**）；关闭 PiP 窗口后的挂起时序与通知回落（心跳阈值 10s）；
-   2s 心跳重喂间隔是否足够。
-5. 回声验证：PiP 窗口拖离识别区域后连续识别，确认无“识别到自己回复”回环
-   （R/36 指出广播含自家 PiP 窗口；公开 API 无窗口位置，无法几何剔除）。
-6. 主 App 挂起后扩展自动回落通知的时序。
-7. 中文识别准确率与单轮 OCR 延迟（PRD 目标 ≤500ms，未测量；`.fast` 不支持中文）；
-   端到端延迟（采集→OCR→HTTP→展示，PRD 目标展示 ≤200ms）。
-8. 扩展进程内 `UNUserNotificationCenter` 弹通知是否如官方文档所述可用。
-9. 流程顺序（R/36 参考实现建议）：先开 PiP 再开广播；真机确认该顺序下
-   broadcast 起播与 PiP detach 均正常。
-
-## 关键技术决策：OCR 在扩展内还是主 App（R/36 三轮调研后的现状）
-
-R/36 硬数据：广播扩展 jetsam 内存硬上限约 **50MB**（Apple 论坛
-thread/651367），切 App 瞬间系统堆积 6-8 个待处理缓冲；扩展内 Vision 无实测
-估计 30–50MB 逼近上限。
-
-**当前实现 = OCR 在扩展内**（已交付，风险已量化，作为可用基线）：
-每轮仅 1 帧、不保留任何 sampleBuffer 引用、≤1280px 小图单次渲染、逐帧零共享
-状态读取。理由：哑扩展方案此前受制于“帧写 mmap 环 = 画面落盘”。
-
-**R/36 第三轮更正后的推荐主通道（待真机冒烟验证后切换）**：
-Apple iPhoneOS `shm_open` man 页明文 iOS 实现 "no visible entry in the file
-system" = **真无文件后备**（与文件 mmap 环本质不同），且官方 App Groups
-entitlement 页列 POSIX 共享内存（命名 `<group id>/<name>`）为认可 IPC。
-故推荐架构：哑扩展（节流+降采样）→ shm_open 帧通道 + Darwin 信号 → 主 App
-（OCR→HTTP→PiP）。**切换前置条件**：shm 跨进程冒烟通过（见下节切片 1）；
-冒烟失败备选 UDS 流式通道（内核中转不落盘）；两通道皆败再评估扩展内 OCR
-（当前基线继续可用）。
-
-为此已把 OCR 抽为架构无关组件 `Shared/OCRService.swift`（两头可迁移，
-切换时无需重写），`ReplyTransport` 可替换接口同样为通道切换预留。
-
-另：Vision 在 iOS 15 的 `.fast` 档**不支持中文**（仅拉丁），`.accurate` 档支持
-zh-Hans/zh-Hant——本工程固定 `.accurate`（R/36 核实，与官方“语言支持随档位/
-修订变化”一致）。
-
-## 真机验证切片 1：通道冒烟（R/36 指定，随 App 交付）
-
-App 内“通道冒烟”区提供三个一键测试（真机运行，结果就地显示）：
-
-| 切片 | 验证内容 | 通过判据 |
+| 项目 | 当前状态 | 证据 / 还需验证 |
 |---|---|---|
-| shm_open 进程内冒烟 | shm_open 在目标机进程内可用（命名 `/<group id>/smoke`、mode 0600 必填） | 写→读回校验一致 |
-| UDS 流式通道冒烟 | App Group 容器内 unix socket（短路径 `s.s`）bind/connect/send/recv | 接收校验一致 |
-| **shm 跨进程探针**（关键） | 开启“shm 冒烟模式”+ 启动广播后，扩展每轮向 `/<group id>/xproc` 写递增序列号，主 App 每 2s 轮询 | 序列号持续递增 |
+| iOS 15 XcodeGen 工程、双 target、扩展嵌入、Bundle ID 与 App Group | 已实现；静态核对 | `project.yml`、`Config/*.plist`、`Config/*.entitlements`；需 Mac 生成工程并构建 |
+| 中文设置、服务地址、识别间隔、ROI 编辑、识别开关 | 已实现；静态核对 | `ScreenAssistant/ContentView.swift`、`ROIEditorView.swift`、`Shared/SharedConfig.swift` |
+| ReplayKit 跨 App 采集、单轮忙时丢帧、ROI、方向处理、640 长边限制 | 已实现；静态核对 | `ScreenAssistantBroadcast/SampleHandler.swift`；扩展内存上限未实测，不宣称 50MB 通过 |
+| Vision 中文 OCR、HTTP 契约、网络失败跳过、下一轮续跑 | 已实现；静态核对 | `Shared/OCRService.swift`、`AnswerEndpoint.swift`；真实后端链路本次未重复请求 |
+| UDS 短 reply、无正文文件邮箱、非阻塞发送/消费、listener 生命周期 | 已接线；静态核对 | `Shared/ReplyTransport.swift`、`Shared/IPC/SAReplyChannel.swift`；需在 iOS 15+ 真机验证 App Group socket 路径与收发 |
+| PiP sample-buffer、iOS 15 playback delegate、PiP audio 会话启动/回收 | 已实现；静态核对 | `ScreenAssistant/PiPDisplayController.swift`、`Config/App-Info.plist`；尚未由 Xcode 编译或真机运行 |
+| 暂停/继续/停止、PiP 关闭、迟到 OCR/HTTP 回调 | 已实现；未运行验证 | 广播与识别开关代次使旧回调丢弃；请求在下一帧观察到暂停后取消 |
+| 网络错误后续轮、204 保留显示、回复到 PiP | 契约代码已实现；端到端未实测 | 需设备连接可达的后端并验证 200/204/错误路径 |
+| PiP 后台持续更新、锁屏/中断、触摸影响、回声、30 分钟稳定性 | 待真机 | iOS 无公开 PiP 几何位置；需按产品验收清单在目标设备记录 |
+| OCR ≤500ms、回复到展示 ≤200ms | 待测 | 本机无 Xcode/设备；不得以 Python/服务端契约结果代替 Swift 测量 |
 
-冒烟结果决定主通道架构走向；请把三个切片的屏幕结果回传给本 worker 或 36。
-注：R/36 提示 SO 11589105 称 shm_open 真机可用，但 2014 年有 ENOENT 前科——
-探针切片就是为此准备的实证。
+## 验收清单中的真机步骤
 
-## 集成说明（给安卓 owner / multi-agent-build-38）
+1. 在 iOS 15+ iPhone 安装签名版，确认两个 target entitlement 和 App Group 容器一致。
+2. PiP 启动后开始广播，从目标 App 识别一条句子，检查 `200 → UDS → PiP`；重复请求检查 `204` 不刷新。
+3. 关闭 PiP、暂停/继续广播、停止广播、快速切换识别开关，确认停止后的迟到响应不覆盖当前内容，下一轮能恢复。
+4. 断网再恢复；检查单轮失败被丢弃且后续轮继续。分别记录 OCR 耗时与 reply 到 PiP 展示耗时。
+5. 在 ROI 内外点击、连续滑动、输入文本、切 App；确认除 PiP 自身系统窗口覆盖区域外交互不受区域编辑层干扰。
+6. 连续运行 30 分钟并记录设备、iOS 版本、扩展峰值 footprint、可用内存、广播/PiP 生命周期和回声情况。
 
-- 本目录独立成库，合入方式：`git merge` 本 worker 分支（不跨目录复制源码）。
-- 依赖远端契约：`POST /v1/answer`（见上表）+ `GET /healthz`（客户端未使用健康检查，
-  联调时可用）。
-- 无第三方依赖、无 SPM 包、无私有 API。
-- App Group/Bundle ID 若与集成方签名体系冲突，按上文“Bundle ID 更换”说明同步修改。
+本机可交付结论：源码、工程配置与静态接线检查已完成；本地 Swift/Xcode 构建、iOS 真机 UDS、PiP/ReplayKit 生命周期、性能和 30 分钟稳定性均未验证。没有把缺失的设备证据标成通过。

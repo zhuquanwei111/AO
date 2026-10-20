@@ -76,7 +76,7 @@ public final class SAReplyChannel {
     /// Darwin sockaddr_un.sun_path = 104 字节含 NUL → 路径最长 103 字节。
     static let sunPathLimit = 103
     /// socket 端点文件名（短名，为组容器路径留余量）。
-    static let defaultSocketFileName = "sa.sock"
+    public static let defaultSocketFileName = "sa.sock"
     /// 固定间隔重试（36 §6.7 推荐口径）。
     static let sendRetryDelay: TimeInterval = 2.0
     /// 每 pending 载荷的有限重试次数，耗尽即丢弃并置失败状态（有界）。

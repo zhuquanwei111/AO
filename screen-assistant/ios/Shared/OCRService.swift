@@ -15,38 +15,36 @@ enum OCRService {
     static func recognizeText(in cgImage: CGImage,
                               completion: @escaping (String) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let request = VNRecognizeTextRequest { request, error in
-                guard error == nil,
-                      let observations = request.results as? [VNRecognizedTextObservation] else {
-                    completion("")
-                    return
-                }
-                // Vision 不保证返回阅读顺序；按 boundingBox 近似排序
-                //（自上而下、同行自左向右；boundingBox 为左下原点归一化坐标）。
-                let sorted = observations.sorted { a, b in
-                    let dy = abs(a.boundingBox.minY - b.boundingBox.minY)
-                    if dy > 0.01 { return a.boundingBox.minY > b.boundingBox.minY }
-                    return a.boundingBox.minX < b.boundingBox.minX
-                }
-                var lines: [String] = []
-                for obs in sorted {
-                    if let candidate = obs.topCandidates(1).first {
-                        lines.append(candidate.string)
+            autoreleasepool {
+                let request = VNRecognizeTextRequest { request, error in
+                    guard error == nil,
+                          let observations = request.results as? [VNRecognizedTextObservation] else {
+                        completion("")
+                        return
                     }
+                    // Vision 不保证返回阅读顺序；按 boundingBox 近似排序
+                    //（自上而下、同行自左向右；boundingBox 为左下原点归一化坐标）。
+                    let sorted = observations.sorted { a, b in
+                        let dy = abs(a.boundingBox.minY - b.boundingBox.minY)
+                        if dy > 0.01 { return a.boundingBox.minY > b.boundingBox.minY }
+                        return a.boundingBox.minX < b.boundingBox.minX
+                    }
+                    let lines = sorted.compactMap { $0.topCandidates(1).first?.string }
+                    completion(lines.joined(separator: "\n"))
                 }
-                completion(lines.joined(separator: "\n"))
-            }
-            request.recognitionLevel = .accurate
-            request.usesLanguageCorrection = true
-            // 官方：简/繁中文识别语言为 zh-Hans / zh-Hant，须为前两个元素，
-            // 英语是唯一可搭配语言。
-            request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
+                request.recognitionLevel = .accurate
+                request.usesLanguageCorrection = false
+                request.preferBackgroundProcessing = true
+                // 官方：简/繁中文识别语言为 zh-Hans / zh-Hant，须为前两个元素，
+                // 英语是唯一可搭配语言。
+                request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
 
-            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-            do {
-                try handler.perform([request])
-            } catch {
-                completion("")
+                let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+                do {
+                    try handler.perform([request])
+                } catch {
+                    completion("")
+                }
             }
         }
     }

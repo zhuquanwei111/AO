@@ -78,11 +78,6 @@ struct ContentView: View {
                         .foregroundColor(.secondary)
                 }
 
-                Section(header: Text("通知回退展示"),
-                        footer: Text("通知为回退路径：PiP 未启动或主 App 挂起（心跳超时）时，回复自动改经本地通知展示。通知正文会经过系统通知中心（系统可能保留内容），不宣称零文本系统留存。")) {
-                    Toggle("通知显示回复正文", isOn: $model.notificationShowsContent)
-                }
-
                 Section(header: Text("悬浮展示（PiP）"),
                         footer: Text(pipFooter)) {
                     if !pip.isSupported {
@@ -96,6 +91,9 @@ struct ContentView: View {
                         case .starting:
                             Label("正在启动 PiP…", systemImage: "pip")
                                 .foregroundColor(.blue)
+                        case .suspended:
+                            Label("PiP 被系统暂时暂停", systemImage: "pause.circle")
+                                .foregroundColor(.orange)
                         case .failed(let reason):
                             Label("PiP 失败：\(reason)", systemImage: "xmark.circle")
                                 .foregroundColor(.red)
@@ -109,8 +107,9 @@ struct ContentView: View {
                                 .font(.footnote)
                                 .foregroundColor(.secondary)
                         }
-                        Button(pip.state == .running ? "停止悬浮条" : "启动悬浮条（PiP）") {
-                            if pip.state == .running {
+                        let pipIsActive = pip.state == .running || pip.state == .starting || pip.state == .suspended
+                        Button(pipIsActive ? "停止悬浮条" : "启动悬浮条（PiP）") {
+                            if pipIsActive {
                                 pip.stop()
                             } else {
                                 pip.start()
@@ -167,14 +166,14 @@ struct ContentView: View {
         "iOS 公开 API 无法在其他 App 上叠加任意可拖矩形选择。识别区域在此编辑：以竖屏满屏为参照的归一化矩形，广播期间扩展按同一比例裁剪当前屏幕内容。"
 
     private let pipFooter =
-        "推荐主展示路径：先启动悬浮条（PiP），再开广播，最后切到目标应用——新回复渲染进系统 PiP 窗口。系统限制（如实）：PiP 必须在前台启动；关闭 PiP 窗口即停止本 App 后台存活，展示自动回落通知；广播停止则识别停止。重要：广播采集整个屏幕（含本悬浮窗），请把 PiP 窗口拖离识别区域，否则可能识别到自己的回复。PiP 窗口可拖动，覆盖区域为系统窗口交互边界（不承诺完全触摸穿透）。PiP 后台存活能力默认未启用（涉及无声音频会话授权，见 README 决策记录）；当前后台展示由通知承接。PiP 链路工程已实现，真机行为待验证。"
+        "主展示路径：在前台启动 PiP，再开广播并切到目标应用；主 App listener 随 PiP 启停，回复通过 App Group UDS 短通道到 PiP。PiP 启动时使用系统要求的 playback 音频会话并混音，不播放静音内容；后台实际存活仍需真机验证，系统仍可能挂起进程或暂时暂停 PiP。关闭 PiP 后扩展无法连接时会有限重试并丢弃回复，不写文件或转通知。广播停止则停止识别。广播采集整个屏幕（含 PiP），请把 PiP 拖离识别区域以降低回声风险；公开 API 无法读取 PiP 位置或保证覆盖区域触摸穿透。"
 
     private let startGuide =
-        "启动步骤：1) 打开“识别开关”；2) 点“启动悬浮条（PiP）”（须在前台，PiP 先于广播启动）；3) 点上方“开始直播”按钮（或从控制中心长按屏幕录制按钮，选择“屏识AI广播”）；4) 在系统弹窗中点“开始直播”，屏幕顶部出现系统广播状态栏即开始跨应用采集；5) 切到目标应用；6) 停止：点状态栏停止广播（广播停止=轮询停止，系统限制），或回本 App 停止 PiP 后停止广播。采集授权、状态栏提示与受保护画面限制均由系统承载，本 App 不规避；广播无法程序化启动或后台静默启动。"
+        "启动步骤：1) 打开识别开关；2) 在前台启动 PiP（建立短回复 listener）；3) 点“开始直播”并在系统弹窗确认；4) 切到目标应用。暂停/继续可切换识别开关或使用系统广播控制；停止广播由系统状态栏操作。关闭 PiP 会停止 listener，通道不可达时回复丢弃。采集授权、状态栏提示与受保护画面限制均由系统承载；广播不能由 App 静默启动。"
 
     private let smokeFooter =
-        "R/36 指定的第一个真机验证切片。shm_open 冒烟：Apple iPhoneOS man 页明文 iOS 实现'文件系统无可见条目'（真无文件后备），但需真机确认（SO 11589105 称可用，2014 年有 ENOENT 前科）。跨进程探针：开启'shm 冒烟模式'并启动广播后，此页每 2s 读取扩展写入的序列号，验证扩展→App 通道是否成立；结论决定主通道架构（shm/UDS/维持扩展内 OCR）。"
+        "shm 与 UDS 冒烟页是通道诊断工具。当前产品链路固定为扩展内 ROI OCR → HTTP → UDS 短回复 → PiP；shm 探针不参与产品数据通道，也不决定是否重写画面传输链。真机测试记录系统版本、错误码和往返结果；Windows 无法替代 iPhone 验证。"
 
     private let guideText =
-        "本 App 与“屏识AI广播”扩展通过 App Group 共享配置（服务地址、间隔、区域、通知设置）与控制开关；不共享、不存储识别句子与回复。识别与请求在系统广播扩展进程内完成，画面仅内存处理，不保存截图、识别内容或回复历史。"
+        "本 App 与“屏识AI广播”扩展通过 App Group 共享配置与控制开关，并通过 UDS 传递短回复；句子和回复正文仅在进程内存及 socket 内核缓冲短暂存在，不写文件或偏好设置。识别与请求在广播扩展进程内完成，画面仅内存处理。"
 }
