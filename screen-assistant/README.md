@@ -42,16 +42,24 @@ adb install -r .\app\build\outputs\apk\debug\app-debug.apk
 
 39当前已集成代码包含ReplayKit上传扩展、ROI编辑、Vision中文OCR、HTTP及本地通知，但未实现回复视频帧、SampleBuffer PiP、跨进程不落盘新回复通道，也未验证主App挂起时持续识别和回复更新。通知降级不满足PiP主体验，且通知正文可能由系统保留。工程需Mac/Xcode生成并签名构建；无Mac/Xcode和真机时构建、广播、真实远端、性能及30分钟稳定性均不能标通过。详见[iOS README](ios/README.md)与主控验收清单。
 
+36号R调研对后续实现的集成约束（详见其报告§6.1/§6.3/§6.5）：
+
+- 主通道优先验证App Group命名空间下的`shm_open`命名共享内存（如`group.xxx/frames`），用Darwin通知只发信号；先在目标真机做短通道冒烟（约30行C/Swift级别）。调研依据为Apple App Groups IPC说明及iPhoneOS `shm_open(2)`无可见文件系统入口说明；当前集成代码尚未实现/验证此通道。
+- 若目标机`shm_open`冒烟失败，再评估UDS流式传帧；socket路径长度与App Group容器路径需实测。参考仓库样例无LICENSE，只可参考设计，不复制代码。
+- 不采用afm式App Group文件`mmap`环来宣称满足严格“不落盘”：文件覆盖写和结束时unlink不能证明内容从未写入存储。只有用户明确放宽该要求时才重新评估。
+- PiP帧展示需按系统版本分支：iOS 15/16使用`AVSampleBufferDisplayLayer.enqueue(_:)`；iOS 17+才可用`sampleBufferRenderer`。支持API不代表当前工程已实现或验证PiP。
+- PiP后台存活30分钟、免费个人签名/App Group链路及中文Vision OCR耗时均未实测；逐项留待Mac与目标真机验证，不以参考实现或API可用性代替实测。先验证无文件帧通道，再接OCR和PiP。
+
 ## 本次集成验证记录
 
 | 项目 | 结果 |
 |---|---|
 | Android debug构建、Android 14模拟器安装启动 | 通过 |
-| MediaProjection授权、前台服务启动、ML Kit中文模型加载与OCR执行 | 通过；模拟器日志确认OCR流水线成功 |
+| MediaProjection授权、前台服务启动、ML Kit中文模型加载与OCR流水线执行 | 通过；中文文本准确性未单独核验 |
 | 客户端HTTP请求到本机服务端 | 请求已到达；服务端返回503，未验证成功模型回答/回复条更新 |
 | 暂停/继续/停止 | 模拟器状态文本和服务状态通过；系统通知撤销投屏、旋转停止未通过测试 |
 | 区域编辑取消与正常触摸 | 模拟器确认泡外点击切换到Gmail，主动编辑时全屏编辑层出现，取消后退出；ROI内外连续点击/滑动/键盘及回复窗触摸策略未完整验证 |
-| OCR到HTTP | 模拟器日志确认OCR流水线成功，客户端请求到本机服务端；服务端返回503，真实模型成功回复和回复条未验证 |
+| OCR到HTTP | 模拟器日志确认OCR流水线成功且客户端请求到达本机服务端；服务端返回503，真实模型成功回复和回复条未验证 |
 | 性能、连续30分钟、真实Redis去重204客户端保持、断网恢复 | 未验证 |
 
 完整结果以当前40会话交付清单为准；APK不纳入源码目录。
