@@ -1,14 +1,20 @@
 import ReplayKit
-import Vision
 import CoreImage
 import CoreGraphics
 import CoreVideo
 import CoreMedia
+import Darwin
 import UserNotifications
 import Foundation
 
 /// 广播上传扩展主类：跨应用采集 → 方向转正 → ROI 内存裁剪 → 中文 OCR →
-/// 基础格式化 → POST /v1/answer → 本地通知展示。
+/// 基础格式化 → POST /v1/answer → PiP 邮箱/通知分流。
+///
+/// 另含**通道冒烟模式**（R/36 指定的第一个真机验证切片）：
+/// 当 App Group 中 `control.shmSmokeMode` 为 true 时，每轮不跑 OCR/网络，
+/// 仅向 shm_open 共享内存（`/<group id>/xproc`）写递增序列号——供主 App 的
+/// ShmCrossProcessProbeView 验证“扩展→App 真无文件后备通道”是否在本机可用。
+/// 冒烟结论决定主通道架构（shm/UDS/维持扩展内 OCR）。
 ///
 /// 隐私与生命周期约束：
 ///   - 视频帧仅存在于本方法调用栈与 CIImage/VNImageRequestHandler 内存中，
@@ -72,6 +78,12 @@ final class SampleHandler: RPBroadcastSampleHandler {
         }
         guard startRound else { return }
 
+        // 通道冒烟模式：仅写 shm 序列号，不跑主链路（R/36 真机验证切片 1）
+        if ControlState.shmSmokeMode() {
+            runShmSmokeRound()
+            return
+        }
+
         // 帧内存处理链：sampleBuffer 引用在方法返回后即失效（官方文档明确），
         // 因此在返回前把需要的内容渲染为独立 CGImage。
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
@@ -123,8 +135,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
             return
         }
 
-        // 5) OCR（后台队列；识别文本仅存在于闭包链内存）
-        recognizeText(in: cgImage) { [weak self] recognizedText in
+        // 5) OCR（架构无关组件，后台队列；识别文本仅存在于闭包链内存）
+        OCRService.recognizeText(in: cgImage) { [weak self] recognizedText in
             guard let self else { return }
 
             // 6) 基础格式化；空白/超限 → 空轮（不发请求不发通知）
@@ -177,48 +189,31 @@ final class SampleHandler: RPBroadcastSampleHandler {
         }
     }
 
-    // MARK: - Vision OCR
+    // MARK: - 通道冒烟（真机验证切片 1，R/36 指定）
 
-    /// 对裁剪后的 CGImage 执行中文 OCR。
-    private func recognizeText(in cgImage: CGImage,
-                               completion: @escaping (String) -> Void) {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let request = VNRecognizeTextRequest { request, error in
-                guard error == nil,
-                      let observations = request.results as? [VNRecognizedTextObservation] else {
-                    completion("")
-                    return
-                }
-                // Vision 不保证返回阅读顺序；按 boundingBox 近似排序
-                //（自上而下、同行自左向右；boundingBox 为左下原点归一化坐标）。
-                let sorted = observations.sorted { a, b in
-                    let dy = abs(a.boundingBox.minY - b.boundingBox.minY)
-                    if dy > 0.01 { return a.boundingBox.minY > b.boundingBox.minY }
-                    return a.boundingBox.minX < b.boundingBox.minX
-                }
-                // accurate 路径对中文按“行/行片段”切分（官方文档）；
-                // 行顺序拼接原始文本，格式化交给 SentenceFormatter。
-                var lines: [String] = []
-                for obs in sorted {
-                    if let candidate = obs.topCandidates(1).first {
-                        lines.append(candidate.string)
-                    }
-                }
-                completion(lines.joined(separator: "\n"))
-            }
-            request.recognitionLevel = .accurate
-            request.usesLanguageCorrection = true
-            // 官方：简/繁中文识别语言为 zh-Hans / zh-Hant，须为前两个元素，
-            // 英语是唯一可搭配语言。
-            request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
-
-            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-            do {
-                try handler.perform([request])
-            } catch {
-                completion("")
-            }
+    /// 向 shm_open 命名共享内存写递增序列号（与 ShmCrossProcessProbeView 布局一致：
+    /// 前 8 字节 Int64 little-endian）。命名格式 `<group id>/xproc`（Apple 规范）。
+    private func runShmSmokeRound() {
+        let name = "/\(AppGroup.identifier)/xproc"
+        let bytes = 64
+        let fd = shm_open(name, O_CREAT | O_RDWR, mode_t(0o600))
+        guard fd >= 0 else {
+            // shm 在本机不可用（ENOENT 前科）：结束本轮，让主链路冒烟结论记录失败
+            endRound()
+            return
         }
+        guard ftruncate(fd, off_t(bytes)) == 0,
+              let map = mmap(nil, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0),
+              map != MAP_FAILED else {
+            close(fd)
+            endRound()
+            return
+        }
+        let seqPtr = map.assumingMemoryBound(to: Int64.self)
+        seqPtr.pointee += 1
+        munmap(map, bytes)
+        close(fd)
+        endRound()
     }
 }
 
