@@ -108,7 +108,7 @@ final class PiPDisplayController: NSObject, ObservableObject {
         // 见 usesSilentPlaybackSessionForPiP 决策注释）
         if Self.usesSilentPlaybackSessionForPiP {
             let session = AVAudioSession.sharedInstance()
-            try? session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            try? session.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
             try? session.setActive(true)
         }
 
@@ -117,12 +117,15 @@ final class PiPDisplayController: NSObject, ObservableObject {
             playbackDelegate: self
         )
         let controller = AVPictureInPictureController(contentSource: source)
-        controller.delegate = self
-        // App 切后台时自动进入 PiP（iOS 14.2+，官方 API）
+        // iOS 15 兼容：delegate 经 setDelegate(_:queue:) 设置（回调保证主队列，
+        // 安全更新 @Published 状态）
+        controller.setDelegate(self, queue: .main)
+        // App 切后台时自动进入 PiP（iOS 14.2+，官方 API；afm 同款）
         controller.canStartPictureInPictureAutomaticallyFromInline = true
         pipController = controller
 
-        // live 内容时间基：rate 1，主时钟驱动
+        // 等比缩放渲染（afm 同款）+ live 内容时间基：rate 1，主时钟驱动
+        displayLayer.videoGravity = .resizeAspect
         let timebase = CMTimebase(masterClock: CMClockGetHostClockTimebase())
         CMTimebaseSetRate(timebase, 1)
         CMTimebaseSetTime(timebase, CMTime.zero)
@@ -130,6 +133,11 @@ final class PiPDisplayController: NSObject, ObservableObject {
 
         isPlaying = true
         enqueue(placeholderFrame())
+        if !controller.isPictureInPicturePossible {
+            // afm 实证：layer 未附着可见 window 层级或非前台时不可 detach
+            state = .failed("PiP 当前不可用：请确认 App 在前台")
+            return
+        }
         state = .starting
         controller.startPictureInPicture()
 
@@ -237,8 +245,10 @@ final class PiPDisplayController: NSObject, ObservableObject {
     private func enqueue(_ cgImage: CGImage) {
         guard let buffer = Self.makeSampleBuffer(from: cgImage,
                                                  timebase: displayLayer.controlTimebase) else { return }
-        // iOS 17 起 enqueue 标记弃用（R/36 O8；iOS 15/16 须用本路径，
-        // 17+ 的 AVSampleBufferVideoRenderer 迁移待真机验证后另行处理）
+        // enqueue 在新 SDK 中标记弃用（R/36 O8 与 afm 注释分别标注 iOS 17/18，
+        // 以实际 SDK 警告为准）；iOS 15/16 须用本路径。刻意不引入
+        // sampleBufferRenderer 门控：该符号在旧 Xcode SDK 不存在，会给 Mac
+        // 构建者增加编译失败风险；enqueue 弃用≠移除，待真机验证后再迁移。
         displayLayer.enqueue(buffer)
     }
 
