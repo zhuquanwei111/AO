@@ -12,7 +12,7 @@ channel.stop()                       // 关闭监听、清槽并清理端点
 
 `Shared/ReplyTransport.swift` 提供每进程单例 adapter。App 与扩展是独立进程，各持有自己的 channel；主 App 在 PiP 启动时开 listener，并以 100ms 轮询取回复；PiP 关闭或启动失败时 stop。扩展每轮只调用 `send(reply:)`。扩展无 listener 时固定间隔重试最多三次后丢弃；不会写通知或文件。
 
-协议是 4 字节大端长度 + UTF-8 载荷，最大 16,384 字节。处理部分读写、短路径校验、陈旧端点清理、接收端单槽覆盖、停止和重启；sender 使用独立串行队列，采集回调不会等待网络 socket 写入。
+协议是 4 字节大端长度 + UTF-8 载荷，最大 16,384 字节。adapter 将载荷编码为数字 capture generation、换行符和 reply；主 App 仅接受当前代次且识别仍开启的 reply。因而停止前已排入扩展有限重试的旧 reply 不会在后续 PiP 会话回填。代次只作控制元数据，正文仍只经 socket 缓冲，不写文件。处理部分读写、短路径校验、陈旧端点清理、接收端单槽覆盖、停止和重启；sender 使用独立串行队列，采集回调不会等待网络 socket 写入。
 
 ## 依据与限制
 

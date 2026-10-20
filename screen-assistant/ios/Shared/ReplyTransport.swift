@@ -25,11 +25,19 @@ final class SAReplyTransport: ReplyTransport {
     }
 
     func send(reply: String) {
-        channel.send(reply: reply)
+        // Attach a numeric session token so a bounded UDS retry from an older
+        // capture run cannot refill PiP after pause, stop, or restart.
+        channel.send(reply: "\(ControlState.captureGeneration())\n\(reply)")
     }
 
     func takeLatestReply() -> String? {
-        channel.takeLatestReply()
+        guard ControlState.userWantsCapture(),
+              let envelope = channel.takeLatestReply(),
+              let separator = envelope.firstIndex(of: "\n"),
+              let generation = Int(envelope[..<separator]),
+              generation == ControlState.captureGeneration() else { return nil }
+        let reply = String(envelope[envelope.index(after: separator)...])
+        return reply.isEmpty ? nil : reply
     }
 }
 

@@ -21,8 +21,8 @@ struct ControlState {
         guard let d = AppGroup.defaults else { return }
         let oldValue = d.bool(forKey: Keys.userWantsCapture)
         guard oldValue != v else { return }
-        d.set(v, forKey: Keys.userWantsCapture)
         d.set(d.integer(forKey: Keys.captureGeneration) &+ 1, forKey: Keys.captureGeneration)
+        d.set(v, forKey: Keys.userWantsCapture)
     }
 
     /// 暂停、停止或重启时递增；扩展据此丢弃迟到的 OCR/网络回调。

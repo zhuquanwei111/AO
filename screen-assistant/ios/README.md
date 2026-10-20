@@ -7,7 +7,7 @@
 1. 主 App 设置服务地址、识别间隔和归一化 ROI；ROI 只在主 App 内编辑。
 2. 用户先在前台启动 PiP，再通过系统广播选择器启动屏幕广播并授予系统权限。
 3. ReplayKit 扩展逐帧节流，在内存中转正、ROI 裁剪、降采样到最长边 640，再用 Vision 简体/繁体中文 OCR。不会缓存帧或文字历史；同一轮完成前丢弃新帧。
-4. 扩展按固定契约 POST `/v1/answer`，仅 `200` 的非空回复发送到 App Group 容器内的 Unix domain socket。帧格式为长度前缀加 UTF-8 reply；句子和回复不写文件、UserDefaults 或日志。
+4. 扩展按固定契约 POST `/v1/answer`，仅 `200` 的非空回复发送到 App Group 容器内的 Unix domain socket。帧格式为长度前缀加 UTF-8 载荷；载荷先带数字 capture generation，再带 reply。主 App 只接受与当前代次一致且识别仍开启的 reply，因此暂停、停止或重启前进入有限重试队列的旧回复会被丢弃。句子和回复不写文件、UserDefaults 或日志。
 5. 主 App 在 PiP 会话期间启动一个 `SAReplyChannel` listener，以 100ms 非阻塞轮询取最新回复并渲染到 sample-buffer PiP；停止/关闭 PiP 时关闭 listener、清理 socket 端点、内存槽和音频会话。
 
 `Shared/IPC/SAReplyChannel.swift` 使用系统 AF_UNIX socket API；App 与扩展各自进程内通过 `ReplyTransportFactory` 持有单例。发送异步执行，单槽覆盖、最多三次有限重试；listener 不可达时丢弃回复。socket 文件仅是 App Group 内端点元数据，正文只在进程内存和内核 socket 缓冲中短暂存在。该实现未在本机 Windows 上编译或真机验证。
@@ -58,7 +58,7 @@ xcodebuild -project ScreenAssistant.xcodeproj \
 | 中文设置、服务地址、识别间隔、ROI 编辑、识别开关 | 已实现；静态核对 | `ScreenAssistant/ContentView.swift`、`ROIEditorView.swift`、`Shared/SharedConfig.swift` |
 | ReplayKit 跨 App 采集、单轮忙时丢帧、ROI、方向处理、640 长边限制 | 已实现；静态核对 | `ScreenAssistantBroadcast/SampleHandler.swift`；扩展内存上限未实测，不宣称 50MB 通过 |
 | Vision 中文 OCR、HTTP 契约、网络失败跳过、下一轮续跑 | 已实现；静态核对 | `Shared/OCRService.swift`、`AnswerEndpoint.swift`；真实后端链路本次未重复请求 |
-| UDS 短 reply、无正文文件邮箱、非阻塞发送/消费、listener 生命周期 | 已接线；静态核对 | `Shared/ReplyTransport.swift`、`Shared/IPC/SAReplyChannel.swift`；需在 iOS 15+ 真机验证 App Group socket 路径与收发 |
+| UDS 短 reply、无正文文件邮箱、非阻塞发送/消费、listener 生命周期 | 已接线；静态核对 | `Shared/ReplyTransport.swift`、`Shared/IPC/SAReplyChannel.swift`；数字代次过滤旧重试；需在 iOS 15+ 真机验证 App Group socket 路径与收发 |
 | PiP sample-buffer、iOS 15 playback delegate、PiP audio 会话启动/回收 | 已实现；静态核对 | `ScreenAssistant/PiPDisplayController.swift`、`Config/App-Info.plist`；尚未由 Xcode 编译或真机运行 |
 | 暂停/继续/停止、PiP 关闭、迟到 OCR/HTTP 回调 | 已实现；未运行验证 | 广播与识别开关代次使旧回调丢弃；请求在下一帧观察到暂停后取消 |
 | 网络错误后续轮、204 保留显示、回复到 PiP | 契约代码已实现；端到端未实测 | 需设备连接可达的后端并验证 200/204/错误路径 |
