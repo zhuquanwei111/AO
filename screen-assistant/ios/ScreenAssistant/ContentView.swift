@@ -1,4 +1,21 @@
 import SwiftUI
+import ReplayKit
+
+/// 系统“开始直播”入口（RPSystemBroadcastPickerView，官方唯一启动路径；
+/// 无法程序化启动广播）。preferredExtension 绑定本 App 的广播扩展，
+/// 用户点击后在系统弹窗中确认。
+struct BroadcastPickerSection: UIViewRepresentable {
+    static let extensionBundleID = "com.screenassistant.ios.broadcast"
+
+    func makeUIView(context: Context) -> RPSystemBroadcastPickerView {
+        let view = RPSystemBroadcastPickerView()
+        view.preferredExtension = Self.extensionBundleID
+        view.showsMicrophoneButton = false
+        return view
+    }
+
+    func updateUIView(_ uiView: RPSystemBroadcastPickerView, context: Context) {}
+}
 
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
@@ -82,6 +99,7 @@ struct ContentView: View {
                 Section(header: Text("采集"),
                         footer: Text(startGuide)) {
                     Toggle("识别开关（扩展按此决定是否处理）", isOn: $model.captureWanted)
+                    BroadcastPickerSection()
                     HStack {
                         Text("已处理轮次")
                         Spacer()
@@ -112,10 +130,10 @@ struct ContentView: View {
         "iOS 公开 API 无法在其他 App 上叠加任意可拖矩形选择。识别区域在此编辑：以竖屏满屏为参照的归一化矩形，广播期间扩展按同一比例裁剪当前屏幕内容。"
 
     private let pipFooter =
-        "推荐主展示路径：先从控制中心启动广播，回到本 App 点“启动悬浮条”，再切到目标应用——新回复渲染进系统 PiP 窗口。PiP 窗口可拖动位置，覆盖区域为系统窗口交互边界（不承诺完全触摸穿透）；建议拖离识别区域与常用操作区。主 App 若被系统挂起（心跳超时），扩展自动改用通知展示，不中断识别。不使用后台音频保活。PiP 链路工程已实现，真机行为待验证（见 README 验收状态）。"
+        "推荐主展示路径：先启动广播，回到本 App 点“启动悬浮条”，再切到目标应用——新回复渲染进系统 PiP 窗口。系统限制（如实）：PiP 必须在前台启动；关闭 PiP 窗口即停止本 App 后台存活，展示自动回落通知；广播停止则识别停止。PiP 窗口可拖动位置，覆盖区域为系统窗口交互边界（不承诺完全触摸穿透）；建议拖离识别区域与常用操作区。本实现不激活音频会话、不播放任何音频（无伪保活）；按 Apple PiP 文档在工程中声明“Audio, AirPlay, and Picture in Picture”后台能力（仅用于 PiP 支持）。PiP 链路工程已实现，真机行为待验证（见 README 验收状态）。"
 
     private let startGuide =
-        "启动步骤：1) 打开本 App 的“识别开关”；2) 从控制中心长按屏幕录制按钮，在列表中选择“屏识AI广播”；3) 点“开始直播”，屏幕顶部出现系统广播状态栏即开始跨应用采集；4) 回到本 App 点“启动悬浮条（PiP）”，再切到目标应用；5) 停止：点状态栏停止广播，或回本 App 停止 PiP 后停止广播。采集授权、状态栏提示与受保护画面限制均由系统承载，本 App 不规避。"
+        "启动步骤：1) 打开“识别开关”；2) 点上方“开始直播”按钮（或从控制中心长按屏幕录制按钮，选择“屏识AI广播”）；3) 在系统弹窗中点“开始直播”，屏幕顶部出现系统广播状态栏即开始跨应用采集；4) 回到本 App 点“启动悬浮条（PiP）”，再切到目标应用；5) 停止：点状态栏停止广播（广播停止=轮询停止，系统限制），或回本 App 停止 PiP 后停止广播。采集授权、状态栏提示与受保护画面限制均由系统承载，本 App 不规避；广播无法程序化启动或后台静默启动。"
 
     private let guideText =
         "本 App 与“屏识AI广播”扩展通过 App Group 共享配置（服务地址、间隔、区域、通知设置）与控制开关；不共享、不存储识别句子与回复。识别与请求在系统广播扩展进程内完成，画面仅内存处理，不保存截图、识别内容或回复历史。"

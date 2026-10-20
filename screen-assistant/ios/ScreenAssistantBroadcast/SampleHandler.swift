@@ -24,8 +24,12 @@ final class SampleHandler: RPBroadcastSampleHandler {
     /// （ReplayKit 回调本身串行，但 OCR/网络完成闭包在后台队列触发。）
     private let stateQueue = DispatchQueue(label: "com.screenassistant.broadcast.state")
 
-    /// 上一轮结束时刻（CFAbsoluteTime）。0 表示尚无完成的轮次。
-    private var lastRoundEndTime: CFAbsoluteTime = 0
+    /// 下一轮可开始的最早时刻（CFAbsoluteTime）。仅在 stateQueue 内读写。
+    /// 逐帧路径只做“时间未到直接丢弃”，把每帧共享状态读取压到每轮一次
+    /// （扩展 jetsam 硬上限约 50MB、切 App 瞬间系统会堆积 6-8 个待处理缓冲——
+    /// R/36 调研数据：Apple 论坛 thread/651367；本实现不保留任何 sampleBuffer
+    /// 引用，逐帧成本 = 一次同步块内 3 次比较）。
+    private var nextRoundEligibleTime: CFAbsoluteTime = 0
     /// 一轮是否正在进行（帧→OCR→请求→响应 全链路）。
     private var roundActive = false
 
@@ -35,7 +39,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
         stateQueue.sync {
-            lastRoundEndTime = 0
+            nextRoundEligibleTime = 0
             roundActive = false
         }
     }
@@ -57,17 +61,19 @@ final class SampleHandler: RPBroadcastSampleHandler {
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer,
                                       with sampleBufferType: RPSampleBufferType) {
         guard sampleBufferType == .video else { return }
-        guard ControlState.userWantsCapture() else { return }
 
-        // 节流 + 防堆积闸门：距上一轮结束不足配置间隔，或上一轮仍在进行 → 跳过本帧。
+        // 闸门（stateQueue 内，纯比较，无共享状态读取）：一轮进行中、或距下一轮
+        // 时间未到 → 直接丢弃本帧；识别开关关闭时每 1s 复查一次（及时响应启停）。
         let now = CFAbsoluteTimeGetCurrent()
-        let interval = SharedConfig.intervalSeconds()
         var startRound = false
         stateQueue.sync {
-            if !roundActive,
-               lastRoundEndTime == 0 || now - lastRoundEndTime >= interval {
-                roundActive = true
-                startRound = true
+            if !roundActive, now >= nextRoundEligibleTime {
+                if ControlState.userWantsCapture() {
+                    roundActive = true
+                    startRound = true
+                } else {
+                    nextRoundEligibleTime = now + 1
+                }
             }
         }
         guard startRound else { return }
@@ -110,7 +116,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
         }
         ciImage = ciImage.cropped(to: cropRect)
 
-        // 3) 下采样到最长边限制（扩展内存上限保护）
+        // 3) 下采样到最长边限制（扩展 jetsam 硬上限约 50MB 的内存保护，
+        //    R/36 调研：切 App 瞬间系统会堆积多个待处理缓冲）
         let longSide = max(ciImage.extent.width, ciImage.extent.height)
         if longSide > SharedConfig.maxCropPixelDimension {
             let scale = SharedConfig.maxCropPixelDimension / longSide
@@ -169,11 +176,12 @@ final class SampleHandler: RPBroadcastSampleHandler {
         }
     }
 
-    /// 结束一轮：清 roundActive 并记录结束时刻（节流基准）。
+    /// 结束一轮：清 roundActive 并按配置间隔排定下一轮可开始时刻。
     private func endRound() {
         stateQueue.sync {
             roundActive = false
-            lastRoundEndTime = CFAbsoluteTimeGetCurrent()
+            nextRoundEligibleTime = CFAbsoluteTimeGetCurrent()
+                + SharedConfig.intervalSeconds()
         }
     }
 

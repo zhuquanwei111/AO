@@ -50,7 +50,8 @@ open ScreenAssistant.xcodeproj
 Xcode 内：
 
 1. 选择 `ScreenAssistant` target → Signing & Capabilities → 勾选你的 Team。
-2. **注册 App Group**：Apple Developer → Identifiers → App Groups → 注册
+2. 在 Apple Developer 注册 App Group（**免费个人开发者账号即可使用 App Groups**，
+   R/36 核实）：Developer → Identifiers → App Groups → 注册
    `group.com.screenassistant.ios`，并把它加入主 App 与扩展两个 App ID 的能力里
    （或在 Xcode 中对两个 target 各添加 "App Groups" capability，值保持一致）。
 3. 真机运行（广播扩展无法在模拟器完整验证，需真机）。
@@ -97,10 +98,16 @@ ATS（`NSAllowsArbitraryLoads`）以允许个人局域网 http 服务；如使�
 与 `init(contentSource:)` 均为 iOS 15.0 恰好可用；5 个 playbackDelegate 必需方法
 已按 live 语义实现（时间范围无限/暂停仅记状态/跳转无操作）。
 
-- **不启用 UIBackgroundModes audio、不激活 AVAudioSession 保活**（禁止无关后台
-  音频伪保活）。主 App 后台存活完全依赖 PiP 自身系统生命周期，该行为**需真机
-  验证**；若系统仍挂起主 App，扩展侧 liveness 心跳检测（2s 周期写时间戳，
+- **后台能力声明与伪保活的区分（重要，如实标注）**：按 Apple PiP 文档在
+  Info.plist 声明 `UIBackgroundModes: audio`（即 Xcode 中的 "Audio, AirPlay,
+  and Picture in Picture" 后台能力——R/36 核实为 PiP 支持的文档化启用方式）；
+  但**代码中不激活 AVAudioSession、不播放任何音频**（无伪保活：不用静音音频
+  占住后台执行权）。主 App 后台存活依赖 PiP 自身系统生命周期，该行为**需真机
+  验证**；关闭 PiP 窗口即停止后台存活、广播停止则识别停止（系统限制，已写入
+  界面文案）。若主 App 被挂起，扩展侧 liveness 心跳检测（2s 周期写时间戳，
   >10s 判定超时）自动把展示回落到通知，不阻塞采集/OCR/网络主链路。
+  如评审认为 plist 声明本身超出授权，可删除该键：PiP 启动与帧渲染不受影响，
+  仅切后台后的存活可能更早失效。
 - PiP 层每 2s 重喂当前帧保持活性（纯渲染，无音频）；间隔是否足够需真机调参。
 - PiP 窗口为系统窗口：用户可拖动位置；覆盖区域为系统自身交互边界，不承诺
   完全触摸穿透（对齐“采集区域不影响前台操作”验收的 iOS 口径：区域编辑只在
@@ -135,13 +142,39 @@ identifier 使新通知覆盖旧通知，通知中心不堆积回复历史；可
 | 采集区域不影响前台操作 | iOS 口径：区域编辑仅在主 App 预览内（跨 App 无编辑层）；PiP 系统窗口可拖动、覆盖处为系统交互边界（不承诺完全穿透）；通知无触摸影响。真机验收按计划矩阵执行（ROI 内外点击/滑动/输入/导航） |
 
 关键待真机验证点：
-1. `RPVideoSampleOrientationKey` 值域在本机型上的实际取值（依据 Telegram-iOS 与
+1. Vision accurate OCR 在扩展内的内存峰值是否落入 ~50MB jetsam 硬上限
+   （R/36 调研：Apple 论坛 thread/651367；切 App 瞬间系统堆 6-8 个缓冲）。
+   若被杀，回退哑扩展架构（见上“关键技术决策”）。
+2. `RPVideoSampleOrientationKey` 值域在本机型上的实际取值（依据 Telegram-iOS 与
    Cap 生产实现：直接映射 `CGImagePropertyOrientation(rawValue:)`）。
-2. 扩展内 accurate OCR 的内存峰值（裁剪后最长边限制 1280px 已做保护）。
-3. 无后台音频模式时 PiP 对主 App 的保活行为；心跳重喂间隔（2s）是否足够。
-4. 主 App 挂起后扩展自动回落通知的时序（心跳超时阈值 10s）。
-5. 中文识别准确率与单轮 OCR 延迟（PRD 目标 ≤500ms，未测量）。
+3. 无音频会话激活（仅 plist 能力声明）时 PiP 对主 App 的保活行为；
+   2s 心跳重喂间隔是否足够；关闭 PiP 窗口后的展示回落时序（心跳超时阈值 10s）。
+4. 主 App 挂起后扩展自动回落通知的时序。
+5. 中文识别准确率与单轮 OCR 延迟（PRD 目标 ≤500ms，未测量；`.fast` 不支持中文）。
 6. 扩展进程内 `UNUserNotificationCenter` 弹通知是否如官方文档所述可用。
+
+## 关键技术决策：OCR 在扩展内还是主 App（R/36 调研后的取舍）
+
+R/36 核实的硬数据：广播扩展 jetsam 内存硬上限约 **50MB**（Apple 论坛
+thread/651367），且切 App 瞬间系统会堆积 6-8 个待处理缓冲。参考项目
+afm-screen-translator（MIT）采用“哑扩展”架构：扩展只节流+降采样+写 App Group
+共享内存环，OCR 放主 App。
+
+**本工程选择 OCR 留在扩展内**，理由（已同步 36）：
+1. **画面零落盘**：PRD 要求画面仅内存处理；哑扩展需把帧写入 mmap 环（磁盘介质），
+   R/36 自己的深核已确认“不证明画面从未落盘”。本设计帧只在扩展进程内存中存在。
+2. **链路不依赖主 App 存活**：主 App 挂起/被杀时（PiP 未开或被系统暂停），
+   扩展仍能完成 OCR+POST+通知回退——哑扩展会把整条链路耦合到主 App 生命周期。
+3. **内存工作集小**：每轮仅处理 1 帧（间隔节流），不保留任何 sampleBuffer 引用；
+   CoreImage 裁剪/降采样为惰性求值，唯一一次渲染发生在 ≤1280px 的小裁剪区上；
+   逐帧路径零共享状态读取（纯时间比较），共享配置每轮读一次。
+4. Vision 在扩展内的峰值是否落入 50MB 预算**仍是首要真机验证项**；若实测被
+   jetsam 杀，回退方案即哑扩展架构（本架构文档已备，届时需接受帧 mmap 的
+   落盘边界并重新报批）。
+
+另：Vision 在 iOS 15 的 `.fast` 档**不支持中文**（仅拉丁），`.accurate` 档支持
+zh-Hans/zh-Hant——本工程固定 `.accurate`（R/36 核实，与官方“语言支持随档位/
+修订变化”一致）。
 
 ## 集成说明（给安卓 owner / multi-agent-build-38）
 

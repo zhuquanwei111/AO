@@ -12,10 +12,15 @@ import Combine
 /// 视频帧 → AVSampleBufferDisplayLayer → 系统 PiP 窗口展示。
 ///
 /// 平台边界（如实）：
-///   - **不启用 UIBackgroundModes audio、不激活 AVAudioSession 保活**（用户禁止
-///     无关后台音频伪保活）。主 App 在后台的存活完全依赖 PiP 自身的系统生命周期；
-///     若系统仍挂起主 App，扩展侧 liveness 心跳检测会自动把展示回落到通知，
-///     不阻塞采集/OCR/网络主链路。此行为需真机验证。
+///   - **不激活 AVAudioSession、不播放任何音频**（禁止无关后台音频伪保活）。
+///     Info.plist 中的 `UIBackgroundModes: audio` 是 Apple PiP 文档要求的
+///     "Audio, AirPlay, and Picture in Picture" 能力声明（R/36 核实），与
+///     “用静音音频占住后台”的伪保活是两回事；playbackDelegate 亦显式
+///     `shouldProhibitBackgroundAudioPlayback = true`。
+///   - 主 App 后台存活依赖 PiP 自身系统生命周期（关闭 PiP 窗口即停止存活、
+///     广播停止则识别停止——系统限制，已写入界面文案）；若系统仍挂起主 App，
+///     扩展侧 liveness 心跳检测自动把展示回落到通知，不阻塞采集/OCR/网络主链路。
+///     此行为需真机验证。
 ///   - PiP 窗口为系统窗口，可被用户拖动；其覆盖区域具有系统自身的交互边界，
 ///     不承诺完全触摸穿透（对齐计划“采集区域不影响前台操作”的 iOS 口径）。
 ///   - iOS 15 的 ContentSource 构造器强制要求 playbackDelegate，全部必需方法
