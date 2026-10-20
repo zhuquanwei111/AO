@@ -36,7 +36,17 @@ adb install -r .\app\build\outputs\apk\debug\app-debug.apk
 
 ## 服务端
 
-启动与变量说明见[server/README.md](server/README.md)。本机共享Redis 6379曾出现MISCONF写入失败；本地集成应使用README中的专用临时Redis或Compose，不修改共享实例配置。服务未配置有效天翼凭据时返回503，不能以模拟响应声称真实模型打通。
+最快启动（Windows PowerShell，Docker Compose）：
+
+```powershell
+cd screen-assistant\server
+Copy-Item .env.example .env
+notepad .env   # 填 TIANYI_API_KEY=你的天翼凭据并保存
+docker compose up -d --build
+Invoke-RestMethod http://127.0.0.1:8000/healthz
+```
+
+Android 模拟器服务地址填`http://10.0.2.2:8000`；真机填电脑在同一局域网的地址。停止服务运行`docker compose down`。本机共享Redis 6379曾出现MISCONF写入失败；Compose会启动独立Redis，不改共享实例配置。未配置有效天翼凭据或模型调用失败时，`/v1/answer`返回503；健康检查正常不代表模型回答已打通。更多变量及非Docker运行方法见[server/README.md](server/README.md)。
 
 ## iOS 状态与缺口
 
