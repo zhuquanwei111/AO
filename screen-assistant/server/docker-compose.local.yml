@@ -15,6 +15,7 @@ services:
     restart: unless-stopped
     ports:
       - "19180:8000"
+      - "8000:8000"
     environment:
       TIANYI_BASE_URL: ${TIANYI_BASE_URL:-https://ai.ctaigw.cn/v1}
       TIANYI_API_KEY: ${TIANYI_API_KEY:?set TIANYI_API_KEY in environment or .env}
