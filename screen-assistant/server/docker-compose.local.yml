@@ -1,0 +1,28 @@
+# 本轮联调专用：服务固定 127.0.0.1:19180，Redis 仅 compose 内部网络（不占宿主机端口）。
+# 用法：先设 $env:TIANYI_API_KEY，再 docker compose -f docker-compose.local.yml up -d --build
+# 停止：docker compose -f docker-compose.local.yml down
+services:
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    restart: unless-stopped
+    labels:
+      ao.session: ${AO_SESSION_ID:-unset}
+      ao.spare: "true"
+
+  server:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "19180:8000"
+    environment:
+      TIANYI_BASE_URL: ${TIANYI_BASE_URL:-https://ai.ctaigw.cn/v1}
+      TIANYI_API_KEY: ${TIANYI_API_KEY:?set TIANYI_API_KEY in environment or .env}
+      TIANYI_MODEL: ${TIANYI_MODEL:-glm-5.3-flash}
+      REDIS_URL: redis://redis:6379/0
+      DEDUP_TTL_SECONDS: ${DEDUP_TTL_SECONDS:-86400}
+    labels:
+      ao.session: ${AO_SESSION_ID:-unset}
+      ao.spare: "true"
+    depends_on:
+      - redis
