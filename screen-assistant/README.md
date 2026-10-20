@@ -1,60 +1,57 @@
-# 屏识AI助手（screen-assistant）
+# 屏识AI助手 V1.0
 
-个人自用：在 Android 上框选一块屏幕区域，按设定间隔对该区域做中文 OCR，把识别到的句子发给远端 `/v1/answer`，回复以不抢焦点的横向悬浮条展示。画面仅在内存处理，不保存任何截图/视频/识别内容/回复。
+Android 客户端按设定间隔采集屏幕区域，进行端上中文 OCR，并把单条文本发送到远端 `/v1/answer`；只把新回复显示在不抢焦点的悬浮条。画面、识别文本和回复不写入本地文件或历史记录。
 
-完整产品要求与固定 HTTP 契约见执行计划（AO 编排产物）：
-`POST /v1/answer` 请求体仅 `{"sentence": "..."}`；200=`{"status":"ok","reply":"..."}`，204=重复（客户端保留展示），422=无效输入，503/504=远端不可用；`GET /healthz` 健康。
+## 模块与当前集成状态
 
-## 模块归属
-
-| 目录 | 内容 | Owner |
+| 目录 | 内容 | 当前状态 |
 |---|---|---|
-| `android/` | Android 客户端（Java，零 androidx，ML Kit 中文 OCR bundled 16.0.1） | 任务A（multi-agent-build-38） |
-| `server/` | 远端服务（FastAPI + Redis 去重 + OpenAI 兼容模型） | 任务S（multi-agent-build-37），本地分支合入 |
-| `ios/` | iOS 客户端（后续任务，尚未建） | 任务I |
+| `android/` | Java、MediaProjection、ML Kit Chinese OCR、HTTP、悬浮展示 | 38提交已集成；40负责本地集成和设备验证 |
+| `server/` | FastAPI、Redis原子去重、天翼模型单轮回答 | 37提交`127ce11`及Redis说明修正`e9034d1`已集成 |
+| `ios/` | ReplayKit广播扩展、Vision中文OCR、HTTP、本地通知 | 39提交`c703f2f`已集成；PiP尚未实现，不能视为iOS交付完成 |
 
-集成方式：各 worker 在自己分支本地提交，安卓 owner 用本地 git 合入，保留原项目文件；不做远端 push。
+固定契约：请求仅为`{"sentence":"..."}`；200更新回复，204保留旧回复；422/503/504和网络错误丢弃当轮，下一轮继续。服务端不保存句子或回复日志，客户端不做文本去重、排队或历史上下文。
 
-## Android 客户端
+## Android 构建与安装
 
-技术要点（依据官方文档逐条核实，详见安卓调研文档）：
-
-- **采集**：`MediaProjection` 整屏采集（系统 API 边界：跨应用不存在“只采集 ROI”，必须整 display 建 `VirtualDisplay` + `ImageReader`，帧在**内存中**按框选区域裁切，处理后即回收，绝不落盘）。
-- **Android 14+ 合规**：每次启动会话都重新弹 `createScreenCaptureIntent()` 授权；先 `startForeground(FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)` 再 `getMediaProjection()`；同一 projection 实例只 `createVirtualDisplay()` 一次——**暂停=保留 VirtualDisplay 仅停轮询，继续=复用**；`onStop` 回调里全量回收（含用户从状态栏停止投屏的场景）。
-- **OCR**：ML Kit v2 中文（`text-recognition-chinese:16.0.1`，bundled 模型端上推理）。
-- **网络**：`HttpURLConnection` + `org.json`，单在途请求，超时连接5s/读取10s；204 保留展示，422/5xx/网络异常本轮静默丢弃；客户端不做文本去重/历史/队列。
-- **展示**：横向悬浮条 `TYPE_APPLICATION_OVERLAY` + `FLAG_NOT_FOCUSABLE|FLAG_NOT_TOUCHABLE`（不抢焦点、点透），6 秒自动隐藏；FGS 通知显示运行状态，系统另有 MediaProjection 常驻标识。
-
-### 构建环境（本机实际路径，全部隔离安装，不改系统设置）
-
-- JDK：`D:\develop\software\JDK\JDK17`（17.0.9，已存在）
-- Android SDK：`C:\Users\admin\.ao\data\artifacts\multi-agent-build-38\tools\android-sdk`（platform-tools + platforms;android-35 + build-tools;35.0.0，`local.properties` 已指向，git 忽略）
-- Gradle：项目内 wrapper 8.14.3 + AGP 8.13.2；compileSdk 35 / targetSdk 34 / minSdk 29
+本地构建环境使用JDK 17、Android SDK 35、项目Gradle Wrapper 8.14.3和AGP 8.13.2；`minSdk 29`，`targetSdk 34`。示例PowerShell：
 
 ```powershell
 $env:JAVA_HOME = "D:\develop\software\JDK\JDK17"
+$env:ANDROID_HOME = "C:\Users\admin\.ao\data\artifacts\multi-agent-build-38\tools\android-sdk"
 cd screen-assistant\android
 .\gradlew.bat :app:assembleDebug
-# 产物：app\build\outputs\apk\debug\app-debug.apk
+adb install -r .\app\build\outputs\apk\debug\app-debug.apk
 ```
 
-### 使用步骤（真机）
+启动应用后填写同一局域网中的服务地址（模拟器访问宿主机用`http://10.0.2.2:8000`）及轮询间隔。首次使用须允许“显示在其他应用上层”、通知（Android 13+）和每次会话的系统屏幕采集授权。选区只在主动编辑时临时出现；完成或取消后移除。正常采集时回复窗口标记`NOT_FOCUSABLE|NOT_TOUCHABLE`，当前模拟器确认采集运行期间没有残留选区层；特定厂商系统与真机触摸穿透仍需目标设备复验。
 
-1. 安装 debug APK，打开“屏识AI助手”。
-2. 填服务地址（如 `http://192.168.1.10:8000`，须与手机同一局域网；模拟器访问宿主机用 `http://10.0.2.2:8000`）与轮询间隔（默认5秒）。
-3. 首次点“启动”/“框选识别区域”会要求**悬浮窗权限**（设置→应用→屏识AI助手→显示在其他应用上层）与**通知权限**（Android 13+）。
-4. “框选识别区域”→自动退到后台→出现“框选区域”悬浮泡（拖动可移，长按退出）→切到目标应用→点悬浮泡→拖动建框、框内拖动移动、四角缩放→完成。
-5. 点“启动”→系统弹屏幕采集授权→允许→自动回到目标应用开始轮询；回复以横向悬浮条出现。
-6. 暂停=保留授权停轮询；停止=全部回收，再次启动需重新授权。
-7. 屏幕旋转会安全停止会话（Android 14 禁止同实例二次建 VirtualDisplay，V1 不做旋转续采），重新框选+启动即可。
+使用步骤：
 
-### 已知边界（如实声明，不冒称）
+1. 点“框选识别区域”，切到目标应用，点击“框选区域”悬浮泡。
+2. 拖动创建/移动区域、拖角缩放，点完成保存；取消则不改选区。
+3. 点“启动”并同意系统采集授权；识别期间悬浮泡和选区编辑层均退出。
+4. 暂停停止轮询但保留授权；继续复用当前投屏会话；停止会释放投屏资源，再启动需重新授权。
+5. 会话中旋转屏幕会安全停止，需重新框选并启动。
 
-- 暂停期间系统投屏标识仍在（projection 未断开所致，符合“后台显示系统状态标识”）。
-- 无新帧的静态画面跳过本轮（内容未变，服务端 24h 去重兜底）。
-- 会话中途旋转不续采（设计取舍，见上）。
-- 30 分钟稳定性与真机行为未经真实设备验证前不标通过；构建通过≠真机验收。
+## 服务端
 
-## 服务端（任务S，待其本地分支合入后此处补运行说明）
+启动与变量说明见[server/README.md](server/README.md)。本机共享Redis 6379曾出现MISCONF写入失败；本地集成应使用README中的专用临时Redis或Compose，不修改共享实例配置。服务未配置有效天翼凭据时返回503，不能以模拟响应声称真实模型打通。
 
-等待 multi-agent-build-37 的 `screen-assistant/server/` 提交；契约以上方固定 HTTP 契约为准。
+## iOS 状态与缺口
+
+39当前已集成代码包含ReplayKit上传扩展、ROI编辑、Vision中文OCR、HTTP及本地通知，但未实现回复视频帧、SampleBuffer PiP、跨进程不落盘新回复通道，也未验证主App挂起时持续识别和回复更新。通知降级不满足PiP主体验，且通知正文可能由系统保留。工程需Mac/Xcode生成并签名构建；无Mac/Xcode和真机时构建、广播、真实远端、性能及30分钟稳定性均不能标通过。详见[iOS README](ios/README.md)与主控验收清单。
+
+## 本次集成验证记录
+
+| 项目 | 结果 |
+|---|---|
+| Android debug构建、Android 14模拟器安装启动 | 通过 |
+| MediaProjection授权、前台服务启动、ML Kit中文模型加载与OCR执行 | 通过；模拟器日志确认OCR流水线成功 |
+| 客户端HTTP请求到本机服务端 | 请求已到达；服务端返回503，未验证成功模型回答/回复条更新 |
+| 暂停/继续/停止 | 模拟器状态文本和服务状态通过；系统通知撤销投屏、旋转停止未通过测试 |
+| 区域编辑取消与正常触摸 | 模拟器确认泡外点击切换到Gmail，主动编辑时全屏编辑层出现，取消后退出；ROI内外连续点击/滑动/键盘及回复窗触摸策略未完整验证 |
+| OCR到HTTP | 模拟器日志确认OCR流水线成功，客户端请求到本机服务端；服务端返回503，真实模型成功回复和回复条未验证 |
+| 性能、连续30分钟、真实Redis去重204客户端保持、断网恢复 | 未验证 |
+
+完整结果以当前40会话交付清单为准；APK不纳入源码目录。
