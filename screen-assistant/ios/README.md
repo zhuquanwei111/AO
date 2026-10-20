@@ -54,8 +54,11 @@ Xcode 内：
    R/36 核实）：Developer → Identifiers → App Groups → 注册
    `group.com.screenassistant.ios`，并把它加入主 App 与扩展两个 App ID 的能力里
    （或在 Xcode 中对两个 target 各添加 "App Groups" capability，值保持一致）。
-3. 真机运行（广播扩展无法在模拟器完整验证，需真机）。
-4. 首次运行到真机后，按 App 内“使用指引”启动一次广播。
+4. 真机运行（**广播扩展在模拟器不可用，必须真机**——OpenTok/AWS 官方样例一致
+   声明，R/36 核实）。
+5. 免费个人开发者账号（Personal Team）签名链（R/36 H1，真机待验）：
+   两个 App ID + App Groups 能力 + 7 天有效期描述文件（过期需重签）。
+6. 首次运行到真机后，按 App 内“使用指引”启动一次广播。
 
 > Bundle ID 若需更换：同步修改 `project.yml` 两处 `PRODUCT_BUNDLE_IDENTIFIER`、
 > `Shared/AppGroup.swift` 的 `identifier`、两份 entitlements 中的 group 值，
@@ -90,7 +93,9 @@ ATS（`NSAllowsArbitraryLoads`）以允许个人局域网 http 服务；如使�
 ## 展示方案：PiP 悬浮条（主路径，工程已实现）+ 本地通知（回退）
 
 **PiP 主路径（本轮新增，真机行为未验证）**：
-扩展收到 200 回复后，若 `pipActive` 且主 App 心跳新鲜（≤10s），回复经
+商业落地先例：App Store 上架应用 PiP Screen Translate（id6756233631）采用同链路
+（广播扩展采集 + 端侧 OCR + 云端 HTTP + PiP 展示，R/36 核实）——组合可行性证据，
+不证明本工程性能。扩展收到 200 回复后，若 `pipActive` 且主 App 心跳新鲜（≤10s），回复经
 `ReplyTransport`（可替换接口，默认单槽瞬态邮箱）+ Darwin 信号传给主 App；
 主 App `PiPDisplayController` 把文本渲染为 640×360 帧并送入
 `AVSampleBufferDisplayLayer` → 系统 PiP 窗口展示。iOS 15 兼容性已核实：
@@ -98,17 +103,27 @@ ATS（`NSAllowsArbitraryLoads`）以允许个人局域网 http 服务；如使�
 与 `init(contentSource:)` 均为 iOS 15.0 恰好可用；5 个 playbackDelegate 必需方法
 已按 live 语义实现（时间范围无限/暂停仅记状态/跳转无操作）。
 
-- **后台能力声明与伪保活的区分（重要，如实标注）**：按 Apple PiP 文档在
-  Info.plist 声明 `UIBackgroundModes: audio`（即 Xcode 中的 "Audio, AirPlay,
-  and Picture in Picture" 后台能力——R/36 核实为 PiP 支持的文档化启用方式）；
-  但**代码中不激活 AVAudioSession、不播放任何音频**（无伪保活：不用静音音频
-  占住后台执行权）。主 App 后台存活依赖 PiP 自身系统生命周期，该行为**需真机
-  验证**；关闭 PiP 窗口即停止后台存活、广播停止则识别停止（系统限制，已写入
-  界面文案）。若主 App 被挂起，扩展侧 liveness 心跳检测（2s 周期写时间戳，
-  >10s 判定超时）自动把展示回落到通知，不阻塞采集/OCR/网络主链路。
-  如评审认为 plist 声明本身超出授权，可删除该键：PiP 启动与帧渲染不受影响，
-  仅切后台后的存活可能更早失效。
-- PiP 层每 2s 重喂当前帧保持活性（纯渲染，无音频）；间隔是否足够需真机调参。
+- **后台存活机制与授权决策（重要，如实）**：R/36 深核结论（官方语义 O5 +
+  afm-screen-translator 实证 + App Store 上架先例 PiP Screen Translate
+  id6756233631）：**PiP 激活 + `UIBackgroundModes=audio` + 活跃 `.playback`
+  会话**三者齐备时主 App 后台不挂起（可继续 OCR/HTTP/更新 PiP）；无声
+  `.playback` 会话是 sample-buffer PiP detach 的前置条件。这与“禁止无关后台
+  音频伪保活”禁令的边界重叠，**已提请主控/用户裁决**。工程实现：
+  `PiPDisplayController.usesSilentPlaybackSessionForPiP` 常量门控，
+  **默认 false（完全遵守禁令）**——代价是 PiP 在真机上可能无法 detach 或
+  切后台即挂起（展示自动回落通知）；获批后改为 true 即启用官方 PiP 采纳
+  链路（无声，不播放任何内容），其余代码不变。Info.plist 的
+  `UIBackgroundModes: audio` 为 Apple PiP 文档要求的能力声明。
+- 关闭 PiP 窗口 = 数秒内主 App 挂起（OCR/HTTP/展示停，如实标注“关窗即暂停”）；
+  广播停止 = 识别停止（系统限制）。均已写入界面文案。
+- **回声风险（R/36 指出）**：广播采集整个屏幕，含本 App 的 PiP 窗口——PiP
+  覆盖识别区域时 OCR 可能读到自己的回复形成回环。公开 API 无法读取 PiP
+  窗口位置，几何剔除不可行；缓解 = 界面文案要求用户把 PiP 拖离识别区域，
+  真机验收清单含“PiP 位置不遮挡 ROI”检查项。
+- PiP 层每 2s 重喂当前帧保持活性（纯渲染）；间隔是否足够需真机调参。
+  `AVSampleBufferDisplayLayer.enqueue` 自 iOS 17 标记弃用（R/36 O8），本工程
+  目标 iOS 15 使用 enqueue（15/16 唯一路径）；17+ 的
+  AVSampleBufferVideoRenderer 迁移待真机验证后处理。
 - PiP 窗口为系统窗口：用户可拖动位置；覆盖区域为系统自身交互边界，不承诺
   完全触摸穿透（对齐“采集区域不影响前台操作”验收的 iOS 口径：区域编辑只在
   主 App 预览内完成，跨 App 不留任何编辑层）；建议用户把 PiP 窗口拖离识别
@@ -147,11 +162,18 @@ identifier 使新通知覆盖旧通知，通知中心不堆积回复历史；可
    若被杀，回退哑扩展架构（见上“关键技术决策”）。
 2. `RPVideoSampleOrientationKey` 值域在本机型上的实际取值（依据 Telegram-iOS 与
    Cap 生产实现：直接映射 `CGImagePropertyOrientation(rawValue:)`）。
-3. 无音频会话激活（仅 plist 能力声明）时 PiP 对主 App 的保活行为；
-   2s 心跳重喂间隔是否足够；关闭 PiP 窗口后的展示回落时序（心跳超时阈值 10s）。
-4. 主 App 挂起后扩展自动回落通知的时序。
-5. 中文识别准确率与单轮 OCR 延迟（PRD 目标 ≤500ms，未测量；`.fast` 不支持中文）。
-6. 扩展进程内 `UNUserNotificationCenter` 弹通知是否如官方文档所述可用。
+3. PiP 三要素组合行为（R/36 H2，未实测）：PiP 激活 + audio 后台能力 + 活跃
+   无声 `.playback` 会话 → 主 App 30 分钟不被系统回收（**当前该会话默认关闭
+   待授权**，见展示方案节决策记录）；关闭 PiP 窗口后的挂起时序与通知回落
+   （心跳超时阈值 10s）；2s 心跳重喂间隔是否足够。
+4. 回声验证：PiP 窗口拖离识别区域后连续识别，确认无“识别到自己回复”回环
+   （R/36 指出广播含自家 PiP 窗口；公开 API 无窗口位置，无法几何剔除）。
+5. 主 App 挂起后扩展自动回落通知的时序。
+6. 中文识别准确率与单轮 OCR 延迟（PRD 目标 ≤500ms，未测量；`.fast` 不支持中文）；
+   端到端延迟（采集→OCR→HTTP→展示，PRD 目标展示 ≤200ms）。
+7. 扩展进程内 `UNUserNotificationCenter` 弹通知是否如官方文档所述可用。
+8. 流程顺序（R/36 参考实现建议）：先开 PiP 再开广播；真机确认该顺序下
+   broadcast 起播与 PiP detach 均正常。
 
 ## 关键技术决策：OCR 在扩展内还是主 App（R/36 调研后的取舍）
 

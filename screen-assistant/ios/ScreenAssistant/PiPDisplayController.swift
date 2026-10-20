@@ -12,19 +12,28 @@ import Combine
 /// 视频帧 → AVSampleBufferDisplayLayer → 系统 PiP 窗口展示。
 ///
 /// 平台边界（如实）：
-///   - **不激活 AVAudioSession、不播放任何音频**（禁止无关后台音频伪保活）。
-///     Info.plist 中的 `UIBackgroundModes: audio` 是 Apple PiP 文档要求的
-///     "Audio, AirPlay, and Picture in Picture" 能力声明（R/36 核实），与
-///     “用静音音频占住后台”的伪保活是两回事；playbackDelegate 亦显式
-///     `shouldProhibitBackgroundAudioPlayback = true`。
+///   - **音频会话默认不激活、不播放任何音频**（遵守“禁止无关后台音频伪保活”）。
+///     R/36 深核表明：PiP 后台存活 = PiP 激活 + UIBackgroundModes=audio + 活跃
+///     .playback 会话三者齐备，.playback 会话是 PiP detach 前置（即使无声）。
+///     该会话是否属于禁令范畴需主控/用户裁决——实现已就绪但由
+///     `usesSilentPlaybackSessionForPiP` 常量门控（默认 false），获批后改一行即启用。
+///     Info.plist 的 `UIBackgroundModes: audio` 是 Apple PiP 文档要求的能力声明
+///     （"Audio, AirPlay, and Picture in Picture"）。
 ///   - 主 App 后台存活依赖 PiP 自身系统生命周期（关闭 PiP 窗口即停止存活、
-///     广播停止则识别停止——系统限制，已写入界面文案）；若系统仍挂起主 App，
+///     广播停止则识别停止——系统限制，已写入界面文案）；若主 App 被挂起，
 ///     扩展侧 liveness 心跳检测自动把展示回落到通知，不阻塞采集/OCR/网络主链路。
 ///     此行为需真机验证。
-///   - PiP 窗口为系统窗口，可被用户拖动；其覆盖区域具有系统自身的交互边界，
+///   - **回声风险（R/36 指出，如实）**：广播采集整个屏幕，含本 App 自己的 PiP
+///     窗口——若 PiP 覆盖识别区域，OCR 可能读到自己的回复形成回环。公开 API
+///     无法读取 PiP 窗口位置，几何剔除不可行；缓解 = 用户将 PiP 窗口拖离识别
+///     区域（界面文案与真机验收清单已含此项）。
+///   - PiP 窗口为系统窗口，可被用户拖动；覆盖区域为系统自身交互边界，
 ///     不承诺完全触摸穿透（对齐计划“采集区域不影响前台操作”的 iOS 口径）。
 ///   - iOS 15 的 ContentSource 构造器强制要求 playbackDelegate，全部必需方法
 ///     已实现（live 语义：时间范围无限、暂停仅记状态、跳转无操作）。
+///   - `AVSampleBufferDisplayLayer.enqueue` 自 iOS 17 标记弃用（iOS 17+ 官方
+///     建议改用 AVSampleBufferVideoRenderer；R/36 O8）。本工程目标 iOS 15，
+///     使用 enqueue（iOS 15/16 必须走此路径），真机验证时留意 17+ 上的行为。
 final class PiPDisplayController: NSObject, ObservableObject {
     static let shared = PiPDisplayController()
 
@@ -39,6 +48,20 @@ final class PiPDisplayController: NSObject, ObservableObject {
 
     @Published private(set) var state: DisplayState = .idle
     @Published private(set) var lastReplyAt: Date?
+
+    /// 【待授权决策】PiP 后台存活的官方机制开关。
+    ///
+    /// R/36 深核（官方语义 O5 + afm-screen-translator 实证 + App Store 上架先例
+    /// PiP Screen Translate id6756233631）：**PiP 激活 + UIBackgroundModes=audio +
+    /// 活跃 .playback 会话**三者齐备时主 App 后台不挂起；.playback 会话是
+    /// sample-buffer PiP detach 的前置条件（即使无声）。这正落入用户
+    /// “禁止无关后台音频伪保活”的禁令边界，需主控/用户裁决：
+    ///   - false（当前默认）：不激活任何音频会话，完全遵守禁令；
+    ///     代价：PiP 在真机上可能无法 detach 或切后台即挂起，展示回落通知。
+    ///   - true（获批后）：激活 .playback/.mixWithOthers 无声会话——该会话是
+    ///     PiP 官方采纳链路的组成部分（非播放任何内容），属于“相关”保活。
+    /// 获批后仅需把本常量改为 true，其余代码无需变动。
+    static let usesSilentPlaybackSessionForPiP = false
 
     /// 心跳周期（秒）：既是扩展侧 liveness 心跳，也是 PiP 层的重喂帧间隔
     /// （防止 displayLayer 长时间无新帧出现的超时/缓冲行为——间隔需真机调参）。
@@ -81,12 +104,22 @@ final class PiPDisplayController: NSObject, ObservableObject {
         guard pipController == nil else { return }
         attachHostViewIfNeeded()
 
+        // 静音 .playback 会话（PiP detach 前置，R/36 核实；默认关闭待授权，
+        // 见 usesSilentPlaybackSessionForPiP 决策注释）
+        if Self.usesSilentPlaybackSessionForPiP {
+            let session = AVAudioSession.sharedInstance()
+            try? session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            try? session.setActive(true)
+        }
+
         let source = AVPictureInPictureController.ContentSource(
             sampleBufferDisplayLayer: displayLayer,
             playbackDelegate: self
         )
         let controller = AVPictureInPictureController(contentSource: source)
         controller.delegate = self
+        // App 切后台时自动进入 PiP（iOS 14.2+，官方 API）
+        controller.canStartPictureInPictureAutomaticallyFromInline = true
         pipController = controller
 
         // live 内容时间基：rate 1，主时钟驱动
@@ -122,6 +155,10 @@ final class PiPDisplayController: NSObject, ObservableObject {
         pipController = nil
         lastRenderedCGImage = nil
         displayLayer.flushAndRemoveImage()
+        if Self.usesSilentPlaybackSessionForPiP {
+            try? AVAudioSession.sharedInstance().setActive(false,
+                                                           options: .notifyOthersOnDeactivation)
+        }
     }
 
     // MARK: - 心跳（liveness + 重喂帧）
@@ -200,6 +237,8 @@ final class PiPDisplayController: NSObject, ObservableObject {
     private func enqueue(_ cgImage: CGImage) {
         guard let buffer = Self.makeSampleBuffer(from: cgImage,
                                                  timebase: displayLayer.controlTimebase) else { return }
+        // iOS 17 起 enqueue 标记弃用（R/36 O8；iOS 15/16 须用本路径，
+        // 17+ 的 AVSampleBufferVideoRenderer 迁移待真机验证后另行处理）
         displayLayer.enqueue(buffer)
     }
 
