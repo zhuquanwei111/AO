@@ -9,6 +9,7 @@ struct ControlState {
         static let extensionRoundCounter = "control.extensionRoundCounter"
         static let pipActive = "control.pipActive"
         static let pipHeartbeatAt = "control.pipHeartbeatAt"
+        static let shmSmokeMode = "control.shmSmokeMode"
     }
 
     /// 主 App 心跳超时阈值（秒）：超过即视为 PiP 展示路径不可用，
@@ -67,5 +68,16 @@ struct ControlState {
         let last = AppGroup.defaults?.double(forKey: Keys.pipHeartbeatAt) ?? 0
         guard last > 0 else { return false }
         return Date().timeIntervalSince1970 - last <= pipLivenessTimeoutSeconds
+    }
+
+    /// 通道冒烟模式（R/36 指定的第一个真机验证切片）：
+    /// 开启后扩展不跑 OCR/网络，仅向 shm 写递增序列号；
+    /// 主 App 用 ShmCrossProcessProbeView 观察跨进程通道是否成立。
+    static func shmSmokeMode() -> Bool {
+        AppGroup.defaults?.bool(forKey: Keys.shmSmokeMode) ?? false
+    }
+
+    static func setShmSmokeMode(_ v: Bool) {
+        AppGroup.defaults?.set(v, forKey: Keys.shmSmokeMode)
     }
 }

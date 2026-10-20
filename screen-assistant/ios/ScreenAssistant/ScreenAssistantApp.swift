@@ -35,6 +35,9 @@ final class AppModel: ObservableObject {
     @Published var captureWanted: Bool {
         didSet { ControlState.setUserWantsCapture(captureWanted) }
     }
+    @Published var shmSmokeMode: Bool {
+        didSet { ControlState.setShmSmokeMode(shmSmokeMode) }
+    }
     @Published var roundCounter: Int = 0
     @Published var lastUpdated: Date?
 
@@ -47,6 +50,7 @@ final class AppModel: ObservableObject {
         roi = SharedConfig.roi()
         notificationShowsContent = SharedConfig.notificationShowsContent()
         captureWanted = ControlState.userWantsCapture()
+        shmSmokeMode = ControlState.shmSmokeMode()
         roundCounter = ControlState.roundCounter()
 
         // 通知权限：主 App 首次启动时请求（展示链路的授权入口；

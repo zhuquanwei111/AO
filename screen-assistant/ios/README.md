@@ -93,9 +93,12 @@ ATS（`NSAllowsArbitraryLoads`）以允许个人局域网 http 服务；如使�
 ## 展示方案：PiP 悬浮条（主路径，工程已实现）+ 本地通知（回退）
 
 **PiP 主路径（本轮新增，真机行为未验证）**：
-商业落地先例：App Store 上架应用 PiP Screen Translate（id6756233631）采用同链路
-（广播扩展采集 + 端侧 OCR + 云端 HTTP + PiP 展示，R/36 核实）——组合可行性证据，
-不证明本工程性能。扩展收到 200 回复后，若 `pipActive` 且主 App 心跳新鲜（≤10s），回复经
+商业线索（仅可行性，不证架构）：App Store 上架应用 PiP Screen Translate
+（id6756233631）采用同链路组合（广播+端侧 OCR+云端 HTTP+PiP，R/36 核实）。
+**afm-screen-translator 定位（R/36 第三轮更正）**：仅 4 commits、要求 iOS 26，
+是**架构参考而非成熟产品**；降 target 到 iOS 15 属 API 推断，未整链实测；
+App Store 文案不能证明内部架构；性能/内存按系统版本与机型区分验证。
+扩展收到 200 回复后，若 `pipActive` 且主 App 心跳新鲜（≤10s），回复经
 `ReplyTransport`（可替换接口，默认单槽瞬态邮箱）+ Darwin 信号传给主 App；
 主 App `PiPDisplayController` 把文本渲染为 640×360 帧并送入
 `AVSampleBufferDisplayLayer` → 系统 PiP 窗口展示。iOS 15 兼容性已核实：
@@ -103,17 +106,15 @@ ATS（`NSAllowsArbitraryLoads`）以允许个人局域网 http 服务；如使�
 与 `init(contentSource:)` 均为 iOS 15.0 恰好可用；5 个 playbackDelegate 必需方法
 已按 live 语义实现（时间范围无限/暂停仅记状态/跳转无操作）。
 
-- **后台存活机制与授权决策（重要，如实）**：R/36 深核结论（官方语义 O5 +
-  afm-screen-translator 实证 + App Store 上架先例 PiP Screen Translate
-  id6756233631）：**PiP 激活 + `UIBackgroundModes=audio` + 活跃 `.playback`
-  会话**三者齐备时主 App 后台不挂起（可继续 OCR/HTTP/更新 PiP）；无声
-  `.playback` 会话是 sample-buffer PiP detach 的前置条件。这与“禁止无关后台
-  音频伪保活”禁令的边界重叠，**已提请主控/用户裁决**。工程实现：
+- **后台存活机制与授权决策（重要，如实）**：R/36 第三轮口径更正后——
+  “PiP 激活 + `UIBackgroundModes=audio` + 活跃 `.playback` 会话 = 主 App
+  后台不挂起”是 **afm 参考经验 + 官方 audio 模式语义的推断，非 Apple 明文
+  保证**（R/36 明确）；静音循环播放保活被禁止。与用户“禁止无关后台音频
+  伪保活”禁令的边界重叠，**已提请主控/用户裁决**。工程实现：
   `PiPDisplayController.usesSilentPlaybackSessionForPiP` 常量门控，
-  **默认 false（完全遵守禁令）**——代价是 PiP 在真机上可能无法 detach 或
-  切后台即挂起（展示自动回落通知）；获批后改为 true 即启用官方 PiP 采纳
-  链路（无声，不播放任何内容），其余代码不变。Info.plist 的
-  `UIBackgroundModes: audio` 为 Apple PiP 文档要求的能力声明。
+  **默认 false（完全遵守禁令）**；获批后改为 true 即启用（无声、不播放
+  任何内容），其余代码不变。30 分钟稳定性属真机项（R/36 H2）。
+  Info.plist 的 `UIBackgroundModes: audio` 为 Apple PiP 文档要求的能力声明。
 - 关闭 PiP 窗口 = 数秒内主 App 挂起（OCR/HTTP/展示停，如实标注“关窗即暂停”）；
   广播停止 = 识别停止（系统限制）。均已写入界面文案。
 - **回声风险（R/36 指出）**：广播采集整个屏幕，含本 App 的 PiP 窗口——PiP
@@ -157,46 +158,66 @@ identifier 使新通知覆盖旧通知，通知中心不堆积回复历史；可
 | 采集区域不影响前台操作 | iOS 口径：区域编辑仅在主 App 预览内（跨 App 无编辑层）；PiP 系统窗口可拖动、覆盖处为系统交互边界（不承诺完全穿透）；通知无触摸影响。真机验收按计划矩阵执行（ROI 内外点击/滑动/输入/导航） |
 
 关键待真机验证点：
-1. Vision accurate OCR 在扩展内的内存峰值是否落入 ~50MB jetsam 硬上限
-   （R/36 调研：Apple 论坛 thread/651367；切 App 瞬间系统堆 6-8 个缓冲）。
-   若被杀，回退哑扩展架构（见上“关键技术决策”）。
-2. `RPVideoSampleOrientationKey` 值域在本机型上的实际取值（依据 Telegram-iOS 与
+1. **通道冒烟（R/36 指定的第一个切片，已随 App 交付）**：shm_open 跨进程
+   （扩展→App）、UDS 容器内 socket、shm 进程内——结果决定主通道架构
+   （见“真机验证切片 1”节）。
+2. Vision accurate OCR 在扩展内的内存峰值是否落入 ~50MB jetsam 硬上限
+   （R/36：Apple 论坛 thread/651367；扩展内 Vision 无实测估 30–50MB）。
+   若被杀且 shm/UDS 冒烟通过，切换哑扩展+通道架构（OCR 已抽为可迁移组件）。
+3. `RPVideoSampleOrientationKey` 值域在本机型上的实际取值（依据 Telegram-iOS 与
    Cap 生产实现：直接映射 `CGImagePropertyOrientation(rawValue:)`）。
-3. PiP 三要素组合行为（R/36 H2，未实测）：PiP 激活 + audio 后台能力 + 活跃
-   无声 `.playback` 会话 → 主 App 30 分钟不被系统回收（**当前该会话默认关闭
-   待授权**，见展示方案节决策记录）；关闭 PiP 窗口后的挂起时序与通知回落
-   （心跳超时阈值 10s）；2s 心跳重喂间隔是否足够。
-4. 回声验证：PiP 窗口拖离识别区域后连续识别，确认无“识别到自己回复”回环
+4. PiP 三要素组合（R/36 H2，**推断非 Apple 保证**）：PiP 激活 + audio 后台
+   能力 + 活跃无声 `.playback` 会话 → 主 App 30 分钟不被系统回收（**该会话
+   默认关闭待授权**）；关闭 PiP 窗口后的挂起时序与通知回落（心跳阈值 10s）；
+   2s 心跳重喂间隔是否足够。
+5. 回声验证：PiP 窗口拖离识别区域后连续识别，确认无“识别到自己回复”回环
    （R/36 指出广播含自家 PiP 窗口；公开 API 无窗口位置，无法几何剔除）。
-5. 主 App 挂起后扩展自动回落通知的时序。
-6. 中文识别准确率与单轮 OCR 延迟（PRD 目标 ≤500ms，未测量；`.fast` 不支持中文）；
+6. 主 App 挂起后扩展自动回落通知的时序。
+7. 中文识别准确率与单轮 OCR 延迟（PRD 目标 ≤500ms，未测量；`.fast` 不支持中文）；
    端到端延迟（采集→OCR→HTTP→展示，PRD 目标展示 ≤200ms）。
-7. 扩展进程内 `UNUserNotificationCenter` 弹通知是否如官方文档所述可用。
-8. 流程顺序（R/36 参考实现建议）：先开 PiP 再开广播；真机确认该顺序下
+8. 扩展进程内 `UNUserNotificationCenter` 弹通知是否如官方文档所述可用。
+9. 流程顺序（R/36 参考实现建议）：先开 PiP 再开广播；真机确认该顺序下
    broadcast 起播与 PiP detach 均正常。
 
-## 关键技术决策：OCR 在扩展内还是主 App（R/36 调研后的取舍）
+## 关键技术决策：OCR 在扩展内还是主 App（R/36 三轮调研后的现状）
 
-R/36 核实的硬数据：广播扩展 jetsam 内存硬上限约 **50MB**（Apple 论坛
-thread/651367），且切 App 瞬间系统会堆积 6-8 个待处理缓冲。参考项目
-afm-screen-translator（MIT）采用“哑扩展”架构：扩展只节流+降采样+写 App Group
-共享内存环，OCR 放主 App。
+R/36 硬数据：广播扩展 jetsam 内存硬上限约 **50MB**（Apple 论坛
+thread/651367），切 App 瞬间系统堆积 6-8 个待处理缓冲；扩展内 Vision 无实测
+估计 30–50MB 逼近上限。
 
-**本工程选择 OCR 留在扩展内**，理由（已同步 36）：
-1. **画面零落盘**：PRD 要求画面仅内存处理；哑扩展需把帧写入 mmap 环（磁盘介质），
-   R/36 自己的深核已确认“不证明画面从未落盘”。本设计帧只在扩展进程内存中存在。
-2. **链路不依赖主 App 存活**：主 App 挂起/被杀时（PiP 未开或被系统暂停），
-   扩展仍能完成 OCR+POST+通知回退——哑扩展会把整条链路耦合到主 App 生命周期。
-3. **内存工作集小**：每轮仅处理 1 帧（间隔节流），不保留任何 sampleBuffer 引用；
-   CoreImage 裁剪/降采样为惰性求值，唯一一次渲染发生在 ≤1280px 的小裁剪区上；
-   逐帧路径零共享状态读取（纯时间比较），共享配置每轮读一次。
-4. Vision 在扩展内的峰值是否落入 50MB 预算**仍是首要真机验证项**；若实测被
-   jetsam 杀，回退方案即哑扩展架构（本架构文档已备，届时需接受帧 mmap 的
-   落盘边界并重新报批）。
+**当前实现 = OCR 在扩展内**（已交付，风险已量化，作为可用基线）：
+每轮仅 1 帧、不保留任何 sampleBuffer 引用、≤1280px 小图单次渲染、逐帧零共享
+状态读取。理由：哑扩展方案此前受制于“帧写 mmap 环 = 画面落盘”。
+
+**R/36 第三轮更正后的推荐主通道（待真机冒烟验证后切换）**：
+Apple iPhoneOS `shm_open` man 页明文 iOS 实现 "no visible entry in the file
+system" = **真无文件后备**（与文件 mmap 环本质不同），且官方 App Groups
+entitlement 页列 POSIX 共享内存（命名 `<group id>/<name>`）为认可 IPC。
+故推荐架构：哑扩展（节流+降采样）→ shm_open 帧通道 + Darwin 信号 → 主 App
+（OCR→HTTP→PiP）。**切换前置条件**：shm 跨进程冒烟通过（见下节切片 1）；
+冒烟失败备选 UDS 流式通道（内核中转不落盘）；两通道皆败再评估扩展内 OCR
+（当前基线继续可用）。
+
+为此已把 OCR 抽为架构无关组件 `Shared/OCRService.swift`（两头可迁移，
+切换时无需重写），`ReplyTransport` 可替换接口同样为通道切换预留。
 
 另：Vision 在 iOS 15 的 `.fast` 档**不支持中文**（仅拉丁），`.accurate` 档支持
 zh-Hans/zh-Hant——本工程固定 `.accurate`（R/36 核实，与官方“语言支持随档位/
 修订变化”一致）。
+
+## 真机验证切片 1：通道冒烟（R/36 指定，随 App 交付）
+
+App 内“通道冒烟”区提供三个一键测试（真机运行，结果就地显示）：
+
+| 切片 | 验证内容 | 通过判据 |
+|---|---|---|
+| shm_open 进程内冒烟 | shm_open 在目标机进程内可用（命名 `/<group id>/smoke`、mode 0600 必填） | 写→读回校验一致 |
+| UDS 流式通道冒烟 | App Group 容器内 unix socket（短路径 `s.s`）bind/connect/send/recv | 接收校验一致 |
+| **shm 跨进程探针**（关键） | 开启“shm 冒烟模式”+ 启动广播后，扩展每轮向 `/<group id>/xproc` 写递增序列号，主 App 每 2s 轮询 | 序列号持续递增 |
+
+冒烟结果决定主通道架构走向；请把三个切片的屏幕结果回传给本 worker 或 36。
+注：R/36 提示 SO 11589105 称 shm_open 真机可用，但 2014 年有 ENOENT 前科——
+探针切片就是为此准备的实证。
 
 ## 集成说明（给安卓 owner / multi-agent-build-38）
 

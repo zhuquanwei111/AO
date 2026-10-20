@@ -17,6 +17,29 @@ struct BroadcastPickerSection: UIViewRepresentable {
     func updateUIView(_ uiView: RPSystemBroadcastPickerView, context: Context) {}
 }
 
+/// UIKit 视图的 SwiftUI 包装（冒烟切片用）。
+struct UIKitHostView<T: UIView>: UIViewControllerRepresentable {
+    let title: String
+    let make: () -> T
+
+    func makeUIViewController(context: Context) -> UIViewController {
+        let vc = UIViewController()
+        vc.title = title
+        let view = make()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        vc.view.addSubview(view)
+        NSLayoutConstraint.activate([
+            view.topAnchor.constraint(equalTo: vc.view.safeAreaLayoutGuide.topAnchor),
+            view.leadingAnchor.constraint(equalTo: vc.view.leadingAnchor),
+            view.trailingAnchor.constraint(equalTo: vc.view.trailingAnchor),
+            view.bottomAnchor.constraint(equalTo: vc.view.bottomAnchor)
+        ])
+        return vc
+    }
+
+    func updateUIViewController(_ uiViewController: UIViewController, context: Context) {}
+}
+
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
     @ObservedObject private var pip = PiPDisplayController.shared
@@ -112,6 +135,20 @@ struct ContentView: View {
                     }
                 }
 
+                Section(header: Text("通道冒烟（真机验证切片 1）"),
+                        footer: Text(smokeFooter)) {
+                    Toggle("shm 冒烟模式（扩展仅写序列号，暂停识别）", isOn: $model.shmSmokeMode)
+                    NavigationLink("shm_open 进程内冒烟") {
+                        UIKitHostView(title: "shm_open 冒烟") { ShmSmokeTestView(frame: .zero) }
+                    }
+                    NavigationLink("UDS 流式通道冒烟") {
+                        UIKitHostView(title: "UDS 冒烟") { UDSSmokeTestView(frame: .zero) }
+                    }
+                    NavigationLink("shm 跨进程探针（扩展→App）") {
+                        UIKitHostView(title: "跨进程 shm 探针") { ShmCrossProcessProbeView(frame: .zero) }
+                    }
+                }
+
                 Section(header: Text("使用指引")) {
                     Text(guideText)
                         .font(.footnote)
@@ -134,6 +171,9 @@ struct ContentView: View {
 
     private let startGuide =
         "启动步骤：1) 打开“识别开关”；2) 点“启动悬浮条（PiP）”（须在前台，PiP 先于广播启动）；3) 点上方“开始直播”按钮（或从控制中心长按屏幕录制按钮，选择“屏识AI广播”）；4) 在系统弹窗中点“开始直播”，屏幕顶部出现系统广播状态栏即开始跨应用采集；5) 切到目标应用；6) 停止：点状态栏停止广播（广播停止=轮询停止，系统限制），或回本 App 停止 PiP 后停止广播。采集授权、状态栏提示与受保护画面限制均由系统承载，本 App 不规避；广播无法程序化启动或后台静默启动。"
+
+    private let smokeFooter =
+        "R/36 指定的第一个真机验证切片。shm_open 冒烟：Apple iPhoneOS man 页明文 iOS 实现'文件系统无可见条目'（真无文件后备），但需真机确认（SO 11589105 称可用，2014 年有 ENOENT 前科）。跨进程探针：开启'shm 冒烟模式'并启动广播后，此页每 2s 读取扩展写入的序列号，验证扩展→App 通道是否成立；结论决定主通道架构（shm/UDS/维持扩展内 OCR）。"
 
     private let guideText =
         "本 App 与“屏识AI广播”扩展通过 App Group 共享配置（服务地址、间隔、区域、通知设置）与控制开关；不共享、不存储识别句子与回复。识别与请求在系统广播扩展进程内完成，画面仅内存处理，不保存截图、识别内容或回复历史。"
