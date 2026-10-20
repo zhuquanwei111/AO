@@ -108,7 +108,8 @@ public class CaptureService extends Service {
         public void run() {
             if (phase != Phase.RUNNING || tornDown) return;
             if (ScreenMetrics.rotation(CaptureService.this) != rotationAtStart) {
-                teardown("屏幕方向已变化，会话已停止，请重新框选并启动");
+                // 回主线程执行teardown（内部有 stopForeground/stopSelf）
+                main.post(() -> teardown("屏幕方向已变化，会话已停止，请重新框选并启动"));
                 return;
             }
             if (busy.get()) {
@@ -233,6 +234,8 @@ public class CaptureService extends Service {
                     phase = Phase.PAUSED;
                     setState("已暂停（保留采集授权）");
                     notifManager.notify(NOTIF_ID, buildNotification("已暂停 · 点击应用继续"));
+                } else if (phase == Phase.IDLE) {
+                    stopSelf(); // 无会话时不滞留空服务
                 }
                 break;
             }
@@ -243,6 +246,8 @@ public class CaptureService extends Service {
                     notifManager.notify(NOTIF_ID, buildNotification("采集中 · 间隔 "
                             + (intervalMs / 1000) + " 秒"));
                     scheduleTick(300);
+                } else if (phase == Phase.IDLE) {
+                    stopSelf();
                 }
                 break;
             }
