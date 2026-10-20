@@ -50,9 +50,22 @@ cd screen-assistant/server
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 $env:TIANYI_API_KEY = "<真实key>"        # 本机已有该用户级变量则可省略
+
+# Redis（二选一；本机预装的原生 6379 实例当前不可用，见下方「重要」）
+# 方式A：专用临时实例（推荐，随用随起，不落盘）
+redis-server --port 6390 --save '' --appendonly no
+$env:REDIS_URL = "redis://127.0.0.1:6390/0"
+# 方式B：直接 docker compose up -d --build（自带 redis:8，无需本机 Redis）
+
 .\.venv\Scripts\python.exe -m uvicorn screen_assistant_server.app:app --host 127.0.0.1 --port 8000
-# 另需本机 Redis：redis-server（默认 6379），或 $env:REDIS_URL="redis://127.0.0.1:6390/0"
 ```
+
+> **重要（R 调研结论修正）**：本机预装的原生 Redis 8.10.1（6379，`D:\develop\software\Redis\...`
+> Windows-x64-msys2 版）当前处于 **MISCONF** 状态：`rdb_last_bgsave_status:err`、工作目录为
+> msys2 路径 `/redis/...` 无法落盘、`stop-writes-on-bgsave-error=yes`，导致**所有写命令被拒**
+> （读命令正常，`redis-cli ping` 仍返回 PONG）。本服务对其写入会按契约返回 503（正确行为，
+> 不降级）。修复需该共享实例自身处理（如修复落盘目录或 `CONFIG SET stop-writes-on-bgsave-error no`），
+> 本任务不做系统级配置改动；集成请用上方方式A/B。
 
 ### Docker（本机已验证构建与启动）
 
@@ -99,6 +112,11 @@ healthz ok/degraded、10 并发同句恰好 1×200 + 9×204（真实 SET NX 原�
 **Docker 路径（已验证）**：`docker build` 成功（python:3.13-slim，252MB）；`docker compose
 config` 通过；`compose up` 后容器内 `healthz` 200 ok（内部 redis + 真实凭据注入）；空 key
 容器 `POST /v1/answer` → 503（无凭据路径，未调用模型）；验证后已 `compose down -v` 收容。
+
+**默认 6379 路径复核（2026-10-20 补充）**：R 调研称原生 Redis 6379 就绪，实测发现其处于
+MISCONF（详见上方「重要」），写命令全拒、服务按契约 503；只读取证：
+`CONFIG GET dir` → `/redis/Redis-8.10.1-Windows-x64-msys2`、`rdb_last_bgsave_status:err`。
+契约测试与真实模型验证均使用专用临时实例（6390，`--save ''`），该路径可用，未受影响。
 
 **未验证 / 不在范围**：公网部署与 HTTPS、多实例部署、30 分钟长稳与 OCR 端到端延迟（属
 客户端+集成验收）、Redis 主从/哨兵等高可用拓扑；模型侧速率限制与配额行为未做压测。
