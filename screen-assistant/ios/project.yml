@@ -22,7 +22,6 @@ targets:
     sources:
       - path: ScreenAssistant
       - path: Shared
-      - path: SmokeChannels
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.screenassistant.ios

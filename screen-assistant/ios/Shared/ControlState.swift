@@ -8,7 +8,6 @@ struct ControlState {
         static let userWantsCapture = "control.userWantsCapture"
         static let captureGeneration = "control.captureGeneration"
         static let extensionRoundCounter = "control.extensionRoundCounter"
-        static let shmSmokeMode = "control.shmSmokeMode"
     }
 
     /// 主 App 中“识别开关”的期望状态。真正的采集授权与生命周期由系统
@@ -39,16 +38,5 @@ struct ControlState {
 
     static func roundCounter() -> Int {
         AppGroup.defaults?.integer(forKey: Keys.extensionRoundCounter) ?? 0
-    }
-
-    /// 通道冒烟模式（R/36 指定的第一个真机验证切片）：
-    /// 开启后扩展不跑 OCR/网络，仅向 shm 写递增序列号；
-    /// 主 App 用 ShmCrossProcessProbeView 观察跨进程通道是否成立。
-    static func shmSmokeMode() -> Bool {
-        AppGroup.defaults?.bool(forKey: Keys.shmSmokeMode) ?? false
-    }
-
-    static func setShmSmokeMode(_ v: Bool) {
-        AppGroup.defaults?.set(v, forKey: Keys.shmSmokeMode)
     }
 }
