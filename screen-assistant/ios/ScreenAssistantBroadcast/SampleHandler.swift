@@ -5,6 +5,7 @@ import CoreVideo
 import CoreMedia
 import Darwin
 import Foundation
+import os
 
 /// 广播上传扩展主类：跨应用采集 → 方向转正 → ROI 内存裁剪 → 中文 OCR →
 /// 基础格式化 → POST /v1/answer → UDS 短回复发送。
@@ -39,8 +40,11 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var isBroadcastPaused = false
     private var activeCaptureGeneration = 0
     private var activeRequest: URLSessionDataTask?
+    private var activeOCR: OCRService.CancellationToken?
 
     private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+    private let memoryLog = Logger(subsystem: "com.screenassistant.broadcast", category: "ocr-memory")
+    // 40MB 为待验证工作预算、50MB 为历史风险参考；均非系统硬保证。
 
     // MARK: - 生命周期
 
@@ -50,8 +54,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
             roundActive = false
             isBroadcastPaused = false
             roundGeneration &+= 1
-            activeRequest?.cancel()
-            activeRequest = nil
+            cancelActiveWork()
         }
     }
 
@@ -60,8 +63,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
             isBroadcastPaused = true
             roundGeneration &+= 1
             roundActive = false
-            activeRequest?.cancel()
-            activeRequest = nil
+            cancelActiveWork()
         }
     }
 
@@ -71,8 +73,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
             roundGeneration &+= 1
             roundActive = false
             nextRoundEligibleTime = 0
-            activeRequest?.cancel()
-            activeRequest = nil
+            cancelActiveWork()
         }
     }
 
@@ -81,8 +82,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
             roundGeneration &+= 1
             roundActive = false
             isBroadcastPaused = true
-            activeRequest?.cancel()
-            activeRequest = nil
+            cancelActiveWork()
         }
         ControlState.setUserWantsCapture(false)
     }
@@ -105,8 +105,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
             if roundActive && (!wantsCapture || activeCaptureGeneration != configuredGeneration) {
                 roundGeneration &+= 1
                 roundActive = false
-                activeRequest?.cancel()
-                activeRequest = nil
+                cancelActiveWork()
             }
             if !isBroadcastPaused, !roundActive, now >= nextRoundEligibleTime {
                 if wantsCapture {
@@ -128,61 +127,19 @@ final class SampleHandler: RPBroadcastSampleHandler {
             return
         }
 
-        // 帧内存处理链：sampleBuffer 引用在方法返回后即失效（官方文档明确），
-        // 因此在返回前把需要的内容渲染为独立 CGImage。
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+        logMemory(stage: "frame-start")
+        // 把像素缓冲、Core Image 中间对象限制在此 autoreleasepool 内；只让最终
+        // ROI CGImage 进入 OCR 单槽，扩展调用返回后释放 sample/pixel buffer。
+        guard let cgImage = autoreleasepool(invoking: { makeOCRImage(from: sampleBuffer) }) else {
             endRound(generation: generation)
             return
         }
-
-        // 1) 方向转正：RPVideoSampleOrientationKey 附件 → CGImagePropertyOrientation
-        //    （Telegram-iOS / Cap 生产实现同款写法）
-        var orientation = CGImagePropertyOrientation.up
-        if let raw = CMGetAttachment(sampleBuffer,
-                                     key: RPVideoSampleOrientationKey as CFString,
-                                     attachmentModeOut: nil) as? NSNumber {
-            orientation = CGImagePropertyOrientation(rawValue: raw.uint32Value) ?? .up
-        }
-
-        // oriented() 对 .left/.right 会交换宽高，extent 在其后读取才是竖屏语义尺寸。
-        var ciImage = CIImage(cvPixelBuffer: pixelBuffer).oriented(orientation)
-
-        // 2) ROI 内存裁剪：归一化矩形（左上原点）→ 像素坐标（CIImage 左下原点）。
-        let extent = ciImage.extent
-        guard extent.width > 0, extent.height > 0 else {
-            endRound(generation: generation)
-            return
-        }
-        let roi = SharedConfig.roi()
-        let cropRect = CGRect(
-            x: extent.minX + roi.minX * extent.width,
-            y: extent.minY + (1 - roi.maxY) * extent.height, // 左上原点 → 左下原点
-            width: roi.width * extent.width,
-            height: roi.height * extent.height
-        ).intersection(extent)
-        guard !cropRect.isNull, cropRect.width > 0, cropRect.height > 0 else {
-            endRound(generation: generation)
-            return
-        }
-        ciImage = ciImage.cropped(to: cropRect)
-
-        // 3) 下采样到最长边限制（扩展 jetsam 硬上限约 50MB 的内存保护，
-        //    R/36 调研：切 App 瞬间系统会堆积多个待处理缓冲）
-        let longSide = max(ciImage.extent.width, ciImage.extent.height)
-        if longSide > SharedConfig.maxCropPixelDimension {
-            let scale = SharedConfig.maxCropPixelDimension / longSide
-            ciImage = ciImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-        }
-
-        // 4) 渲染为独立 CGImage；此后不再引用 sampleBuffer/pixelBuffer。
-        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else {
-            endRound(generation: generation)
-            return
-        }
+        logMemory(stage: "roi-rendered")
 
         // 5) OCR（架构无关组件，后台队列；识别文本仅存在于闭包链内存）
-        OCRService.recognizeText(in: cgImage) { [weak self] recognizedText in
+        guard let ocr = OCRService.recognizeText(in: cgImage, completion: { [weak self] recognizedText in
             guard let self else { return }
+            self.logMemory(stage: "ocr-finished")
             guard self.isCurrentRound(generation, captureGeneration: captureGeneration) else {
                 self.endRound(generation: generation)
                 return
@@ -237,7 +194,19 @@ final class SampleHandler: RPBroadcastSampleHandler {
                     request?.cancel()
                 }
             }
+        }) else {
+            endRound(generation: generation)
+            return
         }
+        stateQueue.sync {
+            if roundActive && !isBroadcastPaused && roundGeneration == generation &&
+                activeCaptureGeneration == captureGeneration {
+                activeOCR = ocr
+            } else {
+                ocr.cancel()
+            }
+        }
+        logMemory(stage: "ocr-submitted")
     }
 
     /// 结束一轮：清 roundActive 并按配置间隔排定下一轮可开始时刻。
@@ -253,10 +222,72 @@ final class SampleHandler: RPBroadcastSampleHandler {
         stateQueue.sync {
             guard roundGeneration == generation else { return }
             roundActive = false
+            activeOCR = nil
             activeRequest = nil
             nextRoundEligibleTime = CFAbsoluteTimeGetCurrent()
                 + SharedConfig.intervalSeconds()
         }
+    }
+
+    /// Core Image 只在采集回调中读取当前帧；ROI 先裁剪再限制最长边，坐标统一限制在 extent。
+    private func makeOCRImage(from sampleBuffer: CMSampleBuffer) -> CGImage? {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return nil }
+        var orientation = CGImagePropertyOrientation.up
+        if let raw = CMGetAttachment(sampleBuffer,
+                                     key: RPVideoSampleOrientationKey as CFString,
+                                     attachmentModeOut: nil) as? NSNumber {
+            orientation = CGImagePropertyOrientation(rawValue: raw.uint32Value) ?? .up
+        }
+
+        var ciImage = CIImage(cvPixelBuffer: pixelBuffer).oriented(orientation)
+        let extent = ciImage.extent
+        guard extent.width > 0, extent.height > 0 else { return nil }
+        let roi = SharedConfig.roi()
+        let normalized = CGRect(
+            x: min(max(roi.minX, 0), 1),
+            y: min(max(1 - roi.maxY, 0), 1),
+            width: min(max(roi.width, 0), 1),
+            height: min(max(roi.height, 0), 1)
+        )
+        let cropRect = CGRect(
+            x: extent.minX + normalized.minX * extent.width,
+            y: extent.minY + normalized.minY * extent.height,
+            width: normalized.width * extent.width,
+            height: normalized.height * extent.height
+        ).intersection(extent)
+        guard !cropRect.isNull, cropRect.width > 0, cropRect.height > 0 else { return nil }
+        ciImage = ciImage.cropped(to: cropRect)
+
+        let longSide = max(ciImage.extent.width, ciImage.extent.height)
+        let maxDimension = SharedConfig.maxCropPixelDimension
+        if longSide > maxDimension {
+            let scale = maxDimension / longSide
+            ciImage = ciImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        }
+        return ciContext.createCGImage(ciImage, from: ciImage.extent)
+    }
+
+    /// 在 stateQueue 内调用；只取消句柄与网络任务，不保存图像或文字诊断内容。
+    private func cancelActiveWork() {
+        activeOCR?.cancel()
+        activeOCR = nil
+        activeRequest?.cancel()
+        activeRequest = nil
+        logMemory(stage: "work-cancelled")
+    }
+
+    /// 仅写固定阶段名与当前进程常驻内存数值，供 Instruments/设备日志配合采样。
+    private func logMemory(stage: String) {
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return }
+        let rssMB = Double(info.resident_size) / 1_048_576
+        memoryLog.info("mem stage=\(stage, privacy: .public) rss_mb=\(rssMB, format: .fixed(precision: 1), privacy: .public)")
     }
 
     // MARK: - 通道冒烟（真机验证切片 1，R/36 指定）
