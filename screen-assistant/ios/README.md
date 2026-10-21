@@ -24,7 +24,7 @@
 
 ## Mac 构建、签名与安装
 
-需要安装 Xcode（含 iOS SDK）和 XcodeGen。仓库目录为 `screen-assistant/ios/`。
+需要安装带 iOS SDK 的 Xcode 和 XcodeGen。工程固定 Swift 5 语言模式（`SWIFT_VERSION=5.0`），不代表编译器版本；CI 固定 Xcode 16.4（Swift 6.1 编译器）与 XcodeGen 2.46.0。Xcode 16.4 需 macOS Sequoia 15.3 至 Tahoe 26.1，并支持 iOS 15+ 设备调试。工程目录为 `screen-assistant/ios/`。语言模式依据 [Apple Xcode build settings](https://developer.apple.com/documentation/xcode/build-settings-reference)、[Xcode 版本支持表](https://developer.apple.com/xcode/system-requirements/) 和 [Xcode 16.4 release notes](https://developer.apple.com/documentation/xcode-release-notes/xcode-16_4-release-notes)。
 
 ```sh
 brew install xcodegen
@@ -49,6 +49,8 @@ xcodebuild -project ScreenAssistant.xcodeproj \
 ```
 
 生成的无签名产物不能安装到设备；设备安装须由 Xcode 使用匹配的签名证书和 provisioning profile 完成。本交付环境为 Windows，没有 Xcode、Apple 签名身份或 iPhone，因此未生成 IPA。
+
+仓库根目录的 `.github/workflows/ios-unsigned-build.yml` 提供手动 GitHub Actions 无签名构建入口：固定 macOS 15 runner、明确校验 Xcode 16.4、从 XcodeGen 2.46.0 源码 tag 生成工程，并构建 `ScreenAssistant` scheme（显式包含广播扩展 target）。工作流验证 `.app/PlugIns/ScreenAssistantBroadcast.appex` 后，以 `ditto` 将 `.app` 目录结构打成 ZIP 上传。该 ZIP 不是 IPA，也不能直接安装；workflow 尚未运行，不能视作 Apple 编译通过。
 
 ## 逐项交付与验证矩阵
 

@@ -7,7 +7,7 @@ options:
 
 settings:
   base:
-    SWIFT_VERSION: "5.9"
+    SWIFT_VERSION: "5.0" # Swift language mode (Xcode 16.4 compiler: Swift 6.1)
     TARGETED_DEVICE_FAMILY: "1,2"
     CODE_SIGN_STYLE: Automatic
     ENABLE_BITCODE: NO
@@ -43,3 +43,14 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.screenassistant.ios.broadcast
         INFOPLIST_FILE: Config/Broadcast-Info.plist
         CODE_SIGN_ENTITLEMENTS: Config/Broadcast.entitlements
+
+schemes:
+  ScreenAssistant:
+    build:
+      targets:
+        ScreenAssistant: all
+        ScreenAssistantBroadcast: all
+    run:
+      config: Debug
+    archive:
+      config: Release
