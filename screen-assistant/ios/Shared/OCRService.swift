@@ -3,49 +3,113 @@ import CoreGraphics
 import Foundation
 
 /// Vision 中文 OCR 服务（架构无关组件）。
-/// 当前由广播扩展调用；若主通道切换为“哑扩展 + shm/UDS 帧通道 + 主 App OCR”
-/// （R/36 建议，待真机冒烟验证），本模块可原样移至主 App 调用，无需重写。
 enum OCRService {
+    /// 广播端只允许一个 OCR 作业。工作队列串行，忙时拒绝新图像，不让图像排队滞留。
+    private static let queue = DispatchQueue(label: "com.screenassistant.ocr", qos: .userInitiated)
+    private static let stateLock = NSLock()
+    private static var isRunning = false
+
+    /// 单次识别的取消句柄。Vision 执行期间取消请求，并确保迟到结果不再调用完成闭包。
+    final class CancellationToken {
+        private let lock = NSLock()
+        private var cancelled = false
+        private var request: VNRecognizeTextRequest?
+        private var completion: ((String) -> Void)?
+
+        fileprivate init(completion: @escaping (String) -> Void) {
+            self.completion = completion
+        }
+
+        fileprivate var isCancelled: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return cancelled
+        }
+
+        fileprivate func attach(_ request: VNRecognizeTextRequest) {
+            lock.lock()
+            let shouldCancel = cancelled
+            if !shouldCancel { self.request = request }
+            lock.unlock()
+            if shouldCancel { request.cancel() }
+        }
+
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            completion = nil
+            let request = self.request
+            self.request = nil
+            lock.unlock()
+            request?.cancel()
+        }
+
+        fileprivate func finish(_ text: String) {
+            lock.lock()
+            guard !cancelled, let completion else {
+                lock.unlock()
+                return
+            }
+            self.completion = nil
+            request = nil
+            lock.unlock()
+            completion(text)
+        }
+    }
+
     /// 对裁剪后的 CGImage 执行中文 OCR，按近似阅读顺序返回行拼接文本。
-    /// 识别文本仅存在于闭包链内存，不保存。
-    ///
-    /// 平台事实：iOS 15 的 Vision `.fast` 档不支持中文（仅拉丁），
-    /// `.accurate` 档支持 zh-Hans/zh-Hant（R/36 核实）；accurate 档对中文
-    /// 按“行/行片段”切分（官方文档），此处逐行取 topCandidate 后拼接。
+    /// 识别文本仅存在于闭包链内存，不保存。返回 nil 表示已有作业在途，调用方应丢弃本帧。
+    @discardableResult
     static func recognizeText(in cgImage: CGImage,
-                              completion: @escaping (String) -> Void) {
-        DispatchQueue.global(qos: .userInitiated).async {
+                              completion: @escaping (String) -> Void) -> CancellationToken? {
+        stateLock.lock()
+        guard !isRunning else {
+            stateLock.unlock()
+            return nil
+        }
+        isRunning = true
+        stateLock.unlock()
+
+        let token = CancellationToken(completion: completion)
+        queue.async {
+            defer {
+                stateLock.lock()
+                isRunning = false
+                stateLock.unlock()
+            }
             autoreleasepool {
+                guard !token.isCancelled else { return }
+
                 let request = VNRecognizeTextRequest { request, error in
                     guard error == nil,
                           let observations = request.results as? [VNRecognizedTextObservation] else {
-                        completion("")
+                        token.finish("")
                         return
                     }
-                    // Vision 不保证返回阅读顺序；按 boundingBox 近似排序
-                    //（自上而下、同行自左向右；boundingBox 为左下原点归一化坐标）。
                     let sorted = observations.sorted { a, b in
                         let dy = abs(a.boundingBox.minY - b.boundingBox.minY)
                         if dy > 0.01 { return a.boundingBox.minY > b.boundingBox.minY }
                         return a.boundingBox.minX < b.boundingBox.minX
                     }
                     let lines = sorted.compactMap { $0.topCandidates(1).first?.string }
-                    completion(lines.joined(separator: "\n"))
+                    token.finish(lines.joined(separator: "\n"))
                 }
                 request.recognitionLevel = .accurate
                 request.usesLanguageCorrection = false
                 request.preferBackgroundProcessing = true
-                // 官方：简/繁中文识别语言为 zh-Hans / zh-Hant，须为前两个元素，
-                // 英语是唯一可搭配语言。
+                // iOS 15 中文保持 accurate；语言配置沿用现有实测结构。
                 request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
+                token.attach(request)
+                guard !token.isCancelled else { return }
 
                 let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
                 do {
                     try handler.perform([request])
                 } catch {
-                    completion("")
+                    token.finish("")
                 }
             }
         }
+        return token
     }
 }
