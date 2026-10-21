@@ -1,0 +1,121 @@
+name: ios-unsigned-build
+
+on:
+  push:
+    branches:
+      - ao/multi-agent-build-46/ios-cloud
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Build configuration for the unsigned compile check
+        type: choice
+        default: Debug
+        options:
+          - Debug
+          - Release
+
+permissions:
+  contents: read
+
+jobs:
+  unsigned-build:
+    runs-on: macos-15
+    timeout-minutes: 35
+    env:
+      XCODE_VERSION: "16.4"
+      XCODEGEN_VERSION: "2.46.0"
+      XCODEGEN_COMMIT: "8445e778451c7e44237b90281bde622d764b0084"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Select and verify Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          XCODE_APP="/Applications/Xcode_${XCODE_VERSION}.app"
+          if [[ ! -d "$XCODE_APP" ]]; then
+            echo "Required Xcode $XCODE_VERSION is missing at $XCODE_APP" >&2
+            exit 1
+          fi
+          sudo xcode-select --switch "$XCODE_APP/Contents/Developer"
+          ACTUAL_XCODE="$(xcodebuild -version | sed -n '1s/^Xcode //p')"
+          if [[ "$ACTUAL_XCODE" != "$XCODE_VERSION" ]]; then
+            echo "Expected Xcode $XCODE_VERSION, found $ACTUAL_XCODE" >&2
+            exit 1
+          fi
+          xcodebuild -version
+
+      - name: Build and verify pinned XcodeGen
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$XCODEGEN_VERSION" \
+            https://github.com/yonaskolb/XcodeGen.git "$RUNNER_TEMP/XcodeGen"
+          ACTUAL_XCODEGEN_COMMIT="$(git -C "$RUNNER_TEMP/XcodeGen" rev-parse HEAD)"
+          if [[ "$ACTUAL_XCODEGEN_COMMIT" != "$XCODEGEN_COMMIT" ]]; then
+            echo "Unexpected XcodeGen $XCODEGEN_VERSION commit: $ACTUAL_XCODEGEN_COMMIT" >&2
+            exit 1
+          fi
+          (
+            cd "$RUNNER_TEMP/XcodeGen"
+            swift run -c release xcodegen --version
+          ) 2>&1 | tee "$RUNNER_TEMP/xcodegen-version.log"
+          grep -F "$XCODEGEN_VERSION" "$RUNNER_TEMP/xcodegen-version.log"
+
+      - name: Generate Xcode project
+        working-directory: screen-assistant/ios
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift run --package-path "$RUNNER_TEMP/XcodeGen" -c release xcodegen generate
+
+      - name: Verify generated scheme
+        working-directory: screen-assistant/ios
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          xcodebuild -list -project ScreenAssistant.xcodeproj 2>&1 | tee build/xcodebuild-list.log
+          grep -Eq '^[[:space:]]+ScreenAssistant[[:space:]]*$' build/xcodebuild-list.log
+
+      - name: Build unsigned iOS app and extension
+        working-directory: screen-assistant/ios
+        env:
+          BUILD_CONFIGURATION: ${{ inputs.configuration || 'Debug' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          xcodebuild \
+            -project ScreenAssistant.xcodeproj \
+            -scheme ScreenAssistant \
+            -destination 'generic/platform=iOS' \
+            -configuration "$BUILD_CONFIGURATION" \
+            -derivedDataPath build/DD \
+            CODE_SIGNING_ALLOWED=NO \
+            SWIFT_VERSION=5.0 \
+            build 2>&1 | tee build/xcodebuild.log
+
+      - name: Verify and package unsigned app
+        working-directory: screen-assistant/ios
+        env:
+          BUILD_CONFIGURATION: ${{ inputs.configuration || 'Debug' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="build/DD/Build/Products/${BUILD_CONFIGURATION}-iphoneos/ScreenAssistant.app"
+          EXTENSION="$APP/PlugIns/ScreenAssistantBroadcast.appex"
+          test -d "$APP" || { echo "Missing app product: $APP" >&2; exit 1; }
+          test -d "$EXTENSION" || { echo "Broadcast extension not embedded: $EXTENSION" >&2; exit 1; }
+          ditto -c -k --sequesterRsrc --keepParent "$APP" build/ScreenAssistant-unsigned.app.zip
+          test -s build/ScreenAssistant-unsigned.app.zip
+
+      - name: Upload unsigned app package (not installable)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: screen-assistant-unsigned-app
+          path: screen-assistant/ios/build/ScreenAssistant-unsigned.app.zip
+          retention-days: 7
+          if-no-files-found: error

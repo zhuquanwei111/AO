@@ -1,0 +1,56 @@
+name: ScreenAssistant
+options:
+  bundleIdPrefix: com.screenassistant
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0" # Swift language mode (Xcode 16.4 compiler: Swift 6.1)
+    TARGETED_DEVICE_FAMILY: "1,2"
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_BITCODE: NO
+    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "1.0"
+    DEVELOPMENT_LANGUAGE: zh-Hans
+
+targets:
+  ScreenAssistant:
+    type: application
+    platform: iOS
+    sources:
+      - path: ScreenAssistant
+      - path: Shared
+      - path: SmokeChannels
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.screenassistant.ios
+        INFOPLIST_FILE: Config/App-Info.plist
+        CODE_SIGN_ENTITLEMENTS: Config/App.entitlements
+    dependencies:
+      - target: ScreenAssistantBroadcast
+        embed: true
+
+  ScreenAssistantBroadcast:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: ScreenAssistantBroadcast
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.screenassistant.ios.broadcast
+        INFOPLIST_FILE: Config/Broadcast-Info.plist
+        CODE_SIGN_ENTITLEMENTS: Config/Broadcast.entitlements
+
+schemes:
+  ScreenAssistant:
+    build:
+      targets:
+        ScreenAssistant: all
+        ScreenAssistantBroadcast: all
+    run:
+      config: Debug
+    archive:
+      config: Release

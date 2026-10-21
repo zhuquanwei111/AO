@@ -1,0 +1,7 @@
+# XcodeGen 生成产物不入库（由 project.yml 生成）
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+DerivedData/
+build/
+.DS_Store
