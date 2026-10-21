@@ -22,6 +22,9 @@ targets:
     sources:
       - path: ScreenAssistant
       - path: Shared
+        excludes:
+          - "IPC/README.md"
+          - "IPC/check_sa_reply_channel.sh"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.screenassistant.ios
@@ -37,6 +40,9 @@ targets:
     sources:
       - path: ScreenAssistantBroadcast
       - path: Shared
+        excludes:
+          - "IPC/README.md"
+          - "IPC/check_sa_reply_channel.sh"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.screenassistant.ios.broadcast
