@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import contextmanager
 from typing import Iterator
 
@@ -14,9 +15,13 @@ import pytest
 import redis as sync_redis
 from fastapi.testclient import TestClient
 
-from screen_assistant_server.app import KEY_PREFIX, create_app
+from screen_assistant_server.app import KEY_PREFIX, create_app, logger
 from screen_assistant_server.config import Settings
-from screen_assistant_server.model_client import ModelTimeoutError, ModelUnavailableError
+from screen_assistant_server.model_client import (
+    ModelAnswer,
+    ModelTimeoutError,
+    ModelUnavailableError,
+)
 
 TEST_REDIS_URL = "redis://127.0.0.1:6390/9"
 
@@ -49,7 +54,7 @@ class FakeModel:
             raise ModelUnavailableError("fake unavailable")
         if self.behavior == "timeout":
             raise ModelTimeoutError("fake timeout")
-        return "好的"
+        return ModelAnswer("好的", "stop", 5, 1, True, True)
 
     async def aclose(self) -> None:
         return None
@@ -74,6 +79,11 @@ def key_of(normalized: str) -> str:
 
     digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
     return f"{KEY_PREFIX}:{digest}"
+
+
+def test_safe_request_diagnostics_are_enabled():
+    assert logger.isEnabledFor(logging.INFO)
+    assert any(handler.level <= logging.INFO for handler in logger.handlers)
 
 
 @pytest.fixture(autouse=True)
