@@ -125,12 +125,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except ModelUnavailableError as exc:
             await dedup.release(key, token)
             logger.warning(
-                "answer failure request_id=%s stage=provider error_code=%s upstream_status=%s finish_reason=%s empty_content=%s",
+                "answer failure request_id=%s stage=provider error_code=%s upstream_status=%s finish_reason=%s empty_content=%s completion_tokens=%s reasoning_tokens=%s reasoning_field_present=%s reasoning_field_nonempty=%s output_limit=%s",
                 request.state.request_id,
                 exc.error_code,
                 exc.upstream_status,
                 exc.finish_reason,
                 exc.empty_content,
+                exc.completion_tokens,
+                exc.reasoning_tokens,
+                exc.reasoning_field_present,
+                exc.reasoning_field_nonempty,
+                exc.output_limit,
             )
             raise HTTPException(status_code=503, detail="model unavailable") from None
 
