@@ -18,7 +18,7 @@ struct ROIEditorView: View {
             ZStack {
                 // 参照背景：模拟竖屏满屏
                 Rectangle()
-                    .fill(Color(.systemGrey6))
+                    .fill(Color(.systemGray6))
                     .frame(width: w, height: h)
 
                 // 框外暗化
