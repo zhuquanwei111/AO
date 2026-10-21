@@ -186,9 +186,8 @@ final class PiPDisplayController: NSObject, ObservableObject {
             }
             guard self.isPlaying else { return }
             // 刷新最后一帧；不播放音频内容。
-            if let image = self.lastRenderedCGImage ?? self.placeholderFrame() {
-                self.enqueue(image)
-            }
+            let image = self.lastRenderedCGImage ?? self.placeholderFrame()
+            self.enqueue(image)
         }
         RunLoop.main.add(timer, forMode: .common)
         heartbeatTimer = timer
@@ -300,7 +299,7 @@ final class PiPDisplayController: NSObject, ObservableObject {
 
         var formatDescription: CMVideoFormatDescription?
         guard CMVideoFormatDescriptionCreateForImageBuffer(
-            kCFAllocatorDefault, pixelBuffer, &formatDescription
+            allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer, formatDescriptionOut: &formatDescription
         ) == noErr, let formatDescription else { return nil }
 
         let pts = timebase.map { CMTimebaseGetTime($0) } ?? CMTime(value: 0, timescale: 600)
@@ -311,14 +310,14 @@ final class PiPDisplayController: NSObject, ObservableObject {
         )
         var sampleBuffer: CMSampleBuffer?
         guard CMSampleBufferCreateForImageBuffer(
-            kCFAllocatorDefault,
-            pixelBuffer,
-            true,
-            nil,
-            nil,
-            formatDescription,
-            &timing,
-            &sampleBuffer
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            dataReady: true,
+            makeDataReadyCallback: nil,
+            refcon: nil,
+            formatDescription: formatDescription,
+            sampleTiming: &timing,
+            sampleBufferOut: &sampleBuffer
         ) == noErr else { return nil }
         return sampleBuffer
     }
