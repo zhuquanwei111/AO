@@ -1,0 +1,2 @@
+# build.sh 必须保持 LF（macOS bash 对 CRLF 直接报错；本文件约束 Tools/ 目录）
+*.sh text eol=lf
