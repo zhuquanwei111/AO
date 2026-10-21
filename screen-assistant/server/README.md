@@ -96,6 +96,46 @@ Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/healthz
   不弹窗，下一轮继续；网络失败同样本轮丢弃。
 - 停止采集后不得把旧响应回填悬浮条（只展示最新运行会话的结果）。
 
+## 真机（iOS）局域网接线（2026-10-21 增补）
+
+模拟器/本机用 loopback（见上文）；真实 iPhone 需局域网地址，由**宿主侧 uvicorn 进程**提供
+（Docker Desktop WSL2 后端在本机无法向 LAN IP 发布端口——显式 IP 发布实测无监听；且 19180
+被 Docker 的内核级端口占位排除其他绑定，故真机端口用 **19280**）：
+
+| 目标 | 地址 | 提供者 |
+|---|---|---|
+| 模拟器/本机 | `http://127.0.0.1:19180`、`http://127.0.0.1:8000` | Docker compose（loopback-only 发布） |
+| 真机（同 Wi-Fi） | `http://<宿主机当前IP>:19280`（2026-10-21 实测 `http://192.168.0.4:19280`） | 宿主 uvicorn，PID 见下文启动命令 |
+
+宿主真机实例启动（与 loopback 服务共用同一专用 Redis，去重状态一致）：
+
+```powershell
+cd screen-assistant/server
+# 前置：docker compose -f docker-compose.local.yml up -d   （其中含 127.0.0.1:16390 专用Redis）
+$env:TIANYI_API_KEY = "<真实key>"
+$env:REDIS_URL = "redis://127.0.0.1:16390/0"
+# IP 每次启动前先核对：Get-NetIPAddress -AddressFamily IPv4 | ? IPAddress -like '192.168.*'
+.\.venv\Scripts\python.exe -m uvicorn screen_assistant_server.app:app --host 192.168.0.4 --port 19280
+```
+
+**已验证（host 侧）**：`netstat` 显示 `192.168.0.4:19280 LISTENING`；该地址自连
+`GET /healthz` → 200 `{"status":"ok","redis":"ok","model_key_configured":true,...}`。
+**未真机验证**：iPhone 实际可达性未测，不得当作已通。
+
+真机可达条件：
+
+1. 手机与宿主机同一 Wi-Fi 网段（当前 192.168.0.x）；路由器未开 AP/客户端隔离。
+2. 防火墙：**无需改动**——监听进程映像为 `...\Python313\python.exe`，已存在
+   `python.exe` Inbound Allow（Public profile，RemoteAddress=Any）规则。若实测仍不通，
+   最小排查步骤（管理员 PowerShell，不关闭防火墙）：
+   `New-NetFirewallRule -DisplayName "screen-assistant 19280" -Direction Inbound -Protocol TCP -LocalPort 19280 -RemoteAddress 192.168.0.0/24 -Action Allow`
+3. **IP 为 DHCP 且已发生一次变更（.2→.4）**：每次真机联调前先核对宿主 IP；建议在路由器
+   为本机设 DHCP 保留。
+4. iOS 侧注意：ATS 默认禁明文 HTTP，Info.plist 需 `NSAppTransportSecurity →
+   NSAllowsLocalNetworking`；iOS 14+ 首次连接会弹「本地网络」权限，需
+   `NSLocalNetworkUsageDescription`。
+5. 本服务无鉴权，仅限可信个人局域网；不做路由器公网转发、不部署公网。
+
 ## 验证证据（2026-10-20，本机）
 
 **真实 Redis（已验证）**：本机 Redis 8.10.1（测试实例 6390 端口）。

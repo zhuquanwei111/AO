@@ -6,6 +6,9 @@ services:
     image: redis:8-alpine
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     restart: unless-stopped
+    ports:
+      # 仅 loopback 发布给宿主侧真机 uvicorn 进程使用；不对局域网开放 Redis
+      - "127.0.0.1:16390:6379"
     labels:
       ao.session: ${AO_SESSION_ID:-unset}
       ao.spare: "true"
@@ -14,8 +17,9 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - "19180:8000"
-      - "8000:8000"
+      # 仅 loopback（模拟器/本机）；LAN IP 19180 由宿主侧 uvicorn 进程提供（见 README）
+      - "127.0.0.1:19180:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       TIANYI_BASE_URL: ${TIANYI_BASE_URL:-https://ai.ctaigw.cn/v1}
       TIANYI_API_KEY: ${TIANYI_API_KEY:?set TIANYI_API_KEY in environment or .env}
