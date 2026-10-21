@@ -154,11 +154,21 @@ public class CaptureService extends Service {
                             }
                             AnswerClient.Result result =
                                     AnswerClient.post(requestUrl, sentence, CONNECT_TIMEOUT_MS, READ_TIMEOUT_MS);
+                            android.util.Log.i("CaptureService", "answer response status=" + result.httpStatus
+                                    + " outcome=" + result.outcome + " request_id=" + safeId(result.requestId)
+                                    + " reply_chars=" + (result.reply == null ? 0 : result.reply.length())
+                                    + " epoch=" + epoch);
                             if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch) {
+                                android.util.Log.i("CaptureService", "answer dropped by lifecycle request_id="
+                                        + safeId(result.requestId) + " phase=" + phase + " current_epoch=" + sessionEpoch);
                                 return; // 会话已停/换轮：不得回填
                             }
                             if (result.outcome == AnswerClient.Outcome.SUCCESS) {
-                                showReply(result.reply, epoch);
+                                showReply(result.reply, epoch, result.requestId);
+                            } else if (result.outcome == AnswerClient.Outcome.DROP) {
+                                android.util.Log.w("CaptureService", "answer dropped request_id="
+                                        + safeId(result.requestId) + " status=" + result.httpStatus
+                                        + " error_type=" + errorType(result.error));
                             }
                             // DUPLICATE：保留当前展示；DROP：本轮静默丢弃
                         } catch (Throwable t) {
@@ -378,13 +388,38 @@ public class CaptureService extends Service {
         return raw.trim().replaceAll("\\s+", " ");
     }
 
-    private void showReply(String reply, int epoch) {
+    private void showReply(String reply, int epoch, String requestId) {
+        android.util.Log.i("CaptureService", "reply dispatch queued request_id=" + safeId(requestId)
+                + " reply_chars=" + (reply == null ? 0 : reply.length()) + " epoch=" + epoch);
         main.post(() -> {
-            if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch) return;
+            if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch) {
+                android.util.Log.i("CaptureService", "reply dispatch rejected request_id=" + safeId(requestId)
+                        + " phase=" + phase + " torn_down=" + tornDown + " epoch=" + epoch
+                        + " current_epoch=" + sessionEpoch);
+                return;
+            }
+            if (android.os.Build.VERSION.SDK_INT >= 23 && !android.provider.Settings.canDrawOverlays(this)) {
+                android.util.Log.w("CaptureService", "reply overlay denied request_id=" + safeId(requestId));
+                return;
+            }
             try {
+                boolean added = replyOverlayView == null;
                 if (replyOverlayView == null) {
                     replyOverlayView = LayoutInflater.from(this).inflate(R.layout.overlay_reply, null);
                     replyTextView = replyOverlayView.findViewById(R.id.tv_reply);
+                    replyOverlayView.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+                        @Override
+                        public void onViewAttachedToWindow(View view) {
+                            android.util.Log.i("CaptureService", "reply overlay attached request_id="
+                                    + safeId(requestId) + " shown=" + view.isShown());
+                        }
+
+                        @Override
+                        public void onViewDetachedFromWindow(View view) {
+                            android.util.Log.i("CaptureService", "reply overlay detached request_id="
+                                    + safeId(requestId));
+                        }
+                    });
                     WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
                             WindowManager.LayoutParams.WRAP_CONTENT,
                             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -401,13 +436,32 @@ public class CaptureService extends Service {
                 }
                 replyTextView.setText(reply);
                 replyOverlayView.setVisibility(View.VISIBLE);
+                android.util.Log.i("CaptureService", "reply overlay visible request_id=" + safeId(requestId)
+                        + " added=" + added + " attached=" + replyOverlayView.isAttachedToWindow()
+                        + " shown=" + replyOverlayView.isShown() + " reply_chars=" + reply.length()
+                        + " focusable=false touchable=false");
                 main.removeCallbacks(replyHide);
                 main.postDelayed(replyHide, REPLY_AUTO_HIDE_MS);
             } catch (Exception e) {
-                android.util.Log.w("CaptureService", "show reply failed", e);
+                android.util.Log.w("CaptureService", "reply overlay failed request_id=" + safeId(requestId)
+                        + " error_type=" + e.getClass().getSimpleName());
                 removeReplyOverlay();
             }
         });
+    }
+
+    private static String safeId(String id) {
+        if (id == null || id.isEmpty()) return "missing";
+        String safe = id.replaceAll("[^A-Za-z0-9_-]", "");
+        return safe.substring(0, Math.min(safe.length(), 64));
+    }
+
+    private static String errorType(String error) {
+        if (error == null || error.isEmpty()) return "unknown";
+        int colon = error.indexOf(':');
+        int space = error.indexOf(' ');
+        int end = colon >= 0 ? colon : (space >= 0 ? space : error.length());
+        return error.substring(0, Math.min(end, 48)).replaceAll("[^A-Za-z0-9_-]", "");
     }
 
     private void removeReplyOverlay() {
