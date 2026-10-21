@@ -80,10 +80,10 @@ Android 模拟器服务地址填`http://10.0.2.2:8000`；真机填电脑在同�
 | MediaProjection、端侧OCR与选区交互 | 通过既有模拟器验收；区域选择只在编辑期间存在，确认/取消后退出。正常采集中回复窗 flags 为`NOT_FOCUSABLE|NOT_TOUCHABLE|NOT_TOUCH_MODAL`。 |
 | Android旧客户端真实请求 | 2026-10-21 05:35:20.591Z收到HTTP 200；旧客户端未记录`X-Request-ID`。200表明服务端生成非空回复，但旧版没有客户端接收/悬浮展示证据；未重复该请求。 |
 | 新客户端固定响应→悬浮窗（不调用模型） | 本地stub的HTTP 200 JSON被解析为`SUCCESS`，回复非空；主线程分发后WindowManager attach回调确认`shown=true`。本地UI截图见artifact `screen-assistant-local-reply-ui.png`。 |
-| 新客户端真实服务端验证 | 05:49:42Z与05:52:00Z前后各启动过受控capture；停止前都未见AnswerClient HTTP/result日志。服务端是否收到POST待45核对，不能据客户端无日志推断未送达。CaptureService已停止。 |
+| 新客户端真实服务端验证 | 05:49:42Z与05:52:00Z前后各启动过受控capture；停止前未见AnswerClient HTTP/result日志。45复核服务端后确认两窗口均无POST，因此无HTTP状态或request ID、未触发去重。CaptureService保持停止。 |
 | 实际HTTP 200→真实回复可见、同句204、断网恢复 | 未验证；固定响应只证实客户端UI分支，不算真实端到端。 |
 | 回复窗底层点击穿透 | 已核对WindowManager flags和回复窗不接管焦点/触摸；没有在覆盖窗口范围内做实体点按复验，厂商系统与真机仍需验证。 |
 | 系统外部撤销MediaProjection | 未验证；已覆盖应用内停止。 |
 | 不落盘、厂商策略、连续30分钟 | 代码设计为仅内存处理；未做文件系统取证、真机或长时间实测。 |
 
-健康检查不等同于回复请求成功。两次受控capture的服务端状态待45确认；若日志显示有POST，应将其纳入请求统计并避免重复测试。
+健康检查不等同于回复请求成功。上述两次受控capture没有到达服务端；实际HTTP 200到悬浮回复的闭环仍需单次受控验证。
