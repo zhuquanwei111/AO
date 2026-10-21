@@ -1,11 +1,14 @@
 # Mac 装机指南（用户本人逐步操作）
 
-适用：macOS 15 + Xcode 16.4+ + iPhone 13（iOS 18.5）。按顺序执行，每步给出验证命令与期望结果。
+适用基线：macOS Sequoia 15.8.1 + Xcode 26.3 + iPhone 11（iOS 26.6.1，当前试验基线）；
+通用步骤适用同类组合。按顺序执行，每步给出验证命令与期望结果。
 工具行为细节（退出码、失败定位、官方依据）见 [README.md](README.md)，本文不重复。
 
-## 1. 安装 Xcode（≥16.4）
+## 1. 安装 Xcode 26.3（本机 macOS Sequoia 15.8.1）
 
-1. App Store 搜索 **Xcode** 安装。
+1. 到 Apple Developer 下载页（developer.apple.com/download/all/，需登录你的 Apple ID）
+   搜索 **Xcode 26.3**，下载 `.xip` 并解压安装到「应用程序」。
+   （App Store 渠道在本系统上可能只提供更高版本，需 macOS Tahoe 26.2+，见下。）
 2. 首次启动：同意许可协议，等待组件安装完成。
 3. Xcode → Settings → Components：确认 iOS 平台组件已下载（`build.sh` 会检查
    `iphoneos` SDK，缺失会明确报错）。
@@ -13,8 +16,15 @@
 5. 终端验证：
 
 ```bash
-xcodebuild -version    # 期望：Xcode 16.x
+xcodebuild -version    # 期望：Xcode 26.3
 ```
+
+版本说明（如实）：
+- Xcode 26.4–26.6 需要 macOS **Tahoe 26.2+**；本机在 Tahoe 兼容列表，可按需升级，
+  **非必须**——Xcode 26.3 为本机对 iOS 26.6.1 装机的当前基线。
+- **不推荐 Xcode 16.4 作 iOS 26.6.1 真机调试基线**：其 SDK 仅到 iOS 18.5，
+  无法识别 iOS 26.6.1 设备。
+- 版本与系统要求以 Apple 官方支持页为准（见文末「官方依据」）。
 
 ## 2. 安装 XcodeGen（Homebrew）
 
@@ -67,7 +77,7 @@ Tools/build.sh
 
 ## 7. iPhone 开启开发者模式
 
-iPhone（iOS 18.5）：**设置 → 隐私与安全性 → 开发者模式 → 打开 → 重启**。
+iPhone（iOS 26.6.1，路径 iOS 26 与此前一致）：**设置 → 隐私与安全性 → 开发者模式 → 打开 → 重启**。
 不开启则无法安装/运行开发者签名的 App。
 
 ## 8. 真机签名装机
@@ -95,8 +105,9 @@ iPhone：**设置 → 通用 → VPN 与设备管理** → 选中你的开发者
 
 ## 10. 免费账号限制（如实）
 
-- 描述文件 **7 天过期**：App 提示不受信任/无法启动时，重跑第 8 步重签即可。
-- 免费账号最多注册 **3 台设备**；每台设备同时最多 **3 个** 免费签名 App，超限先删旧的。
+- 免费 Personal Team：描述文件 **7 天过期**（App 提示不受信任/无法启动时，重跑第 8 步
+  重签即可）；最多注册 **3 台设备**；每台设备同时最多 **3 个** 免费签名 App；
+  每 7 天最多 **10 个** 新 App ID。超限按提示清理后重试。
 - App Group capability 能否随免费 Team 原样签出**以实际签名结果为准**（工程预检不保真，
   本仓库也未实测过该组合）；签名阶段报 App Group / provisioning 错误时按
   [../README.md](../README.md) 处理后重试。
@@ -109,3 +120,11 @@ iPhone：**设置 → 通用 → VPN 与设备管理** → 选中你的开发者
 | `devicectl` 不可用（Xcode 15 之前） | 脚本会自动打印 Xcode 界面 Run 路径：勾 Team → 选真机 → Cmd+R |
 | scheme 不确定 / 生成失败 | 重跑命令（会自动 `xcodegen generate`），或 `--scheme` 指定 |
 | 需要完整错误信息 | 每次运行输出末行「日志：<路径>」（系统临时目录，不进源码） |
+
+## 12. 官方依据
+
+- Xcode 版本与系统要求：https://developer.apple.com/support/xcode/
+- Xcode 26.6 release notes：https://developer.apple.com/documentation/xcode-release-notes/xcode-26_6-release-notes
+- iOS & iPadOS 26.6 release notes：https://developer.apple.com/documentation/ios-ipados-release-notes/ios-ipados-26_6-release-notes
+- 关于开发者模式（Apple 支持）：https://support.apple.com/en-us/122867
+- 关于开发者账户：https://developer.apple.com/help/account/basics/about-your-developer-account
