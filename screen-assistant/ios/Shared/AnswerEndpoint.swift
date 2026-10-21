@@ -40,7 +40,7 @@ struct AnswerEndpoint {
         self.timeout = timeout
     }
 
-    convenience init?(timeout: TimeInterval) {
+    init?(timeout: TimeInterval) {
         guard let base = SharedConfig.serverBaseURL() else { return nil }
         self.init(baseURL: base, timeout: timeout)
     }
