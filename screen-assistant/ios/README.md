@@ -64,7 +64,7 @@ xcodebuild -project ScreenAssistant.xcodeproj \
 
 当前 workflow 仅是本地准备，未运行、未验证签名、未上传。现有 `ios-unsigned-build.yml` 仍只做无签名编译检查，产物不能安装。免费 Personal Team 需要 Mac/Xcode，描述文件 7 天过期；本工程固定 App Group 是否可在免费 Team 下原样注册尚未实测。Windows 侧载工具也不能生成 IPA，且本工程的广播扩展与 App Group 组合未获工具方保证，因此最多作为一次实验，不能当验收路径。侧载必须另有已签名 IPA；当前 unsigned ZIP 不能作为安装包。
 
-开展真机验收前还需确认目标 iPhone 的 iOS 版本，并让它能访问配置的后端地址。不要把未鉴权开发服务直接暴露到公网。
+验收设备需能访问配置的后端地址；不要把未鉴权开发服务直接暴露到公网。
 
 ## 逐项交付与验证矩阵
 
@@ -82,6 +82,9 @@ xcodebuild -project ScreenAssistant.xcodeproj \
 | OCR ≤500ms、回复到展示 ≤200ms | 待测 | 本机无 Xcode/设备；不得以 Python/服务端契约结果代替 Swift 测量 |
 
 ## 验收清单中的真机步骤
+
+主验收参考设备为 iPhone 13 / iOS 18.5（匹配当前 Xcode 16.4 SDK）。这只是测试基准：最低部署版本仍为 iOS 15，不硬编码机型或屏幕尺寸，也不代表该设备已通过验收。ROI 使用归一化坐标，采集方向按 ReplayKit 帧方向处理。用户现有兼容 iPhone 安装后，可依据实测补充运行期适配；不要求降级或购买设备。
+
 
 1. 在 iOS 15+ iPhone 安装签名版，确认两个 target entitlement 和 App Group 容器一致。
 2. PiP 启动后开始广播，从目标 App 识别一条句子，检查 `200 → UDS → PiP`；重复请求检查 `204` 不刷新。
