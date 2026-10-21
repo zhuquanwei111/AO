@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import httpx
 
 SYSTEM_PROMPT = (
@@ -26,11 +28,21 @@ class ModelUnavailableError(Exception):
         upstream_status: int | None = None,
         finish_reason: str | None = None,
         empty_content: bool | None = None,
+        completion_tokens: int | None = None,
+        reasoning_tokens: int | None = None,
+        output_limit: int | None = None,
+        reasoning_field_present: bool | None = None,
+        reasoning_field_nonempty: bool | None = None,
     ) -> None:
         self.error_code = error_code
         self.upstream_status = upstream_status
         self.finish_reason = finish_reason
         self.empty_content = empty_content
+        self.completion_tokens = completion_tokens
+        self.reasoning_tokens = reasoning_tokens
+        self.output_limit = output_limit
+        self.reasoning_field_present = reasoning_field_present
+        self.reasoning_field_nonempty = reasoning_field_nonempty
 
 
 class ModelTimeoutError(Exception):
@@ -51,6 +63,25 @@ _PROVIDER_ERROR_CODES = {
     "10011001": "provider_rate_limited",
 }
 _FINISH_REASONS = {"stop", "length", "content_filter", "tool_calls", "function_call"}
+MAX_OUTPUT_TOKENS = 512
+REASONING_EFFORT = "low"
+
+
+@dataclass(frozen=True)
+class ModelAnswer:
+    reply: str
+    finish_reason: str
+    completion_tokens: int | None
+    reasoning_tokens: int | None
+    reasoning_field_present: bool
+    reasoning_field_nonempty: bool
+
+
+def _token_count(value: object) -> int | None:
+    """Return a non-negative integer count from provider usage metadata only."""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
 
 
 def _provider_error_code(resp: httpx.Response) -> str:
@@ -83,7 +114,7 @@ class TianyiChatClient:
             timeout=httpx.Timeout(timeout_seconds, connect=connect_timeout_seconds),
         )
 
-    async def ask(self, sentence: str) -> str:
+    async def ask(self, sentence: str) -> ModelAnswer:
         payload = {
             "model": self._model,
             "messages": [
@@ -91,7 +122,8 @@ class TianyiChatClient:
                 {"role": "user", "content": sentence},
             ],
             "temperature": 0.2,
-            "max_tokens": 256,
+            "max_tokens": MAX_OUTPUT_TOKENS,
+            "reasoning_effort": REASONING_EFFORT,
             "stream": False,
         }
         try:
@@ -121,11 +153,29 @@ class TianyiChatClient:
             else "other"
         )
         reply = content.strip() if isinstance(content, str) else ""
+        usage = data.get("usage")
+        usage = usage if isinstance(usage, dict) else {}
+        token_details = usage.get("completion_tokens_details")
+        token_details = token_details if isinstance(token_details, dict) else {}
+        reasoning_fields = [
+            message.get(name)
+            for name in ("reasoning_content", "reasoning", "reasoning_details")
+            if name in message
+        ]
+        completion_tokens = _token_count(usage.get("completion_tokens"))
+        reasoning_tokens = _token_count(token_details.get("reasoning_tokens"))
+        reasoning_field_present = bool(reasoning_fields)
+        reasoning_field_nonempty = any(bool(value) for value in reasoning_fields)
         if finish_reason == "length":
             raise ModelUnavailableError(
                 "model_output_truncated",
                 finish_reason=finish_reason,
                 empty_content=not bool(reply),
+                completion_tokens=completion_tokens,
+                reasoning_tokens=reasoning_tokens,
+                output_limit=MAX_OUTPUT_TOKENS,
+                reasoning_field_present=reasoning_field_present,
+                reasoning_field_nonempty=reasoning_field_nonempty,
             )
         if not reply:
             error_code = (
@@ -138,7 +188,14 @@ class TianyiChatClient:
                 finish_reason=finish_reason,
                 empty_content=True,
             )
-        return reply
+        return ModelAnswer(
+            reply=reply,
+            finish_reason=finish_reason,
+            completion_tokens=completion_tokens,
+            reasoning_tokens=reasoning_tokens,
+            reasoning_field_present=reasoning_field_present,
+            reasoning_field_nonempty=reasoning_field_nonempty,
+        )
 
     async def aclose(self) -> None:
         await self._client.aclose()

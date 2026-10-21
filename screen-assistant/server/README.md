@@ -26,7 +26,8 @@ agent/RAG/历史上下文/个性化；不持久化句子或回复日志。
   `DEL`）释放本次占位，**不会误删其他请求的 key**，句子之后可重试。
 - Redis 连接失败不降级为进程内去重，直接 503。
 - 无有效模型凭据（`TIANYI_API_KEY` 为空）时 503，**不返回任何假回复**。
-- 模型故障日志仅记录阶段、固定错误码、上游 HTTP 状态及必要的 `finish_reason`/空内容标记；
+- 模型调用请求显式设置 `reasoning_effort=low`（thinking 仍开启）；日志仅记录 opaque request ID、请求总耗时、
+  模型耗时、固定错误码、上游 HTTP 状态、`finish_reason`、输出/推理 token 数及未知字段标记；
   不打印句子、回复、密钥或完整请求/响应体。`/v1/answer` 的所有响应带 opaque `X-Request-ID`，
   可用于把客户端状态与服务端日志关联；无句子/回复持久化。
 
