@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import contextmanager
 from typing import Iterator
 
@@ -14,7 +15,7 @@ import pytest
 import redis as sync_redis
 from fastapi.testclient import TestClient
 
-from screen_assistant_server.app import KEY_PREFIX, create_app
+from screen_assistant_server.app import KEY_PREFIX, create_app, logger
 from screen_assistant_server.config import Settings
 from screen_assistant_server.model_client import (
     ModelAnswer,
@@ -78,6 +79,10 @@ def key_of(normalized: str) -> str:
 
     digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
     return f"{KEY_PREFIX}:{digest}"
+
+
+def test_safe_request_diagnostics_are_enabled():
+    assert logger.isEnabledFor(logging.INFO)
 
 
 @pytest.fixture(autouse=True)

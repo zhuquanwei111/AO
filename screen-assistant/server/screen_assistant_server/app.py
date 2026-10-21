@@ -34,6 +34,7 @@ from .model_client import (
 )
 
 logger = logging.getLogger("screen_assistant.app")
+logger.setLevel(logging.INFO)
 
 KEY_PREFIX = "sa:answer:v1"
 
