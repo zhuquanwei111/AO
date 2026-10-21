@@ -76,14 +76,14 @@ Android 模拟器服务地址填`http://10.0.2.2:8000`；真机填电脑在同�
 
 | 项目 | 结果 |
 |---|---|
-| Debug构建、安装、启动 | 通过；隔离SDK/Gradle构建成功，新APK `screen-assistant-debug-63c889c.apk`。 |
+| Debug构建、安装、启动 | 通过；私网IPv4地址校验已修复，`http://10.0.2.2:19180`通过启动流程并出现MediaProjection授权。新APK `screen-assistant-debug-urlfix.apk`。 |
 | MediaProjection、端侧OCR与选区交互 | 通过既有模拟器验收；区域选择只在编辑期间存在，确认/取消后退出。正常采集中回复窗 flags 为`NOT_FOCUSABLE|NOT_TOUCHABLE|NOT_TOUCH_MODAL`。 |
 | Android旧客户端真实请求 | 2026-10-21 05:35:20.591Z收到HTTP 200；旧客户端未记录`X-Request-ID`。200表明服务端生成非空回复，但旧版没有客户端接收/悬浮展示证据；未重复该请求。 |
 | 新客户端固定响应→悬浮窗（不调用模型） | 本地stub的HTTP 200 JSON被解析为`SUCCESS`，回复非空；主线程分发后WindowManager attach回调确认`shown=true`。本地UI截图见artifact `screen-assistant-local-reply-ui.png`。 |
-| 新客户端真实服务端验证 | 05:49:42Z与05:52:00Z前后各启动过受控capture；停止前未见AnswerClient HTTP/result日志。45复核服务端后确认两窗口均无POST，因此无HTTP状态或request ID、未触发去重。CaptureService保持停止。 |
-| 实际HTTP 200→真实回复可见、同句204、断网恢复 | 未验证；固定响应只证实客户端UI分支，不算真实端到端。 |
-| 回复窗底层点击穿透 | 已核对WindowManager flags和回复窗不接管焦点/触摸；没有在覆盖窗口范围内做实体点按复验，厂商系统与真机仍需验证。 |
+| 新客户端真实服务端验证 | 2026-10-21 06:27:18Z HTTP 200，`X-Request-ID=61781edb75b049a4ab8a857f043ac46b`，端侧`SUCCESS`、非空reply长度73；WindowManager日志确认悬浮窗`shown=true`并完成attach。真实悬浮截图见artifact `android-real-reply-overlay.png`。 |
+| 重复204、断网恢复 | 同句后续请求收到204去重；一次未及时停止导致相同画面再次得到200（`X-Request-ID=7d8184d665924950a822b3bfae41a591`）及随后204。已force-stop采集。断网恢复未验证。 |
+| 回复窗底层点击穿透 | 日志确认窗口`focusable=false touchable=false`，并核对`NOT_FOCUSABLE|NOT_TOUCHABLE|NOT_TOUCH_MODAL`配置；本轮未在覆盖区域内实际点按，厂商系统与真机仍需验证。 |
 | 系统外部撤销MediaProjection | 未验证；已覆盖应用内停止。 |
 | 不落盘、厂商策略、连续30分钟 | 代码设计为仅内存处理；未做文件系统取证、真机或长时间实测。 |
 
-健康检查不等同于回复请求成功。上述两次受控capture没有到达服务端；实际HTTP 200到悬浮回复的闭环仍需单次受控验证。
+服务端单次新句请求已完成HTTP 200到真实悬浮回复显示的模拟器闭环；自动采集在成功后多跑了后续周期，已停止。真实前台触摸穿透、断网恢复、系统外部撤销MediaProjection及真机验证仍未完成。

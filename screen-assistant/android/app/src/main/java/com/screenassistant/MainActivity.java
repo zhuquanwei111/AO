@@ -12,7 +12,6 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
-import android.util.Patterns;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.TextView;
@@ -137,7 +136,7 @@ public class MainActivity extends Activity {
         } catch (NumberFormatException e) {
             interval = -1;
         }
-        if (url.isEmpty() || !Patterns.WEB_URL.matcher(url).matches()) {
+        if (!isValidServerUrl(url)) {
             Toast.makeText(this, "服务地址无效，示例：http://192.168.1.10:8000", Toast.LENGTH_LONG).show();
             return;
         }
@@ -159,6 +158,20 @@ public class MainActivity extends Activity {
             return; // 授权回调后继续
         }
         requestMediaProjection();
+    }
+
+    private static boolean isValidServerUrl(String value) {
+        if (value == null || value.isEmpty() || value.matches(".*\\s.*")) {
+            return false;
+        }
+        Uri uri = Uri.parse(value);
+        String scheme = uri.getScheme();
+        String host = uri.getHost();
+        int port = uri.getPort();
+        return ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))
+                && host != null && !host.isEmpty()
+                && uri.getEncodedUserInfo() == null
+                && (port == -1 || (port > 0 && port <= 65535));
     }
 
     private void requestMediaProjection() {
