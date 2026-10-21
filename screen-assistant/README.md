@@ -80,8 +80,8 @@ Android 模拟器服务地址填`http://10.0.2.2:8000`；真机填电脑在同�
 | MediaProjection、端侧OCR与选区交互 | 通过既有模拟器验收；区域选择只在编辑期间存在，确认/取消后退出。正常采集中回复窗 flags 为`NOT_FOCUSABLE|NOT_TOUCHABLE|NOT_TOUCH_MODAL`。 |
 | Android旧客户端真实请求 | 2026-10-21 05:35:20.591Z收到HTTP 200；旧客户端未记录`X-Request-ID`。200表明服务端生成非空回复，但旧版没有客户端接收/悬浮展示证据；未重复该请求。 |
 | 新客户端固定响应→悬浮窗（不调用模型） | 本地stub的HTTP 200 JSON被解析为`SUCCESS`，回复非空；主线程分发后WindowManager attach回调确认`shown=true`。本地UI截图见artifact `screen-assistant-local-reply-ui.png`。 |
-| 新客户端真实服务端验证 | 2026-10-21 06:27:18Z HTTP 200，`X-Request-ID=61781edb75b049a4ab8a857f043ac46b`，端侧`SUCCESS`、非空reply长度73；WindowManager日志确认悬浮窗`shown=true`并完成attach。真实悬浮截图见artifact `android-real-reply-overlay.png`。 |
-| 重复204、断网恢复 | 同句后续请求收到204去重；一次未及时停止导致相同画面再次得到200（`X-Request-ID=7d8184d665924950a822b3bfae41a591`）及随后204。已force-stop采集。断网恢复未验证。 |
+| 新客户端真实服务端验证 | 2026-10-21 06:27:18Z HTTP 200，`X-Request-ID=61781edb75b049a4ab8a857f043ac46b`，端侧`SUCCESS`、非空reply长度73；WindowManager日志确认悬浮窗`shown=true`并完成attach。45核对服务端为`outcome=success`、`finish_reason=stop`，模型耗时2906ms/HTTP耗时2926ms，未记录正文。真实悬浮截图见artifact `android-real-reply-overlay.png`。 |
+| 重复204、断网恢复 | 同句后续请求收到204去重；一次未及时停止导致相同画面再次得到200（`X-Request-ID=7d8184d665924950a822b3bfae41a591`，服务端确认success/stop、模型耗时2899ms/HTTP耗时2901ms）及随后204。已force-stop采集。断网恢复未验证。 |
 | 回复窗底层点击穿透 | 日志确认窗口`focusable=false touchable=false`，并核对`NOT_FOCUSABLE|NOT_TOUCHABLE|NOT_TOUCH_MODAL`配置；本轮未在覆盖区域内实际点按，厂商系统与真机仍需验证。 |
 | 系统外部撤销MediaProjection | 未验证；已覆盖应用内停止。 |
 | 不落盘、厂商策略、连续30分钟 | 代码设计为仅内存处理；未做文件系统取证、真机或长时间实测。 |
