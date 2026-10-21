@@ -1,6 +1,5 @@
 import SwiftUI
 import Combine
-import UserNotifications
 
 @main
 struct ScreenAssistantApp: App {
@@ -28,10 +27,6 @@ final class AppModel: ObservableObject {
     @Published var roi: CGRect {
         didSet { SharedConfig.setROI(roi) }
     }
-    @Published var notificationShowsContent: Bool {
-        didSet { SharedConfig.setNotificationShowsContent(notificationShowsContent) }
-    }
-
     @Published var captureWanted: Bool {
         didSet { ControlState.setUserWantsCapture(captureWanted) }
     }
@@ -48,15 +43,9 @@ final class AppModel: ObservableObject {
         intervalSeconds = SharedConfig.intervalSeconds()
         requestTimeout = SharedConfig.requestTimeoutSeconds()
         roi = SharedConfig.roi()
-        notificationShowsContent = SharedConfig.notificationShowsContent()
         captureWanted = ControlState.userWantsCapture()
         shmSmokeMode = ControlState.shmSmokeMode()
         roundCounter = ControlState.roundCounter()
-
-        // 通知权限：主 App 首次启动时请求（展示链路的授权入口；
-        // 未授权则扩展静默降级，不影响采集/OCR/网络）。
-        UNUserNotificationCenter.current()
-            .requestAuthorization(options: [.alert]) { _, _ in }
 
         // 轮询共享状态（扩展每完成一轮会 bump 计数器）。
         // Darwin 通知需要 CFRunLoop 集成，轮询实现更简单且已足够（主 App 仅展示用途）。

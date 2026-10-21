@@ -4,17 +4,17 @@ import CoreGraphics
 import CoreVideo
 import CoreMedia
 import Darwin
-import UserNotifications
 import Foundation
+import os
 
 /// 广播上传扩展主类：跨应用采集 → 方向转正 → ROI 内存裁剪 → 中文 OCR →
-/// 基础格式化 → POST /v1/answer → PiP 邮箱/通知分流。
+/// 基础格式化 → POST /v1/answer → UDS 短回复发送。
 ///
 /// 另含**通道冒烟模式**（R/36 指定的第一个真机验证切片）：
 /// 当 App Group 中 `control.shmSmokeMode` 为 true 时，每轮不跑 OCR/网络，
 /// 仅向 shm_open 共享内存（`/<group id>/xproc`）写递增序列号——供主 App 的
 /// ShmCrossProcessProbeView 验证“扩展→App 真无文件后备通道”是否在本机可用。
-/// 冒烟结论决定主通道架构（shm/UDS/维持扩展内 OCR）。
+/// 该探针只供真机诊断，不切换产品主链路。
 ///
 /// 隐私与生命周期约束：
 ///   - 视频帧仅存在于本方法调用栈与 CIImage/VNImageRequestHandler 内存中，
@@ -23,7 +23,7 @@ import Foundation
 ///   - 一轮 = 帧→OCR→请求→响应，全程 roundActive；期间到达的帧直接跳过
 ///     （PRD：“下一轮忙则跳过以免堆积”）。
 ///   - 空识别 / 网络失败 / 422 / 503 / 504：本轮静默丢弃，下一轮继续。
-///   - 204：不刷新当前展示（通知层面 = 不发新通知）。
+///   - 204：不刷新当前 PiP 展示。
 final class SampleHandler: RPBroadcastSampleHandler {
 
     /// 所有轮次状态只在此串行队列上读写。
@@ -31,15 +31,20 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private let stateQueue = DispatchQueue(label: "com.screenassistant.broadcast.state")
 
     /// 下一轮可开始的最早时刻（CFAbsoluteTime）。仅在 stateQueue 内读写。
-    /// 逐帧路径只做“时间未到直接丢弃”，把每帧共享状态读取压到每轮一次
-    /// （扩展 jetsam 硬上限约 50MB、切 App 瞬间系统会堆积 6-8 个待处理缓冲——
-    /// R/36 调研数据：Apple 论坛 thread/651367；本实现不保留任何 sampleBuffer
-    /// 引用，逐帧成本 = 一次同步块内 3 次比较）。
+    /// 忙时跳过新帧，不保留 sampleBuffer 队列；扩展峰值内存尚未真机测量。
     private var nextRoundEligibleTime: CFAbsoluteTime = 0
     /// 一轮是否正在进行（帧→OCR→请求→响应 全链路）。
     private var roundActive = false
+    /// 暂停、继续、结束广播时使旧 OCR 与 HTTP 回调失效。
+    private var roundGeneration = 0
+    private var isBroadcastPaused = false
+    private var activeCaptureGeneration = 0
+    private var activeRequest: URLSessionDataTask?
+    private var activeOCR: OCRService.CancellationToken?
 
     private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+    private let memoryLog = Logger(subsystem: "com.screenassistant.broadcast", category: "ocr-memory")
+    // 40MB 为待验证工作预算、50MB 为历史风险参考；均非系统硬保证。
 
     // MARK: - 生命周期
 
@@ -47,19 +52,39 @@ final class SampleHandler: RPBroadcastSampleHandler {
         stateQueue.sync {
             nextRoundEligibleTime = 0
             roundActive = false
+            isBroadcastPaused = false
+            roundGeneration &+= 1
+            cancelActiveWork()
         }
     }
 
     override func broadcastPaused() {
-        // 暂停：无处理；恢复后节流逻辑自然继续。
+        stateQueue.sync {
+            isBroadcastPaused = true
+            roundGeneration &+= 1
+            roundActive = false
+            cancelActiveWork()
+        }
     }
 
-    override func broadcastResumed() {}
+    override func broadcastResumed() {
+        stateQueue.sync {
+            isBroadcastPaused = false
+            roundGeneration &+= 1
+            roundActive = false
+            nextRoundEligibleTime = 0
+            cancelActiveWork()
+        }
+    }
 
     override func broadcastFinished() {
         stateQueue.sync {
+            roundGeneration &+= 1
             roundActive = false
+            isBroadcastPaused = true
+            cancelActiveWork()
         }
+        ControlState.setUserWantsCapture(false)
     }
 
     // MARK: - 帧处理
@@ -68,14 +93,26 @@ final class SampleHandler: RPBroadcastSampleHandler {
                                       with sampleBufferType: RPSampleBufferType) {
         guard sampleBufferType == .video else { return }
 
-        // 闸门（stateQueue 内，纯比较，无共享状态读取）：一轮进行中、或距下一轮
-        // 时间未到 → 直接丢弃本帧；识别开关关闭时每 1s 复查一次（及时响应启停）。
+        // 闸门：正在处理、暂停或间隔未到时丢弃当前帧；控制开关每帧读取，
+        // 用 generation 及时使旧 OCR/HTTP 结果失效。
         let now = CFAbsoluteTimeGetCurrent()
         var startRound = false
+        var generation = 0
+        var captureGeneration = 0
         stateQueue.sync {
-            if !roundActive, now >= nextRoundEligibleTime {
-                if ControlState.userWantsCapture() {
+            let wantsCapture = ControlState.userWantsCapture()
+            let configuredGeneration = ControlState.captureGeneration()
+            if roundActive && (!wantsCapture || activeCaptureGeneration != configuredGeneration) {
+                roundGeneration &+= 1
+                roundActive = false
+                cancelActiveWork()
+            }
+            if !isBroadcastPaused, !roundActive, now >= nextRoundEligibleTime {
+                if wantsCapture {
                     roundActive = true
+                    generation = roundGeneration
+                    captureGeneration = configuredGeneration
+                    activeCaptureGeneration = configuredGeneration
                     startRound = true
                 } else {
                     nextRoundEligibleTime = now + 1
@@ -86,97 +123,58 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
         // 通道冒烟模式：仅写 shm 序列号，不跑主链路（R/36 真机验证切片 1）
         if ControlState.shmSmokeMode() {
-            runShmSmokeRound()
+            runShmSmokeRound(generation: generation)
             return
         }
 
-        // 帧内存处理链：sampleBuffer 引用在方法返回后即失效（官方文档明确），
-        // 因此在返回前把需要的内容渲染为独立 CGImage。
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
-            endRound()
+        logMemory(stage: "frame-start")
+        // 把像素缓冲、Core Image 中间对象限制在此 autoreleasepool 内；只让最终
+        // ROI CGImage 进入 OCR 单槽，扩展调用返回后释放 sample/pixel buffer。
+        guard let cgImage = autoreleasepool(invoking: { makeOCRImage(from: sampleBuffer) }) else {
+            endRound(generation: generation)
             return
         }
-
-        // 1) 方向转正：RPVideoSampleOrientationKey 附件 → CGImagePropertyOrientation
-        //    （Telegram-iOS / Cap 生产实现同款写法）
-        var orientation = CGImagePropertyOrientation.up
-        if let raw = CMGetAttachment(sampleBuffer,
-                                     key: RPVideoSampleOrientationKey as CFString,
-                                     attachmentModeOut: nil) as? NSNumber {
-            orientation = CGImagePropertyOrientation(rawValue: raw.uint32Value) ?? .up
-        }
-
-        // oriented() 对 .left/.right 会交换宽高，extent 在其后读取才是竖屏语义尺寸。
-        var ciImage = CIImage(cvPixelBuffer: pixelBuffer).oriented(orientation)
-
-        // 2) ROI 内存裁剪：归一化矩形（左上原点）→ 像素坐标（CIImage 左下原点）。
-        let extent = ciImage.extent
-        guard extent.width > 0, extent.height > 0 else {
-            endRound()
-            return
-        }
-        let roi = SharedConfig.roi()
-        let cropRect = CGRect(
-            x: extent.minX + roi.minX * extent.width,
-            y: extent.minY + (1 - roi.maxY) * extent.height, // 左上原点 → 左下原点
-            width: roi.width * extent.width,
-            height: roi.height * extent.height
-        ).intersection(extent)
-        guard !cropRect.isNull, cropRect.width > 0, cropRect.height > 0 else {
-            endRound()
-            return
-        }
-        ciImage = ciImage.cropped(to: cropRect)
-
-        // 3) 下采样到最长边限制（扩展 jetsam 硬上限约 50MB 的内存保护，
-        //    R/36 调研：切 App 瞬间系统会堆积多个待处理缓冲）
-        let longSide = max(ciImage.extent.width, ciImage.extent.height)
-        if longSide > SharedConfig.maxCropPixelDimension {
-            let scale = SharedConfig.maxCropPixelDimension / longSide
-            ciImage = ciImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-        }
-
-        // 4) 渲染为独立 CGImage；此后不再引用 sampleBuffer/pixelBuffer。
-        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else {
-            endRound()
-            return
-        }
+        logMemory(stage: "roi-rendered")
 
         // 5) OCR（架构无关组件，后台队列；识别文本仅存在于闭包链内存）
-        OCRService.recognizeText(in: cgImage) { [weak self] recognizedText in
+        guard let ocr = OCRService.recognizeText(in: cgImage, completion: { [weak self] recognizedText in
             guard let self else { return }
+            self.logMemory(stage: "ocr-finished")
+            guard self.isCurrentRound(generation, captureGeneration: captureGeneration) else {
+                self.endRound(generation: generation)
+                return
+            }
 
             // 6) 基础格式化；空白/超限 → 空轮（不发请求不发通知）
             guard let sentence = SentenceFormatter.sentence(fromOCRText: recognizedText),
                   sentence.count <= SharedConfig.maxSentenceLength else {
-                self.endRound()
+                self.endRound(generation: generation)
                 return
             }
 
             // 7) 服务未配置 → 本轮丢弃（主 App 设置页有明确提示）
             guard let endpoint = AnswerEndpoint(timeout: SharedConfig.requestTimeoutSeconds()) else {
-                self.endRound()
+                self.endRound(generation: generation)
+                return
+            }
+            guard self.isCurrentRound(generation, captureGeneration: captureGeneration) else {
+                self.endRound(generation: generation)
                 return
             }
             ControlState.bumpRoundCounter()
-            DarwinSignal.post(DarwinSignal.roundDidFinish)
 
             // 8) 请求；响应回来后本轮结束。
-            endpoint.request(sentence: sentence) { [weak self] outcome in
+            let request = endpoint.request(sentence: sentence) { [weak self] outcome in
                 guard let self else { return }
-                defer { self.endRound() }
+                guard self.isCurrentRound(generation, captureGeneration: captureGeneration) else {
+                    self.endRound(generation: generation)
+                    return
+                }
+                defer { self.endRound(generation: generation) }
                 switch outcome {
                 case .ok(let reply):
-                    // 只展示本轮回复；不做本地去重或历史拼接。
-                    // 展示路径分流：PiP 活跃且主 App 心跳新鲜 → 瞬态邮箱 + Darwin
-                    // 信号（主 App 渲染进 PiP 悬浮条）；否则 → 本地通知（回退路径）。
-                    // 主 App 挂起/被杀时心跳超时，自动落到通知，保证新回复仍可展示。
-                    if ControlState.pipLivenessIsFresh() {
-                        ReplyTransportFactory.make().publish(reply: reply)
-                        DarwinSignal.post(DarwinSignal.newReplyAvailable)
-                    } else {
-                        NotificationPresenter.present(reply: reply)
-                    }
+                    // 只发送短回复；PiP 未监听时 UDS 有界重试后丢弃载荷。
+                    ReplyTransportFactory.make().send(reply: reply)
                 case .duplicate:
                     // 204：保留当前展示 → 不发新通知
                     break
@@ -185,69 +183,137 @@ final class SampleHandler: RPBroadcastSampleHandler {
                     break
                 }
             }
+            self.stateQueue.sync {
+                if self.roundActive && !self.isBroadcastPaused &&
+                    self.roundGeneration == generation &&
+                    self.activeCaptureGeneration == captureGeneration &&
+                    ControlState.userWantsCapture() &&
+                    ControlState.captureGeneration() == captureGeneration {
+                    self.activeRequest = request
+                } else {
+                    request?.cancel()
+                }
+            }
+        }) else {
+            endRound(generation: generation)
+            return
         }
+        stateQueue.sync {
+            if roundActive && !isBroadcastPaused && roundGeneration == generation &&
+                activeCaptureGeneration == captureGeneration {
+                activeOCR = ocr
+            } else {
+                ocr.cancel()
+            }
+        }
+        logMemory(stage: "ocr-submitted")
     }
 
     /// 结束一轮：清 roundActive 并按配置间隔排定下一轮可开始时刻。
-    private func endRound() {
+    private func isCurrentRound(_ generation: Int, captureGeneration: Int) -> Bool {
         stateQueue.sync {
+            !isBroadcastPaused && roundGeneration == generation &&
+                ControlState.userWantsCapture() &&
+                ControlState.captureGeneration() == captureGeneration
+        }
+    }
+
+    private func endRound(generation: Int) {
+        stateQueue.sync {
+            guard roundGeneration == generation else { return }
             roundActive = false
+            activeOCR = nil
+            activeRequest = nil
             nextRoundEligibleTime = CFAbsoluteTimeGetCurrent()
                 + SharedConfig.intervalSeconds()
         }
+    }
+
+    /// Core Image 只在采集回调中读取当前帧；ROI 先裁剪再限制最长边，坐标统一限制在 extent。
+    private func makeOCRImage(from sampleBuffer: CMSampleBuffer) -> CGImage? {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return nil }
+        var orientation = CGImagePropertyOrientation.up
+        if let raw = CMGetAttachment(sampleBuffer,
+                                     key: RPVideoSampleOrientationKey as CFString,
+                                     attachmentModeOut: nil) as? NSNumber {
+            orientation = CGImagePropertyOrientation(rawValue: raw.uint32Value) ?? .up
+        }
+
+        var ciImage = CIImage(cvPixelBuffer: pixelBuffer).oriented(orientation)
+        let extent = ciImage.extent
+        guard extent.width > 0, extent.height > 0 else { return nil }
+        let roi = SharedConfig.roi()
+        let normalized = CGRect(
+            x: min(max(roi.minX, 0), 1),
+            y: min(max(1 - roi.maxY, 0), 1),
+            width: min(max(roi.width, 0), 1),
+            height: min(max(roi.height, 0), 1)
+        )
+        let cropRect = CGRect(
+            x: extent.minX + normalized.minX * extent.width,
+            y: extent.minY + normalized.minY * extent.height,
+            width: normalized.width * extent.width,
+            height: normalized.height * extent.height
+        ).intersection(extent)
+        guard !cropRect.isNull, cropRect.width > 0, cropRect.height > 0 else { return nil }
+        ciImage = ciImage.cropped(to: cropRect)
+
+        let longSide = max(ciImage.extent.width, ciImage.extent.height)
+        let maxDimension = SharedConfig.maxCropPixelDimension
+        if longSide > maxDimension {
+            let scale = maxDimension / longSide
+            ciImage = ciImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        }
+        return ciContext.createCGImage(ciImage, from: ciImage.extent)
+    }
+
+    /// 在 stateQueue 内调用；只取消句柄与网络任务，不保存图像或文字诊断内容。
+    private func cancelActiveWork() {
+        activeOCR?.cancel()
+        activeOCR = nil
+        activeRequest?.cancel()
+        activeRequest = nil
+        logMemory(stage: "work-cancelled")
+    }
+
+    /// 仅写固定阶段名与当前进程常驻内存数值，供 Instruments/设备日志配合采样。
+    private func logMemory(stage: String) {
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return }
+        let rssMB = Double(info.resident_size) / 1_048_576
+        memoryLog.info("mem stage=\(stage, privacy: .public) rss_mb=\(rssMB, format: .fixed(precision: 1), privacy: .public)")
     }
 
     // MARK: - 通道冒烟（真机验证切片 1，R/36 指定）
 
     /// 向 shm_open 命名共享内存写递增序列号（与 ShmCrossProcessProbeView 布局一致：
     /// 前 8 字节 Int64 little-endian）。命名格式 `<group id>/xproc`（Apple 规范）。
-    private func runShmSmokeRound() {
+    private func runShmSmokeRound(generation: Int) {
         let name = "/\(AppGroup.identifier)/xproc"
         let bytes = 64
         let fd = shm_open(name, O_CREAT | O_RDWR, mode_t(0o600))
         guard fd >= 0 else {
             // shm 在本机不可用（ENOENT 前科）：结束本轮，让主链路冒烟结论记录失败
-            endRound()
+            endRound(generation: generation)
             return
         }
         guard ftruncate(fd, off_t(bytes)) == 0,
               let map = mmap(nil, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0),
               map != MAP_FAILED else {
             close(fd)
-            endRound()
+            endRound(generation: generation)
             return
         }
         let seqPtr = map.assumingMemoryBound(to: Int64.self)
         seqPtr.pointee += 1
         munmap(map, bytes)
         close(fd)
-        endRound()
-    }
-}
-
-/// 展示回退层：本地通知（PRD 允许的降级路径）。
-/// 隐私边界（交付说明同步标注）：
-///   - 通知正文包含回复文本，会经过 iOS 通知系统（横幅 + 通知中心保留），
-///     系统可能保留/摘要通知内容——不宣称满足“零文本系统留存”。
-///   - 用户可在系统设置关闭“显示预览”，或在本 App 设置中关闭“通知含正文”。
-enum NotificationPresenter {
-    static func present(reply: String) {
-        let center = UNUserNotificationCenter.current()
-        center.getNotificationSettings { settings in
-            guard settings.authorizationStatus == .authorized ||
-                  settings.authorizationStatus == .provisional else { return }
-            let content = UNMutableNotificationContent()
-            content.title = "屏识AI助手"
-            content.body = SharedConfig.notificationShowsContent()
-                ? String(reply.prefix(180))
-                : "有新的识别回复（已隐藏正文）"
-            // 固定 identifier：新通知覆盖旧通知，通知中心不堆积回复历史。
-            let request = UNNotificationRequest(
-                identifier: "screen-assistant.reply",
-                content: content,
-                trigger: nil
-            )
-            center.add(request)
-        }
+        endRound(generation: generation)
     }
 }

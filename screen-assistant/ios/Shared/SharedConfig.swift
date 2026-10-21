@@ -16,7 +16,6 @@ struct SharedConfig {
         static let roiY = "config.roiY"
         static let roiWidth = "config.roiWidth"
         static let roiHeight = "config.roiHeight"
-        static let notificationShowsContent = "config.notificationShowsContent"
     }
 
     // MARK: - 边界常量
@@ -26,7 +25,7 @@ struct SharedConfig {
     /// 发送前的单句长度上限（超出视为无效轮次，跳过，与契约中 422 的客户端侧一致处理）。
     static let maxSentenceLength = 2000
     /// ROI 裁剪后送 OCR 的最长边（像素）。兼顾扩展内存上限与识别精度。
-    static let maxCropPixelDimension: CGFloat = 1280
+    static let maxCropPixelDimension: CGFloat = 640
 
     // MARK: - 读写
 
@@ -102,12 +101,4 @@ struct SharedConfig {
         d?.set(h, forKey: Keys.roiHeight)
     }
 
-    /// 通知是否显示回复正文（隐私开关）。关闭时通知只提示“有新回复”，不含文本。
-    static func notificationShowsContent() -> Bool {
-        AppGroup.defaults?.object(forKey: Keys.notificationShowsContent) as? Bool ?? true
-    }
-
-    static func setNotificationShowsContent(_ v: Bool) {
-        AppGroup.defaults?.set(v, forKey: Keys.notificationShowsContent)
-    }
 }

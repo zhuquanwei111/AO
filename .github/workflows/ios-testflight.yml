@@ -1,0 +1,166 @@
+name: ios-testflight-upload
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_testflight_upload:
+        description: Confirm that this run will sign the app and upload it to App Store Connect
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  signed-testflight-upload:
+    if: ${{ inputs.confirm_testflight_upload }}
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      XCODE_VERSION: "16.4"
+      XCODEGEN_VERSION: "2.46.0"
+      XCODEGEN_COMMIT: "8445e778451c7e44237b90281bde622d764b0084"
+      ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      IOS_TEAM_ID: ${{ vars.IOS_TEAM_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Validate confirmation and signing configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.confirm_testflight_upload }}" != "true" ]]; then
+            echo "Set confirm_testflight_upload=true to sign and upload this build." >&2
+            exit 1
+          fi
+          for name in ASC_KEY_ID ASC_ISSUER_ID ASC_API_KEY_P8 IOS_TEAM_ID; do
+            if [[ -z "${!name}" ]]; then
+              echo "Required GitHub secret/variable is missing: $name" >&2
+              exit 1
+            fi
+          done
+
+      - name: Select and verify Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          XCODE_APP="/Applications/Xcode_${XCODE_VERSION}.app"
+          if [[ ! -d "$XCODE_APP" ]]; then
+            echo "Required Xcode $XCODE_VERSION is missing at $XCODE_APP" >&2
+            exit 1
+          fi
+          sudo xcode-select --switch "$XCODE_APP/Contents/Developer"
+          ACTUAL_XCODE="$(xcodebuild -version | sed -n '1s/^Xcode //p')"
+          if [[ "$ACTUAL_XCODE" != "$XCODE_VERSION" ]]; then
+            echo "Expected Xcode $XCODE_VERSION, found $ACTUAL_XCODE" >&2
+            exit 1
+          fi
+          xcodebuild -version
+
+      - name: Build and verify pinned XcodeGen
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$XCODEGEN_VERSION" \
+            https://github.com/yonaskolb/XcodeGen.git "$RUNNER_TEMP/XcodeGen"
+          ACTUAL_XCODEGEN_COMMIT="$(git -C "$RUNNER_TEMP/XcodeGen" rev-parse HEAD)"
+          if [[ "$ACTUAL_XCODEGEN_COMMIT" != "$XCODEGEN_COMMIT" ]]; then
+            echo "Unexpected XcodeGen $XCODEGEN_VERSION commit: $ACTUAL_XCODEGEN_COMMIT" >&2
+            exit 1
+          fi
+          (
+            cd "$RUNNER_TEMP/XcodeGen"
+            swift run -c release xcodegen --version
+          ) 2>&1 | tee "$RUNNER_TEMP/xcodegen-version.log"
+          grep -F "$XCODEGEN_VERSION" "$RUNNER_TEMP/xcodegen-version.log"
+
+      - name: Generate Xcode project
+        working-directory: screen-assistant/ios
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift run --package-path "$RUNNER_TEMP/XcodeGen" -c release xcodegen generate
+
+      - name: Prepare App Store Connect key
+        shell: bash
+        env:
+          ASC_API_KEY_P8: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          set +x
+          mkdir -p "$RUNNER_TEMP/private_keys"
+          KEY_PATH="$RUNNER_TEMP/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          printf '%s' "$ASC_API_KEY_P8" > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          echo "ASC_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+          unset ASC_API_KEY_P8
+
+      - name: Archive signed app and broadcast extension
+        working-directory: screen-assistant/ios
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          xcodebuild \
+            -project ScreenAssistant.xcodeproj \
+            -scheme ScreenAssistant \
+            -destination 'generic/platform=iOS' \
+            -configuration Release \
+            -archivePath build/ScreenAssistant.xcarchive \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            CODE_SIGN_STYLE=Automatic \
+            DEVELOPMENT_TEAM="$IOS_TEAM_ID" \
+            CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+            SWIFT_VERSION=5.0 \
+            archive 2>&1 | tee build/xcodebuild-archive.log
+
+      - name: Export App Store Connect build
+        working-directory: screen-assistant/ios
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > build/ExportOptions.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>teamID</key><string>${IOS_TEAM_ID}</string>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild \
+            -exportArchive \
+            -archivePath build/ScreenAssistant.xcarchive \
+            -exportPath build/export \
+            -exportOptionsPlist build/ExportOptions.plist \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            2>&1 | tee build/xcodebuild-export.log
+          IPA="$(find build/export -maxdepth 1 -name '*.ipa' -print -quit)"
+          if [[ -z "$IPA" || ! -s "$IPA" ]]; then
+            echo "Xcode export did not produce an IPA." >&2
+            exit 1
+          fi
+          echo "TESTFLIGHT_IPA=$PWD/$IPA" >> "$GITHUB_ENV"
+
+      - name: Upload build to App Store Connect
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          xcrun altool --upload-app \
+            --type ios \
+            --file "$TESTFLIGHT_IPA" \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID"

@@ -7,22 +7,15 @@ import Combine
 
 /// PiP 悬浮回复条控制器（主 App 侧）。
 ///
-/// 链路：广播扩展 OCR+POST 得到 200 回复 →（pipActive 且心跳新鲜时）
-/// 经 ReplyTransport 瞬态邮箱 + Darwin 信号 → 本控制器读取并把文本渲染为
+/// 链路：广播扩展 OCR+POST 得到 200 回复 → UDS 短回复通道 → 本控制器读取并把文本渲染为
 /// 视频帧 → AVSampleBufferDisplayLayer → 系统 PiP 窗口展示。
 ///
 /// 平台边界（如实）：
-///   - **音频会话默认不激活、不播放任何音频**（遵守“禁止无关后台音频伪保活”）。
-///     R/36 深核表明：PiP 后台存活 = PiP 激活 + UIBackgroundModes=audio + 活跃
-///     .playback 会话三者齐备，.playback 会话是 PiP detach 前置（即使无声）。
-///     该会话是否属于禁令范畴需主控/用户裁决——实现已就绪但由
-///     `usesSilentPlaybackSessionForPiP` 常量门控（默认 false），获批后改一行即启用。
-///     Info.plist 的 `UIBackgroundModes: audio` 是 Apple PiP 文档要求的能力声明
-///     （"Audio, AirPlay, and Picture in Picture"）。
-///   - 主 App 后台存活依赖 PiP 自身系统生命周期（关闭 PiP 窗口即停止存活、
-///     广播停止则识别停止——系统限制，已写入界面文案）；若主 App 被挂起，
-///     扩展侧 liveness 心跳检测自动把展示回落到通知，不阻塞采集/OCR/网络主链路。
-///     此行为需真机验证。
+///   - PiP 会话启用 AVAudioSession `.playback` 与 `.mixWithOthers`，并在结束时停用；
+///     不播放静音内容或循环音频。Info.plist 声明 `UIBackgroundModes=audio`。
+///     后台实际存活仍需真机验证，音频后台模式也不保证进程永不挂起。
+///   - 主 App 的 UDS listener 随 PiP 会话启停；扩展无法连接时有限重试并丢弃回复，
+///     不将正文改写到通知或文件。
 ///   - **回声风险（R/36 指出，如实）**：广播采集整个屏幕，含本 App 自己的 PiP
 ///     窗口——若 PiP 覆盖识别区域，OCR 可能读到自己的回复形成回环。公开 API
 ///     无法读取 PiP 窗口位置，几何剔除不可行；缓解 = 用户将 PiP 窗口拖离识别
@@ -42,6 +35,7 @@ final class PiPDisplayController: NSObject, ObservableObject {
         case idle
         case starting
         case running
+        case suspended
         case stopped
         case failed(String)
     }
@@ -49,28 +43,14 @@ final class PiPDisplayController: NSObject, ObservableObject {
     @Published private(set) var state: DisplayState = .idle
     @Published private(set) var lastReplyAt: Date?
 
-    /// 【待授权决策】PiP 后台存活的官方机制开关。
-    ///
-    /// R/36 深核（官方语义 O5 + afm-screen-translator 实证 + App Store 上架先例
-    /// PiP Screen Translate id6756233631）：**PiP 激活 + UIBackgroundModes=audio +
-    /// 活跃 .playback 会话**三者齐备时主 App 后台不挂起；.playback 会话是
-    /// sample-buffer PiP detach 的前置条件（即使无声）。这正落入用户
-    /// “禁止无关后台音频伪保活”的禁令边界，需主控/用户裁决：
-    ///   - false（当前默认）：不激活任何音频会话，完全遵守禁令；
-    ///     代价：PiP 在真机上可能无法 detach 或切后台即挂起，展示回落通知。
-    ///   - true（获批后）：激活 .playback/.mixWithOthers 无声会话——该会话是
-    ///     PiP 官方采纳链路的组成部分（非播放任何内容），属于“相关”保活。
-    /// 获批后仅需把本常量改为 true，其余代码无需变动。
-    static let usesSilentPlaybackSessionForPiP = false
-
-    /// 心跳周期（秒）：既是扩展侧 liveness 心跳，也是 PiP 层的重喂帧间隔
-    /// （防止 displayLayer 长时间无新帧出现的超时/缓冲行为——间隔需真机调参）。
     private let heartbeatInterval: TimeInterval = 2
+    private let replyPollInterval: TimeInterval = 0.1
 
     private var pipController: AVPictureInPictureController?
     private var heartbeatTimer: Timer?
-    private var replyObserver: DarwinObserver?
+    private var replyPollTimer: Timer?
     private let transport = ReplyTransportFactory.make()
+    private var audioSessionActive = false
     private var lastRenderedCGImage: CGImage?
     private var isPlaying = true
 
@@ -98,18 +78,31 @@ final class PiPDisplayController: NSObject, ObservableObject {
 
     func start() {
         guard isSupported else {
+            ControlState.setUserWantsCapture(false)
             state = .unsupported
             return
         }
         guard pipController == nil else { return }
         attachHostViewIfNeeded()
 
-        // 静音 .playback 会话（PiP detach 前置，R/36 核实；默认关闭待授权，
-        // 见 usesSilentPlaybackSessionForPiP 决策注释）
-        if Self.usesSilentPlaybackSessionForPiP {
+        do {
+            try transport.startReceiving()
+        } catch {
+            ControlState.setUserWantsCapture(false)
+            state = .failed("回复通道启动失败：\(error.localizedDescription)")
+            return
+        }
+
+        do {
             let session = AVAudioSession.sharedInstance()
-            try? session.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
-            try? session.setActive(true)
+            try session.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
+            try session.setActive(true)
+            audioSessionActive = true
+        } catch {
+            transport.stopReceiving()
+            ControlState.setUserWantsCapture(false)
+            state = .failed("PiP 音频会话启动失败：\(error.localizedDescription)")
+            return
         }
 
         let source = AVPictureInPictureController.ContentSource(
@@ -117,18 +110,26 @@ final class PiPDisplayController: NSObject, ObservableObject {
             playbackDelegate: self
         )
         let controller = AVPictureInPictureController(contentSource: source)
-        // iOS 15 兼容：delegate 经 setDelegate(_:queue:) 设置（回调保证主队列，
-        // 安全更新 @Published 状态）
-        controller.setDelegate(self, queue: .main)
+        controller.delegate = self
         // App 切后台时自动进入 PiP（iOS 14.2+，官方 API；afm 同款）
         controller.canStartPictureInPictureAutomaticallyFromInline = true
+        controller.requiresLinearPlayback = true
         pipController = controller
 
         // 等比缩放渲染（afm 同款）+ live 内容时间基：rate 1，主时钟驱动
         displayLayer.videoGravity = .resizeAspect
-        let timebase = CMTimebase(masterClock: CMClockGetHostClockTimebase())
-        CMTimebaseSetRate(timebase, 1)
-        CMTimebaseSetTime(timebase, CMTime.zero)
+        var timebase: CMTimebase?
+        guard CMTimebaseCreateWithSourceClock(
+            allocator: kCFAllocatorDefault,
+            sourceClock: CMClockGetHostTimeClock(),
+            timebaseOut: &timebase
+        ) == noErr, let timebase else {
+            state = .failed("无法建立 PiP 视频时间基")
+            teardown()
+            return
+        }
+        CMTimebaseSetRate(timebase, rate: 1)
+        CMTimebaseSetTime(timebase, time: .zero)
         displayLayer.controlTimebase = timebase
 
         isPlaying = true
@@ -136,16 +137,14 @@ final class PiPDisplayController: NSObject, ObservableObject {
         if !controller.isPictureInPicturePossible {
             // afm 实证：layer 未附着可见 window 层级或非前台时不可 detach
             state = .failed("PiP 当前不可用：请确认 App 在前台")
+            teardown()
             return
         }
         state = .starting
         controller.startPictureInPicture()
 
-        // 观察扩展的新回复信号
-        replyObserver = DarwinObserver(name: DarwinSignal.newReplyAvailable) { [weak self] in
-            self?.consumeReply()
-        }
         startHeartbeat()
+        startReplyPolling()
     }
 
     func stop() {
@@ -157,15 +156,18 @@ final class PiPDisplayController: NSObject, ObservableObject {
     private func teardown() {
         heartbeatTimer?.invalidate()
         heartbeatTimer = nil
-        replyObserver = nil
-        ControlState.setPipActive(false)
+        replyPollTimer?.invalidate()
+        replyPollTimer = nil
+        transport.stopReceiving()
+        ControlState.setUserWantsCapture(false)
         hostView.removeFromSuperview()
         pipController = nil
         lastRenderedCGImage = nil
         displayLayer.flushAndRemoveImage()
-        if Self.usesSilentPlaybackSessionForPiP {
+        if audioSessionActive {
             try? AVAudioSession.sharedInstance().setActive(false,
                                                            options: .notifyOthersOnDeactivation)
+            audioSessionActive = false
         }
     }
 
@@ -175,25 +177,42 @@ final class PiPDisplayController: NSObject, ObservableObject {
         heartbeatTimer?.invalidate()
         let timer = Timer(timeInterval: heartbeatInterval, repeats: true) { [weak self] _ in
             guard let self else { return }
-            ControlState.markPipHeartbeat()
-            // 重喂当前帧，保持 PiP 活性（无音频、纯渲染，内存态帧）
+            if self.pipController?.isPictureInPictureSuspended == true {
+                self.state = .suspended
+                return
+            }
+            if self.state == .suspended, self.pipController?.isPictureInPictureActive == true {
+                self.state = .running
+            }
+            guard self.isPlaying else { return }
+            // 刷新最后一帧；不播放音频内容。
             if let image = self.lastRenderedCGImage ?? self.placeholderFrame() {
                 self.enqueue(image)
             }
         }
         RunLoop.main.add(timer, forMode: .common)
         heartbeatTimer = timer
-        ControlState.setPipActive(true)
+    }
+
+    private func startReplyPolling() {
+        replyPollTimer?.invalidate()
+        let timer = Timer(timeInterval: replyPollInterval, repeats: true) { [weak self] _ in
+            self?.consumeReply()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        replyPollTimer = timer
     }
 
     // MARK: - 回复消费与渲染
 
     private func consumeReply() {
         guard state == .running || state == .starting else { return }
-        guard let reply = transport.consumeLatest() else { return }
+        guard let reply = transport.takeLatestReply() else { return }
         let image = renderReplyFrame(reply)
         lastRenderedCGImage = image
-        enqueue(image)
+        if isPlaying {
+            enqueue(image)
+        }
         lastReplyAt = Date()
     }
 
@@ -320,20 +339,29 @@ final class PiPDisplayController: NSObject, ObservableObject {
 extension PiPDisplayController: AVPictureInPictureControllerDelegate {
     func pictureInPictureControllerDidStartPictureInPicture(
         _ pictureInPictureController: AVPictureInPictureController) {
-        state = .running
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.pipController === pictureInPictureController else { return }
+            self.state = .running
+        }
     }
 
     func pictureInPictureControllerDidStopPictureInPicture(
         _ pictureInPictureController: AVPictureInPictureController) {
-        teardown()
-        state = .stopped
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.pipController === pictureInPictureController else { return }
+            self.teardown()
+            self.state = .stopped
+        }
     }
 
     func pictureInPictureController(
         _ pictureInPictureController: AVPictureInPictureController,
         failedToStartPictureInPictureWithError error: Error) {
-        teardown()
-        state = .failed(error.localizedDescription)
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.pipController === pictureInPictureController else { return }
+            self.teardown()
+            self.state = .failed(error.localizedDescription)
+        }
     }
 }
 
@@ -346,19 +374,15 @@ extension PiPDisplayController: AVPictureInPictureSampleBufferPlaybackDelegate {
         _ pictureInPictureController: AVPictureInPictureController,
         setPlaying playing: Bool) {
         isPlaying = playing
-    }
-
-    /// 显式禁止系统为本 PiP 维持后台音频播放路径：本展示无任何音频，
-    /// 不依赖音频会话保活（合规声明）。
-    func pictureInPictureControllerShouldProhibitBackgroundAudioPlayback(
-        _ pictureInPictureController: AVPictureInPictureController) -> Bool {
-        true
+        if playing, let image = lastRenderedCGImage {
+            enqueue(image)
+        }
     }
 
     /// live 语义：时间范围无限。
     func pictureInPictureControllerTimeRangeForPlayback(
         _ pictureInPictureController: AVPictureInPictureController) -> CMTimeRange {
-        CMTimeRange(start: .invalid, duration: .positiveInfinity)
+        CMTimeRange(start: .zero, duration: .positiveInfinity)
     }
 
     func pictureInPictureControllerIsPlaybackPaused(
