@@ -30,9 +30,6 @@ final class AppModel: ObservableObject {
     @Published var captureWanted: Bool {
         didSet { ControlState.setUserWantsCapture(captureWanted) }
     }
-    @Published var shmSmokeMode: Bool {
-        didSet { ControlState.setShmSmokeMode(shmSmokeMode) }
-    }
     @Published var roundCounter: Int = 0
     @Published var lastUpdated: Date?
 
@@ -44,7 +41,6 @@ final class AppModel: ObservableObject {
         requestTimeout = SharedConfig.requestTimeoutSeconds()
         roi = SharedConfig.roi()
         captureWanted = ControlState.userWantsCapture()
-        shmSmokeMode = ControlState.shmSmokeMode()
         roundCounter = ControlState.roundCounter()
 
         // 轮询共享状态（扩展每完成一轮会 bump 计数器）。

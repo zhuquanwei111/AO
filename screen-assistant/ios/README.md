@@ -20,7 +20,7 @@
 - PiP 位置没有可供 App 查询的公开 API；PiP 覆盖处不保证触摸穿透。请将 PiP 拖离 ROI，降低屏幕 OCR 识别自身回复的回声风险。
 - ROI 在主 App 内编辑，不在其他 App 上留下选择层。App 不承诺全局任意悬浮窗或完全无交互边界。
 - App 与 Broadcast Extension 的 `Info.plist` 都声明 `NSLocalNetworkUsageDescription` 和 `NSAllowsLocalNetworking`，供扩展进程连接本地开发服务。iPhone 必须能访问用户配置的服务地址；本机 loopback 地址不适用于实体 iPhone。生产部署应使用 HTTPS；不要将未鉴权开发服务直接暴露到公网。
-- `SmokeChannels/` 与 `Shared/IPC/check_sa_reply_channel.sh` 是诊断工具，不参与产品帧/回复链路。当前实现固定为扩展内 OCR、UDS 只传 reply；不依据未执行的 shm 探针重写帧传输架构。
+- `Shared/IPC/check_sa_reply_channel.sh` 是诊断工具，不参与产品帧/回复链路。当前实现固定为扩展内 OCR、UDS 只传 reply；shm 诊断探针已移除（iOS SDK 编译期不可用，属平台死代码），不依据未执行的探针重写帧传输架构。
 
 ## Mac 构建、签名与安装
 

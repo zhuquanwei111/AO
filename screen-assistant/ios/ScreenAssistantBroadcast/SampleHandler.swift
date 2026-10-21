@@ -10,12 +10,6 @@ import os
 /// 广播上传扩展主类：跨应用采集 → 方向转正 → ROI 内存裁剪 → 中文 OCR →
 /// 基础格式化 → POST /v1/answer → UDS 短回复发送。
 ///
-/// 另含**通道冒烟模式**（R/36 指定的第一个真机验证切片）：
-/// 当 App Group 中 `control.shmSmokeMode` 为 true 时，每轮不跑 OCR/网络，
-/// 仅向 shm_open 共享内存（`/<group id>/xproc`）写递增序列号——供主 App 的
-/// ShmCrossProcessProbeView 验证“扩展→App 真无文件后备通道”是否在本机可用。
-/// 该探针只供真机诊断，不切换产品主链路。
-///
 /// 隐私与生命周期约束：
 ///   - 视频帧仅存在于本方法调用栈与 CIImage/VNImageRequestHandler 内存中，
 ///     方法返回后不保留任何画面引用（官方文档要求），不落盘。
@@ -120,12 +114,6 @@ final class SampleHandler: RPBroadcastSampleHandler {
             }
         }
         guard startRound else { return }
-
-        // 通道冒烟模式：仅写 shm 序列号，不跑主链路（R/36 真机验证切片 1）
-        if ControlState.shmSmokeMode() {
-            runShmSmokeRound(generation: generation)
-            return
-        }
 
         logMemory(stage: "frame-start")
         // 把像素缓冲、Core Image 中间对象限制在此 autoreleasepool 内；只让最终
@@ -290,30 +278,4 @@ final class SampleHandler: RPBroadcastSampleHandler {
         memoryLog.info("mem stage=\(stage, privacy: .public) rss_mb=\(rssMB, format: .fixed(precision: 1), privacy: .public)")
     }
 
-    // MARK: - 通道冒烟（真机验证切片 1，R/36 指定）
-
-    /// 向 shm_open 命名共享内存写递增序列号（与 ShmCrossProcessProbeView 布局一致：
-    /// 前 8 字节 Int64 little-endian）。命名格式 `<group id>/xproc`（Apple 规范）。
-    private func runShmSmokeRound(generation: Int) {
-        let name = "/\(AppGroup.identifier)/xproc"
-        let bytes = 64
-        let fd = shm_open(name, O_CREAT | O_RDWR, mode_t(0o600))
-        guard fd >= 0 else {
-            // shm 在本机不可用（ENOENT 前科）：结束本轮，让主链路冒烟结论记录失败
-            endRound(generation: generation)
-            return
-        }
-        guard ftruncate(fd, off_t(bytes)) == 0,
-              let map = mmap(nil, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0),
-              map != MAP_FAILED else {
-            close(fd)
-            endRound(generation: generation)
-            return
-        }
-        let seqPtr = map.assumingMemoryBound(to: Int64.self)
-        seqPtr.pointee += 1
-        munmap(map, bytes)
-        close(fd)
-        endRound(generation: generation)
-    }
 }
