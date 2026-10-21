@@ -83,6 +83,7 @@ def key_of(normalized: str) -> str:
 
 def test_safe_request_diagnostics_are_enabled():
     assert logger.isEnabledFor(logging.INFO)
+    assert any(handler.level <= logging.INFO for handler in logger.handlers)
 
 
 @pytest.fixture(autouse=True)

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -35,6 +36,12 @@ from .model_client import (
 
 logger = logging.getLogger("screen_assistant.app")
 logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _diagnostic_handler = logging.StreamHandler(sys.stdout)
+    _diagnostic_handler.setLevel(logging.INFO)
+    _diagnostic_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(_diagnostic_handler)
+logger.propagate = False
 
 KEY_PREFIX = "sa:answer:v1"
 
