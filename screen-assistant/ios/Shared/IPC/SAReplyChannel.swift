@@ -85,7 +85,7 @@ public final class SAReplyChannel {
     static let writeTimeout: TimeInterval = 2.0
     /// 已接受连接的空闲超时（对端异常不关连接时的 fd 保护）。
     static let connIdleTimeout: TimeInterval = 10.0
-    static let listenBacklog = 16
+    static let listenBacklog: Int32 = 16
 
     // MARK: - 状态
 
@@ -329,7 +329,7 @@ public final class SAReplyChannel {
                     lastSendFailure = SAReplySendFailure(reason: .listenerUnreachable(attempts: attempt), at: Date())
                     sendInFlight = false
                 } else {
-                    senderQueue.asyncAfter(.now() + Self.sendRetryDelay) { self.flushPending() }
+                    senderQueue.asyncAfter(deadline: .now() + Self.sendRetryDelay) { self.flushPending() }
                 }
             case .writeFailed(let detail):
                 if attempt >= Self.maxSendAttempts {
@@ -337,7 +337,7 @@ public final class SAReplyChannel {
                     lastSendFailure = SAReplySendFailure(reason: .connectionLost(detail: detail), at: Date())
                     sendInFlight = false
                 } else {
-                    senderQueue.asyncAfter(.now() + Self.sendRetryDelay) { self.flushPending() }
+                    senderQueue.asyncAfter(deadline: .now() + Self.sendRetryDelay) { self.flushPending() }
                 }
             }
         }
