@@ -52,6 +52,20 @@ xcodebuild -project ScreenAssistant.xcodeproj \
 
 仓库根目录的 `.github/workflows/ios-unsigned-build.yml` 提供手动 GitHub Actions 无签名构建入口：固定 macOS 15 runner、明确校验 Xcode 16.4、从 XcodeGen 2.46.0 源码 tag 生成工程，并构建 `ScreenAssistant` scheme（显式包含广播扩展 target）。工作流验证 `.app/PlugIns/ScreenAssistantBroadcast.appex` 后，以 `ditto` 将 `.app` 目录结构打成 ZIP 上传。该 ZIP 不是 IPA，也不能直接安装；workflow 尚未运行，不能视作 Apple 编译通过。
 
+## iPhone 安装与 TestFlight 路径
+
+推荐路径是 Apple Developer Program 付费账号 + 云 Mac 签名 + TestFlight。费用按 Apple 当前计划页面和地区显示；本次调研基准为每年 99 美元。TestFlight build 可测试 90 天，到期后需上传新 build。[Apple Developer Program](https://developer.apple.com/programs/) · [TestFlight build 有效期](https://developer.apple.com/help/app-store-connect/test-a-beta-version/testflight-overview/)
+
+1. 账号持有人在 Apple Developer 账号中注册 App ID `com.screenassistant.ios`、扩展 App ID `com.screenassistant.ios.broadcast`，并为两者启用同一个 App Group：`group.com.screenassistant.ios`。这个标识在 `Shared/AppGroup.swift` 中固定，不能在签名时改名或移除，否则 App 与扩展的 UDS 通信会失效。
+2. 在 App Store Connect 创建与主 App Bundle ID 匹配的 App 记录，并生成具备所需访问权限的 App Store Connect API key。
+3. 在仓库 Actions secrets 中配置 `APP_STORE_CONNECT_KEY_ID`、`APP_STORE_CONNECT_ISSUER_ID`、`APP_STORE_CONNECT_API_KEY_P8`；在 Actions variables 中配置 `IOS_TEAM_ID`。私钥仅由账号持有人保管并录入构建环境，不提交到 Git，也不发送给 worker。
+4. 手动运行仓库根目录 `.github/workflows/ios-testflight.yml`，并将确认项设为 true。该 workflow 用 Xcode 自动签名归档 App 与广播扩展，并上传到 App Store Connect；它不会自动邀请测试者或发布到 App Store。Apple 文档支持用 App Store Connect key 配合 `xcodebuild` 云签名，并通过 `altool` 上传。[Xcode 云签名](https://developer.apple.com/videos/play/wwdc2021/10204/) · [上传 build](https://developer.apple.com/help/app-store-connect/manage-builds/upload-builds)
+5. 等待 Apple 处理完成后，在 App Store Connect 的 TestFlight 标签页将 build 加入内部测试组；iPhone 安装 TestFlight 客户端并接受邀请。内部测试需要对应的 App Store Connect 用户权限。
+
+当前 workflow 仅是本地准备，未运行、未验证签名、未上传。现有 `ios-unsigned-build.yml` 仍只做无签名编译检查，产物不能安装。免费 Personal Team 需要 Mac/Xcode，描述文件 7 天过期；本工程固定 App Group 是否可在免费 Team 下原样注册尚未实测。Windows 侧载工具也不能生成 IPA，且本工程的广播扩展与 App Group 组合未获工具方保证，因此最多作为一次实验，不能当验收路径。侧载必须另有已签名 IPA；当前 unsigned ZIP 不能作为安装包。
+
+开展真机验收前还需确认目标 iPhone 的 iOS 版本，并让它能访问配置的后端地址。不要把未鉴权开发服务直接暴露到公网。
+
 ## 逐项交付与验证矩阵
 
 | 项目 | 当前状态 | 证据 / 还需验证 |
