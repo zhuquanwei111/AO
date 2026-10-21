@@ -72,15 +72,18 @@ Android 模拟器服务地址填`http://10.0.2.2:8000`；真机填电脑在同�
 - PiP后台存活30分钟、免费签名/App Group链路及中文Vision OCR耗时未实测，不以代码完成或API可用性替代。
 ## 本次集成验证记录
 
-本地验收以Android 14 `sa34`模拟器为准。旧的ROI内外点击/滑动/键盘、选区确认取消、暂停/继续/停止与旋转结果保留；本次修复提交`63c889c`，新APK见交付附件。
+本地验收以Android 14 `sa34`模拟器为准；已实际验证ROI内外点击/滑动/键盘、选区确认与取消、暂停/继续/停止、旋转安全停止。源码修复提交`63c889c`，记录更新提交`592fc27`。
 
 | 项目 | 结果 |
 |---|---|
-| Debug构建、安装、启动 | 通过；新APK `screen-assistant-debug-63c889c.apk`，使用隔离SDK/Gradle构建。 |
-| Android真实服务端请求 | 2026-10-21 05:35:20.591Z本轮OCR收到HTTP 200；旧客户端没有记录`X-Request-ID`，无法从访问日志恢复该响应头。服务端200表明回复非空，但当时没有客户端非空回复/悬浮显示证据；未重发真实OCR。 |
-| Android响应解析与悬浮分支（本地固定响应，不调用模型） | 本地stub返回200 JSON及request ID；客户端记录`SUCCESS`、回复长度，主线程分发后WindowManager窗口触发attached且shown=true。新悬浮层使用`NOT_FOCUSABLE|NOT_TOUCHABLE|NOT_TOUCH_MODAL`。截图见本机artifact `screen-assistant-local-reply-ui.png`。 |
-| 回复窗前台点击穿透 | 窗口触摸/焦点标志已核对，前台Settings仍为topResumed；没有在覆盖窗口范围内另做实体点击，厂商系统与真机仍需复验。 |
-| 实际服务端HTTP 200→悬浮回复、同句204、断网恢复 | 未通过；真实200发生在旧版且没有保存客户端request ID或悬浮可见证据；等待45通知现行入口可做一次受控真实验证。 |
-| 不落盘、厂商真机策略、连续30分钟 | 代码设计声明不落盘；本轮未做文件系统取证、真机或长时间实测。 |
+| Debug构建、安装、启动 | 通过；隔离SDK/Gradle构建成功，新APK `screen-assistant-debug-63c889c.apk`。 |
+| MediaProjection、端侧OCR与选区交互 | 通过既有模拟器验收；区域选择只在编辑期间存在，确认/取消后退出。正常采集中回复窗 flags 为`NOT_FOCUSABLE|NOT_TOUCHABLE|NOT_TOUCH_MODAL`。 |
+| Android旧客户端真实请求 | 2026-10-21 05:35:20.591Z收到HTTP 200；旧客户端未记录`X-Request-ID`。200表明服务端生成非空回复，但旧版没有客户端接收/悬浮展示证据；未重复该请求。 |
+| 新客户端固定响应→悬浮窗（不调用模型） | 本地stub的HTTP 200 JSON被解析为`SUCCESS`，回复非空；主线程分发后WindowManager attach回调确认`shown=true`。本地UI截图见artifact `screen-assistant-local-reply-ui.png`。 |
+| 新客户端真实服务端验证 | 05:49:42Z与05:52:00Z前后各启动过受控capture；停止前都未见AnswerClient HTTP/result日志。服务端是否收到POST待45核对，不能据客户端无日志推断未送达。CaptureService已停止。 |
+| 实际HTTP 200→真实回复可见、同句204、断网恢复 | 未验证；固定响应只证实客户端UI分支，不算真实端到端。 |
+| 回复窗底层点击穿透 | 已核对WindowManager flags和回复窗不接管焦点/触摸；没有在覆盖窗口范围内做实体点按复验，厂商系统与真机仍需验证。 |
+| 系统外部撤销MediaProjection | 未验证；已覆盖应用内停止。 |
+| 不落盘、厂商策略、连续30分钟 | 代码设计为仅内存处理；未做文件系统取证、真机或长时间实测。 |
 
-后端健康检查通过不等同于模型答复打通。模拟器真实服务端OCR只确认一条HTTP 200；本地固定响应仅验证Android解析与WindowManager挂载，不计入真实端到端通过。
+健康检查不等同于回复请求成功。两次受控capture的服务端状态待45确认；若日志显示有POST，应将其纳入请求统计并避免重复测试。
