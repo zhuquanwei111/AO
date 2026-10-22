@@ -33,7 +33,7 @@ import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions;
 import java.nio.ByteBuffer;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 采集前台服务（foregroundServiceType=mediaProjection）。
@@ -84,9 +84,9 @@ public class CaptureService extends Service {
     private final Handler main = new Handler(Looper.getMainLooper());
     private ExecutorService workExecutor;
 
-    private final AtomicBoolean busy = new AtomicBoolean(false);
-    private boolean tornDown = true;
-    private int sessionEpoch = 0;
+    private final AtomicInteger busyEpoch = new AtomicInteger(-1);
+    private volatile boolean tornDown = true;
+    private volatile int sessionEpoch = 0;
     private int rotationAtStart;
     private int intervalMs = 5000;
     private String serverUrl = "";
@@ -112,8 +112,8 @@ public class CaptureService extends Service {
                 main.post(() -> teardown("屏幕方向已变化，会话已停止，请重新框选并启动"));
                 return;
             }
-            if (busy.get()) {
-                scheduleNext();
+            if (busyEpoch.get() == sessionEpoch) {
+                scheduleTick(intervalMs);
                 return;
             }
             Image image = null;
@@ -131,43 +131,58 @@ public class CaptureService extends Service {
             }
             if (crop == null) {
                 // 无新帧：屏幕内容未变，跳过本轮（服务端去重语义兜底）
-                scheduleNext();
+                scheduleTick(intervalMs);
                 return;
             }
-            busy.set(true);
-            final Bitmap b = crop;
             final int epoch = sessionEpoch;
+            if (!busyEpoch.compareAndSet(-1, epoch)) {
+                scheduleNext(epoch);
+                return;
+            }
+            final Bitmap b = crop;
+            final String requestUrl = serverUrl;
             recognizer.process(InputImage.fromBitmap(b, 0))
                     .addOnSuccessListener(workExecutor, text -> {
                         b.recycle();
                         try {
+                            if (epoch != sessionEpoch) return;
                             String sentence = normalize(text.getText());
                             if (sentence.isEmpty()) {
-                                busy.set(false);
-                                scheduleNext();
+                                busyEpoch.compareAndSet(epoch, -1);
+                                scheduleNext(epoch);
                                 return;
                             }
                             AnswerClient.Result result =
-                                    AnswerClient.post(serverUrl, sentence, CONNECT_TIMEOUT_MS, READ_TIMEOUT_MS);
-                            busy.set(false);
+                                    AnswerClient.post(requestUrl, sentence, CONNECT_TIMEOUT_MS, READ_TIMEOUT_MS);
+                            android.util.Log.i("CaptureService", "answer response status=" + result.httpStatus
+                                    + " outcome=" + result.outcome + " request_id=" + safeId(result.requestId)
+                                    + " reply_chars=" + (result.reply == null ? 0 : result.reply.length())
+                                    + " epoch=" + epoch);
                             if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch) {
+                                android.util.Log.i("CaptureService", "answer dropped by lifecycle request_id="
+                                        + safeId(result.requestId) + " phase=" + phase + " current_epoch=" + sessionEpoch);
                                 return; // 会话已停/换轮：不得回填
                             }
                             if (result.outcome == AnswerClient.Outcome.SUCCESS) {
-                                showReply(result.reply);
+                                showReply(result.reply, epoch, result.requestId);
+                            } else if (result.outcome == AnswerClient.Outcome.DROP) {
+                                android.util.Log.w("CaptureService", "answer dropped request_id="
+                                        + safeId(result.requestId) + " status=" + result.httpStatus
+                                        + " error_type=" + errorType(result.error));
                             }
                             // DUPLICATE：保留当前展示；DROP：本轮静默丢弃
                         } catch (Throwable t) {
                             android.util.Log.w("CaptureService", "round failed", t);
-                            busy.set(false);
+                        } finally {
+                            busyEpoch.compareAndSet(epoch, -1);
+                            scheduleNext(epoch);
                         }
-                        scheduleNext();
                     })
                     .addOnFailureListener(workExecutor, e -> {
                         b.recycle();
                         android.util.Log.w("CaptureService", "ocr failed", e);
-                        busy.set(false);
-                        scheduleNext();
+                        busyEpoch.compareAndSet(epoch, -1);
+                        scheduleNext(epoch);
                     });
         }
     };
@@ -289,7 +304,6 @@ public class CaptureService extends Service {
             int[] size = ScreenMetrics.realSizeDpi(this);
             screenSize = size;
             rotationAtStart = ScreenMetrics.rotation(this);
-            busy.set(false);
 
             imageReader = ImageReader.newInstance(size[0], size[1], PixelFormat.RGBA_8888, 3);
             projection = mpm.getMediaProjection(resultCode, data);
@@ -319,8 +333,8 @@ public class CaptureService extends Service {
         }
     }
 
-    private void scheduleNext() {
-        scheduleTick(intervalMs);
+    private void scheduleNext(int epoch) {
+        if (epoch == sessionEpoch) scheduleTick(intervalMs);
     }
 
     /** 依据归一化区域计算帧内像素裁切矩形，含越界钳制；无有效区域返回默认中央区域。 */
@@ -374,13 +388,38 @@ public class CaptureService extends Service {
         return raw.trim().replaceAll("\\s+", " ");
     }
 
-    private void showReply(String reply) {
+    private void showReply(String reply, int epoch, String requestId) {
+        android.util.Log.i("CaptureService", "reply dispatch queued request_id=" + safeId(requestId)
+                + " reply_chars=" + (reply == null ? 0 : reply.length()) + " epoch=" + epoch);
         main.post(() -> {
-            if (phase != Phase.RUNNING || tornDown) return;
+            if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch) {
+                android.util.Log.i("CaptureService", "reply dispatch rejected request_id=" + safeId(requestId)
+                        + " phase=" + phase + " torn_down=" + tornDown + " epoch=" + epoch
+                        + " current_epoch=" + sessionEpoch);
+                return;
+            }
+            if (android.os.Build.VERSION.SDK_INT >= 23 && !android.provider.Settings.canDrawOverlays(this)) {
+                android.util.Log.w("CaptureService", "reply overlay denied request_id=" + safeId(requestId));
+                return;
+            }
             try {
+                boolean added = replyOverlayView == null;
                 if (replyOverlayView == null) {
                     replyOverlayView = LayoutInflater.from(this).inflate(R.layout.overlay_reply, null);
                     replyTextView = replyOverlayView.findViewById(R.id.tv_reply);
+                    replyOverlayView.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+                        @Override
+                        public void onViewAttachedToWindow(View view) {
+                            android.util.Log.i("CaptureService", "reply overlay attached request_id="
+                                    + safeId(requestId) + " shown=" + view.isShown());
+                        }
+
+                        @Override
+                        public void onViewDetachedFromWindow(View view) {
+                            android.util.Log.i("CaptureService", "reply overlay detached request_id="
+                                    + safeId(requestId));
+                        }
+                    });
                     WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
                             WindowManager.LayoutParams.WRAP_CONTENT,
                             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -397,13 +436,32 @@ public class CaptureService extends Service {
                 }
                 replyTextView.setText(reply);
                 replyOverlayView.setVisibility(View.VISIBLE);
+                android.util.Log.i("CaptureService", "reply overlay visible request_id=" + safeId(requestId)
+                        + " added=" + added + " attached=" + replyOverlayView.isAttachedToWindow()
+                        + " shown=" + replyOverlayView.isShown() + " reply_chars=" + reply.length()
+                        + " focusable=false touchable=false");
                 main.removeCallbacks(replyHide);
                 main.postDelayed(replyHide, REPLY_AUTO_HIDE_MS);
             } catch (Exception e) {
-                android.util.Log.w("CaptureService", "show reply failed", e);
+                android.util.Log.w("CaptureService", "reply overlay failed request_id=" + safeId(requestId)
+                        + " error_type=" + e.getClass().getSimpleName());
                 removeReplyOverlay();
             }
         });
+    }
+
+    private static String safeId(String id) {
+        if (id == null || id.isEmpty()) return "missing";
+        String safe = id.replaceAll("[^A-Za-z0-9_-]", "");
+        return safe.substring(0, Math.min(safe.length(), 64));
+    }
+
+    private static String errorType(String error) {
+        if (error == null || error.isEmpty()) return "unknown";
+        int colon = error.indexOf(':');
+        int space = error.indexOf(' ');
+        int end = colon >= 0 ? colon : (space >= 0 ? space : error.length());
+        return error.substring(0, Math.min(end, 48)).replaceAll("[^A-Za-z0-9_-]", "");
     }
 
     private void removeReplyOverlay() {
@@ -455,7 +513,6 @@ public class CaptureService extends Service {
         tornDown = true;
         phase = Phase.IDLE;
         sessionEpoch++;
-        busy.set(false);
         if (captureHandler != null) captureHandler.removeCallbacksAndMessages(null);
         main.removeCallbacks(replyHide);
         main.post(this::removeReplyOverlay);

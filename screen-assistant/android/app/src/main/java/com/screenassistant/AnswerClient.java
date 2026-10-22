@@ -26,8 +26,11 @@ public final class AnswerClient {
         public final Outcome outcome;
         public final String reply;   // 仅 SUCCESS 时非空
         public final String error;   // 仅 DROP 时可能含诊断信息（只写日志/通知，不展示给用户弹窗）
-        Result(Outcome o, String reply, String error) {
+        public final int httpStatus;
+        public final String requestId;
+        Result(Outcome o, String reply, String error, int httpStatus, String requestId) {
             this.outcome = o; this.reply = reply; this.error = error;
+            this.httpStatus = httpStatus; this.requestId = requestId;
         }
     }
 
@@ -56,22 +59,30 @@ public final class AnswerClient {
                 os.flush();
             }
             int code = conn.getResponseCode();
-            if (code == 204) return new Result(Outcome.DUPLICATE, null, null);
+            String requestId = conn.getHeaderField("X-Request-ID");
+            if (code == 204) return new Result(Outcome.DUPLICATE, null, null, code, requestId);
             if (code == 200) {
                 String respBody = readAll(conn.getInputStream(), 64 * 1024);
                 JSONObject jo = new JSONObject(respBody);
-                if ("ok".equals(jo.optString("status")) && !jo.optString("reply").isEmpty()) {
-                    return new Result(Outcome.SUCCESS, jo.optString("reply"), null);
+                String reply = jo.optString("reply", "");
+                if ("ok".equals(jo.optString("status")) && !reply.trim().isEmpty()) {
+                    return new Result(Outcome.SUCCESS, reply, null, code, requestId);
                 }
-                return new Result(Outcome.DROP, null, "200响应格式无效");
+                return new Result(Outcome.DROP, null, "200响应格式无效", code, requestId);
             }
             // 422 / 5xx / 其他：本轮丢弃
-            return new Result(Outcome.DROP, null, "HTTP " + code);
+            return new Result(Outcome.DROP, null, "HTTP " + code, code, requestId);
         } catch (IOException | org.json.JSONException | RuntimeException e) {
-            return new Result(Outcome.DROP, null, e.getClass().getSimpleName() + ": " + e.getMessage());
+            String requestId = conn == null ? null : conn.getHeaderField("X-Request-ID");
+            return new Result(Outcome.DROP, null, e.getClass().getSimpleName() + ": " + e.getMessage(),
+                    conn == null ? -1 : safeResponseCode(conn), requestId);
         } finally {
             if (conn != null) conn.disconnect();
         }
+    }
+
+    private static int safeResponseCode(HttpURLConnection conn) {
+        try { return conn.getResponseCode(); } catch (IOException ignored) { return -1; }
     }
 
     private static String readAll(InputStream in, int cap) throws IOException {
