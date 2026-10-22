@@ -6,9 +6,13 @@ import ReplayKit
 /// 用户点击后在系统弹窗中确认。
 struct BroadcastPickerSection: UIViewRepresentable {
     static let extensionBundleID = "com.screenassistant.ios.broadcast"
+    static let buttonSize: CGFloat = 50
 
     func makeUIView(context: Context) -> RPSystemBroadcastPickerView {
-        let view = RPSystemBroadcastPickerView()
+        let view = RPSystemBroadcastPickerView(
+            frame: CGRect(x: 0, y: 0, width: Self.buttonSize, height: Self.buttonSize)
+        )
+        view.tintColor = .label
         view.preferredExtension = Self.extensionBundleID
         view.showsMicrophoneButton = false
         return view
@@ -98,7 +102,18 @@ struct ContentView: View {
                 Section(header: Text("采集"),
                         footer: Text(startGuide)) {
                     Toggle("识别开关（扩展按此决定是否处理）", isOn: $model.captureWanted)
-                    BroadcastPickerSection()
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("开始屏幕广播")
+                            Text("点右侧广播按钮，在系统弹窗中确认")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        BroadcastPickerSection()
+                            .frame(width: BroadcastPickerSection.buttonSize,
+                                   height: BroadcastPickerSection.buttonSize)
+                    }
                     HStack {
                         Text("已处理轮次")
                         Spacer()
@@ -132,7 +147,7 @@ struct ContentView: View {
         "主展示路径：在前台启动 PiP，再开广播并切到目标应用；主 App listener 随 PiP 启停，回复通过 App Group UDS 短通道到 PiP。PiP 启动时使用系统要求的 playback 音频会话并混音，不播放静音内容；后台实际存活仍需真机验证，系统仍可能挂起进程或暂时暂停 PiP。关闭 PiP 后扩展无法连接时会有限重试并丢弃回复，不写文件或转通知。广播停止则停止识别。广播采集整个屏幕（含 PiP），请把 PiP 拖离识别区域以降低回声风险；公开 API 无法读取 PiP 位置或保证覆盖区域触摸穿透。"
 
     private let startGuide =
-        "启动步骤：1) 打开识别开关；2) 在前台启动 PiP（建立短回复 listener）；3) 点“开始直播”并在系统弹窗确认；4) 切到目标应用。暂停/继续可切换识别开关或使用系统广播控制；停止广播由系统状态栏操作。关闭 PiP 会停止 listener，通道不可达时回复丢弃。采集授权、状态栏提示与受保护画面限制均由系统承载；广播不能由 App 静默启动。"
+        "启动步骤：1) 打开识别开关；2) 在前台启动 PiP（建立短回复 listener）；3) 点“开始屏幕广播”右侧的广播按钮，在系统弹窗中确认开始直播；4) 切到目标应用。暂停/继续可切换识别开关或使用系统广播控制；停止广播由系统状态栏操作。关闭 PiP 会停止 listener，通道不可达时回复丢弃。采集授权、状态栏提示与受保护画面限制均由系统承载；广播不能由 App 静默启动。"
 
     private let guideText =
         "本 App 与“屏识AI广播”扩展通过 App Group 共享配置与控制开关，并通过 UDS 传递短回复；句子和回复正文仅在进程内存及 socket 内核缓冲短暂存在，不写文件或偏好设置。识别与请求在广播扩展进程内完成，画面仅内存处理。"

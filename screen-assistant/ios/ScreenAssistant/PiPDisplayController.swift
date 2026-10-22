@@ -275,7 +275,12 @@ final class PiPDisplayController: NSObject, ObservableObject {
         let width = cgImage.width
         let height = cgImage.height
         var pixelBuffer: CVPixelBuffer?
-        let attrs: [CFString: Any] = [kCVPixelBufferCGImageCompatibilityKey: true]
+        // AVSampleBufferDisplayLayer 要求图像缓冲由 IOSurface 支持。
+        let attrs: [CFString: Any] = [
+            kCVPixelBufferCGImageCompatibilityKey: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: true,
+            kCVPixelBufferIOSurfacePropertiesKey: [:] as [String: Any]
+        ]
         guard CVPixelBufferCreate(kCFAllocatorDefault, width, height,
                                   kCVPixelFormatType_32BGRA, attrs as CFDictionary,
                                   &pixelBuffer) == kCVReturnSuccess,
