@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">屏识AI助手</string>
+    <string name="status_idle">状态：未运行</string>
+    <string name="label_server">服务地址（远端 /v1/answer）</string>
+    <string name="hint_url">例：http://192.168.1.10:8000</string>
+    <string name="label_interval">轮询间隔（秒，1~3600）</string>
+    <string name="hint_interval">5</string>
+    <string name="btn_region">框选识别区域</string>
+    <string name="btn_start">启动</string>
+    <string name="btn_pause">暂停</string>
+    <string name="btn_stop">停止</string>
+    <string name="btn_confirm">完成</string>
+    <string name="btn_cancel">取消</string>
+    <string name="hint_steps">使用步骤：\n1. 填写服务地址与轮询间隔\n2. 点击“框选识别区域”，切到目标应用后点击悬浮泡，拖动/缩放选定区域\n3. 点击“启动”并允许屏幕采集\n4. 回到目标应用，识别结果将以横向悬浮条展示\n\n说明：\n· 仅内存处理，不保存截图/识别内容/回复\n· 空白画面自动跳过本轮；网络失败静默丢弃、下轮继续\n· 暂停保留采集授权；停止需重新授权\n· 屏幕旋转后会安全停止，请重新框选并启动</string>
+</resources>
