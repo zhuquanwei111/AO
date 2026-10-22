@@ -1,0 +1,20 @@
+services:
+  redis:
+    image: redis:8-alpine
+    # 端口仅调试用；服务端通过内部网络访问
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  server:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      TIANYI_BASE_URL: ${TIANYI_BASE_URL:-https://ai.ctaigw.cn/v1}
+      TIANYI_API_KEY: ${TIANYI_API_KEY:?set TIANYI_API_KEY in environment or .env}
+      TIANYI_MODEL: ${TIANYI_MODEL:-glm-5.3-flash}
+      REDIS_URL: redis://redis:6379/0
+      DEDUP_TTL_SECONDS: ${DEDUP_TTL_SECONDS:-86400}
+    depends_on:
+      - redis
