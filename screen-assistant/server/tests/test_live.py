@@ -1,8 +1,8 @@
 """M2 契约：显式测试观察、临时 SQLite；不调用模型或 Redis。"""
 from __future__ import annotations
 
-import sqlite3
 import asyncio
+import sqlite3
 
 import httpx
 import pytest
@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from screen_assistant_server.app import create_app
 from screen_assistant_server.config import Settings
+from screen_assistant_server.live_store import LiveStore
 
 
 class Clock:
@@ -353,16 +354,22 @@ def test_typed_observations_fuse_by_time_and_platform_notice_preempts(tmp_path):
                     "source": "fixture:platform_notice_region", "observed_at_ms": clock.now,
                     "availability": "available", "coverage": "confirmed_notice_region",
                     "reliability": "known", "confidence": 0.96,
-                    "content": {"text": "请调整直播内容", "region_confirmed": True,
-                                "explicit_warning_confirmed": True},
+                        "content": {"text": "请查看直播提示", "region_confirmed": True,
+                                    "explicit_warning_confirmed": False,
+                                    "text_position": {"x": 0.1, "y": 0.2, "width": 0.7, "height": 0.12},
+                                    "ocr_lines": [{"text": "请查看直播提示",
+                                                   "bbox": {"x": 0.1, "y": 0.2, "width": 0.7, "height": 0.12},
+                                                   "confidence": 0.91}]},
                 }
                 warning_result = await post(u3, h3, notice)
                 await ordinary_task
                 assert warning_result["reason"] == "generated"
                 warning_events = (await client.get(u3 + "/events", headers=h3)).json()["events"]
                 assert len(warning_events) == 1
-                assert warning_events[0]["sources"][0]["evidence_text"] == "请调整直播内容"
-                assert "请调整直播内容" in warning_events[0]["display_text"]
+                assert warning_events[0]["sources"][0]["evidence_text"] == "请查看直播提示"
+                assert warning_events[0]["sources"][0]["text_position"]["x"] == 0.1
+                assert warning_events[0]["sources"][0]["ocr_lines"][0]["confidence"] == 0.91
+                assert "请查看直播提示" in warning_events[0]["display_text"]
                 stopped = await client.post(u3 + "/stop", headers=h3)
                 assert stopped.status_code == 200
                 after_stop = await client.post(u3 + "/observations", headers=h3, json=normal_comment)
@@ -378,14 +385,21 @@ def test_stopped_session_online_count_peak_weighted_average_and_gaps(tmp_path):
         sid = session["session_id"]
         url = f"/v1/live/sessions/{sid}"
 
-        def submit(event_id, raw_text=None, *, availability="available", field_confirmed=True):
+        def submit(event_id, raw_text=None, *, availability="available", field_confirmed=True,
+                   evidence=False):
             body = {
                 "kind": "online_count", "event_id": event_id,
                 "source": "fixture:calibrated_online_field", "observed_at_ms": clock.now,
                 "availability": availability, "coverage": "calibrated_online_field",
                 "reliability": "known", "confidence": 0.94,
-                "content": ({"raw_text": raw_text, "field_semantics_confirmed": field_confirmed}
-                            if availability == "available" else None),
+                "content": ({
+                    "raw_text": raw_text, "field_semantics_confirmed": field_confirmed,
+                    "text_position": {"x": 0.2, "y": 0.1, "width": 0.3, "height": 0.04},
+                    "ocr_lines": [{"text": raw_text, "bbox": {"x": 0.2, "y": 0.1, "width": 0.3, "height": 0.04},
+                                   "confidence": 0.88}],
+                } if availability == "available" and evidence else
+                    ({"raw_text": raw_text, "field_semantics_confirmed": field_confirmed}
+                     if availability == "available" else None)),
             }
             response = client.post(url + "/observations", headers=headers, json=body)
             assert response.status_code == 200, response.text
@@ -399,7 +413,7 @@ def test_stopped_session_online_count_peak_weighted_average_and_gaps(tmp_path):
         clock.now += 2_000
         assert submit("count-missing", availability="missing")["reason"] == "source_missing"
         clock.now += 16_000
-        assert submit("count-500", "在线人数约0.5千")["reason"] == "windowed"
+        assert submit("count-500", "0.5千", evidence=True)["reason"] == "windowed"
         assert client.post(url + "/stop", headers=headers).status_code == 200
 
         summary = client.get(url + "/summary", headers=headers)
@@ -407,7 +421,11 @@ def test_stopped_session_online_count_peak_weighted_average_and_gaps(tmp_path):
         data = summary.json()["online_count"]
         assert data["status"] == "available"
         assert data["peak"] == {
-            "nominal_value": 500, "raw_text": "在线人数约0.5千", "approximate": True,
+            "nominal_value": 500, "raw_text": "0.5千", "approximate": True,
+            "display_unit": "千",
+            "text_position": {"x": 0.2, "y": 0.1, "width": 0.3, "height": 0.04},
+            "ocr_lines": [{"text": "0.5千", "bbox": {"x": 0.2, "y": 0.1, "width": 0.3, "height": 0.04},
+                           "confidence": 0.88}],
             "observed_at_ms": clock.now, "confidence": 0.94,
         }
         assert data["time_weighted_average"] == {
@@ -436,6 +454,30 @@ def test_stopped_session_online_count_peak_weighted_average_and_gaps(tmp_path):
         assert empty_summary["status"] == "unknown"
         assert empty_summary["peak"] is None and empty_summary["time_weighted_average"] is None
         assert empty_summary["coverage"]["sample_issues"] == {"observation_time_unknown": 1}
+
+
+def test_m5_count_evidence_columns_migrate_existing_m4_database(tmp_path):
+    path = tmp_path / "m4.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute("""
+        CREATE TABLE live_count_samples (
+            session_id TEXT NOT NULL, event_hash TEXT NOT NULL, source TEXT NOT NULL,
+            observed_at_ms INTEGER, effective_at_ms INTEGER NOT NULL, received_at_ms INTEGER NOT NULL,
+            availability TEXT NOT NULL, reliability TEXT NOT NULL, coverage TEXT NOT NULL,
+            confidence REAL, field_semantics_confirmed INTEGER NOT NULL,
+            raw_text TEXT, parsed_count INTEGER, approximate INTEGER NOT NULL,
+            reason TEXT NOT NULL, PRIMARY KEY (session_id, event_hash)
+        )
+    """)
+    connection.commit()
+    connection.close()
+
+    store = LiveStore(str(path), lambda: 1_800_000_000_000)
+    try:
+        columns = {row["name"] for row in store.db.execute("PRAGMA table_info(live_count_samples)")}
+        assert {"display_unit", "text_position_json", "ocr_lines_json"} <= columns
+    finally:
+        store.close()
 
 
 def test_fixture_loop_dedup_independent_questions_and_reopen(tmp_path):

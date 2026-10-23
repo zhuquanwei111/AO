@@ -19,6 +19,14 @@ def test_confirmed_online_count_units_and_proxy_rejection():
     assert parse_online_count("在线人数 999", field_semantics_confirmed=False) is None
 
 
+def test_user_selected_count_region_accepts_bare_digits_and_marks_approximate_units():
+    assert parse_online_count("1,260", field_semantics_confirmed=True) == 1260
+    assert parse_online_count("1.2万", field_semantics_confirmed=True) == 12000
+    assert parse_online_count("约 0.8千", field_semantics_confirmed=True) == 800
+    assert parse_online_count("热度 1.2万", field_semantics_confirmed=True) is None
+    assert parse_online_count("累计观看 2600", field_semantics_confirmed=True) is None
+
+
 def test_typed_observation_keeps_missing_unreliable_and_confidence_unknown_distinct():
     adapter = TypeAdapter(Observation)
     missing = adapter.validate_python({

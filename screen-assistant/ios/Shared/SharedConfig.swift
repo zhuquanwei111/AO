@@ -16,6 +16,16 @@ struct SharedConfig {
         static let roiY = "config.roiY"
         static let roiWidth = "config.roiWidth"
         static let roiHeight = "config.roiHeight"
+        static let onlineCountROIEnabled = "config.onlineCountROI.enabled"
+        static let onlineCountROIX = "config.onlineCountROI.x"
+        static let onlineCountROIY = "config.onlineCountROI.y"
+        static let onlineCountROIWidth = "config.onlineCountROI.width"
+        static let onlineCountROIHeight = "config.onlineCountROI.height"
+        static let platformNoticeROIEnabled = "config.platformNoticeROI.enabled"
+        static let platformNoticeROIX = "config.platformNoticeROI.x"
+        static let platformNoticeROIY = "config.platformNoticeROI.y"
+        static let platformNoticeROIWidth = "config.platformNoticeROI.width"
+        static let platformNoticeROIHeight = "config.platformNoticeROI.height"
     }
 
     // MARK: - 边界常量
@@ -99,6 +109,64 @@ struct SharedConfig {
         d?.set(y, forKey: Keys.roiY)
         d?.set(w, forKey: Keys.roiWidth)
         d?.set(h, forKey: Keys.roiHeight)
+    }
+
+    static func onlineCountROI() -> CGRect? {
+        configuredROI(enabledKey: Keys.onlineCountROIEnabled, xKey: Keys.onlineCountROIX,
+                      yKey: Keys.onlineCountROIY, widthKey: Keys.onlineCountROIWidth,
+                      heightKey: Keys.onlineCountROIHeight)
+    }
+
+    static func setOnlineCountROI(_ roi: CGRect?) {
+        setConfiguredROI(roi, enabledKey: Keys.onlineCountROIEnabled, xKey: Keys.onlineCountROIX,
+                         yKey: Keys.onlineCountROIY, widthKey: Keys.onlineCountROIWidth,
+                         heightKey: Keys.onlineCountROIHeight)
+    }
+
+    static func platformNoticeROI() -> CGRect? {
+        configuredROI(enabledKey: Keys.platformNoticeROIEnabled, xKey: Keys.platformNoticeROIX,
+                      yKey: Keys.platformNoticeROIY, widthKey: Keys.platformNoticeROIWidth,
+                      heightKey: Keys.platformNoticeROIHeight)
+    }
+
+    static func setPlatformNoticeROI(_ roi: CGRect?) {
+        setConfiguredROI(roi, enabledKey: Keys.platformNoticeROIEnabled, xKey: Keys.platformNoticeROIX,
+                         yKey: Keys.platformNoticeROIY, widthKey: Keys.platformNoticeROIWidth,
+                         heightKey: Keys.platformNoticeROIHeight)
+    }
+
+    private static func configuredROI(enabledKey: String, xKey: String, yKey: String,
+                                      widthKey: String, heightKey: String) -> CGRect? {
+        guard let defaults = AppGroup.defaults, defaults.bool(forKey: enabledKey) else { return nil }
+        let x = defaults.double(forKey: xKey)
+        let y = defaults.double(forKey: yKey)
+        let width = defaults.double(forKey: widthKey)
+        let height = defaults.double(forKey: heightKey)
+        guard x.isFinite, y.isFinite, width.isFinite, height.isFinite,
+              x >= 0, y >= 0, width > 0, height > 0, x + width <= 1, y + height <= 1 else { return nil }
+        return CGRect(x: x, y: y, width: width, height: height)
+    }
+
+    private static func setConfiguredROI(_ roi: CGRect?, enabledKey: String, xKey: String, yKey: String,
+                                         widthKey: String, heightKey: String) {
+        guard let defaults = AppGroup.defaults else { return }
+        guard let roi else {
+            defaults.set(false, forKey: enabledKey)
+            defaults.removeObject(forKey: xKey)
+            defaults.removeObject(forKey: yKey)
+            defaults.removeObject(forKey: widthKey)
+            defaults.removeObject(forKey: heightKey)
+            return
+        }
+        let x = min(max(roi.minX, 0), 1)
+        let y = min(max(roi.minY, 0), 1)
+        let width = min(max(roi.width, 0.01), 1 - x)
+        let height = min(max(roi.height, 0.01), 1 - y)
+        defaults.set(x, forKey: xKey)
+        defaults.set(y, forKey: yKey)
+        defaults.set(width, forKey: widthKey)
+        defaults.set(height, forKey: heightKey)
+        defaults.set(true, forKey: enabledKey)
     }
 
 }

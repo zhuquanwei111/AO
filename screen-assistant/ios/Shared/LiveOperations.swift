@@ -72,6 +72,73 @@ struct LiveEventPage: Decodable {
     }
 }
 
+struct LiveCountPeak: Decodable {
+    let nominalValue: Double
+    let rawText: String
+    let approximate: Bool
+    let displayUnit: String
+    let textPosition: [String: Double]?
+    let observedAtMS: Int64
+    let confidence: Double?
+    enum CodingKeys: String, CodingKey {
+        case nominalValue = "nominal_value", rawText = "raw_text", approximate
+        case displayUnit = "display_unit", textPosition = "text_position"
+        case observedAtMS = "observed_at_ms", confidence
+    }
+}
+
+struct LiveCountAverage: Decodable {
+    let nominalValue: Double
+    let approximate: Bool
+    let method: String
+    enum CodingKeys: String, CodingKey {
+        case nominalValue = "nominal_value", approximate, method
+    }
+}
+
+struct LiveCountCoverage: Decodable {
+    let recordedSamples: Int?
+    let validValueSamples: Int?
+    let coveredDurationMS: Int64?
+    let uncoveredBetweenSamplesMS: Int64?
+    let uncoveredIntervals: Int?
+    let longestUncoveredIntervalMS: Int64?
+    let uncoveredBeforeFirstValidMS: Int64?
+    let uncoveredAfterLastValidMS: Int64?
+    let sampleIssues: [String: Int]?
+    enum CodingKeys: String, CodingKey {
+        case recordedSamples = "recorded_samples", validValueSamples = "valid_value_samples"
+        case coveredDurationMS = "covered_duration_ms"
+        case uncoveredBetweenSamplesMS = "uncovered_between_samples_ms"
+        case uncoveredIntervals = "uncovered_intervals"
+        case longestUncoveredIntervalMS = "longest_uncovered_interval_ms"
+        case uncoveredBeforeFirstValidMS = "uncovered_before_first_valid_ms"
+        case uncoveredAfterLastValidMS = "uncovered_after_last_valid_ms"
+        case sampleIssues = "sample_issues"
+    }
+}
+
+struct LiveOnlineCountSummary: Decodable {
+    let status: String
+    let peak: LiveCountPeak?
+    let timeWeightedAverage: LiveCountAverage?
+    let coverage: LiveCountCoverage
+    enum CodingKeys: String, CodingKey {
+        case status, peak, timeWeightedAverage = "time_weighted_average", coverage
+    }
+}
+
+struct LiveSessionSummary: Decodable {
+    let sessionID: String
+    let startedAtMS: Int64
+    let stoppedAtMS: Int64?
+    let onlineCount: LiveOnlineCountSummary
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id", startedAtMS = "started_at_ms"
+        case stoppedAtMS = "stopped_at_ms", onlineCount = "online_count"
+    }
+}
+
 /// 薄适配 M2 的场次接口。所有路径都相对用户配置的服务基地址，保留其路径前缀。
 struct LiveOperationsClient {
     private let baseURL: URL
@@ -120,6 +187,15 @@ struct LiveOperationsClient {
         loadEvents(credentials, after: "", accumulated: [], completion: completion)
     }
 
+    func summary(_ credentials: LiveSessionCredentials,
+                 completion: @escaping (Result<LiveSessionSummary, Error>) -> Void) {
+        let request = authorized(endpoint("v1", "live", "sessions", credentials.sessionID, "summary"),
+                                 token: credentials.token)
+        session.dataTask(with: request) { data, response, error in
+            completion(Self.decode(LiveSessionSummary.self, data: data, response: response, error: error))
+        }.resume()
+    }
+
     private func loadEvents(_ credentials: LiveSessionCredentials, after: String,
                             accumulated: [LivePrompt],
                             completion: @escaping (Result<LiveEventPage, Error>) -> Void) {
@@ -162,6 +238,37 @@ struct LiveOperationsClient {
         let task = session.dataTask(with: request) { _, _, _ in completion() }
         task.resume()
         return task
+    }
+
+    /// 按序发送一个采样周期内的typed数值/提醒观察，始终只有一个HTTP收件请求在途。
+    func submitObservations(_ payloads: [[String: Any]],
+                            shouldContinue: @escaping () -> Bool,
+                            onTask: @escaping (URLSessionDataTask?) -> Void,
+                            completion: @escaping () -> Void) {
+        func submit(_ index: Int) {
+            guard index < payloads.count, shouldContinue(),
+                  let credentials = LiveSessionState.credentials() else {
+                onTask(nil)
+                completion()
+                return
+            }
+            var request = authorized(endpoint("v1", "live", "sessions", credentials.sessionID,
+                                               "observations"), token: credentials.token)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try? JSONSerialization.data(withJSONObject: payloads[index])
+            let task = session.dataTask(with: request) { _, _, _ in
+                guard shouldContinue() else {
+                    onTask(nil)
+                    completion()
+                    return
+                }
+                submit(index + 1)
+            }
+            onTask(task)
+            task.resume()
+        }
+        submit(0)
     }
 
     func submitPersonSignal(startedAtMS: Int64, observedAtMS: Int64, confidence: Double,

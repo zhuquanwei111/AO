@@ -26,10 +26,20 @@ class CommentContent(BaseModel):
     platform_message_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
+class OCRLine(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    text: str = Field(min_length=1, max_length=200)
+    bbox: Position
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
 class OnlineCountContent(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     raw_text: str = Field(min_length=1, max_length=120)
     field_semantics_confirmed: bool = False
+    display_unit: str | None = Field(default=None, max_length=16)
+    text_position: Position | None = None
+    ocr_lines: list[OCRLine] = Field(default_factory=list, max_length=20)
 
 
 class InteractionContent(BaseModel):
@@ -74,6 +84,8 @@ class PlatformNoticeContent(BaseModel):
     text: str = Field(min_length=1, max_length=500)
     region_confirmed: bool = False
     explicit_warning_confirmed: bool = False
+    text_position: Position | None = None
+    ocr_lines: list[OCRLine] = Field(default_factory=list, max_length=20)
 
 
 class QualityContent(BaseModel):
@@ -164,12 +176,12 @@ def validate_observation_content(body: dict) -> tuple[bool, str | None]:
     return True, None
 
 
-_FIELD = re.compile(r"(?:当前|目前)?在线(?:人数)?\s*[:：]?\s*(?:约|≈|~)?\s*(\d+(?:\.\d+)?)\s*(万人|万|千|人|位)?")
+_FIELD = re.compile(r"(?:约|≈|~)?\s*(\d+(?:\.\d+)?)\s*(万人|万|千|人|位)?")
 _NOT_ONLINE_FIELDS = ("人气", "热度", "累计", "观看", "浏览", "点赞", "排名")
 
 
-def parse_online_count(raw_text: str, *, field_semantics_confirmed: bool) -> int | None:
-    """Parse only an explicitly confirmed live-online field; never guess from proxies."""
+def online_count_details(raw_text: str, *, field_semantics_confirmed: bool) -> dict | None:
+    """Parse a user-selected online-count region; never infer from known proxy labels."""
     if not field_semantics_confirmed:
         return None
     text = unicodedata.normalize("NFKC", raw_text).replace(",", "").replace("，", "")
@@ -187,7 +199,13 @@ def parse_online_count(raw_text: str, *, field_semantics_confirmed: bool) -> int
     result = round(value * multiplier)
     if not 0 <= result <= 100_000_000:
         return None
-    return result
+    approximate = multiplier > 1 or any(marker in text for marker in ("约", "≈", "~", "左右", "+"))
+    return {"nominal_value": result, "display_unit": unit or "未标单位", "approximate": approximate}
+
+
+def parse_online_count(raw_text: str, *, field_semantics_confirmed: bool) -> int | None:
+    details = online_count_details(raw_text, field_semantics_confirmed=field_semantics_confirmed)
+    return details["nominal_value"] if details else None
 
 
 def _candidate(topic: str, priority: int, phenomenon: str, suggestion: str | None,
@@ -214,10 +232,10 @@ def build_candidate(observations: list[dict]) -> dict | None:
         if row["kind"] != "platform_notice":
             continue
         content = row["content"]
-        if not content["region_confirmed"] or not content["explicit_warning_confirmed"]:
+        if not content["region_confirmed"]:
             continue
-        wording = f"屏幕出现疑似提醒：‘{content['text'][:24]}’，请核对来源和原文后再处理。"
-        phenomenon = "提醒区域出现待核验的屏幕文字候选"
+        wording = f"平台提示区域出现“{content['text'][:24]}”，请查看；来源与含义尚未核实。"
+        phenomenon = "用户指定的平台提示区域出现文字"
         return _candidate("platform_notice", 100, phenomenon, wording, [row])
 
     for row in reversed(rows):

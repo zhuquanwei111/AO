@@ -27,6 +27,12 @@ final class AppModel: ObservableObject {
     @Published var roi: CGRect {
         didSet { SharedConfig.setROI(roi) }
     }
+    @Published var onlineCountROI: CGRect? {
+        didSet { SharedConfig.setOnlineCountROI(onlineCountROI) }
+    }
+    @Published var platformNoticeROI: CGRect? {
+        didSet { SharedConfig.setPlatformNoticeROI(platformNoticeROI) }
+    }
     @Published var captureWanted: Bool {
         didSet { ControlState.setUserWantsCapture(captureWanted) }
     }
@@ -35,6 +41,7 @@ final class AppModel: ObservableObject {
     @Published var liveDescription = ""
     @Published var liveStatus = "未开始"
     @Published var liveEvents: [LivePrompt] = []
+    @Published var liveSummary: LiveSessionSummary?
     @Published var liveActive = false
 
     private var timer: AnyCancellable?
@@ -48,6 +55,8 @@ final class AppModel: ObservableObject {
         intervalSeconds = SharedConfig.intervalSeconds()
         requestTimeout = SharedConfig.requestTimeoutSeconds()
         roi = SharedConfig.roi()
+        onlineCountROI = SharedConfig.onlineCountROI()
+        platformNoticeROI = SharedConfig.platformNoticeROI()
         captureWanted = ControlState.userWantsCapture()
         liveActive = LiveSessionState.credentials() != nil
         roundCounter = ControlState.roundCounter()
@@ -105,6 +114,7 @@ final class AppModel: ObservableObject {
                     self.liveActive = true
                     self.liveStatus = "直播辅助已开始；请在前台启动 PiP 与 ReplayKit 广播"
                     self.liveEvents = []
+                    self.liveSummary = nil
                     self.liveCursor = ""
                     self.captureWanted = true
                     self.pollLivePrompts()
@@ -136,16 +146,7 @@ final class AppModel: ObservableObject {
                 self.liveActive = false
                 self.liveCredentials = nil
                 self.liveStatus = "已结束，正在读取本场记录"
-                client.events(credentials) { result in
-                    DispatchQueue.main.async {
-                        if case .success(let page) = result {
-                            self.liveEvents = page.events
-                            self.liveStatus = "本场结束，共 \(page.events.count) 条记录"
-                        } else {
-                            self.liveStatus = "场次已结束；记录暂不可读取"
-                        }
-                    }
-                }
+                self.loadStoppedOverview(credentials, client: client)
             }
         }
     }
@@ -169,6 +170,7 @@ final class AppModel: ObservableObject {
                         self.liveStatus = "服务端场次已停止"
                         self.liveActive = false
                         LiveSessionState.clear()
+                        self.loadStoppedOverview(credentials, client: client)
                     } else {
                         self.liveStatus = "直播辅助运行中"
                         self.pollLivePrompts()
@@ -179,6 +181,41 @@ final class AppModel: ObservableObject {
                         self?.pollLivePrompts()
                     }
                 }
+            }
+        }
+    }
+
+    private func loadStoppedOverview(_ credentials: LiveSessionCredentials, client: LiveOperationsClient) {
+        let group = DispatchGroup()
+        var fetchedEvents: LiveEventPage?
+        var fetchedSummary: LiveSessionSummary?
+        group.enter()
+        client.events(credentials) { result in
+            DispatchQueue.main.async {
+                if case .success(let page) = result { fetchedEvents = page }
+                group.leave()
+            }
+        }
+        group.enter()
+        client.summary(credentials) { result in
+            DispatchQueue.main.async {
+                if case .success(let summary) = result { fetchedSummary = summary }
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) { [weak self] in
+            guard let self else { return }
+            self.liveEvents = fetchedEvents?.events ?? []
+            self.liveSummary = fetchedSummary
+            switch (fetchedEvents, fetchedSummary) {
+            case let (.some(page), .some(_)):
+                self.liveStatus = "本场结束，已读取 \(page.events.count) 条记录"
+            case (.some, .none):
+                self.liveStatus = "本场结束；人数概览暂不可读，事件记录已读取"
+            case (.none, .some):
+                self.liveStatus = "本场结束；人数概览已读取，事件记录暂不可读"
+            case (.none, .none):
+                self.liveStatus = "本场已结束；概览和记录暂不可读取"
             }
         }
     }

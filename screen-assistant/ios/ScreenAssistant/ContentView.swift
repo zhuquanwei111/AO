@@ -56,6 +56,45 @@ struct ContentView: View {
                         .foregroundColor(.secondary)
                 }
 
+                Section(header: Text("直播数据识别区域"),
+                        footer: Text("仅识别你在主播界面选定的裁剪区域。未保存区域时停用对应来源；请勿把热度或累计观看选作在线人数。")) {
+                    NavigationLink {
+                        OptionalROIEditorView(title: "选择在线人数区域", currentROI: model.onlineCountROI) {
+                            model.onlineCountROI = $0
+                        }
+                    } label: {
+                        HStack {
+                            Text("在线人数区域")
+                            Spacer()
+                            Text(model.onlineCountROI == nil ? "未配置" : "已配置")
+                                .foregroundColor(model.onlineCountROI == nil ? .secondary : .green)
+                        }
+                    }
+                    .disabled(model.liveActive)
+                    if model.onlineCountROI != nil {
+                        Button("停用在线人数采集", role: .destructive) { model.onlineCountROI = nil }
+                            .disabled(model.liveActive)
+                    }
+
+                    NavigationLink {
+                        OptionalROIEditorView(title: "选择平台提醒区域", currentROI: model.platformNoticeROI) {
+                            model.platformNoticeROI = $0
+                        }
+                    } label: {
+                        HStack {
+                            Text("平台提醒区域")
+                            Spacer()
+                            Text(model.platformNoticeROI == nil ? "未配置" : "已配置")
+                                .foregroundColor(model.platformNoticeROI == nil ? .secondary : .green)
+                        }
+                    }
+                    .disabled(model.liveActive)
+                    if model.platformNoticeROI != nil {
+                        Button("停用平台提醒采集", role: .destructive) { model.platformNoticeROI = nil }
+                            .disabled(model.liveActive)
+                    }
+                }
+
                 Section(header: Text("悬浮展示（PiP）"),
                         footer: Text(pipFooter)) {
                     if !pip.isSupported {
@@ -122,8 +161,14 @@ struct ContentView: View {
                     Text(model.liveStatus)
                         .font(.footnote)
                         .foregroundColor(.secondary)
-                    NavigationLink("本场事件记录（\(model.liveEvents.count)）") {
-                        LiveEventListView(events: model.liveEvents)
+                    if let summary = model.liveSummary {
+                        NavigationLink("本场概览与事件记录") {
+                            LiveSessionOverviewView(summary: summary, events: model.liveEvents)
+                        }
+                    } else {
+                        NavigationLink("当前收到的事件记录") {
+                            LiveEventListView(events: model.liveEvents)
+                        }
                     }
                 }
 
@@ -158,6 +203,121 @@ struct ContentView: View {
 
     private let guideText =
         "本 App 与“屏识AI广播”扩展通过 App Group 共享配置与控制开关，并通过 UDS 传递短回复；句子和回复正文仅在进程内存及 socket 内核缓冲短暂存在，不写文件或偏好设置。识别与请求在广播扩展进程内完成，画面仅内存处理。"
+}
+
+private struct LiveSessionOverviewView: View {
+    let summary: LiveSessionSummary
+    let events: [LivePrompt]
+
+    var body: some View {
+        List {
+            Section(header: Text("辅助场次")) {
+                dateRow("开始", milliseconds: summary.startedAtMS)
+                if let stopped = summary.stoppedAtMS {
+                    dateRow("结束", milliseconds: stopped)
+                    row("辅助时长", duration(stopped - summary.startedAtMS))
+                }
+            }
+            Section(header: Text("采样在线人数"), footer: Text("仅表示本辅助场次采样到的屏幕读数，不代表抖音完整统计。")) {
+                if let peak = summary.onlineCount.peak {
+                    row("采样峰值", "\(peak.approximate ? "约" : "")\(number(peak.nominalValue, maximumFractionDigits: 0)) 人")
+                    row("峰值屏幕原文", peak.rawText)
+                    row("显示单位", peak.displayUnit)
+                } else {
+                    row("采样峰值", "未知（没有有效读数）")
+                }
+                if let average = summary.onlineCount.timeWeightedAverage {
+                    row("有效时段平均", "\(average.approximate ? "约" : "")\(number(average.nominalValue, maximumFractionDigits: 1)) 人")
+                } else {
+                    row("有效时段平均", "未知（没有有效连续采样时段）")
+                }
+                if let recorded = summary.onlineCount.coverage.recordedSamples {
+                    let valid = summary.onlineCount.coverage.validValueSamples ?? 0
+                    row("有效采样覆盖", "\(valid) / \(recorded) 条；加权时段 \(duration(summary.onlineCount.coverage.coveredDurationMS ?? 0))")
+                }
+                let coverage = summary.onlineCount.coverage
+                if let gaps = coverage.uncoveredIntervals, gaps > 0 {
+                    row("采样断档", "\(gaps) 段；最长 \(duration(coverage.longestUncoveredIntervalMS ?? 0))")
+                }
+                if let before = coverage.uncoveredBeforeFirstValidMS, before > 0 {
+                    row("首个有效读数前", "未覆盖 \(duration(before))")
+                }
+                if let after = coverage.uncoveredAfterLastValidMS, after > 0 {
+                    row("末个有效读数后", "未覆盖 \(duration(after))")
+                }
+                if let issues = coverage.sampleIssues, !issues.isEmpty {
+                    let labels = issues.sorted { $0.key < $1.key }.map { "\(issueName($0.key)) \($0.value)" }
+                    row("缺失／无效样本", labels.joined(separator: "、"))
+                }
+            }
+            Section(header: Text("事件记录（\(events.count)条）")) {
+                if events.isEmpty {
+                    Text("本场没有已保存的运营事件")
+                        .foregroundColor(.secondary)
+                } else {
+                    ForEach(events) { event in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 4) {
+                                Text(Date(timeIntervalSince1970: Double(event.startAtMS) / 1000), style: .time)
+                                if event.endAtMS > event.startAtMS {
+                                    Text("–")
+                                    Text(Date(timeIntervalSince1970: Double(event.endAtMS) / 1000), style: .time)
+                                }
+                            }
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            Text(event.phenomenon).font(.subheadline)
+                            Text(event.suggestion).font(.body)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+            }
+        }
+        .navigationTitle("本场概览")
+    }
+
+    private func dateRow(_ title: String, milliseconds: Int64) -> some View {
+        row(title, Date(timeIntervalSince1970: Double(milliseconds) / 1000).formatted(date: .abbreviated, time: .shortened))
+    }
+
+    private func row(_ title: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(title)
+            Spacer(minLength: 12)
+            Text(value).multilineTextAlignment(.trailing).foregroundColor(.secondary)
+        }
+    }
+
+    private func number(_ value: Double, maximumFractionDigits: Int) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.maximumFractionDigits = maximumFractionDigits
+        formatter.minimumFractionDigits = 0
+        return formatter.string(from: NSNumber(value: value)) ?? String(value)
+    }
+
+    private func duration(_ milliseconds: Int64) -> String {
+        let seconds = max(0, milliseconds / 1000)
+        let hours = seconds / 3600
+        let minutes = (seconds % 3600) / 60
+        let remaining = seconds % 60
+        if hours > 0 { return "\(hours)小时\(minutes)分" }
+        if minutes > 0 { return "\(minutes)分\(remaining)秒" }
+        return "\(remaining)秒"
+    }
+
+    private func issueName(_ reason: String) -> String {
+        switch reason {
+        case "source_missing": return "未读到"
+        case "count_unreadable": return "数字无法解析"
+        case "field_semantics_unconfirmed": return "字段未确认"
+        case "late": return "过期"
+        case "unreliable", "source_unreliable": return "不可靠"
+        default: return reason
+        }
+    }
 }
 
 private struct LiveEventListView: View {

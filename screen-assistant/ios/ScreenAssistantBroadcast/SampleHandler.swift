@@ -125,18 +125,31 @@ final class SampleHandler: RPBroadcastSampleHandler {
         guard startRound else { return }
 
         logMemory(stage: "frame-start")
-        // 把像素缓冲、Core Image 中间对象限制在此 autoreleasepool 内；只让最终
-        // ROI CGImage 进入 OCR 单槽，扩展调用返回后释放 sample/pixel buffer。
+        // 每类数据只裁剪用户指定的小区域；图像只进入一个串行OCR作业，不落盘或上传。
         let observationROI = SharedConfig.roi()
-        guard let cgImage = autoreleasepool(invoking: { makeOCRImage(from: sampleBuffer, roi: observationROI) }) else {
-            endRound(generation: generation)
-            return
+        var regionROIs: [String: CGRect] = ["comment": observationROI]
+        var regions: [OCRService.RegionInput] = [
+            OCRService.RegionInput(identifier: "comment",
+                                   image: autoreleasepool(invoking: { makeOCRImage(from: sampleBuffer, roi: observationROI) })
+        ]
+        if LiveSessionState.isEnabled() {
+            if let roi = SharedConfig.onlineCountROI() {
+                regionROIs["online_count"] = roi
+                regions.append(OCRService.RegionInput(identifier: "online_count",
+                                                       image: autoreleasepool(invoking: { makeOCRImage(from: sampleBuffer, roi: roi) })
+            }
+            if let roi = SharedConfig.platformNoticeROI() {
+                regionROIs["platform_notice"] = roi
+                regions.append(OCRService.RegionInput(identifier: "platform_notice",
+                                                       image: autoreleasepool(invoking: { makeOCRImage(from: sampleBuffer, roi: roi) })
+            }
         }
+        guard regions.contains(where: { $0.image != nil }) else { endRound(generation: generation); return }
         logMemory(stage: "roi-rendered")
         let sampleObservedAtMS = Int64(Date().timeIntervalSince1970 * 1000)
 
-        // 5) OCR（架构无关组件，后台队列；识别文本仅存在于闭包链内存）
-        guard let ocr = OCRService.recognizeText(in: cgImage, completion: { [weak self] recognizedLines in
+        // 同一个有界OCR任务串行识别评论、可选人数和提醒裁剪图。
+        guard let ocr = OCRService.recognize(regions: regions, completion: { [weak self] results in
             guard let self else { return }
             self.logMemory(stage: "ocr-finished")
             guard self.isCurrentRound(generation, captureGeneration: captureGeneration) else {
@@ -150,30 +163,50 @@ final class SampleHandler: RPBroadcastSampleHandler {
                     self.endRound(generation: generation)
                     return
                 }
-                guard let line = recognizedLines.first(where: { LiveCommentFilter.isWorthwhileQuestion($0.text) }),
-                      let question = SentenceFormatter.sentence(fromOCRText: line.text),
-                      question.count <= SharedConfig.maxSentenceLength else {
-                    self.endRound(generation: generation)
-                    return
-                }
-                let position = LiveCommentFilter.screenPosition(line.boundingBox, within: observationROI)
-                let request = liveClient.submitObservation(question, textPosition: position,
-                                                           observedAtMS: sampleObservedAtMS) { [weak self] in
-                    self?.endRound(generation: generation)
-                }
-                self.stateQueue.sync {
-                    if self.roundActive && !self.isBroadcastPaused && self.roundGeneration == generation &&
-                        self.activeCaptureGeneration == captureGeneration {
-                        self.activeRequest = request
-                    } else {
-                        request?.cancel()
+                let commentLines = results.first(where: { $0.identifier == "comment" })?.lines ?? []
+                let questionPayload = commentLines.first(where: { LiveCommentFilter.isWorthwhileQuestion($0.text) })
+                    .flatMap { line -> (String, [String: Double])? in
+                        guard let question = SentenceFormatter.sentence(fromOCRText: line.text),
+                              question.count <= SharedConfig.maxSentenceLength else { return nil }
+                        return (question, LiveCommentFilter.screenPosition(line.boundingBox, within: observationROI))
                     }
+                var typedPayloads: [[String: Any]] = []
+                if let noticeROI = regionROIs["platform_notice"] {
+                    let lines = results.first(where: { $0.identifier == "platform_notice" })?.lines ?? []
+                    typedPayloads.append(Self.platformNoticePayload(lines: lines, roi: noticeROI,
+                                                                    observedAtMS: sampleObservedAtMS))
                 }
-                if request == nil { self.endRound(generation: generation) }
+                if let countROI = regionROIs["online_count"] {
+                    let lines = results.first(where: { $0.identifier == "online_count" })?.lines ?? []
+                    typedPayloads.append(Self.onlineCountPayload(lines: lines, roi: countROI,
+                                                                 observedAtMS: sampleObservedAtMS))
+                }
+                let finish = { [weak self] in self?.endRound(generation: generation) }
+                let sendQuestion = { [weak self] in
+                    guard let self, self.isCurrentRound(generation, captureGeneration: captureGeneration),
+                          let (question, position) = questionPayload else { finish(); return }
+                    let task = liveClient.submitObservation(question, textPosition: position,
+                                                            observedAtMS: sampleObservedAtMS) { finish() }
+                    self.installActiveRequest(task, generation: generation,
+                                              captureGeneration: captureGeneration)
+                    if task == nil { finish() }
+                }
+                guard !typedPayloads.isEmpty else { sendQuestion(); return }
+                liveClient.submitObservations(typedPayloads,
+                    shouldContinue: { [weak self] in
+                        guard let self else { return false }
+                        return self.isCurrentRound(generation, captureGeneration: captureGeneration)
+                    },
+                    onTask: { [weak self] task in
+                        self?.installActiveRequest(task, generation: generation,
+                                                   captureGeneration: captureGeneration)
+                    },
+                    completion: sendQuestion)
                 return
             }
 
             // 旧问答继续使用 ROI 整段文本；运营分支只处理上方筛选出的单行候选。
+            let recognizedLines = results.first(where: { $0.identifier == "comment" })?.lines ?? []
             let recognizedText = recognizedLines.map(\.text).joined(separator: "\n")
             guard let sentence = SentenceFormatter.sentence(fromOCRText: recognizedText),
                   sentence.count <= SharedConfig.maxSentenceLength else {
@@ -236,6 +269,75 @@ final class SampleHandler: RPBroadcastSampleHandler {
             }
         }
         logMemory(stage: "ocr-submitted")
+    }
+
+    private static func onlineCountPayload(lines: [OCRService.TextLine], roi: CGRect,
+                                           observedAtMS: Int64) -> [String: Any] {
+        let rawText = String(lines.map(\.text).joined(separator: " ").prefix(120))
+        let available = !rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let content: Any
+        if available {
+            content = [
+                "raw_text": rawText, "field_semantics_confirmed": true,
+                "text_position": mergedPosition(lines: lines, roi: roi),
+                "ocr_lines": Array(lines.prefix(20)).map { ocrLinePayload($0, roi: roi) }
+            ] as [String: Any]
+        } else { content = NSNull() }
+        let confidence: Any
+        if let value = lines.map(\.confidence).max() { confidence = Double(value) }
+        else { confidence = NSNull() }
+        return [
+            "event_id": UUID().uuidString.lowercased(),
+            "kind": "online_count", "source": "ios_replaykit_online_count_roi",
+            "observed_at_ms": observedAtMS, "availability": available ? "available" : "missing",
+            "coverage": "user_selected_count_roi", "reliability": "known",
+            "confidence": confidence, "content": content
+        ]
+    }
+
+    private static func platformNoticePayload(lines: [OCRService.TextLine], roi: CGRect,
+                                              observedAtMS: Int64) -> [String: Any] {
+        let text = String(lines.map(\.text).joined(separator: "\n").prefix(500))
+        let available = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let content: Any
+        if available {
+            content = [
+                "text": text, "region_confirmed": true, "explicit_warning_confirmed": false,
+                "text_position": mergedPosition(lines: lines, roi: roi),
+                "ocr_lines": Array(lines.prefix(20)).map { ocrLinePayload($0, roi: roi) }
+            ] as [String: Any]
+        } else { content = NSNull() }
+        let confidence: Any
+        if let value = lines.map(\.confidence).max() { confidence = Double(value) }
+        else { confidence = NSNull() }
+        return [
+            "event_id": UUID().uuidString.lowercased(),
+            "kind": "platform_notice", "source": "ios_replaykit_platform_notice_roi",
+            "observed_at_ms": observedAtMS, "availability": available ? "available" : "missing",
+            "coverage": "user_selected_notice_roi", "reliability": "known",
+            "confidence": confidence, "content": content
+        ]
+    }
+
+    private static func ocrLinePayload(_ line: OCRService.TextLine, roi: CGRect) -> [String: Any] {
+        ["text": String(line.text.prefix(200)),
+         "bbox": LiveCommentFilter.screenPosition(line.boundingBox, within: roi),
+         "confidence": Double(line.confidence)]
+    }
+
+    private static func mergedPosition(lines: [OCRService.TextLine], roi: CGRect) -> [String: Double] {
+        let bounds = lines.map(\.boundingBox).reduce(CGRect.null) { $0.union($1) }
+        return LiveCommentFilter.screenPosition(bounds, within: roi)
+    }
+
+    private func installActiveRequest(_ request: URLSessionDataTask?, generation: Int,
+                                      captureGeneration: Int) {
+        stateQueue.sync {
+            if roundActive && !isBroadcastPaused && roundGeneration == generation &&
+                activeCaptureGeneration == captureGeneration {
+                activeRequest = request
+            } else { request?.cancel() }
+        }
     }
 
     /// 结束一轮：清 roundActive 并按配置间隔排定下一轮可开始时刻。

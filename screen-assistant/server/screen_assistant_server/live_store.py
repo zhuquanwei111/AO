@@ -19,7 +19,7 @@ from .live_rules import (
     MAX_PENDING, MAX_WINDOW_OBSERVATIONS, PROMPT_TTL_MS, WINDOW_MS, question,
     FUSION_FUTURE_SKEW_MS,
 )
-from .live_fusion import build_candidate, parse_online_count, validate_observation_content
+from .live_fusion import build_candidate, online_count_details, validate_observation_content
 
 
 def digest(value: str) -> str:
@@ -55,7 +55,8 @@ class LiveStore:
                 observed_at_ms INTEGER, effective_at_ms INTEGER NOT NULL, received_at_ms INTEGER NOT NULL,
                 availability TEXT NOT NULL, reliability TEXT NOT NULL, coverage TEXT NOT NULL,
                 confidence REAL, field_semantics_confirmed INTEGER NOT NULL,
-                raw_text TEXT, parsed_count INTEGER, approximate INTEGER NOT NULL,
+                raw_text TEXT, display_unit TEXT, parsed_count INTEGER, approximate INTEGER NOT NULL,
+                text_position_json TEXT, ocr_lines_json TEXT,
                 reason TEXT NOT NULL, PRIMARY KEY (session_id, event_hash)
             );
             CREATE INDEX IF NOT EXISTS live_count_samples_session_source_time
@@ -71,6 +72,14 @@ class LiveStore:
             CREATE INDEX IF NOT EXISTS live_events_topic
                 ON live_events (session_id, topic_hash, generated_at_ms);
         """)
+        count_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(live_count_samples)")}
+        for column, definition in (
+            ("display_unit", "TEXT"),
+            ("text_position_json", "TEXT"),
+            ("ocr_lines_json", "TEXT"),
+        ):
+            if column not in count_columns:
+                self.db.execute(f"ALTER TABLE live_count_samples ADD COLUMN {column} {definition}")
 
     def close(self):
         self.db.close()
@@ -157,6 +166,7 @@ class LiveStore:
             "time_basis": "observed" if observed is not None else "received",
         }
         parsed = None
+        count_details = None
         usable, reason = validate_observation_content(body)
         if usable and body["kind"] == "online_count" and observed is None:
             usable, reason = False, "observation_time_unknown"
@@ -164,15 +174,17 @@ class LiveStore:
             usable, reason = False, "late"
         if usable and body["kind"] == "online_count":
             content = body["content"]
-            parsed = parse_online_count(
+            count_details = online_count_details(
                 content["raw_text"],
                 field_semantics_confirmed=content["field_semantics_confirmed"],
             )
-            if parsed is None:
+            if count_details is None:
                 usable, reason = False, (
                     "field_semantics_unconfirmed"
                     if not content["field_semantics_confirmed"] else "count_unreadable"
                 )
+            else:
+                parsed = count_details["nominal_value"]
         message_hash = None
         if usable and body["kind"] == "comment":
             content = body["content"]
@@ -211,13 +223,20 @@ class LiveStore:
                 content = body.get("content") or {}
                 raw_text = content.get("raw_text")
                 self.db.execute("""
-                    INSERT INTO live_count_samples VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    INSERT INTO live_count_samples (
+                        session_id,event_hash,source,observed_at_ms,effective_at_ms,received_at_ms,
+                        availability,reliability,coverage,confidence,field_semantics_confirmed,
+                        raw_text,display_unit,parsed_count,approximate,text_position_json,
+                        ocr_lines_json,reason
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, (
                     sid, event_hash, body["source"], observed, effective, received_at_ms,
                     body["availability"], body["reliability"], body["coverage"],
                     body.get("confidence"), int(bool(content.get("field_semantics_confirmed"))),
-                    raw_text, parsed, int(any(marker in raw_text for marker in ("约", "≈", "~", "+", "左右")))
-                    if raw_text else 0, result["reason"],
+                    raw_text, count_details["display_unit"] if count_details else content.get("display_unit"),
+                    parsed, int(bool(count_details and count_details["approximate"])),
+                    json.dumps(content["text_position"], ensure_ascii=False) if content.get("text_position") else None,
+                    json.dumps(content.get("ocr_lines", []), ensure_ascii=False), result["reason"],
                 ))
         if usable:
             item = dict(body)
@@ -291,6 +310,10 @@ class LiveStore:
                 "peak": ({
                     "nominal_value": peak_sample["parsed_count"],
                     "raw_text": peak_sample["raw_text"], "approximate": bool(peak_sample["approximate"]),
+                    "display_unit": peak_sample["display_unit"] or "未标单位",
+                    "text_position": json.loads(peak_sample["text_position_json"])
+                    if peak_sample["text_position_json"] else None,
+                    "ocr_lines": json.loads(peak_sample["ocr_lines_json"] or "[]"),
                     "observed_at_ms": peak_sample["observed_at_ms"],
                     "confidence": peak_sample["confidence"],
                 } if peak_sample else None),
@@ -425,6 +448,10 @@ class LiveStore:
                 item["ended_at_ms"] = row["ended_at_ms"]
             if row["kind"] == "platform_notice":
                 item["evidence_text"] = row["content"]["text"]
+                if row["content"].get("text_position"):
+                    item["text_position"] = row["content"]["text_position"]
+                if row["content"].get("ocr_lines"):
+                    item["ocr_lines"] = row["content"]["ocr_lines"]
                 item["source_verification"] = (
                     "declared_fixture_input" if row["source"].startswith("fixture:")
                     else "unverified_client_observation"
@@ -442,7 +469,13 @@ class LiveStore:
                 item["client_reported_field_semantics"] = row["content"]["field_semantics_confirmed"]
                 item["raw_count_text"] = raw_count
                 item["parsed_count"] = row.get("normalized_count")
-                item["approximate"] = any(marker in raw_count for marker in ("约", "≈", "~", "+", "左右"))
+                details = online_count_details(raw_count, field_semantics_confirmed=True)
+                item["approximate"] = bool(details and details["approximate"])
+                item["display_unit"] = details["display_unit"] if details else row["content"].get("display_unit")
+                if row["content"].get("text_position"):
+                    item["text_position"] = row["content"]["text_position"]
+                if row["content"].get("ocr_lines"):
+                    item["ocr_lines"] = row["content"]["ocr_lines"]
             if row["kind"] == "transcript":
                 item["is_final"] = row["content"]["is_final"]
                 item["revision"] = row["content"]["revision"]
