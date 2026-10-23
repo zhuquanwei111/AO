@@ -1,4 +1,4 @@
-"""独立运营 HTTP 路由；M2 只处理显式 fixture，不接真实采集或模型。"""
+"""独立运营路由；显式区分测试 fixture 与 iOS 实时观察。"""
 from __future__ import annotations
 
 import asyncio
@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .live_rules import MAX_SESSION_WAITERS, MAX_WAITERS, MAX_WAIT_MS
 from .live_store import LiveStore
+from .model_client import ModelTimeoutError, ModelUnavailableError
 
 router = APIRouter(prefix="/v1/live/sessions", tags=["live-test-fixture"])
 
@@ -20,17 +21,38 @@ class CreateSession(BaseModel):
     description: str = Field(default="", max_length=500)
 
 
+class TextPosition(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    x: float = Field(ge=0.0, le=1.0)
+    y: float = Field(ge=0.0, le=1.0)
+    width: float = Field(gt=0.0, le=1.0)
+    height: float = Field(gt=0.0, le=1.0)
+
+
 class CommentObservation(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     event_id: str = Field(min_length=1, max_length=128)
-    input_mode: Literal["test_fixture"]
+    input_mode: Literal["test_fixture", "live_observation"]
     source: str = Field(min_length=1, max_length=64)
     coverage: Literal["structured_sample", "ocr_visible_sample", "unknown"]
     reliability: Literal["known", "unknown"] = "unknown"
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    text_position: TextPosition | None = None
     text: str = Field(min_length=1, max_length=500)
     author_id: str | None = Field(default=None, min_length=1, max_length=128)
     platform_message_id: str | None = Field(default=None, min_length=1, max_length=128)
     observed_at_ms: int | None = Field(default=None, ge=0, le=2**63-1, strict=True)
+
+
+class PersonSignal(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    event_id: str = Field(min_length=1, max_length=128)
+    source: Literal["ios_replaykit_vision"]
+    signal: Literal["head_down"]
+    confidence: float = Field(ge=0.5, le=1.0)
+    sample_count: int = Field(ge=5, le=100)
+    started_at_ms: int = Field(ge=0, le=2**63-1, strict=True)
+    observed_at_ms: int = Field(ge=0, le=2**63-1, strict=True)
 
 
 class LiveService:
@@ -65,7 +87,7 @@ class LiveService:
         async with self.lock:
             # 请求取消时等待正在进行的数据库操作结束，再释放锁/关闭连接。
             result = await self.call(method, *args)
-            if method == "stop" or (method == "add_comment" and result.get("prompt_id")):
+            if method == "stop" or (method in {"add_comment", "save_live_prompt", "add_signal"} and result.get("prompt_id")):
                 for future in self.waiters.get(args[0], ()):
                     if not future.done():
                         future.set_result(None)
@@ -125,7 +147,31 @@ async def add_comment(session_id: str, payload: CommentObservation, request: Req
                       token: str | None = Header(None, alias="X-Live-Session-Token")):
     service = request.app.state.live
     received_at_ms = service.clock()
-    return await service.run("add_comment", session_id, token, payload.model_dump(), received_at_ms)
+    body = payload.model_dump()
+    result = await service.run("add_comment", session_id, token, body, received_at_ms)
+    if body["input_mode"] == "live_observation" and result.get("candidate"):
+        cfg = request.app.state.settings
+        if not cfg.tianyi_api_key:
+            return {k: v for k, v in result.items() if k != "candidate"} | {"reason": "model_unavailable"}
+        try:
+            description = await service.run("description", session_id, token)
+            suggestion = await request.app.state.model.suggest_live(
+                body["text"], description, body["source"], result["effective_at_ms"]
+            )
+        except (ModelTimeoutError, ModelUnavailableError):
+            return {k: v for k, v in result.items() if k != "candidate"} | {"reason": "model_unavailable"}
+        prompt = await service.run(
+            "save_live_prompt", session_id, token, body, result["effective_at_ms"], suggestion
+        )
+        return {k: v for k, v in result.items() if k != "candidate"} | prompt
+    return result
+
+
+@router.post("/{session_id}/signals")
+async def add_signal(session_id: str, payload: PersonSignal, request: Request,
+                     token: str | None = Header(None, alias="X-Live-Session-Token")):
+    service = request.app.state.live
+    return await service.run("add_signal", session_id, token, payload.model_dump(), service.clock())
 
 
 @router.get("/{session_id}/prompts")

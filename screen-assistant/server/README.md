@@ -213,8 +213,8 @@ MISCONF（详见上方「重要」），写命令全拒、服务按契约 503；
 
 `event_id/source/coverage/text/input_mode` 必填；`author_id/platform_message_id/observed_at_ms`
 可选；`reliability` 缺省 `unknown`。coverage 只允许 `structured_sample/ocr_visible_sample/unknown`，
-不是全量保证；source 只是标签，不证明授权。只有 fixture 模式可提交，不能用 `real_capture`
-伪装真实接入。可靠性未知、OCR尚无行跟踪、缺少独立身份或消息证据都返回明确不计数原因。
+不是全量保证；source 只是标签，不证明授权。M2交付时只接受 `test_fixture`；M3新增的实际观察
+模式见下文。fixture不得改名冒充真实接入。可靠性未知或来源证据不足时会明确不计数。
 
 第二条换独立ID与作者、正文 `你来自哪里？`，短窗口内可得到：
 
@@ -263,3 +263,35 @@ cursor 绑定场次且对应递增记录顺序，客户端当作不透明字符�
 loopback Redis，核对目录身份后为旧测试提供 `TEST_REDIS_URL`，结束关闭所属进程树。
 它不使用旧Redis或Docker，不开启HTTP服务。旧测试的默认地址保持不变，所有断言保留。
 本地验证不替代iOS接线、Apple构建、真机后台/PiP或抖音实播验证。
+
+## M3：iOS 运营观察接线（本地实现）
+
+M3 在 M2 fixture 契约上增加 `input_mode=live_observation`，不改变旧 `/v1/answer`。
+ReplayKit OCR 保留逐行文本框：iOS 将裁剪ROI内的 Vision 框映射为全屏左上原点归一化
+`text_position`，并提交 `source=ios_replaykit_ocr` 与 `observed_at_ms`。运营分支只挑
+首条符合明确问题特征的单行候选；普通数字、一般提示或无关界面文字不作为评论内容，未匹配行
+不发送到模型。当前 OCR API 不提供识别置信度，因此 `confidence` 保持 `null`。没有作者/平台
+消息ID时，按来源、规范化问句和10秒观察时间桶做重放抑制，不推断昵称归属、多人或全量覆盖；
+bbox仅表示文本位置，不能证明昵称与评论配对。
+
+客户端把当前场次 ID、能力令牌和开场时间放在 App Group 容器的受文件保护 JSON 状态中，
+仅以 UserDefaults 布尔值发布是否启用；场次结束后移除授权文件并清除启用标志。
+
+单条符合当前明确问句规则的实时样本会进入独立运营提示路径：服务端使用已有
+`TIANYI_BASE_URL`、`TIANYI_API_KEY`、`TIANYI_MODEL` 和模型超时配置，通过同一 OpenAI
+兼容 `/chat/completions` 传输发独立系统提示；评论以不可信资料传入。模型失败、超时、截断、
+空输出或超长输出不生成提示。fixture 继续走既有重复问题确定性模板，不调用模型。人物
+`head_down` 由 iOS Vision 观察器在连续有效姿态满足窗口后触发轻模板，不调用模型。
+
+新增 `POST /v1/live/sessions/{id}/signals` 只接受有界 `head_down` 信号及 source、confidence、
+sample_count、开始/观察时间；按场次令牌授权，并设置90秒冷却。黑帧/无可读姿态只重置连续窗口，
+不转换为离镜结论。iOS 独立长轮询 `/prompts`，实际收到的短句送现有 PiP renderer；stop 后读取
+`/events` 分页列表。服务端 `returned_to_client` 仍不是 PiP 显示确认。
+
+服务端测试的实时模型响应使用受控 fake；没有读取实际 `.env`、key，也没有发真实业务模型请求。
+本机没有 Apple 工具链，ReplayKit 与 Vision 代码未编译/安装/真机运行。M3 的“实时观察”仅指
+客户端代码已接入 ReplayKit 当前交付帧中的 OCR/Vision；它不证明抖音原生同机开播时 ReplayKit
+可持续收到未遮挡评论或主播画面，也不证明平台未阻止或限制采集。主播侧在线人数与平台提醒有
+明确的屏幕候选来源，但本切片没有独立区域和实屏校准：不解析人数、不按评论关键词声称官方警告，
+也不把热度/累计观看当在线人数。语音转写和 ASR 未接入。后续沿现有选区编辑器增加可选在线人数
+区域与平台提醒区域，须由用户在真实主播界面选择核对后才启用对应解析/提醒。

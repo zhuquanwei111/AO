@@ -38,6 +38,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
     private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
     private lazy var inputDiagnostics = InputDiagnosticsSampler(context: ciContext)
+    private let livePersonObserver = LivePersonObserver()
     private let memoryLog = Logger(subsystem: "com.screenassistant.broadcast", category: "ocr-memory")
     // 40MB 为待验证工作预算、50MB 为历史风险参考；均非系统硬保证。
 
@@ -93,6 +94,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         // 原始输入诊断独立于视频筛选、OCR开关、轮次忙闲和远端响应。
         inputDiagnostics.observe(sampleBuffer, type: sampleBufferType)
         guard sampleBufferType == .video else { return }
+        livePersonObserver.observe(sampleBuffer)
 
         // 闸门：正在处理、暂停或间隔未到时丢弃当前帧；控制开关每帧读取，
         // 用 generation 及时使旧 OCR/HTTP 结果失效。
@@ -125,14 +127,16 @@ final class SampleHandler: RPBroadcastSampleHandler {
         logMemory(stage: "frame-start")
         // 把像素缓冲、Core Image 中间对象限制在此 autoreleasepool 内；只让最终
         // ROI CGImage 进入 OCR 单槽，扩展调用返回后释放 sample/pixel buffer。
-        guard let cgImage = autoreleasepool(invoking: { makeOCRImage(from: sampleBuffer) }) else {
+        let observationROI = SharedConfig.roi()
+        guard let cgImage = autoreleasepool(invoking: { makeOCRImage(from: sampleBuffer, roi: observationROI) }) else {
             endRound(generation: generation)
             return
         }
         logMemory(stage: "roi-rendered")
+        let sampleObservedAtMS = Int64(Date().timeIntervalSince1970 * 1000)
 
         // 5) OCR（架构无关组件，后台队列；识别文本仅存在于闭包链内存）
-        guard let ocr = OCRService.recognizeText(in: cgImage, completion: { [weak self] recognizedText in
+        guard let ocr = OCRService.recognizeText(in: cgImage, completion: { [weak self] recognizedLines in
             guard let self else { return }
             self.logMemory(stage: "ocr-finished")
             guard self.isCurrentRound(generation, captureGeneration: captureGeneration) else {
@@ -140,7 +144,37 @@ final class SampleHandler: RPBroadcastSampleHandler {
                 return
             }
 
-            // 6) 基础格式化；空白/超限 → 空轮（不发请求不发通知）
+            // 运营会话使用独立收件契约；旧 OCR 问答不得抢先进入 PiP。
+            if LiveSessionState.isEnabled() {
+                guard let liveClient = SharedConfig.serverBaseURL().flatMap({ LiveOperationsClient(baseURL: $0) }) else {
+                    self.endRound(generation: generation)
+                    return
+                }
+                guard let line = recognizedLines.first(where: { LiveCommentFilter.isWorthwhileQuestion($0.text) }),
+                      let question = SentenceFormatter.sentence(fromOCRText: line.text),
+                      question.count <= SharedConfig.maxSentenceLength else {
+                    self.endRound(generation: generation)
+                    return
+                }
+                let position = LiveCommentFilter.screenPosition(line.boundingBox, within: observationROI)
+                let request = liveClient.submitObservation(question, textPosition: position,
+                                                           observedAtMS: sampleObservedAtMS) { [weak self] in
+                    self?.endRound(generation: generation)
+                }
+                self.stateQueue.sync {
+                    if self.roundActive && !self.isBroadcastPaused && self.roundGeneration == generation &&
+                        self.activeCaptureGeneration == captureGeneration {
+                        self.activeRequest = request
+                    } else {
+                        request?.cancel()
+                    }
+                }
+                if request == nil { self.endRound(generation: generation) }
+                return
+            }
+
+            // 旧问答继续使用 ROI 整段文本；运营分支只处理上方筛选出的单行候选。
+            let recognizedText = recognizedLines.map(\.text).joined(separator: "\n")
             guard let sentence = SentenceFormatter.sentence(fromOCRText: recognizedText),
                   sentence.count <= SharedConfig.maxSentenceLength else {
                 self.endRound(generation: generation)
@@ -225,7 +259,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     /// Core Image 只在采集回调中读取当前帧；ROI 先裁剪再限制最长边，坐标统一限制在 extent。
-    private func makeOCRImage(from sampleBuffer: CMSampleBuffer) -> CGImage? {
+    private func makeOCRImage(from sampleBuffer: CMSampleBuffer, roi: CGRect) -> CGImage? {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return nil }
         var orientation = CGImagePropertyOrientation.up
         if let raw = CMGetAttachment(sampleBuffer,
@@ -237,7 +271,6 @@ final class SampleHandler: RPBroadcastSampleHandler {
         var ciImage = CIImage(cvPixelBuffer: pixelBuffer).oriented(orientation)
         let extent = ciImage.extent
         guard extent.width > 0, extent.height > 0 else { return nil }
-        let roi = SharedConfig.roi()
         let normalized = CGRect(
             x: min(max(roi.minX, 0), 1),
             y: min(max(1 - roi.maxY, 0), 1),

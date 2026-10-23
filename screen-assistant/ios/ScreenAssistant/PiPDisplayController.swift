@@ -215,6 +215,17 @@ final class PiPDisplayController: NSObject, ObservableObject {
         lastReplyAt = Date()
     }
 
+    /// 运营建议来自独立 HTTP 收件器；收到后直接刷新同一个 PiP renderer。
+    func showLivePrompt(_ text: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.pipController != nil else { return }
+            let image = self.renderReplyFrame(text)
+            self.lastRenderedCGImage = image
+            if self.isPlaying { self.enqueue(image) }
+            self.lastReplyAt = Date()
+        }
+    }
+
     /// 把回复文本渲染为 640×360 帧图（内存态，不落盘）。
     private func renderReplyFrame(_ reply: String) -> CGImage {
         let size = CGSize(width: 640, height: 360)

@@ -9,14 +9,20 @@ enum OCRService {
     private static let stateLock = NSLock()
     private static var isRunning = false
 
+    struct TextLine {
+        let text: String
+        /// Vision 坐标，原点在左下角，范围 0...1，相对当前裁剪图像。
+        let boundingBox: CGRect
+    }
+
     /// 单次识别的取消句柄。Vision 执行期间取消请求，并确保迟到结果不再调用完成闭包。
     final class CancellationToken {
         private let lock = NSLock()
         private var cancelled = false
         private var request: VNRecognizeTextRequest?
-        private var completion: ((String) -> Void)?
+        private var completion: (([TextLine]) -> Void)?
 
-        fileprivate init(completion: @escaping (String) -> Void) {
+        fileprivate init(completion: @escaping ([TextLine]) -> Void) {
             self.completion = completion
         }
 
@@ -44,7 +50,7 @@ enum OCRService {
             request?.cancel()
         }
 
-        fileprivate func finish(_ text: String) {
+        fileprivate func finish(_ lines: [TextLine]) {
             lock.lock()
             guard !cancelled, let completion else {
                 lock.unlock()
@@ -53,7 +59,7 @@ enum OCRService {
             self.completion = nil
             request = nil
             lock.unlock()
-            completion(text)
+            completion(lines)
         }
     }
 
@@ -61,7 +67,7 @@ enum OCRService {
     /// 识别文本仅存在于闭包链内存，不保存。返回 nil 表示已有作业在途，调用方应丢弃本帧。
     @discardableResult
     static func recognizeText(in cgImage: CGImage,
-                              completion: @escaping (String) -> Void) -> CancellationToken? {
+                              completion: @escaping ([TextLine]) -> Void) -> CancellationToken? {
         stateLock.lock()
         guard !isRunning else {
             stateLock.unlock()
@@ -83,7 +89,7 @@ enum OCRService {
                 let request = VNRecognizeTextRequest { request, error in
                     guard error == nil,
                           let observations = request.results as? [VNRecognizedTextObservation] else {
-                        token.finish("")
+                        token.finish([])
                         return
                     }
                     let sorted = observations.sorted { a, b in
@@ -91,8 +97,11 @@ enum OCRService {
                         if dy > 0.01 { return a.boundingBox.minY > b.boundingBox.minY }
                         return a.boundingBox.minX < b.boundingBox.minX
                     }
-                    let lines = sorted.compactMap { $0.topCandidates(1).first?.string }
-                    token.finish(lines.joined(separator: "\n"))
+                    let lines = sorted.compactMap { observation -> TextLine? in
+                        guard let text = observation.topCandidates(1).first?.string else { return nil }
+                        return TextLine(text: text, boundingBox: observation.boundingBox)
+                    }
+                    token.finish(lines)
                 }
                 request.recognitionLevel = .accurate
                 request.usesLanguageCorrection = false
@@ -106,7 +115,7 @@ enum OCRService {
                 do {
                     try handler.perform([request])
                 } catch {
-                    token.finish("")
+                    token.finish([])
                 }
             }
         }

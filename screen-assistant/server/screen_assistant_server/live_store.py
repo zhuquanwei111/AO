@@ -89,6 +89,9 @@ class LiveStore:
             )
         return {"session_id": sid, "session_token": token, "started_at_ms": now}
 
+    def description(self, sid: str, token: str | None) -> str:
+        return self.authorize(sid, token)["description"]
+
     def stop(self, sid: str, token: str | None):
         row = self.authorize(sid, token)
         stopped = row["stopped_at_ms"]
@@ -209,15 +212,17 @@ class LiveStore:
         result.update(received_at_ms=received_at_ms, effective_at_ms=when, time_basis=basis)
         topic = question(body["text"])
         message = digest(json.dumps([body["source"], body["platform_message_id"]])) if body["platform_message_id"] else None
+        if message is None and topic is not None and body["input_mode"] == "live_observation":
+            message = digest(json.dumps([body["source"], "ocr-topic", topic[0], when // 10_000]))
         author = digest(json.dumps([body["source"], body["author_id"]])) if body["author_id"] else None
         reason = None
         if body["reliability"] != "known" or body["coverage"] == "unknown":
             reason = "unreliable"
-        elif body["coverage"] == "ocr_visible_sample":
+        elif body["coverage"] == "ocr_visible_sample" and body["input_mode"] != "live_observation":
             reason = "ocr_tracking_unavailable"
         elif now-when > MAX_OBSERVATION_AGE_MS:
             reason = "late"
-        elif not message and not author:
+        elif not message and not author and body["input_mode"] != "live_observation":
             reason = "no_independent_evidence"
         elif message and self.db.execute(
             "SELECT 1 FROM live_observations WHERE session_id=? AND message_hash=?", (sid, message)
@@ -225,7 +230,7 @@ class LiveStore:
             reason = "duplicate_message"
         elif topic is None:
             reason = "not_a_question"
-        elif not message and any(o["topic"] == topic[0] and o["author"] == author for o in window):
+        elif not message and author and any(o["topic"] == topic[0] and o["author"] == author for o in window):
             reason = "same_author_without_message_id"
         if reason:
             result["reason"] = reason
@@ -237,11 +242,137 @@ class LiveStore:
                            "received_at_ms": received_at_ms})
             group = [o for o in window if o["topic"] == topic[0]]
             result["reason"] = "awaiting_repeat"
-            if Counter(o["topic"] for o in window)[topic[0]] >= 2:
+            if body["input_mode"] == "live_observation":
+                # OCR has no platform message/author identity. A stable content key
+                # suppresses frame replay without claiming independent viewers.
+                latest = self.db.execute(
+                    "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash=?",
+                    (sid, digest(topic[0])),
+                ).fetchone()[0]
+                if latest is not None and now-latest < COOLDOWN_MS:
+                    result["reason"] = "cooldown"
+                else:
+                    result["candidate"] = topic[1]
+            elif Counter(o["topic"] for o in window)[topic[0]] >= 2:
                 result.update(self.generate(sid, session, topic, group, now))
         self.db.execute("INSERT INTO live_observations VALUES (?,?,?,?,?)",
                         (sid, key, fingerprint, message, json.dumps(result)))
         return result, window
+
+    def save_live_prompt(self, sid: str, token: str | None, body: dict,
+                         observed_at_ms: int, suggestion: str):
+        session = self.authorize(sid, token)
+        if session["stopped_at_ms"] is not None:
+            raise HTTPException(409, "live session stopped")
+        topic = question(body["text"])
+        if topic is None:
+            return {"reason": "not_a_question"}
+        now = self.clock()
+        topic_hash = digest(topic[0])
+        last = self.db.execute(
+            "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash=?",
+            (sid, topic_hash),
+        ).fetchone()[0]
+        if last is not None and now-last < COOLDOWN_MS:
+            return {"reason": "cooldown"}
+        pending = self.db.execute(
+            "SELECT COUNT(*) FROM live_events WHERE session_id=? AND returned_at_ms IS NULL AND expires_at_ms>?",
+            (sid, now),
+        ).fetchone()[0]
+        total = self.db.execute(
+            "SELECT COUNT(*) FROM live_events WHERE session_id=?", (sid,)
+        ).fetchone()[0]
+        if pending >= MAX_PENDING:
+            return {"reason": "pending_limit"}
+        if total >= MAX_EVENTS:
+            raise HTTPException(429, "live event limit reached")
+        event = {
+            "prompt_id": uuid.uuid4().hex,
+            "input_mode": "live_observation",
+            "first_received_at_ms": now,
+            "last_received_at_ms": now,
+            "start_at_ms": observed_at_ms,
+            "end_at_ms": observed_at_ms,
+            "start_offset_ms": observed_at_ms-session["started_at_ms"],
+            "end_offset_ms": observed_at_ms-session["started_at_ms"],
+            "time_basis": "observed",
+            "phenomenon": f"公屏出现一条可见问题：{topic[1]}",
+            "suggestion": suggestion,
+            "display_text": suggestion,
+            "observation_count": 1,
+            "sources": [{"source": body["source"], "coverage": body["coverage"],
+                         "time_basis": "observed", "input_mode": "live_observation",
+                         "reliability": body["reliability"],
+                         "confidence": body.get("confidence"),
+                         "text_position": body.get("text_position"), "count": 1}],
+        }
+        with self.db:
+            self.db.execute(
+                "INSERT INTO live_events (session_id,topic_hash,generated_at_ms,expires_at_ms,payload) VALUES (?,?,?,?,?)",
+                (sid, topic_hash, now, now+PROMPT_TTL_MS, json.dumps(event, ensure_ascii=False)),
+            )
+        return {"reason": "generated", "prompt_id": event["prompt_id"]}
+
+    def add_signal(self, sid: str, token: str | None, body: dict, received_at_ms: int):
+        session = self.authorize(sid, token)
+        if session["stopped_at_ms"] is not None:
+            raise HTTPException(409, "live session stopped")
+        if not (session["started_at_ms"] <= body["started_at_ms"] <= body["observed_at_ms"] <= received_at_ms):
+            raise HTTPException(422, "signal time outside live session")
+        key = digest(body["event_id"])
+        fingerprint = digest(json.dumps(body, ensure_ascii=False, sort_keys=True))
+        prior = self.db.execute(
+            "SELECT fingerprint,result FROM live_observations WHERE session_id=? AND event_hash=?", (sid, key)
+        ).fetchone()
+        if prior:
+            if prior["fingerprint"] != fingerprint:
+                raise HTTPException(409, "observation id already used with different content")
+            return json.loads(prior["result"])
+        count = self.db.execute(
+            "SELECT COUNT(*) FROM live_observations WHERE session_id=?", (sid,)
+        ).fetchone()[0]
+        if count >= MAX_OBSERVATIONS:
+            raise HTTPException(429, "live observation limit reached")
+        now = self.clock()
+        topic_hash = digest("person:head_down")
+        last = self.db.execute(
+            "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash=?", (sid, topic_hash)
+        ).fetchone()[0]
+        event_row = None
+        if last is not None and now-last < 90_000:
+            result = {"status": "suppressed", "reason": "cooldown", "prompt_id": None}
+        else:
+            total = self.db.execute("SELECT COUNT(*) FROM live_events WHERE session_id=?", (sid,)).fetchone()[0]
+            if total >= MAX_EVENTS:
+                raise HTTPException(429, "live event limit reached")
+            phenomenon = "画面中可见人物持续低头"
+            suggestion = "抬头看一下镜头，接住观众的互动。"
+            event = {
+                "prompt_id": uuid.uuid4().hex, "input_mode": "live_observation",
+                "first_received_at_ms": received_at_ms, "last_received_at_ms": received_at_ms,
+                "start_at_ms": body["started_at_ms"], "end_at_ms": body["observed_at_ms"],
+                "start_offset_ms": body["started_at_ms"]-session["started_at_ms"],
+                "end_offset_ms": body["observed_at_ms"]-session["started_at_ms"],
+                "time_basis": "observed", "phenomenon": phenomenon,
+                "suggestion": suggestion, "display_text": suggestion,
+                "observation_count": body["sample_count"],
+                "sources": [{"source": body["source"], "coverage": "vision_pose_sample",
+                             "time_basis": "observed", "input_mode": "live_observation",
+                             "reliability": "known", "confidence": body["confidence"],
+                             "count": body["sample_count"]}],
+            }
+            event_row = (sid, topic_hash, now, now+PROMPT_TTL_MS,
+                         json.dumps(event, ensure_ascii=False))
+            result = {"status": "accepted", "reason": "generated", "prompt_id": event["prompt_id"]}
+        with self.db:
+            if event_row is not None:
+                self.db.execute(
+                    "INSERT INTO live_events (session_id,topic_hash,generated_at_ms,expires_at_ms,payload) VALUES (?,?,?,?,?)",
+                    event_row,
+                )
+            self.db.execute("INSERT INTO live_observations VALUES (?,?,?,?,?)",
+                            (sid, key, fingerprint, None, json.dumps(result)))
+        return result
 
     def generate(self, sid, session, topic, group, now):
         topic_hash = digest(topic[0])

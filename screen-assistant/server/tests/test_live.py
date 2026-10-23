@@ -79,6 +79,142 @@ def post_comment(client, sid, headers, event_id, **changes):
     return response.json()
 
 
+class ControlledOperationsModel:
+    def __init__(self):
+        self.observations = []
+
+    async def suggest_live(self, observation, description="", source="unknown", observed_at_ms=None):
+        self.observations.append((observation, description, source, observed_at_ms))
+        return "顺着这个问题聊两句，再邀请大家分享。"
+
+    async def ask(self, sentence):
+        from screen_assistant_server.model_client import ModelAnswer
+        return ModelAnswer("旧问答仍可用", "stop", 3, 0, False, False)
+
+    async def aclose(self):
+        return None
+
+
+def test_real_observation_model_prompt_poll_record_stop_and_isolation(tmp_path):
+    clock = Clock()
+    config = settings(tmp_path / "live.sqlite3")
+    # 仅启用受控模型调用分支，不读取任何外部凭据或端点。
+    config = config.__class__(**{**config.__dict__, "tianyi_api_key": "controlled-test"})
+    app = create_app(config, live_clock=clock)
+    model = ControlledOperationsModel()
+    with TestClient(app) as client:
+        app.state.model = model
+        session, headers = create(client)
+        sid = session["session_id"]
+        url = f"/v1/live/sessions/{sid}"
+        body = {
+            "event_id": "ocr-observation-1", "input_mode": "live_observation",
+            "source": "ios_replaykit_ocr", "coverage": "ocr_visible_sample",
+            "reliability": "known", "text": "主播你是哪里人？",
+            "text_position": {"x": 0.1, "y": 0.3, "width": 0.2, "height": 0.04},
+            "observed_at_ms": clock.now,
+        }
+        generated = client.post(url + "/comments", headers=headers, json=body)
+        assert generated.status_code == 200, generated.text
+        result = generated.json()
+        assert result["reason"] == "generated" and result["prompt_id"]
+        assert model.observations == [(body["text"], "", "ios_replaykit_ocr", clock.now)]
+        # bbox 每帧会轻微漂移，但同题同来源同时间桶仍会抑制重放。
+        replay = dict(body, event_id="ocr-observation-replay",
+                      text_position={"x": 0.105, "y": 0.3, "width": 0.2, "height": 0.04})
+        assert client.post(url + "/comments", headers=headers, json=replay).json()["reason"] == "duplicate_message"
+
+        page = client.get(url + "/prompts", headers=headers, params={"wait_ms": 0}).json()
+        assert len(page["prompts"]) == 1
+        prompt = page["prompts"][0]
+        assert prompt["input_mode"] == "live_observation"
+        assert prompt["display_text"] == "顺着这个问题聊两句，再邀请大家分享。"
+        assert prompt["sources"][0]["source"] == "ios_replaykit_ocr"
+        assert prompt["sources"][0]["text_position"] == body["text_position"]
+        assert prompt["start_at_ms"] == clock.now
+
+        other, other_headers = create(client)
+        assert client.get(f"/v1/live/sessions/{other['session_id']}/events",
+                          headers=headers).status_code == 403
+        clock.now += 15_001
+        assert client.get(url + "/prompts", headers=headers).json()["prompts"] == []
+        assert len(client.get(url + "/events", headers=headers).json()["events"]) == 1
+        stopped = client.post(url + "/stop", headers=headers)
+        assert stopped.status_code == 200
+        assert client.get(url + "/prompts", headers=headers).json()["stopped"] is True
+        assert client.post(url + "/comments", headers=headers, json=body).status_code == 409
+        assert client.post("/v1/answer", json={"sentence": " "}).status_code == 422
+
+
+def test_mixed_screen_lines_are_not_sent_as_one_comment_and_identity_stays_unknown(tmp_path):
+    clock = Clock()
+    config = settings(tmp_path / "live.sqlite3")
+    config = config.__class__(**{**config.__dict__, "tianyi_api_key": "controlled-test"})
+    app = create_app(config, live_clock=clock)
+    model = ControlledOperationsModel()
+    with TestClient(app) as client:
+        app.state.model = model
+        session, headers = create(client)
+        url = f"/v1/live/sessions/{session['session_id']}"
+
+        # 模拟同一ROI里的普通数字/提示行；它们没有变成评论或模型输入。
+        for event_id, text in (("count-line", "在线 3.2万人"),
+                               ("notice-line", "平台提醒：请检查直播内容")):
+            response = client.post(url + "/comments", headers=headers, json={
+                "event_id": event_id, "input_mode": "live_observation",
+                "source": "ios_replaykit_ocr", "coverage": "ocr_visible_sample",
+                "reliability": "known", "text": text,
+                "text_position": {"x": 0.7, "y": 0.1, "width": 0.2, "height": 0.03},
+                "observed_at_ms": clock.now,
+            })
+            assert response.status_code == 200
+            assert response.json()["reason"] == "not_a_question"
+        assert model.observations == []
+
+        # 单独候选的问题行带bbox和来源/时刻，不臆造昵称或平台消息ID。
+        question_body = {
+            "event_id": "question-line", "input_mode": "live_observation",
+            "source": "ios_replaykit_ocr", "coverage": "ocr_visible_sample",
+            "reliability": "known", "text": "主播你是哪里人？",
+            "text_position": {"x": 0.2, "y": 0.6, "width": 0.3, "height": 0.04},
+            "observed_at_ms": clock.now,
+        }
+        response = client.post(url + "/comments", headers=headers, json=question_body)
+        assert response.status_code == 200 and response.json()["reason"] == "generated"
+        assert model.observations == [(
+            question_body["text"], "", "ios_replaykit_ocr", clock.now
+        )]
+        event = client.get(url + "/events", headers=headers).json()["events"][0]
+        source = event["sources"][0]
+        assert source["text_position"] == question_body["text_position"]
+        assert "author_id" not in source and "platform_message_id" not in source
+
+
+def test_person_signal_candidate_is_recorded_with_confidence_and_cooldown(tmp_path):
+    clock = Clock()
+    with TestClient(create_app(settings(tmp_path / "live.sqlite3"), live_clock=clock)) as client:
+        session, headers = create(client)
+        sid = session["session_id"]
+        url = f"/v1/live/sessions/{sid}"
+        signal = {
+            "event_id": "vision-head-down-1", "source": "ios_replaykit_vision",
+            "signal": "head_down", "confidence": 0.82, "sample_count": 6,
+            "started_at_ms": clock.now, "observed_at_ms": clock.now + 15_000,
+        }
+        clock.now += 16_000
+        first = client.post(url + "/signals", headers=headers, json=signal)
+        assert first.status_code == 200, first.text
+        assert first.json()["reason"] == "generated"
+        repeat = dict(signal, event_id="vision-head-down-2", started_at_ms=clock.now-15_000,
+                      observed_at_ms=clock.now)
+        assert client.post(url + "/signals", headers=headers, json=repeat).json()["reason"] == "cooldown"
+        events = client.get(url + "/events", headers=headers).json()["events"]
+        assert len(events) == 1
+        assert events[0]["phenomenon"] == "画面中可见人物持续低头"
+        assert events[0]["sources"][0]["confidence"] == 0.82
+        assert events[0]["observation_count"] == 6
+
+
 def test_fixture_loop_dedup_independent_questions_and_reopen(tmp_path):
     path, clock = tmp_path / "live.sqlite3", Clock()
     with TestClient(create_app(settings(path), live_clock=clock)) as client:

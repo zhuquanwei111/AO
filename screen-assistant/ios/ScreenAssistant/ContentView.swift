@@ -29,6 +29,7 @@ struct ContentView: View {
                         .keyboardType(.URL)
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
+                        .disabled(model.liveActive)
                     if !model.serverURLString.isEmpty && !model.serverURLIsValid {
                         Label("地址无效：需以 http:// 或 https:// 开头", systemImage: "exclamationmark.triangle.fill")
                             .foregroundColor(.orange)
@@ -111,6 +112,21 @@ struct ContentView: View {
                     }
                 }
 
+                Section(header: Text("直播运营"),
+                        footer: Text("手动开始/结束本场辅助。评论仅来自 ReplayKit 当前可见 OCR 样本；不代表公屏全量。运营提示使用现有 PiP。")) {
+                    TextField("本场补充说明（选填）", text: $model.liveDescription)
+                    Button(model.liveActive ? "结束本场辅助" : "开始本场辅助") {
+                        if model.liveActive { model.stopLiveSession() }
+                        else { model.startLiveSession() }
+                    }
+                    Text(model.liveStatus)
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                    NavigationLink("本场事件记录（\(model.liveEvents.count)）") {
+                        LiveEventListView(events: model.liveEvents)
+                    }
+                }
+
                 Section(header: Text("测试工具")) {
                     NavigationLink("输入检查（测试）") {
                         InputDiagnosticsView()
@@ -142,4 +158,28 @@ struct ContentView: View {
 
     private let guideText =
         "本 App 与“屏识AI广播”扩展通过 App Group 共享配置与控制开关，并通过 UDS 传递短回复；句子和回复正文仅在进程内存及 socket 内核缓冲短暂存在，不写文件或偏好设置。识别与请求在广播扩展进程内完成，画面仅内存处理。"
+}
+
+private struct LiveEventListView: View {
+    let events: [LivePrompt]
+
+    var body: some View {
+        List(events) { event in
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 4) {
+                    Text(Date(timeIntervalSince1970: Double(event.startAtMS) / 1000), style: .time)
+                    if event.endAtMS > event.startAtMS {
+                        Text("–")
+                        Text(Date(timeIntervalSince1970: Double(event.endAtMS) / 1000), style: .time)
+                    }
+                }
+                .font(.caption)
+                .foregroundColor(.secondary)
+                Text(event.phenomenon).font(.subheadline)
+                Text(event.suggestion).font(.body)
+            }
+            .padding(.vertical, 4)
+        }
+        .navigationTitle("本场事件记录")
+    }
 }
