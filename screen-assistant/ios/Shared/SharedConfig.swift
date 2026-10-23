@@ -3,7 +3,7 @@ import CoreGraphics
 
 /// 运行配置：主 App 写入，广播扩展每轮开始前**重新读取**（保证即时生效、不留过期快照）。
 ///
-/// 隐私约束（PRD）：App Group 仅存本文件中的配置项与 ControlState 中的控制/状态标志；
+/// 隐私约束（PRD）：App Group 仅存配置项、ControlState 控制标志及 InputDiagnostics 数值摘要；
 /// 严禁写入识别句子、回复文本、画面数据或任何历史记录。
 struct SharedConfig {
     // MARK: - 键（全部限定在受控清单内）

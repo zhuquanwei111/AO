@@ -111,6 +111,12 @@ struct ContentView: View {
                     }
                 }
 
+                Section(header: Text("测试工具")) {
+                    NavigationLink("输入检查（测试）") {
+                        InputDiagnosticsView()
+                    }
+                }
+
                 Section(header: Text("使用指引")) {
                     Text(guideText)
                         .font(.footnote)

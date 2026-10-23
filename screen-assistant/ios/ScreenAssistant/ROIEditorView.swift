@@ -5,6 +5,7 @@ import SwiftUI
 /// 扩展侧换算为像素（CIImage 左下原点）后裁剪。
 struct ROIEditorView: View {
     @Binding var roi: CGRect
+    var title: String = "编辑识别区域"
     @State private var dragStart: CGRect?
 
     var body: some View {
@@ -77,7 +78,7 @@ struct ROIEditorView: View {
             .frame(width: box.width, height: box.height)
             .position(x: proxy.size.width / 2, y: proxy.size.height / 2)
         }
-        .navigationTitle("编辑识别区域")
+        .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) {

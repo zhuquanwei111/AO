@@ -11,8 +11,8 @@ import os
 /// 基础格式化 → POST /v1/answer → UDS 短回复发送。
 ///
 /// 隐私与生命周期约束：
-///   - 视频帧仅存在于本方法调用栈与 CIImage/VNImageRequestHandler 内存中，
-///     方法返回后不保留任何画面引用（官方文档要求），不落盘。
+///   - 原始 sample/pixel buffer 不出采集回调；OCR仅保留自有ROI图像。
+///     输入测试可保留一张自有小图做单在途检测；所有图像仅内存处理，不落盘。
 ///   - 不持久化句子/回复；每轮的句子与回复只活到本轮结束。
 ///   - 一轮 = 帧→OCR→请求→响应，全程 roundActive；期间到达的帧直接跳过
 ///     （PRD：“下一轮忙则跳过以免堆积”）。
@@ -37,12 +37,14 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var activeOCR: OCRService.CancellationToken?
 
     private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+    private lazy var inputDiagnostics = InputDiagnosticsSampler(context: ciContext)
     private let memoryLog = Logger(subsystem: "com.screenassistant.broadcast", category: "ocr-memory")
     // 40MB 为待验证工作预算、50MB 为历史风险参考；均非系统硬保证。
 
     // MARK: - 生命周期
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
+        inputDiagnostics.transition(to: .running)
         stateQueue.sync {
             nextRoundEligibleTime = 0
             roundActive = false
@@ -53,6 +55,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     override func broadcastPaused() {
+        inputDiagnostics.transition(to: .paused)
         stateQueue.sync {
             isBroadcastPaused = true
             roundGeneration &+= 1
@@ -62,6 +65,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     override func broadcastResumed() {
+        inputDiagnostics.transition(to: .running)
         stateQueue.sync {
             isBroadcastPaused = false
             roundGeneration &+= 1
@@ -72,6 +76,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     override func broadcastFinished() {
+        inputDiagnostics.transition(to: .finished)
         stateQueue.sync {
             roundGeneration &+= 1
             roundActive = false
@@ -85,6 +90,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer,
                                       with sampleBufferType: RPSampleBufferType) {
+        // 原始输入诊断独立于视频筛选、OCR开关、轮次忙闲和远端响应。
+        inputDiagnostics.observe(sampleBuffer, type: sampleBufferType)
         guard sampleBufferType == .video else { return }
 
         // 闸门：正在处理、暂停或间隔未到时丢弃当前帧；控制开关每帧读取，
