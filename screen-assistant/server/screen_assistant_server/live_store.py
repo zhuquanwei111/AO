@@ -387,7 +387,8 @@ class LiveStore:
             "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash=?",
             (sid, topic_hash),
         ).fetchone()[0]
-        if last_same_topic is not None and now - last_same_topic < COOLDOWN_MS:
+        topic_cooldown = 90_000 if candidate["topic"] == "person:head_down" else COOLDOWN_MS
+        if last_same_topic is not None and now - last_same_topic < topic_cooldown:
             return None
         if candidate["priority"] < 100:
             recent = self.db.execute(
@@ -415,7 +416,8 @@ class LiveStore:
             "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash=?",
             (sid, topic_hash),
         ).fetchone()[0]
-        if last is not None and now-last < COOLDOWN_MS:
+        topic_cooldown = 90_000 if candidate["topic"] == "person:head_down" else COOLDOWN_MS
+        if last is not None and now-last < topic_cooldown:
             return {"reason": "cooldown", "prompt_id": None}
         if candidate["priority"] < 100:
             higher = self.db.execute(

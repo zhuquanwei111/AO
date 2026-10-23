@@ -2,18 +2,26 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import json
 import re
 import sqlite3
 import time
+from collections import deque
+from dataclasses import dataclass
 from typing import Literal
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
-from .live_rules import FUSION_SETTLE_MS, MAX_SESSION_WAITERS, MAX_WAITERS, MAX_WAIT_MS
-from .live_store import LiveStore
+from .live_rules import (
+    FUSION_FUTURE_SKEW_MS, FUSION_SETTLE_MS, MAX_OBSERVATION_AGE_MS,
+    MAX_SESSION_WAITERS, MAX_WAITERS, MAX_WAIT_MS,
+)
+from .live_store import LiveStore, digest
 from .model_client import ModelTimeoutError, ModelUnavailableError
 from .live_fusion import Observation
+from .person_observation import PersonObservation as PersonObservationValue, PersonPolicy
 
 router = APIRouter(prefix="/v1/live/sessions", tags=["live-test-fixture"])
 
@@ -57,6 +65,36 @@ class PersonSignal(BaseModel):
     observed_at_ms: int = Field(ge=0, le=2**63-1, strict=True)
 
 
+class PersonObservationPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    source: Literal["ios_replaykit_vision"]
+    coverage: Literal["sampled_person_roi"]
+    segment_id: str = Field(min_length=1, max_length=128)
+    sequence: int = Field(ge=0, le=2**53)
+    observed_at_ms: int = Field(ge=0, le=2**53)
+    uptime_ms: int = Field(ge=0, le=2**53)
+    quality: str = Field(min_length=1, max_length=64)
+    person_count: int | None = Field(default=None, ge=0, le=10)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
+    person_box: list[float] | None = Field(default=None, max_length=4)
+    body_vector: list[float] | None = Field(default=None, max_length=10)
+    face_vector: list[float] | None = Field(default=None, max_length=3)
+    head_ratio: float | None = Field(default=None, allow_inf_nan=False)
+    head_confidence: float | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
+    pts_seconds: float | None = Field(default=None, allow_inf_nan=False)
+
+
+@dataclass
+class PersonSessionState:
+    segment_id: str
+    policy: PersonPolicy
+    last_sequence: int
+    last_uptime_ms: int
+    last_observed_at_ms: int
+    last_fingerprint: str
+    retired_segments: deque[str]
+
+
 class LiveService:
     def __init__(self, path: str, clock):
         self.path, self.clock = path, clock
@@ -64,10 +102,14 @@ class LiveService:
         self.lock = asyncio.Lock()
         self.fusion_lock = asyncio.Lock()
         self.waiters: dict[str, set[asyncio.Future]] = {}
+        self.person_states: dict[str, PersonSessionState] = {}
 
     def dispatch(self, method: str, *args):
         # 延迟初始化，使新存储不可写时不影响旧问答/健康检查的生命周期。
         if method == "close":
+            for state in self.person_states.values():
+                state.policy.stop()
+            self.person_states.clear()
             if self.store is not None:
                 self.store.close()
                 self.store = None
@@ -90,6 +132,10 @@ class LiveService:
         async with self.lock:
             # 请求取消时等待正在进行的数据库操作结束，再释放锁/关闭连接。
             result = await self.call(method, *args)
+            if method == "stop":
+                state = self.person_states.pop(args[0], None)
+                if state is not None:
+                    state.policy.stop()
             if method == "stop" or (method in {
                 "add_comment", "save_live_prompt", "add_signal", "save_fusion_candidate"
             } and result.get("prompt_id")):
@@ -97,6 +143,86 @@ class LiveService:
                     if not future.done():
                         future.set_result(None)
             return result
+
+    async def observe_person(self, sid: str, token: str | None,
+                             payload: dict, received_at_ms: int):
+        """Run one bounded numeric sample through a session-owned policy."""
+        async with self.lock:
+            session = await self.call("audio_access", sid, token)
+            item = PersonObservationValue.from_payload(payload)
+            if not item.valid():
+                raise HTTPException(422, "invalid person observation")
+            if (item.observed_at_ms < session["started_at_ms"]
+                    or item.observed_at_ms > received_at_ms + FUSION_FUTURE_SKEW_MS):
+                raise HTTPException(422, "person observation time outside live session")
+            if received_at_ms - item.observed_at_ms > MAX_OBSERVATION_AGE_MS:
+                return {"status": "ignored", "reason": "late_observation"}
+
+            fingerprint = digest(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            state = self.person_states.get(sid)
+            prior_state = copy.deepcopy(state)
+            retired_segments = state.retired_segments if state is not None else deque(maxlen=64)
+            if state is not None and item.segment_id in state.retired_segments:
+                return {"status": "ignored", "reason": "old_segment"}
+            if state is not None and item.segment_id == state.segment_id:
+                if item.sequence == state.last_sequence:
+                    if fingerprint == state.last_fingerprint:
+                        return {"status": "duplicate", "reason": "duplicate_event"}
+                    raise HTTPException(409, "person sequence reused with different content")
+                if (item.sequence < state.last_sequence or item.uptime_ms <= state.last_uptime_ms
+                        or item.observed_at_ms <= state.last_observed_at_ms):
+                    return {"status": "ignored", "reason": "stale_person_sample"}
+            elif state is not None:
+                if (item.uptime_ms <= state.last_uptime_ms
+                        or item.observed_at_ms <= state.last_observed_at_ms):
+                    return {"status": "ignored", "reason": "old_segment"}
+                retired_segments.append(state.segment_id)
+                state.policy.stop()
+                state = None
+
+            if state is None:
+                policy = PersonPolicy()
+                policy.start(item.segment_id)
+                state = PersonSessionState(
+                    item.segment_id, policy, -1, -1, -1, "", retired_segments,
+                )
+                self.person_states[sid] = state
+
+            decision = state.policy.observe(item)
+            if decision.presence == "ignored":
+                return {"status": "ignored", "reason": "stale_person_sample"}
+            state.last_sequence = item.sequence
+            state.last_uptime_ms = item.uptime_ms
+            state.last_observed_at_ms = item.observed_at_ms
+            state.last_fingerprint = fingerprint
+            response = {
+                "status": "observed", "reason": decision.presence,
+                "presence": decision.presence, "motion": decision.motion,
+                "facial_change": decision.facial_change,
+            }
+            candidate = decision.candidate
+            if candidate is None:
+                return response
+
+            event_id = "person-candidate:" + digest(f"{item.segment_id}:{item.sequence}")
+            body = {
+                "kind": "person_state", "event_id": event_id,
+                "source": candidate.source, "observed_at_ms": candidate.observed_at_ms,
+                "started_at_ms": candidate.started_at_ms,
+                "ended_at_ms": candidate.observed_at_ms,
+                "availability": "available", "coverage": candidate.coverage,
+                "reliability": "known", "confidence": candidate.confidence,
+                "content": {"signal": candidate.kind, "sample_count": candidate.sample_count},
+            }
+            try:
+                result = await self.call("add_observation", sid, token, body, received_at_ms)
+            except Exception:
+                if prior_state is None:
+                    self.person_states.pop(sid, None)
+                else:
+                    self.person_states[sid] = prior_state
+                raise
+            return {"result": result, "body": body, "candidate": True}
 
     async def poll(self, sid, token, after, wait_ms):
         loop = asyncio.get_running_loop()
@@ -266,6 +392,20 @@ async def add_typed_observation(session_id: str, payload: Observation, request: 
         service, session_id, token, request, result, body,
         urgent=body["kind"] == "platform_notice",
     )
+
+
+@router.post("/{session_id}/person-observations")
+async def add_person_observation(session_id: str, payload: PersonObservationPayload, request: Request,
+                                 token: str | None = Header(None, alias="X-Live-Session-Token")):
+    service = request.app.state.live
+    body = payload.model_dump()
+    outcome = await service.observe_person(session_id, token, body, service.clock())
+    if not outcome.get("candidate"):
+        return outcome
+    candidate_result = await process_fusion_observation(
+        service, session_id, token, request, outcome["result"], outcome["body"], urgent=False
+    )
+    return candidate_result
 
 
 @router.post("/{session_id}/signals")

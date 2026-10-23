@@ -35,10 +35,21 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var activeCaptureGeneration = 0
     private var activeRequest: URLSessionDataTask?
     private var activeOCR: OCRService.CancellationToken?
+    private let personObservationQueue = DispatchQueue(label: "com.screenassistant.person-observation-http")
+    private let personObservationSession: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 5
+        configuration.timeoutIntervalForResource = 7
+        return URLSession(configuration: configuration)
+    }()
+    private var personObservationRequest: URLSessionDataTask?
+    private var personObservationRequestID: UUID?
 
     private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
     private lazy var inputDiagnostics = InputDiagnosticsSampler(context: ciContext)
-    private let livePersonObserver = LivePersonObserver()
+    private lazy var livePersonObserver = LivePersonObserver(onObservation: { [weak self] observation, sessionID, token in
+        self?.submitPersonObservation(observation, sessionID: sessionID, token: token)
+    })
     private let continuousAudio = ContinuousAudioCapture()
     private let memoryLog = Logger(subsystem: "com.screenassistant.broadcast", category: "ocr-memory")
     // 40MB 为待验证工作预算、50MB 为历史风险参考；均非系统硬保证。
@@ -46,6 +57,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     // MARK: - 生命周期
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
+        resetPersonObservationTransport()
         continuousAudio.transition(running: true)
         inputDiagnostics.transition(to: .running)
         stateQueue.sync {
@@ -58,6 +70,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     override func broadcastPaused() {
+        resetPersonObservationTransport()
         continuousAudio.transition(running: false)
         inputDiagnostics.transition(to: .paused)
         stateQueue.sync {
@@ -69,6 +82,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     override func broadcastResumed() {
+        resetPersonObservationTransport()
         continuousAudio.transition(running: true)
         inputDiagnostics.transition(to: .running)
         stateQueue.sync {
@@ -81,6 +95,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     override func broadcastFinished() {
+        resetPersonObservationTransport()
         continuousAudio.transition(running: false)
         inputDiagnostics.transition(to: .finished)
         stateQueue.sync {
@@ -275,6 +290,51 @@ final class SampleHandler: RPBroadcastSampleHandler {
             }
         }
         logMemory(stage: "ocr-submitted")
+    }
+
+    /// M7数值出口使用取样时的场次凭据；只保留一个HTTP请求在途，不等待服务端响应。
+    private func submitPersonObservation(_ observation: LivePersonObservation,
+                                         sessionID: String, token: String) {
+        guard LiveSessionState.isEnabled(), ControlState.userWantsCapture(),
+              let credentials = LiveSessionState.credentials(),
+              credentials.sessionID == sessionID, credentials.token == token,
+              let baseURL = SharedConfig.serverBaseURL(),
+              let body = try? JSONEncoder().encode(observation) else { return }
+        let url = ["v1", "live", "sessions", sessionID, "person-observations"].reduce(baseURL) {
+            $0.appendingPathComponent($1, isDirectory: false)
+        }
+        var request = URLRequest(url: url, timeoutInterval: 5)
+        request.httpMethod = "POST"
+        request.setValue(token, forHTTPHeaderField: "X-Live-Session-Token")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+        let requestID = UUID()
+        personObservationQueue.async { [weak self] in
+            guard let self, self.personObservationRequest == nil,
+                  let current = LiveSessionState.credentials(),
+                  current.sessionID == sessionID, current.token == token,
+                  LiveSessionState.isEnabled(), ControlState.userWantsCapture() else { return }
+            let task = self.personObservationSession.dataTask(with: request) { [weak self] _, _, _ in
+                guard let self else { return }
+                self.personObservationQueue.async {
+                    guard self.personObservationRequestID == requestID else { return }
+                    self.personObservationRequest = nil
+                    self.personObservationRequestID = nil
+                }
+            }
+            self.personObservationRequestID = requestID
+            self.personObservationRequest = task
+            task.resume()
+        }
+    }
+
+    private func resetPersonObservationTransport() {
+        livePersonObserver.reset()
+        personObservationQueue.sync {
+            personObservationRequest?.cancel()
+            personObservationRequest = nil
+            personObservationRequestID = nil
+        }
     }
 
     private static func onlineCountPayload(lines: [OCRService.TextLine], roi: CGRect,

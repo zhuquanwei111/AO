@@ -99,7 +99,7 @@ class TranscriptContent(BaseModel):
 
 class PersonContent(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    signal: Literal["head_down"]
+    signal: Literal["head_down", "person_not_visible_candidate"]
     sample_count: int = Field(ge=5, le=100)
 
 
@@ -281,7 +281,9 @@ def build_candidate(observations: list[dict]) -> dict | None:
         if parsed:
             questions.setdefault(parsed[0], []).append(row)
     person = next((row for row in reversed(rows)
-                   if row["kind"] == "person_state" and row["content"]["signal"] == "head_down"), None)
+                   if row["kind"] == "person_state" and row["content"]["signal"] in {
+                       "head_down", "person_not_visible_candidate"
+                   }), None)
 
     # 体验担忧是比一般趋势/节奏提示更急的候选，但只依据评论原文。
     for row in reversed(comments):
@@ -386,7 +388,7 @@ def build_candidate(observations: list[dict]) -> dict | None:
                                   [left, right])
 
     for topic, topic_rows in questions.items():
-        if person:
+        if person and person["content"]["signal"] == "head_down":
             return _candidate("person_question", 40,
                               "持续低头候选与近期可见问题同时出现",
                               "你刚才持续低头了一会儿，抬头看一下镜头，再接住这个问题。",
@@ -397,6 +399,11 @@ def build_candidate(observations: list[dict]) -> dict | None:
                               "近期可见公屏重复出现同一问题主题",
                               f"近期重复出现“{label}”的问题，可以集中回应一次，再邀请大家接着聊。",
                               topic_rows[-2:])
+
+    if person and person["content"]["signal"] == "person_not_visible_candidate":
+        return _candidate("person:head_down", 20,
+                          "采样画面里持续暂未看到人物（候选）",
+                          "画面里暂未看到你，确认一下镜头位置。", [person])
 
     for topic_rows in questions.values():
         row = topic_rows[-1]

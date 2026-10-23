@@ -19,7 +19,7 @@ final class LivePersonObserver {
     private let vision = DispatchQueue(label: "com.screenassistant.live-person.vision", qos: .utility)
     private let context = CIContext(options: [.useSoftwareRenderer: false])
     /// 在Vision串行队列上调用；只接数值，处理应立即返回，不执行阻塞网络/媒体存储。
-    private let onObservation: ((LivePersonObservation) -> Void)?
+    private let onObservation: ((LivePersonObservation, String, String) -> Void)?
     private var nextSampleAt: TimeInterval = 0
     private var inFlight = false
     private var sourceToken: SourceToken?
@@ -38,7 +38,7 @@ final class LivePersonObserver {
         return URLSession(configuration: config)
     }()
 
-    init(onObservation: ((LivePersonObservation) -> Void)? = nil) {
+    init(onObservation: ((LivePersonObservation, String, String) -> Void)? = nil) {
         self.onObservation = onObservation
     }
 
@@ -154,7 +154,9 @@ final class LivePersonObserver {
                 }
                 return observation
             }
-            if let accepted { self.onObservation?(accepted) }
+            if let accepted {
+                self.onObservation?(accepted, token.sessionID, token.credentialToken)
+            }
         }
     }
 
