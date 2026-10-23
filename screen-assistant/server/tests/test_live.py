@@ -83,8 +83,8 @@ class ControlledOperationsModel:
     def __init__(self):
         self.observations = []
 
-    async def suggest_live(self, observation, description="", source="unknown", observed_at_ms=None):
-        self.observations.append((observation, description, source, observed_at_ms))
+    async def suggest_live(self, observation, description="", source="unknown", observed_at_ms=None, context=""):
+        self.observations.append((observation, description, source, observed_at_ms, context))
         return "顺着这个问题聊两句，再邀请大家分享。"
 
     async def ask(self, sentence):
@@ -118,7 +118,7 @@ def test_real_observation_model_prompt_poll_record_stop_and_isolation(tmp_path):
         assert generated.status_code == 200, generated.text
         result = generated.json()
         assert result["reason"] == "generated" and result["prompt_id"]
-        assert model.observations == [(body["text"], "", "ios_replaykit_ocr", clock.now)]
+        assert model.observations == [(body["text"], "", "ios_replaykit_ocr", clock.now, "")]
         # bbox 每帧会轻微漂移，但同题同来源同时间桶仍会抑制重放。
         replay = dict(body, event_id="ocr-observation-replay",
                       text_position={"x": 0.105, "y": 0.3, "width": 0.2, "height": 0.04})
@@ -182,7 +182,7 @@ def test_mixed_screen_lines_are_not_sent_as_one_comment_and_identity_stays_unkno
         response = client.post(url + "/comments", headers=headers, json=question_body)
         assert response.status_code == 200 and response.json()["reason"] == "generated"
         assert model.observations == [(
-            question_body["text"], "", "ios_replaykit_ocr", clock.now
+            question_body["text"], "", "ios_replaykit_ocr", clock.now, ""
         )]
         event = client.get(url + "/events", headers=headers).json()["events"][0]
         source = event["sources"][0]
@@ -213,6 +213,229 @@ def test_person_signal_candidate_is_recorded_with_confidence_and_cooldown(tmp_pa
         assert events[0]["phenomenon"] == "画面中可见人物持续低头"
         assert events[0]["sources"][0]["confidence"] == 0.82
         assert events[0]["observation_count"] == 6
+
+
+def test_typed_observations_fuse_by_time_and_platform_notice_preempts(tmp_path):
+    async def run():
+        clock = Clock()
+        app = create_app(settings(tmp_path / "live.sqlite3"), live_clock=clock)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://fixture") as client:
+                async def session():
+                    value = (await client.post("/v1/live/sessions", json={})).json()
+                    return value, {"X-Live-Session-Token": value["session_token"]}
+
+                async def post(url, headers, body):
+                    response = await client.post(url + "/observations", headers=headers, json=body)
+                    assert response.status_code == 200, response.text
+                    return response.json()
+
+                # 先留足启动时间，使观察区间落在本场内；读数故意以 1,3,2 的到达顺序送达。
+                clock.now += 10_000
+                value, headers = await session()
+                clock.now += 30_000
+                url = f"/v1/live/sessions/{value['session_id']}"
+                now = clock.now
+                count_payloads = []
+                for index, (offset, amount) in enumerate(((1_000, 1_800), (7_000, 2_500), (4_000, 2_100))):
+                    count_payloads.append({
+                        "kind": "online_count", "event_id": f"count-{index}",
+                        "source": "fixture:confirmed_online_region", "observed_at_ms": now-offset,
+                        "availability": "available", "coverage": "confirmed_online_field",
+                        "reliability": "known", "confidence": 0.96,
+                        "content": {"raw_text": f"在线人数 {amount}人", "field_semantics_confirmed": True},
+                    })
+                interaction = {
+                    "kind": "interaction", "event_id": "window-interaction",
+                    "source": "fixture:interaction_counter", "observed_at_ms": now,
+                    "started_at_ms": now-8_000, "ended_at_ms": now,
+                    "availability": "available", "coverage": "complete_window",
+                    "reliability": "known", "confidence": None,
+                    "content": {"count": 0, "window_started_at_ms": now-8_000,
+                                "window_ended_at_ms": now, "coverage_complete": True},
+                }
+                transcript = {
+                    "kind": "transcript", "event_id": "host-transcript",
+                    "source": "fixture:host_asr", "observed_at_ms": now,
+                    "started_at_ms": now-2_000, "ended_at_ms": now,
+                    "availability": "available", "coverage": "continuous",
+                    "reliability": "known", "confidence": None,
+                    "content": {"text": "刚才我们聊到这个话题", "segment_started_at_ms": now-2_000,
+                                "segment_ended_at_ms": now, "is_final": True,
+                                "speaker_is_host": True},
+                }
+                quiet = {
+                    "kind": "quality", "event_id": "unreliable-audio",
+                    "source": "audio:mic", "observed_at_ms": now,
+                    "availability": "unreliable", "coverage": "energy_sample",
+                    "reliability": "unknown", "confidence": None, "content": None,
+                }
+                assert (await post(url, headers, quiet))["reason"] == "source_unreliable"
+                results = await asyncio.gather(*[
+                    post(url, headers, payload)
+                    for payload in [count_payloads[0], count_payloads[1], count_payloads[2], interaction, transcript]
+                ])
+                events = (await client.get(url + "/events", headers=headers)).json()["events"]
+                assert len(events) == 1
+                event = events[0]
+                assert "互动不多" in event["display_text"] and "在线人数连续回落" in event["display_text"]
+                assert {item["kind"] for item in event["sources"]} == {
+                    "online_count", "interaction", "transcript"
+                }
+                assert event["observation_count"] == 5
+                assert all(item["source_verification"] == "declared_fixture_input"
+                           for item in event["sources"])
+                count_sources = [item for item in event["sources"] if item["kind"] == "online_count"]
+                assert all("raw_count_text" in item and item["parsed_count"] is not None
+                           for item in count_sources)
+                assert all(result["received_at_ms"] <= clock.now for result in results)
+
+                # 重复 event_id 幂等；过期读数与未配置字段不会进入数字趋势。
+                duplicate = await post(url, headers, count_payloads[0])
+                assert duplicate["reason"] == "duplicate_event"
+                missing = dict(count_payloads[0], event_id="missing-count", availability="missing", content=None)
+                assert (await post(url, headers, missing))["reason"] == "source_missing"
+                stale = dict(count_payloads[0], event_id="stale-count", observed_at_ms=now-20_000)
+                assert (await post(url, headers, stale))["reason"] == "late"
+                unconfirmed = dict(count_payloads[0], event_id="unknown-count",
+                                   content={"raw_text": "在线人数 9999人", "field_semantics_confirmed": False})
+                assert (await post(url, headers, unconfirmed))["reason"] == "field_semantics_unconfirmed"
+
+                # 新场次中，候选人物状态与可见问题组成一句；随后明确平台提示越过融合等待并抢占。
+                clock.now += 5_000
+                second, h2 = await session()
+                clock.now += 5_000
+                u2 = f"/v1/live/sessions/{second['session_id']}"
+                now2 = clock.now
+                person = {
+                    "kind": "person_state", "event_id": "head-down",
+                    "source": "fixture:vision_person", "observed_at_ms": now2,
+                    "started_at_ms": now2-5_000, "ended_at_ms": now2,
+                    "availability": "available", "coverage": "vision_pose_sample",
+                    "reliability": "known", "confidence": 0.83,
+                    "content": {"signal": "head_down", "sample_count": 6},
+                }
+                comment = {
+                    "kind": "comment", "event_id": "visible-question", "source": "fixture:ocr_comment",
+                    "observed_at_ms": now2, "availability": "available",
+                    "coverage": "ocr_visible_sample", "reliability": "known", "confidence": 0.88,
+                    "content": {"text": "主播你是哪里人？", "text_position": None,
+                                "author_id": None, "platform_message_id": None},
+                }
+                await asyncio.gather(post(u2, h2, person), post(u2, h2, comment))
+                fused = (await client.get(u2 + "/events", headers=h2)).json()["events"]
+                assert len(fused) == 1 and "持续低头" in fused[0]["phenomenon"]
+                assert len(fused[0]["sources"]) == 2
+
+                clock.now += 5_000
+                repeated_session, hr = await session()
+                ur = f"/v1/live/sessions/{repeated_session['session_id']}"
+                repeat_rows = [dict(comment, event_id=f"repeat-question-{index}",
+                                    source="fixture:ocr_comment", observed_at_ms=clock.now,
+                                    content={"text": "主播你是哪里人？",
+                                             "text_position": {"x": 0.2 + index * 0.2, "y": 0.6,
+                                                                "width": 0.3, "height": 0.04},
+                                             "author_id": None, "platform_message_id": None})
+                               for index in range(2)]
+                await asyncio.gather(*(post(ur, hr, row) for row in repeat_rows))
+                repeated = (await client.get(ur + "/events", headers=hr)).json()["events"]
+                assert len(repeated) == 1 and "重复出现同一问题主题" in repeated[0]["phenomenon"]
+                assert len(repeated[0]["sources"]) == 2
+
+                # 警告明确来自已核对提醒区，原文证据保留，且优先于普通评论模型任务。
+                third, h3 = await session()
+                u3 = f"/v1/live/sessions/{third['session_id']}"
+                normal_comment = dict(comment, event_id="ordinary-question", observed_at_ms=clock.now)
+                ordinary_task = asyncio.create_task(post(u3, h3, normal_comment))
+                await asyncio.sleep(0.03)
+                notice = {
+                    "kind": "platform_notice", "event_id": "confirmed-warning",
+                    "source": "fixture:platform_notice_region", "observed_at_ms": clock.now,
+                    "availability": "available", "coverage": "confirmed_notice_region",
+                    "reliability": "known", "confidence": 0.96,
+                    "content": {"text": "请调整直播内容", "region_confirmed": True,
+                                "explicit_warning_confirmed": True},
+                }
+                warning_result = await post(u3, h3, notice)
+                await ordinary_task
+                assert warning_result["reason"] == "generated"
+                warning_events = (await client.get(u3 + "/events", headers=h3)).json()["events"]
+                assert len(warning_events) == 1
+                assert warning_events[0]["sources"][0]["evidence_text"] == "请调整直播内容"
+                assert "请调整直播内容" in warning_events[0]["display_text"]
+                stopped = await client.post(u3 + "/stop", headers=h3)
+                assert stopped.status_code == 200
+                after_stop = await client.post(u3 + "/observations", headers=h3, json=normal_comment)
+                assert after_stop.status_code == 409
+
+    asyncio.run(run())
+
+
+def test_stopped_session_online_count_peak_weighted_average_and_gaps(tmp_path):
+    clock = Clock()
+    with TestClient(create_app(settings(tmp_path / "live.sqlite3"), live_clock=clock)) as client:
+        session, headers = create(client)
+        sid = session["session_id"]
+        url = f"/v1/live/sessions/{sid}"
+
+        def submit(event_id, raw_text=None, *, availability="available", field_confirmed=True):
+            body = {
+                "kind": "online_count", "event_id": event_id,
+                "source": "fixture:calibrated_online_field", "observed_at_ms": clock.now,
+                "availability": availability, "coverage": "calibrated_online_field",
+                "reliability": "known", "confidence": 0.94,
+                "content": ({"raw_text": raw_text, "field_semantics_confirmed": field_confirmed}
+                            if availability == "available" else None),
+            }
+            response = client.post(url + "/observations", headers=headers, json=body)
+            assert response.status_code == 200, response.text
+            return response.json()
+
+        assert submit("count-100", "在线人数 100人")["reason"] == "windowed"
+        clock.now += 2_000
+        assert submit("count-200", "在线人数 200人")["reason"] == "windowed"
+        clock.now += 6_000
+        assert submit("count-400", "在线人数约0.4千")["reason"] == "windowed"
+        clock.now += 2_000
+        assert submit("count-missing", availability="missing")["reason"] == "source_missing"
+        clock.now += 16_000
+        assert submit("count-500", "在线人数约0.5千")["reason"] == "windowed"
+        assert client.post(url + "/stop", headers=headers).status_code == 200
+
+        summary = client.get(url + "/summary", headers=headers)
+        assert summary.status_code == 200, summary.text
+        data = summary.json()["online_count"]
+        assert data["status"] == "available"
+        assert data["peak"] == {
+            "nominal_value": 500, "raw_text": "在线人数约0.5千", "approximate": True,
+            "observed_at_ms": clock.now, "confidence": 0.94,
+        }
+        assert data["time_weighted_average"] == {
+            "nominal_value": 175.0, "approximate": True,
+            "method": "previous_sample_hold_between_valid_observations",
+        }
+        assert data["coverage"]["covered_duration_ms"] == 8_000
+        assert data["coverage"]["uncovered_between_samples_ms"] == 18_000
+        assert data["coverage"]["sample_issues"] == {"source_missing": 1}
+        assert summary.json()["online_count_by_source"][0]["source_verification"] == "declared_fixture_input"
+
+        empty, empty_headers = create(client)
+        empty_url = f"/v1/live/sessions/{empty['session_id']}"
+        unknown_time = {
+            "kind": "online_count", "event_id": "count-without-time",
+            "source": "fixture:calibrated_online_field",
+            "availability": "available", "coverage": "calibrated_online_field",
+            "reliability": "known", "confidence": None,
+            "content": {"raw_text": "在线人数 900人", "field_semantics_confirmed": True},
+        }
+        unknown_result = client.post(empty_url + "/observations", headers=empty_headers, json=unknown_time)
+        assert unknown_result.status_code == 200
+        assert unknown_result.json()["reason"] == "observation_time_unknown"
+        client.post(empty_url + "/stop", headers=empty_headers)
+        empty_summary = client.get(empty_url + "/summary", headers=empty_headers).json()["online_count"]
+        assert empty_summary["status"] == "unknown"
+        assert empty_summary["peak"] is None and empty_summary["time_weighted_average"] is None
+        assert empty_summary["coverage"]["sample_issues"] == {"observation_time_unknown": 1}
 
 
 def test_fixture_loop_dedup_independent_questions_and_reopen(tmp_path):
