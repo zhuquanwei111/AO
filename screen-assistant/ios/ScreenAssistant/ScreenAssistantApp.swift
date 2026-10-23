@@ -43,6 +43,10 @@ final class AppModel: ObservableObject {
     @Published var liveEvents: [LivePrompt] = []
     @Published var liveSummary: LiveSessionSummary?
     @Published var liveActive = false
+    @Published var audioSettings: AudioCaptureSettings {
+        didSet { AudioCaptureSettings.save(audioSettings) }
+    }
+    @Published var audioStatus = AudioCaptureStatus()
 
     private var timer: AnyCancellable?
     private var liveCredentials: LiveSessionCredentials?
@@ -58,6 +62,12 @@ final class AppModel: ObservableObject {
         onlineCountROI = SharedConfig.onlineCountROI()
         platformNoticeROI = SharedConfig.platformNoticeROI()
         captureWanted = ControlState.userWantsCapture()
+        audioSettings = AudioCaptureSettings.load()
+        if LiveSessionState.credentials() == nil {
+            audioSettings.appHostConfirmed = false
+            audioSettings.micHostConfirmed = false
+            AudioCaptureSettings.save(audioSettings)
+        }
         liveActive = LiveSessionState.credentials() != nil
         roundCounter = ControlState.roundCounter()
 
@@ -67,6 +77,7 @@ final class AppModel: ObservableObject {
             .autoconnect()
             .sink { [weak self] _ in
                 guard let self else { return }
+                self.audioStatus = AudioCaptureStatus.load()
                 let latest = ControlState.roundCounter()
                 if latest != self.roundCounter {
                     self.roundCounter = latest
@@ -143,6 +154,8 @@ final class AppModel: ObservableObject {
                     return
                 }
                 LiveSessionState.clear()
+                self.audioSettings.appHostConfirmed = false
+                self.audioSettings.micHostConfirmed = false
                 self.liveActive = false
                 self.liveCredentials = nil
                 self.liveStatus = "已结束，正在读取本场记录"
@@ -170,6 +183,8 @@ final class AppModel: ObservableObject {
                         self.liveStatus = "服务端场次已停止"
                         self.liveActive = false
                         LiveSessionState.clear()
+                        self.audioSettings.appHostConfirmed = false
+                        self.audioSettings.micHostConfirmed = false
                         self.loadStoppedOverview(credentials, client: client)
                     } else {
                         self.liveStatus = "直播辅助运行中"

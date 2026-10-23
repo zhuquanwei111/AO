@@ -39,12 +39,14 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
     private lazy var inputDiagnostics = InputDiagnosticsSampler(context: ciContext)
     private let livePersonObserver = LivePersonObserver()
+    private let continuousAudio = ContinuousAudioCapture()
     private let memoryLog = Logger(subsystem: "com.screenassistant.broadcast", category: "ocr-memory")
     // 40MB 为待验证工作预算、50MB 为历史风险参考；均非系统硬保证。
 
     // MARK: - 生命周期
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
+        continuousAudio.transition(running: true)
         inputDiagnostics.transition(to: .running)
         stateQueue.sync {
             nextRoundEligibleTime = 0
@@ -56,6 +58,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     override func broadcastPaused() {
+        continuousAudio.transition(running: false)
         inputDiagnostics.transition(to: .paused)
         stateQueue.sync {
             isBroadcastPaused = true
@@ -66,6 +69,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     override func broadcastResumed() {
+        continuousAudio.transition(running: true)
         inputDiagnostics.transition(to: .running)
         stateQueue.sync {
             isBroadcastPaused = false
@@ -77,6 +81,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     override func broadcastFinished() {
+        continuousAudio.transition(running: false)
         inputDiagnostics.transition(to: .finished)
         stateQueue.sync {
             roundGeneration &+= 1
@@ -93,6 +98,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
                                       with sampleBufferType: RPSampleBufferType) {
         // 原始输入诊断独立于视频筛选、OCR开关、轮次忙闲和远端响应。
         inputDiagnostics.observe(sampleBuffer, type: sampleBufferType)
+        continuousAudio.observe(sampleBuffer, type: sampleBufferType)
         guard sampleBufferType == .video else { return }
         livePersonObserver.observe(sampleBuffer)
 

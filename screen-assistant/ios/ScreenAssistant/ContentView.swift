@@ -6,15 +6,18 @@ import ReplayKit
 /// 用户点击后在系统弹窗中确认。
 struct BroadcastPickerSection: UIViewRepresentable {
     static let extensionBundleID = "com.screenassistant.ios.broadcast"
+    var showsMicrophoneButton = false
 
     func makeUIView(context: Context) -> RPSystemBroadcastPickerView {
         let view = RPSystemBroadcastPickerView()
         view.preferredExtension = Self.extensionBundleID
-        view.showsMicrophoneButton = false
+        view.showsMicrophoneButton = showsMicrophoneButton
         return view
     }
 
-    func updateUIView(_ uiView: RPSystemBroadcastPickerView, context: Context) {}
+    func updateUIView(_ uiView: RPSystemBroadcastPickerView, context: Context) {
+        uiView.showsMicrophoneButton = showsMicrophoneButton
+    }
 }
 
 struct ContentView: View {
@@ -138,7 +141,8 @@ struct ContentView: View {
                 Section(header: Text("采集"),
                         footer: Text(startGuide)) {
                     Toggle("识别开关（扩展按此决定是否处理）", isOn: $model.captureWanted)
-                    BroadcastPickerSection()
+                    BroadcastPickerSection(showsMicrophoneButton: model.audioSettings.enabled &&
+                        model.audioSettings.includes("audioMic"))
                     HStack {
                         Text("已处理轮次")
                         Spacer()
@@ -147,6 +151,32 @@ struct ContentView: View {
                         if let t = model.lastUpdated {
                             Text("（\(t, style: .time)）")
                                 .foregroundColor(.secondary)
+                        }
+                    }
+                }
+
+                Section(header: Text("语音辅助（待设备验证）"),
+                        footer: Text("仅处理系统已经交付的音轨。麦克风由你在系统广播面板手动选择；显示按钮不会自动开启麦克风。先用唯一短词核对音轨和原直播收音；音乐、他人声或来源不明时不要确认主播声。")) {
+                    Toggle("允许连续音频分析（默认关闭）", isOn: $model.audioSettings.enabled)
+                    if model.audioSettings.enabled {
+                        Picker("分析音轨", selection: $model.audioSettings.source) {
+                            Text("应用音轨 audioApp").tag("audioApp")
+                            Text("麦克风音轨 audioMic").tag("audioMic")
+                            Text("两轨分别分析").tag("both")
+                        }.disabled(model.liveActive)
+                        if model.audioSettings.includes("audioApp") {
+                            Toggle("短词核对：应用音轨仅含主播声", isOn: $model.audioSettings.appHostConfirmed)
+                        }
+                        if model.audioSettings.includes("audioMic") {
+                            Toggle("短词核对：麦克风轨仅含主播声", isOn: $model.audioSettings.micHostConfirmed)
+                        }
+                        Text("未确认时转写仅作参考，不生成语速或停顿结论。")
+                            .font(.footnote).foregroundColor(.secondary)
+                        Text(model.audioStatus.phase).font(.footnote)
+                        Text("应用块 \(model.audioStatus.copiedApp) · 麦克风块 \(model.audioStatus.copiedMic) · 已送包 \(model.audioStatus.uploaded) · 丢弃 \(model.audioStatus.dropped)")
+                            .font(.caption).foregroundColor(.secondary)
+                        if let issue = model.audioStatus.issue {
+                            Text(issue).font(.footnote).foregroundColor(.orange)
                         }
                     }
                 }
