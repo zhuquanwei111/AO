@@ -243,7 +243,7 @@ final class PiPDisplayController: NSObject, ObservableObject {
             guard let self, self.pipController != nil else { return }
             let text = PiPTextFormatter.plainText(rawText)
             guard !text.isEmpty else { return }
-            let comparisonText = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            let comparisonText = text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
             guard comparisonText != self.lastDisplayedText || kind != self.lastDisplayedKind else {
                 return
             }
@@ -483,7 +483,18 @@ private enum PiPTextFormatter {
         var text = source.replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
 
-        // 代码围栏只作边界标记；保留围栏内的代码正文。
+        // 暂存围栏正文，避免把其中合法的 #、列表符等当作排版前缀清掉。
+        var fencedBlocks: [String: String] = [:]
+        let fencePattern = #"(?ms)^[ \t]*```[^\n]*\n(.*?)^[ \t]*```[ \t]*$"#
+        if let expression = try? NSRegularExpression(pattern: fencePattern) {
+            let nsText = text as NSString
+            let matches = expression.matches(in: text, range: NSRange(location: 0, length: nsText.length))
+            for (index, match) in matches.enumerated().reversed() {
+                let token = "PIPFENCEDBLOCK\(index)END"
+                fencedBlocks[token] = nsText.substring(with: match.range(at: 1))
+                text = (text as NSString).replacingCharacters(in: match.range, with: token)
+            }
+        }
         text = replacing(#"(?m)^[ \t]*```[^\n]*[ \t]*$"#, in: text, with: "")
         text = replacing(#"(?m)^[ \t]{0,3}#{1,6}[ \t]+"#, in: text, with: "")
         text = replacing(#"(?m)^[ \t]{0,3}>[ \t]?"#, in: text, with: "")
@@ -510,7 +521,11 @@ private enum PiPTextFormatter {
             compactLines.append(line)
             previousWasBlank = isBlank
         }
-        return compactLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        text = compactLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        for (token, block) in fencedBlocks {
+            text = text.replacingOccurrences(of: token, with: block)
+        }
+        return text
     }
 
     private static func replacing(_ pattern: String, in text: String, with template: String) -> String {
