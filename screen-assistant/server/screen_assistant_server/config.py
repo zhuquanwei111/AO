@@ -37,9 +37,11 @@ class Settings:
     model_connect_timeout_seconds: float
     live_db_path: str = "data/live.sqlite3"
     audio_enabled: bool = False
+    # 保留旧配置形状；生产音频已改用funasr_model_path，不再连接WebSocket。
     funasr_url: str = ""
     funasr_mode: str = "online"
     silero_model_path: str = ""
+    funasr_model_path: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -58,4 +60,5 @@ class Settings:
             funasr_url=os.getenv("FUNASR_WS_URL", ""),
             funasr_mode=os.getenv("FUNASR_MODE", "online"),
             silero_model_path=os.getenv("SILERO_ONNX_PATH", ""),
+            funasr_model_path=os.getenv("FUNASR_MODEL_PATH", ""),
         )

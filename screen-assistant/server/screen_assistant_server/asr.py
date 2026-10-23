@@ -1,4 +1,4 @@
-"""现成Silero VAD / FunASR WebSocket薄适配；不下载模型、不保存音频。"""
+"""现成Silero VAD / FunASR官方流式SDK薄适配；只加载已有本地模型。"""
 from __future__ import annotations
 
 import asyncio
@@ -35,8 +35,75 @@ class SileroVAD:
         return [(int(row["start"]), int(row["end"])) for row in regions]
 
 
+class FunASRSDK:
+    """直接复用官方600ms流式示例；offload由现有AudioService提供。"""
+    def __init__(self, model_path: str, offload):
+        self.model_path, self.offload = model_path, offload
+        self.model = None
+        # AutoModel.generate会修改内部kwargs，不能并发访问同一模型。
+        self.lock = asyncio.Lock()
+
+    def _load(self):
+        path = Path(self.model_path)
+        if not path.is_dir() or any(not (path / name).is_file() for name in (
+            "model.pt", "config.yaml", "configuration.json", "tokens.json", "am.mvn", "seg_dict"
+        )):
+            raise AudioEngineUnavailable("prepared local Paraformer directory required")
+        from funasr import AutoModel
+        self.model = AutoModel(model=str(path.resolve()), device="cpu", ncpu=4,
+                               disable_update=True, disable_pbar=True)
+
+    async def prepare(self):
+        async with self.lock:
+            if self.model is None:
+                # 首次加载也在后台；在窗口分析期限开始前完成准备。
+                await self.offload(self._load)
+
+    def _chunk(self, pcm, cache, final):
+        import numpy as np
+        samples = np.frombuffer(pcm, dtype="<i2").astype("float32") / 32768
+        result = self.model.generate(
+            input=samples, cache=cache, is_final=final, chunk_size=[0, 10, 5],
+            encoder_chunk_look_back=4, decoder_chunk_look_back=1,
+        )
+        if not isinstance(result, list) or len(result) != 1:
+            raise AudioEngineUnavailable("invalid FunASR SDK result")
+        text = result[0].get("text", "")
+        if not isinstance(text, str) or len(text) > 500:
+            raise AudioEngineUnavailable("invalid FunASR SDK transcript")
+        return text
+
+    async def transcribe(self, pcm: bytes, segment_id: str, emit):
+        if not pcm or len(pcm) % 2 or len(pcm) > 192000:
+            raise AudioEngineUnavailable("SDK requires a bounded PCM speech segment")
+        await self.prepare()
+        async with self.lock:
+            cache, text = {}, ""
+            try:
+                for offset in range(0, len(pcm), 19200):
+                    final = offset+19200 >= len(pcm)
+                    delta = await self.offload(self._chunk, pcm[offset:offset+19200], cache, final)
+                    text += delta
+                    if len(text) > 500:
+                        raise AudioEngineUnavailable("FunASR SDK segment transcript too long")
+                    # 空末块不增字；只把已识别的累计文字提交final。
+                    if text and (delta or final):
+                        await emit(text, final, "online")
+            finally:
+                cache.clear()
+
+    async def aclose(self):
+        async with self.lock:
+            await self.offload(self._release)
+
+    def _release(self):
+        self.model = None
+
+
 class FunASRConnection:
-    """每个VAD语段一条有界连接；online为增量，2pass-offline替换当前句。
+    """历史WebSocket适配，仅保留原协议回归；生产AudioService使用FunASRSDK。
+
+    每个VAD语段一条有界连接；online为增量，2pass-offline替换当前句。
 
     文本在段内按官方客户端的增量语义累计。句尾发送结束标志，未收到结束确认
     不把中间结果升级final。2pass内部多句无时间戳时不用于精确停顿。

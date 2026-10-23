@@ -10,12 +10,11 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from typing import Literal
-from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from .asr import AudioEngineUnavailable, FunASRConnection, SileroVAD
+from .asr import AudioEngineUnavailable, FunASRSDK, SileroVAD
 
 router = APIRouter(prefix="/v1/live/sessions", tags=["audio"])
 RATE, WINDOW_FRAMES, MAX_TRACKS = 16000, 96000, 16
@@ -128,7 +127,7 @@ class AudioService:
         self.closing: set[str] = set()
         self.body_readers: dict[str, int] = {}
         self.vad_factory = lambda: SileroVAD(settings.silero_model_path)
-        self.asr = FunASRConnection(settings.funasr_url, mode=settings.funasr_mode)
+        self.asr = FunASRSDK(settings.funasr_model_path, self.offload)
         self.reaper = asyncio.create_task(self.reap()) if settings.audio_enabled else None
 
     async def expire(self):
@@ -164,13 +163,8 @@ class AudioService:
     def configured(self):
         if not self.settings.audio_enabled:
             raise HTTPException(503, "audio adapter disabled")
-        if self.settings.funasr_mode not in {"online", "2pass"}:
-            raise HTTPException(503, "unsupported FunASR mode")
-        url = urlsplit(self.settings.funasr_url)
-        # 仅明确的本机分析服务；不接付费云、不接任意上传目标。
-        if (url.scheme not in {"ws", "wss"} or url.hostname not in {"127.0.0.1", "localhost", "::1"}
-                or url.username or url.password or url.query or url.fragment):
-            raise HTTPException(503, "local FunASR WebSocket URL required")
+        if not self.settings.funasr_model_path:
+            raise HTTPException(503, "local FunASR model directory required")
 
     async def ingest(self, sid, token, packet: AudioPacket):
         session = await self.access(sid, token)
@@ -202,6 +196,8 @@ class AudioService:
         try:
             if track.vad is None:
                 track.vad = await self.offload(self.vad_factory)
+                if isinstance(self.asr, FunASRSDK):
+                    await self.asr.prepare()
             if track.stream_id != packet.stream_id:
                 if packet.sequence != 0:
                     raise HTTPException(409, "new audio capture must start at sequence zero")
@@ -458,6 +454,8 @@ class AudioService:
             job.cancel()
         await asyncio.gather(*jobs, return_exceptions=True)
         self.tracks.clear()
+        if isinstance(self.asr, FunASRSDK):
+            await self.asr.aclose()
 
 
 @router.post("/{session_id}/audio")

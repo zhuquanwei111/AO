@@ -47,7 +47,7 @@ class ASRFixture:
 
 def enabled_settings(path):
     return replace(settings(path), audio_enabled=True, funasr_url="ws://127.0.0.1:10095",
-                   silero_model_path="fixture-only")
+                   silero_model_path="fixture-only", funasr_model_path="fixture-only")
 
 
 def fixture_app(tmp_path, clock, regions=None):
