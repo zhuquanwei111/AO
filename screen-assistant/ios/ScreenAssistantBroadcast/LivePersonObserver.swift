@@ -4,114 +4,185 @@ import CoreImage
 import CoreMedia
 import CoreVideo
 import ImageIO
-import Vision
 
-/// 仅在运营场次中对已交付视频帧做低频 Vision 姿态观察；单在途、小图、无画面不作离镜结论。
+/// 低频、单在途人物观察。默认保留旧head_down出口；新观测须由集成方接线。
 final class LivePersonObserver {
+    private struct SourceToken: Equatable {
+        let sessionID: String
+        let credentialToken: String
+        let captureGeneration: Int
+        let broadcastSegment: String
+        let region: DiagnosticRegion
+        let orientation: UInt32
+    }
     private let state = DispatchQueue(label: "com.screenassistant.live-person.state")
     private let vision = DispatchQueue(label: "com.screenassistant.live-person.vision", qos: .utility)
     private let context = CIContext(options: [.useSoftwareRenderer: false])
+    /// 在Vision串行队列上调用；只接数值，处理应立即返回，不执行阻塞网络/媒体存储。
+    private let onObservation: ((LivePersonObservation) -> Void)?
     private var nextSampleAt: TimeInterval = 0
     private var inFlight = false
-    private var downCount = 0
-    private var downStartedAtMS: Int64 = 0
-    private var lastPromptAt: TimeInterval = 0
+    private var sourceToken: SourceToken?
+    private var segmentID = UUID().uuidString
+    private var sequence = 0
+    private var previousGray: [Double]?
+    private var lastPTS: Double?
+    private var lastSampleUptime: TimeInterval?
+    private var headWindow = PersonHeadWindow()
+    private var pendingSignal: URLSessionDataTask?
+    private var signalID: UUID?
+    private let network: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 20
+        config.timeoutIntervalForResource = 25
+        return URLSession(configuration: config)
+    }()
+
+    init(onObservation: ((LivePersonObservation) -> Void)? = nil) {
+        self.onObservation = onObservation
+    }
+
+    /// 可供统一生命周期接线直接调用；不提前释放旧Vision槽位。
+    func reset() { state.sync { invalidate() } }
+
+    private func invalidate() {
+        sourceToken = nil
+        segmentID = UUID().uuidString
+        sequence = 0
+        previousGray = nil
+        lastPTS = nil
+        lastSampleUptime = nil
+        nextSampleAt = 0
+        headWindow.start(segmentID)
+        pendingSignal?.cancel()
+        pendingSignal = nil
+        signalID = nil
+    }
+
+    private static func token(orientation: UInt32) -> SourceToken? {
+        guard LiveSessionState.isEnabled(), ControlState.userWantsCapture(),
+              let credentials = LiveSessionState.credentials(),
+              let snapshot = InputDiagnosticsStore.snapshot(),
+              snapshot.phase != .paused, snapshot.phase != .finished else { return nil }
+        // M1的生命周期转换即使诊断关闭也更换segment；不要求开启60秒检查。
+        return SourceToken(sessionID: credentials.sessionID, credentialToken: credentials.token,
+                           captureGeneration: ControlState.captureGeneration(),
+                           broadcastSegment: snapshot.segmentID,
+                           region: InputDiagnosticsStore.configuration().region.clamped,
+                           orientation: orientation)
+    }
 
     func observe(_ sample: CMSampleBuffer) {
         guard LiveSessionState.isEnabled(), ControlState.userWantsCapture(),
               CMSampleBufferIsValid(sample), CMSampleBufferDataIsReady(sample),
               let pixels = CMSampleBufferGetImageBuffer(sample) else {
-            state.async { self.resetPose(); self.nextSampleAt = 0 }
+            reset()
             return
         }
         let uptime = ProcessInfo.processInfo.systemUptime
-        let shouldSample = state.sync { () -> Bool in
+        let reserved = state.sync { () -> Bool in
             guard !inFlight, uptime >= nextSampleAt else { return false }
             nextSampleAt = uptime + 3
             inFlight = true
             return true
         }
-        guard shouldSample else { return }
+        guard reserved else { return }
         var orientation = CGImagePropertyOrientation.up
         if let raw = CMGetAttachment(sample, key: RPVideoSampleOrientationKey as CFString,
                                      attachmentModeOut: nil) as? NSNumber {
             orientation = CGImagePropertyOrientation(rawValue: raw.uint32Value) ?? .up
         }
+        guard let token = Self.token(orientation: orientation.rawValue) else {
+            state.sync { inFlight = false; invalidate(); nextSampleAt = uptime + 3 }
+            return
+        }
+        let seconds = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample))
+        let pts = seconds.isFinite ? seconds : nil
+        let work = state.sync { () -> (String, Int, [Double]?, Bool) in
+            if sourceToken != token || lastSampleUptime.map({ uptime - $0 > 6.5 }) == true ||
+                (pts != nil && lastPTS != nil && pts! < lastPTS!) {
+                invalidate()
+                sourceToken = token
+            }
+            let fresh = pts != nil && (lastPTS == nil || pts! > lastPTS!)
+            if fresh { lastPTS = pts }
+            lastSampleUptime = uptime
+            nextSampleAt = uptime + 3
+            sequence = min(sequence + 1, Int.max - 1)
+            return (segmentID, sequence, previousGray, fresh)
+        }
         guard let image = autoreleasepool(invoking: { () -> CGImage? in
             var frame = CIImage(cvPixelBuffer: pixels).oriented(orientation)
             let extent = frame.extent
             guard extent.width > 0, extent.height > 0 else { return nil }
-            // 复用 M1 诊断页持久化的独立选区；只读其位置，不受诊断默认关闭/60秒窗控制。
-            let region = InputDiagnosticsStore.configuration().region.clamped
-            let crop = CGRect(
-                x: extent.minX + CGFloat(region.x) * extent.width,
-                y: extent.minY + CGFloat(1 - region.y - region.height) * extent.height,
-                width: CGFloat(region.width) * extent.width,
-                height: CGFloat(region.height) * extent.height
-            ).intersection(extent)
-            guard !crop.isNull, crop.width > 0, crop.height > 0 else { return nil }
+            let r = token.region
+            let crop = CGRect(x: extent.minX + CGFloat(r.x) * extent.width,
+                              y: extent.minY + CGFloat(1 - r.y - r.height) * extent.height,
+                              width: CGFloat(r.width) * extent.width,
+                              height: CGFloat(r.height) * extent.height).intersection(extent)
+            guard !crop.isNull, crop.width >= 96, crop.height >= 96 else { return nil }
             frame = frame.cropped(to: crop)
-            let scale = min(1, 512 / max(frame.extent.width, frame.extent.height))
+            let scale = min(1, 512 / max(crop.width, crop.height))
             frame = frame.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
             return context.createCGImage(frame, from: frame.extent)
         }) else {
-            state.async { self.inFlight = false; self.resetPose() }
+            state.sync { inFlight = false; invalidate(); nextSampleAt = uptime + 3 }
             return
         }
         let observedAtMS = Int64(Date().timeIntervalSince1970 * 1000)
         vision.async { [weak self] in
             guard let self else { return }
-            let request = VNDetectHumanBodyPoseRequest()
-            var result = (false, 0.0)
-            do {
-                try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
-                result = Self.isHeadDown(request.results?.first)
-            } catch {
-                result = (false, 0)
-            }
-            self.state.async {
+            var result = autoreleasepool { PersonVisionFeatures.inspect(image, previous: work.2) }
+            if !work.3 { result.quality = "source_timestamp_unknown_or_stalled" }
+            let currentToken = Self.token(orientation: token.orientation)
+            let accepted = self.state.sync { () -> LivePersonObservation? in
                 self.inFlight = false
-                guard LiveSessionState.isEnabled(), ControlState.userWantsCapture() else {
-                    self.resetPose()
-                    return
+                guard self.segmentID == work.0, self.sourceToken == token, currentToken == token,
+                      ProcessInfo.processInfo.systemUptime - uptime < 6.5 else {
+                    self.invalidate()
+                    return nil
                 }
-                guard result.0 else {
-                    // 无姿态或不可读帧只重置连续窗口；不把它解释成离镜。
-                    self.resetPose()
-                    return
+                self.previousGray = result.gray.isEmpty ? nil : result.gray
+                let observation = LivePersonObservation(
+                    segmentID: work.0, sequence: work.1, observedAtMS: observedAtMS,
+                    uptimeMS: Int64(uptime * 1000), quality: result.quality,
+                    personCount: result.count, confidence: result.confidence, personBox: result.box,
+                    bodyVector: result.body, faceVector: result.face, headRatio: result.headRatio,
+                    headConfidence: result.headConfidence, ptsSeconds: pts)
+                if let candidate = self.headWindow.consume(observation) {
+                    self.submitLegacy(candidate, token: token)
                 }
-                if self.downCount == 0 { self.downStartedAtMS = observedAtMS }
-                self.downCount += 1
-                let elapsed = observedAtMS - self.downStartedAtMS
-                guard self.downCount >= 6, elapsed >= 15_000,
-                      self.lastPromptAt == 0 || ProcessInfo.processInfo.systemUptime - self.lastPromptAt >= 90 else { return }
-                self.lastPromptAt = ProcessInfo.processInfo.systemUptime
-                let started = self.downStartedAtMS
-                let count = self.downCount
-                guard let baseURL = SharedConfig.serverBaseURL(),
-                      let client = LiveOperationsClient(baseURL: baseURL) else { return }
-                client.submitPersonSignal(startedAtMS: started, observedAtMS: observedAtMS,
-                                          confidence: result.1, sampleCount: count) { }
+                return observation
+            }
+            if let accepted { self.onObservation?(accepted) }
+        }
+    }
+
+    private func submitLegacy(_ candidate: PersonHeadCandidate, token: SourceToken) {
+        guard pendingSignal == nil, let base = SharedConfig.serverBaseURL() else { return }
+        let url = ["v1", "live", "sessions", token.sessionID, "signals"].reduce(base) {
+            $0.appendingPathComponent($1, isDirectory: false)
+        }
+        var request = URLRequest(url: url, timeoutInterval: 20)
+        request.httpMethod = "POST"
+        request.setValue(token.credentialToken, forHTTPHeaderField: "X-Live-Session-Token")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // Shared客户端在调用时重读凭据；此薄适配固定取样时场次，防旧观测发给新场。
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "event_id": UUID().uuidString.lowercased(), "source": "ios_replaykit_vision",
+            "signal": "head_down", "confidence": candidate.confidence,
+            "sample_count": candidate.sampleCount, "started_at_ms": candidate.startedAtMS,
+            "observed_at_ms": candidate.observedAtMS
+        ])
+        let id = UUID()
+        signalID = id
+        let task = network.dataTask(with: request) { [weak self] _, _, _ in
+            guard let self else { return }
+            self.state.async {
+                if self.signalID == id { self.pendingSignal = nil; self.signalID = nil }
             }
         }
-    }
-
-    private func resetPose() {
-        downCount = 0
-        downStartedAtMS = 0
-    }
-
-    private static func isHeadDown(_ observation: VNHumanBodyPoseObservation?) -> (Bool, Double) {
-        guard let observation,
-              let nose = try? observation.recognizedPoint(.nose),
-              let left = try? observation.recognizedPoint(.leftShoulder),
-              let right = try? observation.recognizedPoint(.rightShoulder),
-              nose.confidence >= 0.45, left.confidence >= 0.45, right.confidence >= 0.45 else {
-            return (false, 0)
-        }
-        let shouldersY = (left.location.y + right.location.y) / 2
-        let verticalGap = nose.location.y - shouldersY
-        let confidence = min(nose.confidence, min(left.confidence, right.confidence))
-        return (verticalGap < 0.065, Double(confidence))
+        pendingSignal = task
+        task.resume()
     }
 }
