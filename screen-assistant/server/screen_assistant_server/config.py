@@ -35,6 +35,7 @@ class Settings:
     max_sentence_chars: int
     model_timeout_seconds: float
     model_connect_timeout_seconds: float
+    live_db_path: str = "data/live.sqlite3"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -48,4 +49,5 @@ class Settings:
             max_sentence_chars=_env_int("MAX_SENTENCE_CHARS", 2000),
             model_timeout_seconds=_env_float("MODEL_TIMEOUT_SECONDS", 30.0),
             model_connect_timeout_seconds=_env_float("MODEL_CONNECT_TIMEOUT_SECONDS", 5.0),
+            live_db_path=os.getenv("LIVE_DB_PATH", "data/live.sqlite3"),
         )
