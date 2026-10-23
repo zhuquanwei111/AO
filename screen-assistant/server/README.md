@@ -169,4 +169,97 @@ MISCONF（详见上方「重要」），写命令全拒、服务按契约 503；
 - 模型失败且此刻 Redis 恰好不可用 → 占位无法立即释放，该句在 TTL 内会得到 204（保留旧
   展示）；TTL 过期后自动恢复可重试。占位值是随机 token，不影响其他句子。
 - 去重 key 为句子 SHA-256 摘要：完整覆盖规范化句子，原文不入 key、不入日志。
-- 服务无鉴权（执行计划范围：个人自用、无鉴权扩展）；请勿直接暴露公网。
+- 原 `/v1/answer` 无鉴权（原执行计划范围：个人自用）；新 `/v1/live` 按场次令牌隔离。
+  两者均未作公网部署验收，请勿直接暴露公网。
+
+## M2：本地 fixture 公屏→提示→事件记录
+
+本节为后端增量，前面的真实模型/Docker记录是旧问答链的历史验证，不能作为 M2
+或抖音原生开播验收。M2 **只接显式测试观察**，没有抖音采集适配器、iOS收件器、ASR、
+流量或完整合规能力；当前用确定性自然短句模板，不调用真实模型，不增加依赖。
+
+复用 FastAPI/Pydantic、`deque/Counter`、`asyncio` 和 `sqlite3`。
+`LIVE_DB_PATH` 默认 `data/live.sqlite3`（相对 server 工作目录），可设为可写的持久路径；
+测试使用临时目录。数据库在线程中延迟打开，异常返回运营接口503，不阻断旧问答生命周期。
+只支持单进程，不使用多 worker；容器卷挂载/部署未验证，临时容器目录不构成持久化保证。
+
+| 接口 | 输入/查询 | 结果 |
+|---|---|---|
+| `POST /v1/live/sessions` | 可无请求体，或 `{"description":"本场选填说明"}` | 201：`session_id, started_at_ms, session_token` |
+| `POST /v1/live/sessions/{id}/comments` | 下述观察对象 | 200：`status, counted, reason, prompt_id, received_at_ms, effective_at_ms, time_basis` |
+| `GET /v1/live/sessions/{id}/prompts` | `after` 默认空；`wait_ms` 默认0、范围0—15000 | `prompts, next_cursor, stopped, session_id` |
+| `POST /v1/live/sessions/{id}/stop` | 无请求体；重复调用幂等 | `session_id, stopped_at_ms` |
+| `GET /v1/live/sessions/{id}/events` | `after` 默认空；`limit` 默认50、范围1—100 | `events, next_cursor, has_more, session_id, started_at_ms, stopped_at_ms` |
+
+除创建外，均需 `X-Live-Session-Token: <创建返回的令牌>`；只存 SHA-256 摘要，
+令牌仅创建时返回，调用方应妥善保存且不得写日志。不存在/不匹配均403；同幂等ID内容
+冲突、停止后输入409；无效参数/时刻/cursor422；达到容量上限429；存储不可用503。
+旧 `/healthz` 仍检查旧问答依赖，不代表运营数据库状态。
+
+评论示例（**人工构造 fixture，ID 不是实际平台数据**）：
+
+```json
+{
+  "event_id": "fixture-observation-1",
+  "input_mode": "test_fixture",
+  "source": "fixture:chat",
+  "coverage": "structured_sample",
+  "reliability": "known",
+  "text": "主播你是哪里人？",
+  "platform_message_id": "fixture-message-1",
+  "author_id": "fixture-author-a"
+}
+```
+
+`event_id/source/coverage/text/input_mode` 必填；`author_id/platform_message_id/observed_at_ms`
+可选；`reliability` 缺省 `unknown`。coverage 只允许 `structured_sample/ocr_visible_sample/unknown`，
+不是全量保证；source 只是标签，不证明授权。只有 fixture 模式可提交，不能用 `real_capture`
+伪装真实接入。可靠性未知、OCR尚无行跟踪、缺少独立身份或消息证据都返回明确不计数原因。
+
+第二条换独立ID与作者、正文 `你来自哪里？`，短窗口内可得到：
+
+```json
+{"status":"accepted","counted":true,"reason":"generated","prompt_id":"<不透明ID>",
+ "received_at_ms":1790000001000,"effective_at_ms":1790000001000,"time_basis":"received"}
+```
+
+展示短句为 `公屏反复问“来自哪里”，可以集中答一下。`。无作者但有两个不同消息ID也可
+触发该句，不声称“多位”。同 event_id 完全重投不再次计数；相同 source+平台消息ID不重复；
+只有作者时，同作者同主题在窗口内最多计一次。不要把同一实际评论同时从两个 source 喂入
+并宣称跨源去重。小范围家乡/开播时间问句有显式同义归一化；其他明确问句仅完整文本重复，
+不做泛化语义聚类，不删除否定词/数字。不确定则不合并，普通陈述保持安静。
+
+时间全部为 UTC 毫秒；HTTP 入口捕获 `received_at_ms`，缺 `observed_at_ms` 时采用该时刻且
+`time_basis=received`。源观察时刻须处于开场至接收之间，接收不能晚于处理时刻；
+负数、未来、开场前和倒置时刻拒绝。`observed` 仍只是调用方观察时间，不是平台事件时间。
+事件包含 `start_at_ms/end_at_ms`、相对开场的 `start_offset_ms/end_offset_ms`、
+`first_received_at_ms/last_received_at_ms`；点事件起止相同，混合时间依据标 `mixed`。
+
+每条事件分别保留 `phenomenon/suggestion/display_text` 与样本来源、观察条数；
+`generated_at_ms/expires_at_ms/returned_at_ms/delivery_state` 区分生成和服务器返回。
+`returned_to_client` 仅表示已用于服务器响应，**不是手机已收到或PiP已显示的确认**。
+不持久化整场原始公屏，只存事件摘要及幂等元数据。重启保留记录/幂等/冷却，但原始窗口
+不持久化，重新积累；SQLite重开后仍在有效期的提示可读取。
+
+cursor 绑定场次且对应递增记录顺序，客户端当作不透明字符串，原样回传 `next_cursor`，
+不要解析、加一、按字典序比较或跨场复用。提示和复盘各自保存续读位置；未到期提示在
+相同 after 下可重读，调用方按 prompt_id 幂等展示。过期仅从提示收件过滤，复盘记录保留；
+停止后提示接口立即返回 `stopped=true` 且无提示，评论拒绝，复盘仍可查询。
+
+可解释的首版默认：窗口30秒、观察最多晚到10秒、重复阈值2条、同主题冷却60秒、
+提示有效15秒；窗口最多200条、待返回提示16条、单场事件1000条/幂等元数据10000条。
+冷却内的额外重复不生成新事件，已生成事件保留当时的窗口快照，不把后续全部评论记入复盘。
+长轮询最多15秒，单场4/全进程16等待者，活跃场次最多8；等待不持数据库锁，取消释放名额。
+这些是保守资源边界，不是多房间能力或原PRD性能承诺；达到限制需停场/新建或后续明确方案。
+
+隔离验证（在 server 工作目录，需本机 PATH 中有 `redis-server`）：
+
+```powershell
+.venv/Scripts/python.exe -m pytest tests/test_live.py -q
+.venv/Scripts/python.exe tests/run_isolated.py
+```
+
+第一条只用临时SQLite/ASGI，不连接Redis或真实模型；第二条启动随机临时目录/端口的
+loopback Redis，核对目录身份后为旧测试提供 `TEST_REDIS_URL`，结束关闭所属进程树。
+它不使用旧Redis或Docker，不开启HTTP服务。旧测试的默认地址保持不变，所有断言保留。
+本地验证不替代iOS接线、Apple构建、真机后台/PiP或抖音实播验证。

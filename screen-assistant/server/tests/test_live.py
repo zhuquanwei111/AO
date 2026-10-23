@@ -396,3 +396,97 @@ def test_live_storage_failure_does_not_break_legacy_contract(tmp_path):
         assert client.post("/v1/live/sessions", json={}).status_code == 503
         # 旧接口在调用模型/Redis 前的输入校验仍可独立执行。
         assert client.post("/v1/answer", json={"sentence": " "}).status_code == 422
+
+
+def test_event_pagination_and_fresh_prompts_survive_reopen(tmp_path):
+    path, clock = tmp_path / "live.sqlite3", Clock()
+    with TestClient(create_app(settings(path), live_clock=clock)) as client:
+        session, headers = create(client)
+        sid, url = session["session_id"], f"/v1/live/sessions/{session['session_id']}"
+        for i in range(3):
+            for j in range(2):
+                post_comment(client, sid, headers, f"{i}-{j}", text=f"问题{i}怎么做？")
+        after, ids = "", []
+        for i in range(3):
+            page = client.get(url + "/events", headers=headers,
+                              params={"after": after, "limit": 1}).json()
+            assert len(page["events"]) == 1
+            assert page["has_more"] is (i < 2)
+            ids.append(page["events"][0]["prompt_id"])
+            assert page["next_cursor"] != after
+            after = page["next_cursor"]
+        assert len(set(ids)) == 3
+    with TestClient(create_app(settings(path), live_clock=clock)) as client:
+        result = client.get(url + "/prompts", headers=headers).json()
+        assert [p["prompt_id"] for p in result["prompts"]] == ids
+        assert all(p["delivery_state"] == "returned_to_client" for p in result["prompts"])
+        assert client.get(url + "/prompts", headers=headers,
+                          params={"after": result["next_cursor"]}).json()["prompts"] == []
+
+
+def test_poll_global_waiter_bound(tmp_path):
+    from screen_assistant_server.live_rules import MAX_WAITERS, MAX_SESSION_WAITERS
+
+    async def run():
+        app = create_app(settings(tmp_path / "live.sqlite3"))
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://fixture") as client:
+                polls = []
+                try:
+                    for _ in range(MAX_WAITERS // MAX_SESSION_WAITERS):
+                        session = (await client.post("/v1/live/sessions", json={})).json()
+                        for _ in range(MAX_SESSION_WAITERS):
+                            polls.append(asyncio.create_task(client.get(
+                                f"/v1/live/sessions/{session['session_id']}/prompts",
+                                headers={"X-Live-Session-Token": session["session_token"]}, params={"wait_ms": 5000})))
+                    await wait_for_waiters(app, MAX_WAITERS)
+                    other = (await client.post("/v1/live/sessions", json={})).json()
+                    response = await client.get(f"/v1/live/sessions/{other['session_id']}/prompts",
+                        headers={"X-Live-Session-Token": other["session_token"]}, params={"wait_ms": 100})
+                    assert response.status_code == 429
+                finally:
+                    for task in polls:
+                        task.cancel()
+                    await asyncio.gather(*polls, return_exceptions=True)
+                assert not app.state.live.waiters
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("changes", [
+    {"input_mode": "real_capture"}, {"input_mode": None}, {"reliability": "guessed"},
+    {"coverage": "full_platform_stream"}, {"text": " "}, {"text": "长" * 501},
+    {"event_id": ""}, {"extra": "unexpected"},
+])
+def test_fixture_input_validation(tmp_path, changes):
+    with TestClient(create_app(settings(tmp_path / "live.sqlite3"))) as client:
+        session, headers = create(client)
+        response = client.post(f"/v1/live/sessions/{session['session_id']}/comments",
+                               headers=headers, json={**observation("bad"), **changes})
+        assert response.status_code == 422
+
+
+def test_received_time_is_captured_before_store_queue_delay(tmp_path):
+    clock = Clock()
+    app = create_app(settings(tmp_path / "live.sqlite3"), live_clock=clock)
+    with TestClient(app) as client:
+        session, headers = create(client)
+        started, sid = clock.now, session["session_id"]
+        original = app.state.live.run
+
+        async def delayed(method, *args):
+            if method == "add_comment":
+                clock.now += 500
+            return await original(method, *args)
+
+        app.state.live.run = delayed
+        first = post_comment(client, sid, headers, "first")
+        assert first["received_at_ms"] == first["effective_at_ms"] == started
+        assert first["time_basis"] == "received"
+        second = post_comment(client, sid, headers, "second")
+        assert second["received_at_ms"] == started + 500
+        duplicate = post_comment(client, sid, headers, "first")
+        assert duplicate["received_at_ms"] == started
+        event = client.get(f"/v1/live/sessions/{sid}/events", headers=headers).json()["events"][0]
+        assert event["first_received_at_ms"] == started
+        assert event["last_received_at_ms"] == started + 500
+        assert event["start_offset_ms"] == 0 and event["end_offset_ms"] == 500

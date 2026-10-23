@@ -171,39 +171,42 @@ class LiveStore:
         return {"session_id": sid, "prompts": prompts, "stopped": stopped,
                 "next_cursor": self.cursor(sid, rows[-1]["seq"] if rows else maximum)}
 
-    def add_comment(self, sid: str, token: str | None, body: dict):
+    def add_comment(self, sid: str, token: str | None, body: dict, received_at_ms: int):
         with self.db:
-            result, window = self._add_comment(sid, token, body)
+            result, window = self._add_comment(sid, token, body, received_at_ms)
         if window is not None:
             self.windows[sid] = window
         return result
 
-    def _add_comment(self, sid: str, token: str | None, body: dict):
+    def _add_comment(self, sid: str, token: str | None, body: dict, received_at_ms: int):
         session = self.authorize(sid, token)
         if session["stopped_at_ms"] is not None:
             raise HTTPException(409, "live session stopped")
         key = digest(body["event_id"])
         fingerprint = digest(json.dumps(body, ensure_ascii=False, sort_keys=True))
         previous = self.db.execute(
-            "SELECT fingerprint FROM live_observations WHERE session_id=? AND event_hash=?", (sid, key)
+            "SELECT fingerprint,result FROM live_observations WHERE session_id=? AND event_hash=?", (sid, key)
         ).fetchone()
         if previous:
             if previous["fingerprint"] != fingerprint:
                 raise HTTPException(409, "observation id already used with different content")
-            return {"status": "duplicate", "counted": False, "prompt_id": None, "reason": "duplicate_event"}, None
+            result = json.loads(previous["result"])
+            result.update(status="duplicate", counted=False, prompt_id=None, reason="duplicate_event")
+            return result, None
         count = self.db.execute(
             "SELECT COUNT(*) FROM live_observations WHERE session_id=?", (sid,)
         ).fetchone()[0]
         if count >= MAX_OBSERVATIONS:
             raise HTTPException(429, "live observation limit reached")
         now = self.clock()
-        when = body["observed_at_ms"] if body["observed_at_ms"] is not None else now
-        if not session["started_at_ms"] <= when <= now:
+        when = body["observed_at_ms"] if body["observed_at_ms"] is not None else received_at_ms
+        if not session["started_at_ms"] <= when <= received_at_ms <= now:
             raise HTTPException(422, "observation time outside live session")
         basis = "observed" if body["observed_at_ms"] is not None else "received"
-        window = deque((o for o in self.windows.get(sid, ()) if o["when"] >= now-WINDOW_MS),
+        window = deque((o for o in self.windows.get(sid, ()) if now-WINDOW_MS <= o["when"] <= now),
                        maxlen=MAX_WINDOW_OBSERVATIONS)
         result = {"status": "accepted", "counted": False, "prompt_id": None, "reason": None}
+        result.update(received_at_ms=received_at_ms, effective_at_ms=when, time_basis=basis)
         topic = question(body["text"])
         message = digest(json.dumps([body["source"], body["platform_message_id"]])) if body["platform_message_id"] else None
         author = digest(json.dumps([body["source"], body["author_id"]])) if body["author_id"] else None
@@ -230,7 +233,8 @@ class LiveStore:
         else:
             result["counted"] = True
             window.append({"topic": topic[0], "when": when, "basis": basis,
-                           "source": body["source"], "coverage": body["coverage"], "author": author})
+                           "source": body["source"], "coverage": body["coverage"], "author": author,
+                           "received_at_ms": received_at_ms})
             group = [o for o in window if o["topic"] == topic[0]]
             result["reason"] = "awaiting_repeat"
             if Counter(o["topic"] for o in window)[topic[0]] >= 2:
@@ -259,6 +263,8 @@ class LiveStore:
         sources = Counter((o["source"], o["coverage"], o["basis"]) for o in group)
         bases = {o["basis"] for o in group}
         event = {"prompt_id": uuid.uuid4().hex, "input_mode": "test_fixture",
+                 "first_received_at_ms": min(o["received_at_ms"] for o in group),
+                 "last_received_at_ms": max(o["received_at_ms"] for o in group),
                  "start_at_ms": first, "end_at_ms": last,
                  "start_offset_ms": first-session["started_at_ms"],
                  "end_offset_ms": last-session["started_at_ms"],

@@ -123,7 +123,9 @@ async def list_events(session_id: str, request: Request,
 @router.post("/{session_id}/comments")
 async def add_comment(session_id: str, payload: CommentObservation, request: Request,
                       token: str | None = Header(None, alias="X-Live-Session-Token")):
-    return await request.app.state.live.run("add_comment", session_id, token, payload.model_dump())
+    service = request.app.state.live
+    received_at_ms = service.clock()
+    return await service.run("add_comment", session_id, token, payload.model_dump(), received_at_ms)
 
 
 @router.get("/{session_id}/prompts")
