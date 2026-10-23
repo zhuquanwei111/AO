@@ -15,8 +15,8 @@ class PersonObservation:
     observed_at_ms: int
     uptime_ms: int
     quality: str
-    person_count: int | None
-    confidence: float | None
+    person_count: int | None = None
+    confidence: float | None = None
     person_box: tuple[float, ...] | None = None  # 可靠人体框，左上归一化；脸框不代替。
     body_vector: tuple[float, ...] | None = None  # 鼻/肩6值；双腕可见时追加4值。
     face_vector: tuple[float, ...] | None = None  # 两眼、嘴的几何开合比例；不是情绪。

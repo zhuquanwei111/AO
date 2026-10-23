@@ -141,12 +141,17 @@ def test_malformed_numeric_evidence_is_rejected_without_advancing_state(field, v
 def test_ios_numeric_payload_adapter_has_no_media_or_false_confidence_requirement():
     payload = {"segment_id": "a", "sequence": 1, "observed_at_ms": 4000,
                "uptime_ms": 3000, "quality": "valid", "person_count": 0,
-               "confidence": None, "head_ratio": None, "pts_seconds": 3.0}
+               "head_ratio": None, "pts_seconds": 3.0}  # Swift省略nil字段，不能要求显式null。
     value = PersonObservation.from_payload(payload)
     assert value.valid() and value.face_vector is None
     policy = PersonPolicy()
     policy.start("a")
     assert policy.observe(value).presence == "unknown"
+    unknown = PersonObservation.from_payload({"segment_id": "a", "sequence": 2,
+                                             "observed_at_ms": 7000, "uptime_ms": 6000,
+                                             "quality": "vision_error"})
+    assert unknown.valid() and unknown.person_count is None and unknown.confidence is None
+    assert policy.observe(unknown).presence == "unknown"
 
 
 def test_one_frame_change_and_new_exit_during_cooldown_do_not_prompt():
