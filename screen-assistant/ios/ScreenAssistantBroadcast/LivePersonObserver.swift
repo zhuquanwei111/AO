@@ -65,10 +65,15 @@ final class LivePersonObserver {
               let snapshot = InputDiagnosticsStore.snapshot(),
               snapshot.phase != .paused, snapshot.phase != .finished else { return nil }
         // M1的生命周期转换即使诊断关闭也更换segment；不要求开启60秒检查。
+        let diagnosticRegion = InputDiagnosticsStore.configuration().region.clamped
+        let region = SharedConfig.personROI().map {
+            DiagnosticRegion(x: Double($0.minX), y: Double($0.minY),
+                             width: Double($0.width), height: Double($0.height)).clamped
+        } ?? diagnosticRegion
         return SourceToken(sessionID: credentials.sessionID, credentialToken: credentials.token,
                            captureGeneration: ControlState.captureGeneration(),
                            broadcastSegment: snapshot.segmentID,
-                           region: InputDiagnosticsStore.configuration().region.clamped,
+                           region: region,
                            orientation: orientation)
     }
 

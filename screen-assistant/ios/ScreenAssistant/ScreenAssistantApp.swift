@@ -33,6 +33,9 @@ final class AppModel: ObservableObject {
     @Published var platformNoticeROI: CGRect? {
         didSet { SharedConfig.setPlatformNoticeROI(platformNoticeROI) }
     }
+    @Published var personROI: CGRect {
+        didSet { SharedConfig.setPersonROI(personROI) }
+    }
     @Published var captureWanted: Bool {
         didSet { ControlState.setUserWantsCapture(captureWanted) }
     }
@@ -61,6 +64,11 @@ final class AppModel: ObservableObject {
         roi = SharedConfig.roi()
         onlineCountROI = SharedConfig.onlineCountROI()
         platformNoticeROI = SharedConfig.platformNoticeROI()
+        let diagnosticRegion = InputDiagnosticsStore.configuration().region.clamped
+        personROI = SharedConfig.personROI() ?? CGRect(x: CGFloat(diagnosticRegion.x),
+                                                       y: CGFloat(diagnosticRegion.y),
+                                                       width: CGFloat(diagnosticRegion.width),
+                                                       height: CGFloat(diagnosticRegion.height))
         captureWanted = ControlState.userWantsCapture()
         audioSettings = AudioCaptureSettings.load()
         if LiveSessionState.credentials() == nil {
@@ -101,6 +109,13 @@ final class AppModel: ObservableObject {
 
     var serverURLIsValid: Bool {
         SharedConfig.serverBaseURL() != nil
+    }
+
+    func applyLiveAreaPreset() {
+        roi = LiveAreaPresets.comments
+        onlineCountROI = LiveAreaPresets.onlineCount
+        personROI = LiveAreaPresets.person
+        // 平台提醒没有参考坐标，本操作不配置或清除用户现有选择。
     }
 
     func startLiveSession() {

@@ -23,6 +23,7 @@ struct BroadcastPickerSection: UIViewRepresentable {
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
     @ObservedObject private var pip = PiPDisplayController.shared
+    @State private var confirmsLiveAreaPreset = false
 
     var body: some View {
         NavigationView {
@@ -61,6 +62,22 @@ struct ContentView: View {
 
                 Section(header: Text("直播数据识别区域"),
                         footer: Text("仅识别你在主播界面选定的裁剪区域。未保存区域时停用对应来源；请勿把热度或累计观看选作在线人数。")) {
+                    Button("应用参考直播区域预设…") {
+                        confirmsLiveAreaPreset = true
+                    }
+                    .disabled(model.liveActive)
+
+                    NavigationLink("编辑主播人物区域") {
+                        ROIEditorView(roi: $model.personROI,
+                                      title: "编辑主播人物区域",
+                                      showsPresets: false)
+                    }
+                    .disabled(model.liveActive)
+
+                    Text("当前人物区域：\(roiSummary(for: model.personROI))")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+
                     NavigationLink {
                         OptionalROIEditorView(title: "选择在线人数区域", currentROI: model.onlineCountROI) {
                             model.onlineCountROI = $0
@@ -214,11 +231,22 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("屏识AI助手")
+            .alert("应用参考直播区域预设？", isPresented: $confirmsLiveAreaPreset) {
+                Button("应用并替换评论、人数、人物区域", role: .destructive) {
+                    model.applyLiveAreaPreset()
+                }
+                Button("取消", role: .cancel) { }
+            } message: {
+                Text("将设置评论 x=0.03 y=0.69 w=0.82 h=0.25、人数 x=0.80 y=0.055 w=0.10 h=0.045、人物 x=0 y=0.14 w=1 h=0.80。已有这三类自定义框会被替换；平台提醒区域保持原样（默认未配置）。请在主播界面核对后再开始采集。")
+            }
         }
     }
 
     private var roiSummary: String {
-        let r = model.roi
+        roiSummary(for: model.roi)
+    }
+
+    private func roiSummary(for r: CGRect) -> String {
         return String(format: "x=%.2f  y=%.2f  宽=%.2f  高=%.2f", r.minX, r.minY, r.width, r.height)
     }
 

@@ -26,6 +26,11 @@ struct SharedConfig {
         static let platformNoticeROIY = "config.platformNoticeROI.y"
         static let platformNoticeROIWidth = "config.platformNoticeROI.width"
         static let platformNoticeROIHeight = "config.platformNoticeROI.height"
+        static let personROIEnabled = "config.personROI.enabled"
+        static let personROIX = "config.personROI.x"
+        static let personROIY = "config.personROI.y"
+        static let personROIWidth = "config.personROI.width"
+        static let personROIHeight = "config.personROI.height"
     }
 
     // MARK: - 边界常量
@@ -135,6 +140,19 @@ struct SharedConfig {
                          heightKey: Keys.platformNoticeROIHeight)
     }
 
+    /// 直播人物采样区域；未设置时人物观察器继续沿用既有输入诊断区域。
+    static func personROI() -> CGRect? {
+        configuredROI(enabledKey: Keys.personROIEnabled, xKey: Keys.personROIX,
+                      yKey: Keys.personROIY, widthKey: Keys.personROIWidth,
+                      heightKey: Keys.personROIHeight)
+    }
+
+    static func setPersonROI(_ roi: CGRect?) {
+        setConfiguredROI(roi, enabledKey: Keys.personROIEnabled, xKey: Keys.personROIX,
+                         yKey: Keys.personROIY, widthKey: Keys.personROIWidth,
+                         heightKey: Keys.personROIHeight)
+    }
+
     private static func configuredROI(enabledKey: String, xKey: String, yKey: String,
                                       widthKey: String, heightKey: String) -> CGRect? {
         guard let defaults = AppGroup.defaults, defaults.bool(forKey: enabledKey) else { return nil }
@@ -169,4 +187,11 @@ struct SharedConfig {
         defaults.set(true, forKey: enabledKey)
     }
 
+}
+
+/// 用户确认后可一次应用；归一化坐标使用竖屏满屏左上原点。
+enum LiveAreaPresets {
+    static let comments = CGRect(x: 0.03, y: 0.69, width: 0.82, height: 0.25)
+    static let onlineCount = CGRect(x: 0.80, y: 0.055, width: 0.10, height: 0.045)
+    static let person = CGRect(x: 0.00, y: 0.14, width: 1.00, height: 0.80)
 }
