@@ -114,6 +114,12 @@ class LiveStore:
     def description(self, sid: str, token: str | None) -> str:
         return self.authorize(sid, token)["description"]
 
+    def audio_access(self, sid: str, token: str | None):
+        row = self.authorize(sid, token)
+        if row["stopped_at_ms"] is not None:
+            raise HTTPException(409, "live session stopped")
+        return {"started_at_ms": row["started_at_ms"]}
+
     def stop(self, sid: str, token: str | None):
         row = self.authorize(sid, token)
         stopped = row["stopped_at_ms"]
@@ -165,6 +171,10 @@ class LiveStore:
             "effective_at_ms": effective,
             "time_basis": "observed" if observed is not None else "received",
         }
+        if body["kind"] == "transcript" and observed is not None:
+            evidence = (body.get("content") or {}).get("audio_evidence") or {}
+            if evidence.get("time_basis") == "pts_arrival_approx":
+                result["time_basis"] = "pts_arrival_approx"
         parsed = None
         count_details = None
         usable, reason = validate_observation_content(body)
@@ -480,6 +490,10 @@ class LiveStore:
                 item["is_final"] = row["content"]["is_final"]
                 item["revision"] = row["content"]["revision"]
                 item["supersedes_event_id"] = row["content"].get("supersedes_event_id")
+                if row["content"].get("audio_evidence"):
+                    item["audio_evidence"] = row["content"]["audio_evidence"]
+                    item["time_basis"] = row["content"]["audio_evidence"]["time_basis"]
+                item["evidence_text"] = row["content"]["text"][:120]
             sources.append(item)
         event = {
             "prompt_id": uuid.uuid4().hex, "input_mode": "live_observation",
@@ -487,7 +501,7 @@ class LiveStore:
             "start_at_ms": start_at, "end_at_ms": end_at,
             "start_offset_ms": start_at - session["started_at_ms"],
             "end_offset_ms": end_at - session["started_at_ms"],
-            "time_basis": "observed" if all(s["time_basis"] == "observed" for s in sources) else "received",
+            "time_basis": (sources[0]["time_basis"] if len({s["time_basis"] for s in sources}) == 1 else "mixed"),
             "phenomenon": candidate["phenomenon"], "suggestion": suggestion,
             "display_text": suggestion,
             "observation_count": sum(

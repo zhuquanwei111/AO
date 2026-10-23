@@ -295,3 +295,34 @@ sample_count、开始/观察时间；按场次令牌授权，并设置90秒冷�
 明确的屏幕候选来源，但本切片没有独立区域和实屏校准：不解析人数、不按评论关键词声称官方警告，
 也不把热度/累计观看当在线人数。语音转写和 ASR 未接入。后续沿现有选区编辑器增加可选在线人数
 区域与平台提醒区域，须由用户在真实主播界面选择核对后才启用对应解析/提醒。
+## M6 可选音频适配（默认关闭）
+
+在现有场次内 `POST /v1/live/sessions/{id}/audio`，沿用
+`X-Live-Session-Token`。入口不启动新 listener；仅接受16kHz、单声道、s16le
+PCM的Base64 JSON，每包<=600ms、正文<=64KiB，完整契约见 `AudioPacket`
+（`screen_assistant_server/audio.py`）。必须携带音源、采集代次、包序号、原格式及逐块
+原始PTS/帧数/序号；可选近似墙钟锚点。没有锚点不伪造说话UTC时刻。
+`final=true`可处理尾窗；空PCM结束包必须同时使用空`spans`，且属于当前采集代次。
+
+现有server启动环境追加以下变量；本功能不自动安装框架、下载权重或启动ASR服务：
+
+| 配置 | 值 |
+|---|---|
+| `AUDIO_ENABLED` | `1`，未设置默认关闭 |
+| `FUNASR_WS_URL` | 已准备好的本机官方服务，如 `ws://127.0.0.1:10095`，只允许loopback |
+| `FUNASR_MODE` | 默认`online`；`2pass`须先准备并核准其额外模型 |
+| `SILERO_ONNX_PATH` | 已批准、已存在的Silero ONNX绝对路径 |
+
+基础依赖沿用`requirements.txt`，音频分析运行时另见`requirements-audio.txt`。
+Silero使用官方`OnnxWrapper/get_speech_timestamps`；FunASR使用官方JSON+binary PCM协议，
+协商`binary`子协议，以`is_speaking=false,is_end=true`结束，并要求
+`is_end=true,is_final=true`确认。只返回单句final、缺少全段ACK的旧服务会失败，不冒充完成。
+官方参考见[客户端](https://github.com/modelscope/FunASR/blob/main/runtime/python/websocket/funasr_wss_client.py)
+与[协议](https://github.com/modelscope/FunASR/blob/main/runtime/docs/websocket_protocol_zh.md)。
+不要启用第三方服务的录音/离线片段落盘选项；本适配不保存原始PCM。
+
+每轨最多6秒待分析PCM和一个分析作业；最多16轨，空闲15秒清除，过载切断连续性。
+VAD按短窗处理，边界可能切词，转写段时间来自VAD区间，不是词级对齐；不会补造缺块。
+仅确认主播、VAD有效、具备同源连续覆盖和近似时钟映射的最终结果进入M4节奏规则。
+VAD不是音乐/说话人分类器；来源、音乐或混声不明时撤回主播确认或关闭音频。
+真实ASR/VAD引擎和iOS采集仍须运行验证；测试fixture不等于识别验收。

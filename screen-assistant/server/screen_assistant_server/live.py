@@ -177,7 +177,24 @@ async def create_session(request: Request, payload: CreateSession | None = None)
 @router.post("/{session_id}/stop")
 async def stop_session(session_id: str, request: Request,
                        token: str | None = Header(None, alias="X-Live-Session-Token")):
-    return await request.app.state.live.run("stop", session_id, token)
+    # 幂等stop保留；有音频时先处理已收到的尾窗，再关闭M4收件。
+    service = request.app.state.live
+    async with service.lock:
+        row = await service.call("authorize", session_id, token)
+        stopped = row["stopped_at_ms"] is not None
+    audio_result = None
+    if not stopped:
+        audio_result = await request.app.state.audio.finish_session(session_id, token)
+    request.app.state.audio.closing.add(session_id)
+    try:
+        if audio_result and audio_result["transcript_count"]:
+            await service.deliver_fusion(session_id, token, request)
+        result = await service.run("stop", session_id, token)
+    finally:
+        request.app.state.audio.closing.discard(session_id)
+    if audio_result is not None and (audio_result["transcript_count"] or audio_result["incomplete"]):
+        result["audio"] = audio_result
+    return result
 
 
 @router.get("/{session_id}/events")

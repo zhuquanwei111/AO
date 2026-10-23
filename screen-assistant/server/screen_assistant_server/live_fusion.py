@@ -8,6 +8,7 @@ from typing import Annotated, Literal, Union
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .live_rules import COUNT_TREND_SAMPLES, INTERACTION_SPARSE_MAX, question
+from .audio import AudioSpan, OriginalFormat
 
 
 class Position(BaseModel):
@@ -56,19 +57,42 @@ class InteractionContent(BaseModel):
         return self
 
 
+class TranscriptAudioEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    segment_id: str = Field(min_length=1, max_length=64)
+    continuity_id: str = Field(min_length=1, max_length=64)
+    source: Literal["audioMic", "audioApp"]
+    stream_id: str = Field(min_length=1, max_length=64)
+    time_basis: Literal["pts_arrival_approx", "media_pts_only"]
+    vad: Literal["silero"]
+    speech_validated: bool
+    coverage_started_at_ms: int | None = Field(default=None, ge=0, le=2**63-1)
+    coverage_ended_at_ms: int | None = Field(default=None, ge=0, le=2**63-1)
+    media_started_ms: int = Field(ge=0, le=2**63-1)
+    media_ended_ms: int = Field(ge=0, le=2**63-1)
+    original_format: OriginalFormat
+    first_span: AudioSpan
+    last_span: AudioSpan
+    recognizer_mode: Literal["online", "2pass-online", "2pass-offline"]
+
+
 class TranscriptContent(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     text: str = Field(min_length=1, max_length=500)
-    segment_started_at_ms: int = Field(ge=0, le=2**63 - 1, strict=True)
-    segment_ended_at_ms: int = Field(ge=0, le=2**63 - 1, strict=True)
+    segment_started_at_ms: int | None = Field(default=None, ge=0, le=2**63 - 1, strict=True)
+    segment_ended_at_ms: int | None = Field(default=None, ge=0, le=2**63 - 1, strict=True)
     is_final: bool = False
     speaker_is_host: bool = False
     revision: int = Field(default=0, ge=0, le=100)
     supersedes_event_id: str | None = Field(default=None, min_length=1, max_length=128)
+    audio_evidence: TranscriptAudioEvidence | None = None
 
     @model_validator(mode="after")
     def ordered_segment(self):
-        if self.segment_ended_at_ms <= self.segment_started_at_ms:
+        if ((self.segment_started_at_ms is None) != (self.segment_ended_at_ms is None)):
+            raise ValueError("transcript clock mapping must include both endpoints")
+        if (self.segment_started_at_ms is not None and
+                self.segment_ended_at_ms <= self.segment_started_at_ms):
             raise ValueError("transcript segment must have positive duration")
         return self
 
@@ -295,16 +319,40 @@ def build_candidate(observations: list[dict]) -> dict | None:
                         and row["content"]["coverage_complete"]
                         and row["content"]["count"] <= INTERACTION_SPARSE_MAX), None)
     transcript_revisions: dict[tuple, dict] = {}
+    superseded = {row["content"].get("supersedes_event_id") for row in rows
+                  if row["kind"] == "transcript"}
     for row in rows:
-        if (row["kind"] != "transcript" or not row["content"]["is_final"]
-                or not row["content"]["speaker_is_host"] or row["coverage"] != "continuous"):
+        if row["kind"] != "transcript" or row["event_id"] in superseded:
             continue
         content = row["content"]
-        segment_key = (row["source"], content["segment_started_at_ms"], content["segment_ended_at_ms"])
+        evidence = content.get("audio_evidence") or {}
+        segment_key = (row["source"], evidence.get("segment_id") or (
+            content["segment_started_at_ms"], content["segment_ended_at_ms"]))
         current = transcript_revisions.get(segment_key)
         if current is None or content["revision"] > current["content"]["revision"]:
             transcript_revisions[segment_key] = row
-    transcripts = sorted(transcript_revisions.values(), key=lambda row: row["effective_at_ms"])
+    groups: dict[tuple, list[dict]] = {}
+    for row in transcript_revisions.values():
+        content = row["content"]
+        evidence = content.get("audio_evidence") or {}
+        if (not content["is_final"] or not content["speaker_is_host"]
+                or row["coverage"] != "continuous" or row["reliability"] != "known"
+                or content["segment_started_at_ms"] is None):
+            continue
+        # 旧fixture保留；生产默认必须有VAD、连续覆盖与时钟映射证据。
+        if not row["source"].startswith("fixture:") and not (
+            evidence.get("speech_validated") is True
+            and evidence.get("time_basis") == "pts_arrival_approx"
+            and evidence.get("continuity_id")
+            and evidence.get("coverage_started_at_ms") is not None
+            and evidence.get("coverage_ended_at_ms") is not None
+            and evidence["coverage_started_at_ms"] <= content["segment_started_at_ms"]
+            and evidence["coverage_ended_at_ms"] >= content["segment_ended_at_ms"]
+        ):
+            continue
+        groups.setdefault((row["source"], evidence.get("continuity_id")), []).append(row)
+    transcripts = sorted(max(groups.values(), key=lambda group: max(
+        row["effective_at_ms"] for row in group), default=[]), key=lambda row: row["effective_at_ms"])
 
     if falling and interaction and transcripts:
         selected = [*falling, interaction, transcripts[-1]]
@@ -329,7 +377,10 @@ def build_candidate(observations: list[dict]) -> dict | None:
         ordered = sorted(selected, key=lambda row: row["content"]["segment_started_at_ms"])
         for left, right in zip(ordered, ordered[1:]):
             gap = right["content"]["segment_started_at_ms"] - left["content"]["segment_ended_at_ms"]
-            if gap >= 5_000:
+            evidence = right["content"].get("audio_evidence") or {}
+            covered = (right["source"].startswith("fixture:") or
+                       evidence.get("coverage_started_at_ms", 2**63) <= left["content"]["segment_ended_at_ms"])
+            if gap >= 5_000 and covered:
                 return _candidate("speech_pause", 30, "连续转写窗口中出现较长停顿",
                                   "刚才停了一会儿，可以顺着当前话题补一句或接住公屏。",
                                   [left, right])
@@ -353,7 +404,10 @@ def build_candidate(observations: list[dict]) -> dict | None:
         if parsed:
             return _candidate("question:" + parsed[0], 25,
                               f"公屏出现一条可见问题：{parsed[1]}", None, [row],
-                              model_text=row["content"]["text"])
+                              model_text=row["content"]["text"],
+                              model_context=("近期主播原话（仅供参考，不判定已答）：" +
+                                  " / ".join(item["content"]["text"][:120] for item in transcripts[-2:])
+                                  if transcripts else ""))
 
     if person:
         return _candidate("person:head_down", 20, "画面中可见人物持续低头",

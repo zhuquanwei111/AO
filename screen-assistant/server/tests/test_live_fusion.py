@@ -105,3 +105,45 @@ def test_explicit_comment_concern_is_cautious_and_quotes_are_not_live_claims():
     assert "确认一下实际情况" in candidate["suggestion"]
     assert build_candidate([comment("quote", "主播提到‘听不清’这个词")]) is None
     assert build_candidate([comment("negated", "不是没声音")]) is None
+
+
+def audio_transcript(index, start, end, *, source='ios_replaykit_audioMic_asr', continuity='one'):
+    return dict(kind='transcript', event_id=f'event-{index}', source=source,
+        effective_at_ms=end, received_at_ms=end, observed_at_ms=end,
+        started_at_ms=start, ended_at_ms=end, availability='available',
+        reliability='known', coverage='continuous', content=dict(
+            text='欢迎一起聊聊今天的生活故事和想法'*3,
+            segment_started_at_ms=start, segment_ended_at_ms=end, is_final=True,
+            speaker_is_host=True, revision=0, supersedes_event_id=None,
+            audio_evidence=dict(segment_id=f'segment-{index}', continuity_id=continuity,
+                speech_validated=True, time_basis='pts_arrival_approx',
+                coverage_started_at_ms=0, coverage_ended_at_ms=end)))
+
+
+def test_audio_pace_never_combines_sources_or_gaps_or_unverified_voice():
+    rows = [audio_transcript(i, i*2000, (i+1)*2000) for i in range(3)]
+    assert build_candidate(rows)['topic'] == 'speech_pace'
+    rows[0]['source'] = 'ios_replaykit_audioApp_asr'
+    assert build_candidate(rows) is None
+    rows[0]['source'] = rows[1]['source']
+    rows[0]['content']['audio_evidence']['continuity_id'] = 'before-gap'
+    assert build_candidate(rows) is None
+    for row in rows:
+        row['content'].pop('audio_evidence')
+    assert build_candidate(rows) is None
+
+
+def test_revision_with_changed_end_replaces_one_segment_and_pause_requires_covered_gap():
+    rows = [audio_transcript('left', 0, 1000), audio_transcript('right', 7000, 8000)]
+    assert build_candidate(rows)['topic'] == 'speech_pause'
+    revised = audio_transcript('revision', 7000, 8200)
+    revised['content'].update(revision=1, supersedes_event_id=rows[1]['event_id'])
+    revised['content']['audio_evidence']['segment_id'] = rows[1]['content']['audio_evidence']['segment_id']
+    result = build_candidate([*rows, revised])
+    assert len(result['observations']) == 2
+    assert result['observations'][-1]['event_id'] == 'event-revision'
+    revised['content']['audio_evidence']['coverage_started_at_ms'] = 7000
+    assert build_candidate([rows[0], revised]) is None
+    revised['content']['audio_evidence']['coverage_started_at_ms'] = 0
+    revised['content']['audio_evidence']['continuity_id'] = 'after-gap'
+    assert build_candidate([rows[0], revised]) is None

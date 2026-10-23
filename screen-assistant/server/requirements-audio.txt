@@ -1,0 +1,5 @@
+# Optional analysis-side adapters. No recognizer weights are bundled/downloaded.
+-r requirements.txt
+silero-vad>=6,<7
+onnxruntime>=1.20,<2
+# silero-vad declares torch/numpy; use an approved CPU-compatible environment.
