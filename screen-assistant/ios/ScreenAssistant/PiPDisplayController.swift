@@ -57,19 +57,19 @@ final class PiPDisplayController: NSObject, ObservableObject {
     private var isPlaying = true
 
     private enum DisplayKind: Equatable {
-        case audience
+        case quickAnswer
         case operation
 
         var label: String {
             switch self {
-            case .audience: return "观众"
+            case .quickAnswer: return "问答"
             case .operation: return "运营"
             }
         }
 
         var tint: UIColor {
             switch self {
-            case .audience: return .systemBlue
+            case .quickAnswer: return .systemBlue
             case .operation: return .systemOrange
             }
         }
@@ -230,7 +230,7 @@ final class PiPDisplayController: NSObject, ObservableObject {
     private func consumeReply() {
         guard state == .running || state == .starting else { return }
         guard let reply = transport.takeLatestReply() else { return }
-        showContent(reply, kind: .audience)
+        showContent(reply, kind: .quickAnswer)
     }
 
     /// M4 的行动建议统一走同一显示入口，并明确标为运营内容。
