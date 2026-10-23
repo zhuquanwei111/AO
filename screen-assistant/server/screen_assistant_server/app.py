@@ -12,7 +12,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import sys
 import time
@@ -27,7 +26,6 @@ from redis.exceptions import RedisError
 
 from .config import Settings
 from .live import LiveService, router as live_router, utc_ms
-from .live_store import LiveStore
 from .dedup import AnswerDeduper, DedupStoreUnavailableError
 from .model_client import (
     MAX_OUTPUT_TOKENS,
@@ -70,8 +68,7 @@ def create_app(settings: Settings | None = None, *, live_clock=None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        store = await asyncio.to_thread(LiveStore, cfg.live_db_path, live_clock or utc_ms)
-        app.state.live = LiveService(store)
+        app.state.live = LiveService(cfg.live_db_path, live_clock or utc_ms)
         redis = Redis.from_url(cfg.redis_url, decode_responses=True)
         app.state.redis = redis
         app.state.dedup = AnswerDeduper(
