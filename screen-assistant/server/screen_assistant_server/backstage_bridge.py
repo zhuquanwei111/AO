@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -28,7 +29,11 @@ class BridgeConfig:
     gate_a: str | None = None
     poll_seconds: float = 2.0
     request_timeout: float = 15.0
-    cli_timeout: float = 180.0
+    cli_timeout: float = 480.0
+
+    def __post_init__(self):
+        if not 60.0 <= self.cli_timeout <= 600.0:
+            raise ValueError("cli timeout must be between 60 and 600 seconds")
 
     @classmethod
     def from_env(cls) -> "BridgeConfig":
@@ -41,6 +46,10 @@ class BridgeConfig:
         def optional(name: str) -> str | None:
             return os.environ.get(name, "").strip() or None
 
+        cli_timeout = float(os.environ.get("BACKSTAGE_CLI_TIMEOUT_SECONDS", "480"))
+        if not 60.0 <= cli_timeout <= 600.0:
+            raise ValueError("BACKSTAGE_CLI_TIMEOUT_SECONDS must be between 60 and 600")
+
         return cls(
             server_url=required("BACKSTAGE_SERVER_URL").rstrip("/"),
             worker_token=required("BACKSTAGE_WORKER_TOKEN"),
@@ -51,6 +60,7 @@ class BridgeConfig:
             scratch_dir=optional("BACKSTAGE_CLI_SCRATCH"),
             gate_a=optional("BACKSTAGE_CLI_GATE_A"),
             poll_seconds=max(0.5, float(os.environ.get("BACKSTAGE_POLL_SECONDS", "2"))),
+            cli_timeout=cli_timeout,
         )
 
 
@@ -109,15 +119,25 @@ class BackstageBridge:
         child_env = {key: value for key, value in os.environ.items()
                      if key != "BACKSTAGE_WORKER_TOKEN" and not key.startswith("AO_")}
         try:
-            completed = subprocess.run(
-                self._cli_args(command, task), cwd=str(entry.parent), env=child_env,
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=self.config.cli_timeout, check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
+            process_options = {
+                "cwd": str(entry.parent), "env": child_env,
+                "stdout": subprocess.PIPE, "stderr": subprocess.PIPE,
+                "text": True, "encoding": "utf-8", "errors": "replace",
+            }
+            if os.name == "nt":
+                process_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                process_options["start_new_session"] = True
+            process = subprocess.Popen(self._cli_args(command, task), **process_options)
+            try:
+                stdout, _ = process.communicate(timeout=self.config.cli_timeout)
+            except subprocess.TimeoutExpired:
+                self._terminate_process_tree(process)
+                return {"status": "needs_input", "reason": "cli_timeout"}
+        except OSError:
             return {"status": "needs_input", "reason": "cli_execution_unavailable"}
         try:
-            output = json.loads(completed.stdout)
+            output = json.loads(stdout)
         except (json.JSONDecodeError, TypeError):
             return {"status": "needs_input", "reason": "cli_result_unavailable"}
         if isinstance(output, dict) and isinstance(output.get("record"), dict):
@@ -127,12 +147,52 @@ class BackstageBridge:
         }
 
     @staticmethod
+    def _terminate_process_tree(process: subprocess.Popen) -> None:
+        """Stop only this timed-out CLI process and its children, then reap it boundedly."""
+        if process.poll() is None:
+            try:
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=5.0, check=False,
+                    )
+                else:
+                    os.killpg(process.pid, signal.SIGKILL)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+        try:
+            process.communicate(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.communicate(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                pass
+
+    @staticmethod
     def result_payload(task: dict, result: dict) -> dict:
         record = result.get("record") if isinstance(result.get("record"), dict) else result
         if record.get("session_id") not in (None, task["session_id"]):
             raise ValueError("backstage session identity mismatch")
         if record.get("douyin_account") not in (None, task["douyin_account"]):
             raise ValueError("backstage account identity mismatch")
+
+        start_source = task.get("start_signal_source") or "ios_app"
+        stop_source = task.get("stop_signal_source") or start_source
+        if (start_source not in {"ios_app", "android_app"} or stop_source != start_source):
+            raise ValueError("backstage app signal source mismatch")
+        if (record.get("start_signal_source") != start_source
+                or record.get("stop_signal_source") != stop_source):
+            raise ValueError("backstage record signal source mismatch")
 
         status = record.get("status")
         if status not in {"captured_locally", "partial", "needs_input", "failed"}:
@@ -158,10 +218,6 @@ class BackstageBridge:
         captured_at = record.get("metrics_captured_at")
         if any(value is not None for value in metrics.values()) and not captured_at:
             raise ValueError("backstage metric timestamp missing")
-        start_source = task.get("start_signal_source") or "ios_app"
-        stop_source = task.get("stop_signal_source") or start_source
-        if start_source not in {"ios_app", "android_app"} or stop_source != start_source:
-            raise ValueError("backstage app signal source mismatch")
         return {
             "task_id": task["task_id"], "douyin_account": task["douyin_account"],
             "status": status, "room_id": record.get("room_id"), "metrics": metrics,

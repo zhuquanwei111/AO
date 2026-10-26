@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import subprocess
 
+import pytest
+
 from screen_assistant_server.backstage_bridge import BackstageBridge, BridgeConfig
 
 
@@ -15,6 +17,7 @@ def test_bridge_uses_one_cli_task_and_posts_result_to_origin_session():
     result_record = {
         "status": "partial", "session_id": "session-001",
         "douyin_account": "test-account",
+        "start_signal_source": "ios_app", "stop_signal_source": "ios_app",
         "metrics": {"累计观众": 12000, "新增粉丝": 2, "评论人数": None,
                     "送礼人数": 1, "获得音浪": 25000},
         "raw_displays": {"累计观众": "约1.2万"},
@@ -74,8 +77,10 @@ def test_bridge_uses_one_cli_task_and_posts_result_to_origin_session():
 
 def test_bridge_preserves_unknown_capture_time_for_empty_result():
     task = {"task_id": "t", "session_id": "s", "douyin_account": "a",
-            "stop_signal_received": True, "start_signal_source": "ios_app"}
-    record = {"status": "needs_input", "metrics": {}, "missing_fields": ["累计观众"]}
+            "stop_signal_received": True, "start_signal_source": "ios_app",
+            "stop_signal_source": "ios_app"}
+    record = {"status": "needs_input", "metrics": {}, "missing_fields": ["累计观众"],
+              "start_signal_source": "ios_app", "stop_signal_source": "ios_app"}
     payload = BackstageBridge.result_payload(task, record)
     assert payload["metrics_captured_at"] is None
     assert payload["metrics"]["累计观众"] is None
@@ -89,7 +94,10 @@ def test_bridge_forwards_android_app_signal_source_without_ios_relabeling():
     bridge = BackstageBridge(BridgeConfig("http://localhost", "worker", "python", "cli.py"))
     assert "--source=android_app" in bridge._cli_args("start", task)
     assert "--source=android_app" in bridge._cli_args("stop", task)
-    payload = bridge.result_payload(task, {"status": "needs_input", "metrics": {}})
+    payload = bridge.result_payload(task, {
+        "status": "needs_input", "metrics": {},
+        "start_signal_source": "android_app", "stop_signal_source": "android_app",
+    })
     assert payload["start_signal_source"] == "android_app"
     assert payload["stop_signal_source"] == "android_app"
 
@@ -124,7 +132,9 @@ def test_android_app_task_uses_existing_bridge_and_posts_to_same_session():
         if command == "result":
             return {"record": {"session_id": "android-session",
                                "douyin_account": "android-account",
-                               "status": "needs_input", "metrics": {}}}
+                               "status": "needs_input", "metrics": {},
+                               "start_signal_source": "android_app",
+                               "stop_signal_source": "android_app"}}
         return {"record": {"status": "waiting_for_stop"}}
 
     bridge = BackstageBridge(
@@ -160,7 +170,9 @@ def test_bridge_rejects_cli_result_identity_drift_before_posting():
         cli_calls.append(command)
         if command == "result":
             return {"record": {"session_id": "s2", "douyin_account": "a",
-                               "status": "needs_input", "metrics": {}}}
+                               "status": "needs_input", "metrics": {},
+                               "start_signal_source": "ios_app",
+                               "stop_signal_source": "ios_app"}}
         return {"record": {"status": "waiting_for_stop"}}
 
     bridge = BackstageBridge(
@@ -177,21 +189,69 @@ def test_bridge_rejects_cli_result_identity_drift_before_posting():
     assert not any(path.endswith("/backstage/result") for _, path, _ in calls)
 
 
+def test_bridge_rejects_simulated_record_for_real_app_task_before_posting():
+    task = {"task_id": "t", "session_id": "s", "douyin_account": "a",
+            "status": "waiting_for_stop", "start_signal_source": "android_app",
+            "stop_signal_source": "android_app", "stop_signal_received": True,
+            "stopped_at_ms": 100}
+    calls = []
+
+    def http(method, path, payload=None):
+        calls.append((method, path, payload))
+        if path.endswith("/backstage/tasks/claim"):
+            return {"status": "claimed", "task": task}
+        if method == "GET":
+            return {"status": "ok", "task": task}
+        raise AssertionError((method, path))
+
+    def cli(command, claimed_task):
+        if command == "result":
+            return {"record": {
+                "session_id": "s", "douyin_account": "a", "status": "partial",
+                "metrics": {}, "start_signal_source": "test_simulated",
+                "stop_signal_source": "test_simulated",
+            }}
+        return {"record": {"status": "waiting_for_stop"}}
+
+    bridge = BackstageBridge(
+        BridgeConfig("http://localhost", "worker", "python", "recap.py"),
+        http=http, cli=cli, sleep=lambda _: None,
+    )
+    with pytest.raises(ValueError, match="record signal source mismatch"):
+        bridge.run_once()
+    assert not any(path.endswith("/backstage/result") for _, path, _ in calls)
+
+
 def test_cli_process_uses_argument_list_and_never_receives_worker_token(monkeypatch):
     config = BridgeConfig("http://localhost", "worker-secret", "python.exe", "recap.py")
     task = {"task_id": "t", "session_id": "s", "douyin_account": "a;& arbitrary"}
     calls = []
 
-    def run(args, **kwargs):
+    class FakeProcess:
+        pid = 1234
+        returncode = 2
+
+        def communicate(self, timeout=None):
+            assert timeout == 480.0
+            return '{"record":{"status":"needs_input"}}', ""
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    def popen(args, **kwargs):
         calls.append((args, kwargs))
-        return subprocess.CompletedProcess(args, 0, '{"record":{"status":"waiting_for_stop"}}', "")
+        return FakeProcess()
 
     monkeypatch.setenv("BACKSTAGE_WORKER_TOKEN", "worker-secret")
     monkeypatch.setenv("AO_SESSION_ID", "ao-session-test")
-    monkeypatch.setattr("screen_assistant_server.backstage_bridge.subprocess.run", run)
+    monkeypatch.setattr("screen_assistant_server.backstage_bridge.subprocess.Popen", popen)
     bridge = BackstageBridge(config)
     bridge.cli = bridge._cli
-    bridge.cli("start", task)
+    result = bridge.cli("start", task)
+    assert result["record"]["status"] == "needs_input"
 
     args, kwargs = calls[0]
     assert "--source=ios_app" in args
@@ -201,3 +261,41 @@ def test_cli_process_uses_argument_list_and_never_receives_worker_token(monkeypa
     assert "BACKSTAGE_WORKER_TOKEN" not in kwargs["env"]
     assert "AO_SESSION_ID" not in kwargs["env"]
     assert "worker-secret" not in args and "worker-secret" not in kwargs["env"].values()
+
+
+def test_cli_timeout_terminates_its_process_tree_and_returns_needs_input(monkeypatch):
+    task = {"task_id": "t", "session_id": "s", "douyin_account": "a",
+            "start_signal_source": "ios_app", "stop_signal_source": "ios_app"}
+    cleanup = []
+
+    class TimedOutProcess:
+        pid = 2345
+
+        def communicate(self, timeout=None):
+            raise subprocess.TimeoutExpired("recap_glm.py", timeout)
+
+    process = TimedOutProcess()
+    monkeypatch.setattr(
+        "screen_assistant_server.backstage_bridge.subprocess.Popen",
+        lambda *args, **kwargs: process,
+    )
+    monkeypatch.setattr(
+        BackstageBridge, "_terminate_process_tree",
+        staticmethod(lambda current: cleanup.append(current)),
+    )
+    bridge = BackstageBridge(BridgeConfig("http://localhost", "worker", "python", "recap.py"))
+    result = bridge._cli("start", task)
+    assert result == {"status": "needs_input", "reason": "cli_timeout"}
+    assert cleanup == [process]
+
+
+def test_bridge_cli_timeout_config_is_bounded(monkeypatch):
+    monkeypatch.setenv("BACKSTAGE_SERVER_URL", "http://localhost")
+    monkeypatch.setenv("BACKSTAGE_WORKER_TOKEN", "worker")
+    monkeypatch.setenv("BACKSTAGE_CLI_PYTHON", "python")
+    monkeypatch.setenv("BACKSTAGE_CLI_ENTRY", "recap.py")
+    monkeypatch.setenv("BACKSTAGE_CLI_TIMEOUT_SECONDS", "540")
+    assert BridgeConfig.from_env().cli_timeout == 540
+    monkeypatch.setenv("BACKSTAGE_CLI_TIMEOUT_SECONDS", "601")
+    with pytest.raises(ValueError, match="between 60 and 600"):
+        BridgeConfig.from_env()
