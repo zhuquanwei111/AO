@@ -34,7 +34,7 @@ import java.util.function.Consumer;
 
 /** 仅SDK及现有HTTP协议的薄适配；同帧时间、单在途推理、最多一个待发批次。 */
 final class LiveFrameAnalyzer implements AutoCloseable {
-    static final String PERSON_SOURCE="android_mediaprojection_mlkit_pose";
+    static final String PERSON_SOURCE="android_vision_person";
     static final class Frame implements AutoCloseable {
         final Map<String,Bitmap> images=new LinkedHashMap<>();
         final Map<String,Rect> rects=new LinkedHashMap<>();
@@ -43,11 +43,12 @@ final class LiveFrameAnalyzer implements AutoCloseable {
         Frame(int width,int height) { this.width=width; this.height=height; }
         @Override public void close() { for (Bitmap b:images.values()) b.recycle(); }
     }
-    static Frame snapshot(Context context, Image image, boolean ocr) {
+    static Frame snapshot(Context context, Image image, boolean ocr, boolean person) {
         Frame f=new Frame(image.getWidth(),image.getHeight());
         try {
             for (int i=1;i<Regions.KEYS.length;i++) {
                 String key=Regions.KEYS[i]; if (!ocr && !key.equals("person")) continue;
+                if (key.equals("person") && !person) continue;
                 float[] region=Prefs.getRegion(context,key); if (region==null) continue;
                 int[] r=Regions.crop(region,f.width,f.height); Rect rect=new Rect(r[0],r[1],r[2],r[3]);
                 Bitmap crop=CaptureService.cropImage(image,rect);
@@ -92,7 +93,7 @@ final class LiveFrameAnalyzer implements AutoCloseable {
 
     private static JSONObject observation(String kind,long wall,JSONObject content,double confidence) throws Exception {
         return new JSONObject().put("kind",kind).put("event_id",UUID.randomUUID().toString())
-                .put("source","android_mediaprojection_ocr").put("observed_at_ms",wall)
+                .put("source","android_media_projection_ocr").put("observed_at_ms",wall)
                 .put("availability",content==null?"missing":"available").put("coverage","ocr_visible_sample")
                 .put("reliability",confidence>=.5?"known":"unknown")
                 .put("confidence",confidence<0?JSONObject.NULL:confidence).put("content",content==null?JSONObject.NULL:content);
@@ -118,7 +119,7 @@ final class LiveFrameAnalyzer implements AutoCloseable {
                 int left=Math.max(roi.left,roi.left+box.left),top=Math.max(roi.top,roi.top+box.top);
                 int right=Math.min(roi.right,roi.left+box.right),bottom=Math.min(roi.bottom,roi.top+box.bottom);
                 if (left>=right || top>=bottom) continue;
-                String value=DisplayText.plain(line.getText()); if (value.isEmpty()) continue;
+                String value=DisplayText.observed(line.getText()); if (value.isEmpty()) continue;
                 double score=line.getConfidence(); if (!Double.isFinite(score)||score<0||score>1) score=0;
                 JSONObject position=Regions.position(left,top,right,bottom,frame.width,frame.height);
                 confidence=Math.min(confidence,score);
@@ -201,15 +202,12 @@ final class LiveFrameAnalyzer implements AutoCloseable {
         if (nose==null || left==null || right==null) return p.put("quality","not_detected_unconfirmed");
         double confidence=Math.min(nose.getInFrameLikelihood(),Math.min(left.getInFrameLikelihood(),right.getInFrameLikelihood()));
         if (confidence<.65 || faceCount!=1) return p.put("quality","low_confidence");
-        double width=Math.hypot(left.getPosition().x-right.getPosition().x,left.getPosition().y-right.getPosition().y);
-        if (width/image.getWidth()<.08) return p.put("quality","small_pose");
-        double x=(left.getPosition().x+right.getPosition().x)/2,y=(left.getPosition().y+right.getPosition().y)/2;
+        double[] points={nose.getPosition().x,nose.getPosition().y,left.getPosition().x,left.getPosition().y,
+                right.getPosition().x,right.getPosition().y};
+        double[] body=PersonGeometry.body(points,image.getWidth(),image.getHeight());
+        if (body==null) return p.put("quality","invalid_or_small_pose");
         JSONArray vector=new JSONArray();
-        for (PoseLandmark point:new PoseLandmark[]{nose,left,right}) {
-            double vx=(point.getPosition().x-x)/width,vy=(y-point.getPosition().y)/width; // 与iOS向上y一致
-            if (!Double.isFinite(vx)||!Double.isFinite(vy)||Math.abs(vx)>5||Math.abs(vy)>5) return p.put("quality","invalid_pose");
-            vector.put(vx).put(vy);
-        }
+        for (double value:body) vector.put(value);
         status.accept("人物：采样中可见一个可靠姿态；不代表身份认证/情绪判断");
         return p.put("quality","valid").put("person_count",1).put("confidence",confidence)
                 .put("body_vector",vector).put("head_ratio",vector.getDouble(1)).put("head_confidence",confidence);

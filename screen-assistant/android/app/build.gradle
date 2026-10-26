@@ -37,3 +37,10 @@ dependencies {
     testImplementation 'junit:junit:4.13.2'
     testImplementation 'org.json:json:20240303'
 }
+
+tasks.register('verifyLiveContract', JavaExec) {
+    dependsOn 'compileDebugUnitTestJavaWithJavac'
+    classpath = tasks.named('testDebugUnitTest').get().classpath
+    mainClass = 'com.screenassistant.LiveContractProbe'
+    args providers.gradleProperty('liveContractBase').getOrElse('')
+}

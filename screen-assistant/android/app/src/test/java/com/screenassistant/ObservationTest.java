@@ -4,6 +4,14 @@ import org.junit.Test;
 import static org.junit.Assert.*;
 
 public class ObservationTest {
+    @Test public void sdkPixelsMapToExistingIosNormalizedNoseShoulderGeometry() {
+        double[] portrait=PersonGeometry.body(new double[]{50,60,30,100,70,100},100,200);
+        double[] landscape=PersonGeometry.body(new double[]{100,30,60,50,140,50},200,100);
+        assertNotNull(portrait); assertArrayEquals(portrait,landscape,.00001);
+        assertEquals(.5,portrait[1],.00001);
+        assertNull(PersonGeometry.body(new double[]{50,60,49,100,51,100},100,200));
+        assertNull(PersonGeometry.body(new double[]{Double.NaN,60,30,100,70,100},100,200));
+    }
     @Test public void normalizedRegionRejectsNaNAndMapsSameFrameCoordinates() throws Exception {
         assertFalse(Regions.valid(new float[]{Float.NaN,0,1,1}));
         assertFalse(Regions.valid(new float[]{-.1f,0,1,1}));

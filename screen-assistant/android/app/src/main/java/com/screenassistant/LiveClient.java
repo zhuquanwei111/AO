@@ -61,8 +61,17 @@ public final class LiveClient {
     }
 
     public static JSONObject call(Session s, String path, JSONObject body) throws IOException, JSONException {
-        return request(s.baseUrl, "/v1/live/sessions/" + encode(s.id) + "/" + path,
+        JSONObject result = request(s.baseUrl, "/v1/live/sessions/" + encode(s.id) + "/" + path,
                 body == null ? "GET" : "POST", s.token, body, path.startsWith("prompts") ? 22000 : 15000);
+        if (result.has("session_id") && !s.id.equals(result.getString("session_id"))) throw new IOException("场次响应不匹配");
+        return result;
+    }
+
+    public static JSONObject start(Session s) throws IOException, JSONException {
+        return call(s,"start",new JSONObject().put("source","android_app"));
+    }
+    public static JSONObject stop(Session s) throws IOException, JSONException {
+        return call(s,"stop",new JSONObject().put("source","android_app"));
     }
 
     public static JSONObject poll(Session s, String cursor) throws IOException, JSONException {

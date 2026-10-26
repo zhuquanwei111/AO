@@ -89,6 +89,7 @@ public class CaptureService extends Service {
     private String displayedText = "";
     private LiveFrameAnalyzer liveAnalyzer;
     private long lastLiveOcr;
+    private long lastLivePerson, lastFrameTimestamp;
     private AudioCapture audioCapture;
     private boolean microphoneForeground;
     public static volatile java.util.concurrent.CompletableFuture<Void> audioCompletion = java.util.concurrent.CompletableFuture.completedFuture(null);
@@ -356,6 +357,8 @@ public class CaptureService extends Service {
             if (liveSession != null) liveAnalyzer = new LiveFrameAnalyzer(this, recognizer, liveSession,
                     () -> !tornDown && !uiVisible && phase == Phase.RUNNING && sessionEpoch == epoch, this::setState);
             lastLiveOcr = 0;
+            lastLivePerson = 0; lastFrameTimestamp = 0;
+            displayedText = "";
             phase = Phase.RUNNING;
             startAudio();
             if (liveSession != null) startPromptPolling(liveSession, sessionEpoch);
@@ -411,9 +414,17 @@ public class CaptureService extends Service {
         try (Image image = imageReader.acquireLatestImage()) {
             if (image != null) {
                 long now = android.os.SystemClock.elapsedRealtime();
+                if (image.getTimestamp() <= lastFrameTimestamp) {
+                    if (liveAnalyzer != null) liveAnalyzer.invalidateBefore(now);
+                    setState("屏幕源时间戳未前进，本轮不发送旧画面");
+                    busyEpoch.compareAndSet(epoch, -1); scheduleNext(epoch); return;
+                }
+                lastFrameTimestamp = image.getTimestamp();
                 boolean ocr = now - lastLiveOcr >= intervalMs;
-                frame = LiveFrameAnalyzer.snapshot(this, image, ocr);
+                boolean person = now - lastLivePerson >= 3000;
+                frame = LiveFrameAnalyzer.snapshot(this, image, ocr, person);
                 if (ocr) lastLiveOcr = now;
+                if (person) lastLivePerson = now;
             }
         } catch (Exception e) { setState("屏幕取样失败：" + e.getClass().getSimpleName()); }
         if (frame == null) { busyEpoch.compareAndSet(epoch, -1); scheduleNext(epoch); return; }
@@ -527,12 +538,14 @@ public class CaptureService extends Service {
         android.util.Log.i("CaptureService", "reply dispatch queued request_id=" + safeId(requestId)
                 + " reply_chars=" + (reply == null ? 0 : reply.length()) + " epoch=" + epoch);
         main.post(() -> {
-            if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch) {
+            if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch || uiVisible
+                    || expiresAt > 0 && expiresAt <= System.currentTimeMillis()) {
                 android.util.Log.i("CaptureService", "reply dispatch rejected request_id=" + safeId(requestId)
                         + " phase=" + phase + " torn_down=" + tornDown + " epoch=" + epoch
                         + " current_epoch=" + sessionEpoch);
                 return;
             }
+            if (reply.equals(displayedText)) return;
             if (android.os.Build.VERSION.SDK_INT >= 23 && !android.provider.Settings.canDrawOverlays(this)) {
                 android.util.Log.w("CaptureService", "reply overlay denied request_id=" + safeId(requestId));
                 return;
@@ -565,6 +578,9 @@ public class CaptureService extends Service {
                                     | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                             PixelFormat.TRANSLUCENT);
                     lp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+                    // Android12+不可信覆盖层的触摸穿透必须满足系统最大遮挡透明度。
+                    lp.alpha = android.os.Build.VERSION.SDK_INT >= 31
+                            ? Math.min(.8f, getSystemService(android.hardware.input.InputManager.class).getMaximumObscuringOpacityForTouch()) : .8f;
                     lp.y = (int) (64 * getResources().getDisplayMetrics().density);
                     lp.width = Math.max(200, screenSize[0]
                             - (int) (32 * getResources().getDisplayMetrics().density));

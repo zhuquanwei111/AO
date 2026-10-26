@@ -3,6 +3,7 @@ package com.screenassistant;
 /** 两种真实用途均整条替换；纯文本归一化后的相同内容不重新显示。 */
 public final class DisplayText {
     private DisplayText() {}
+    public static String observed(String raw) { return raw == null ? "" : raw.trim().replaceAll("\\s+", " "); }
     public static String plain(String raw) {
         if (raw == null) return "";
         return raw.replaceAll("(?m)^\\s*```[^\\n]*$", "")

@@ -17,6 +17,7 @@ final class LivePanel {
     private final TextView state;
     private final EditText description, account;
     private final Button create, stop;
+    private final Button retryStart;
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private boolean working;
 
@@ -30,6 +31,7 @@ final class LivePanel {
         parent.addView(description);
         create = button(parent, "开始运营场次并采集");
         stop = button(parent, "结束运营场次");
+        retryStart = button(parent, "重试本场后台任务启动");
         Button recap = button(parent, "查看最近场次复盘／刷新后台汇总");
         create.setOnClickListener(v -> {
             EditText url = activity.findViewById(R.id.et_url);
@@ -44,10 +46,10 @@ final class LivePanel {
                 try {
                     LiveClient.Session session = LiveClient.create(base, descriptionSnapshot, accountSnapshot);
                     if (!Prefs.saveSession(activity, session)) {
-                        LiveClient.call(session, "stop", new JSONObject());
+                        LiveClient.stop(session);
                         throw new java.io.IOException("凭证保存失败，已请求结束该场次");
                     }
-                    if (!accountSnapshot.isEmpty()) LiveClient.call(session, "start", new JSONObject());
+                    LiveClient.start(session);
                     activity.runOnUiThread(() -> {
                         working = false; refresh();
                         if (!activity.isFinishing() && !activity.isDestroyed()) capture.run();
@@ -64,13 +66,22 @@ final class LivePanel {
                 try {
                     try { CaptureService.audioCompletion.get(20, java.util.concurrent.TimeUnit.SECONDS); }
                     catch (Exception audioError) { /* 后端stop仍对已收PCM收尾；界面保留音频诊断。 */ }
-                    LiveClient.call(session, "stop", new JSONObject());
+                    LiveClient.stop(session);
                     if (!Prefs.saveSession(activity, session.asStopped())) throw new java.io.IOException("停止成功但本地状态保存失败，可重试");
                     activity.runOnUiThread(() -> {
                         working = false; refresh();
                         if (!activity.isFinishing() && !activity.isDestroyed()) activity.startActivity(new Intent(activity, RecapActivity.class));
                     });
                 } catch (Exception e) { finish("结束未确认：" + e.getMessage() + "，已停本地采集，请重试结束"); }
+            });
+        });
+        retryStart.setOnClickListener(v -> {
+            LiveClient.Session session = Prefs.getSession(activity);
+            if (session == null || session.stopped) return;
+            working = true; refresh();
+            io.execute(() -> {
+                try { LiveClient.start(session); finish("本场后台启动已确认；采集仍按所选开关运行"); }
+                catch (Exception e) { finish("后台启动未确认：" + e.getMessage() + "；屏幕取数可继续，复盘将保留实际状态"); }
             });
         });
         recap.setOnClickListener(v -> activity.startActivity(new Intent(activity, RecapActivity.class)));
@@ -88,9 +99,10 @@ final class LivePanel {
         boolean active = s != null && !s.stopped;
         create.setEnabled(!working && !active && CaptureService.phase == CaptureService.Phase.IDLE);
         stop.setEnabled(!working && active);
+        retryStart.setEnabled(!working && active);
         state.setText(working ? "场次请求中…" : active
                 ? "运营场次进行中；可用下方按钮启动/重试采集，结束请点这里。"
-                : "运营场次：" + (s == null ? "尚未创建" : "已结束，可查看复盘"));
+                : "运营场次：" + (s == null ? Prefs.hasCachedRecap(activity) ? "已保存最近复盘" : "尚未创建" : "已结束，可查看复盘"));
     }
     void close() { io.shutdown(); }
 }

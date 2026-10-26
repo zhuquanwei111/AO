@@ -54,6 +54,7 @@ public class LiveClientTest {
     }
 
     @Test public void cleansMarkdownWithoutDeletingNumbersOrFencedBody() {
+        assertEquals("1. 200 **原文**",DisplayText.observed(" 1.  200 **原文** "));
         assertEquals("运营\n保持 123 人", DisplayText.labeled("运营", "# **保持** [123 人](https://x)"));
         assertEquals("正文 继续", DisplayText.plain("```text\n正文\n```\n- 继续"));
         assertEquals("问答\n你好", DisplayText.labeled("问答", "*你好*"));
