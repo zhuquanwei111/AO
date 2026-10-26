@@ -42,8 +42,8 @@ public class RecapActivity extends Activity {
         TextView t = new TextView(this); t.setTextSize(16); t.setPadding(0, 12, 0, 12);
         t.setTextIsSelectable(true); parent.addView(t); return t;
     }
-    @Override protected void onStart() { super.onStart(); visible = true; rounds = 0; load(true); }
-    @Override protected void onStop() { visible = false; main.removeCallbacks(refresh); super.onStop(); }
+    @Override protected void onStart() { super.onStart(); CaptureService.uiVisible = true; visible = true; rounds = 0; load(true); }
+    @Override protected void onStop() { CaptureService.uiVisible = false; visible = false; main.removeCallbacks(refresh); super.onStop(); }
     @Override protected void onDestroy() { io.shutdown(); super.onDestroy(); }
 
     private void load(boolean includeEvents) {

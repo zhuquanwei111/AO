@@ -50,7 +50,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class CaptureService extends Service {
 
-    public enum Phase { IDLE, RUNNING, PAUSED }
+    public enum Phase { IDLE, RUNNING, PAUSED, STOPPING }
 
     public static final String ACTION_START = "com.screenassistant.START";
     public static final String ACTION_PAUSE = "com.screenassistant.PAUSE";
@@ -60,6 +60,7 @@ public class CaptureService extends Service {
     /** 供 MainActivity 刷新 UI 的轻量状态（进程内静态，无持久化）。 */
     public static volatile Phase phase = Phase.IDLE;
     public static volatile String lastMessage = "";
+    public static volatile boolean uiVisible;
 
     private static final String EXTRA_RESULT_CODE = "result_code";
     private static final String EXTRA_RESULT_DATA = "result_data";
@@ -86,6 +87,12 @@ public class CaptureService extends Service {
     private ExecutorService promptExecutor;
     private LiveClient.Session liveSession;
     private String displayedText = "";
+    private LiveFrameAnalyzer liveAnalyzer;
+    private long lastLiveOcr;
+    private AudioCapture audioCapture;
+    private boolean microphoneForeground;
+    public static volatile java.util.concurrent.CompletableFuture<Void> audioCompletion = java.util.concurrent.CompletableFuture.completedFuture(null);
+    private String audioMessage = "";
 
     private final AtomicInteger busyEpoch = new AtomicInteger(-1);
     private volatile boolean tornDown = true;
@@ -110,6 +117,7 @@ public class CaptureService extends Service {
         @Override
         public void run() {
             if (phase != Phase.RUNNING || tornDown) return;
+            if (uiVisible) { main.post(CaptureService.this::removeReplyOverlay); scheduleTick(intervalMs); return; }
             if (ScreenMetrics.rotation(CaptureService.this) != rotationAtStart) {
                 // 回主线程执行teardown（内部有 stopForeground/stopSelf）
                 main.post(() -> teardown("屏幕方向已变化，会话已停止，请重新框选并启动"));
@@ -119,6 +127,7 @@ public class CaptureService extends Service {
                 scheduleTick(intervalMs);
                 return;
             }
+            if (liveSession != null) { liveTick(); return; }
             Image image = null;
             Bitmap crop = null;
             try {
@@ -236,9 +245,19 @@ public class CaptureService extends Service {
         String action = intent == null ? ACTION_STOP : intent.getAction();
         switch (action == null ? "" : action) {
             case ACTION_START: {
+                if (!tornDown) return START_NOT_STICKY;
                 // Android14：必须先成为 mediaProjection 前台服务，才允许 getMediaProjection()
-                startForeground(NOTIF_ID, buildNotification("正在启动…"),
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+                int types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION;
+                LiveClient.Session stored = Prefs.getSession(this);
+                microphoneForeground = android.os.Build.VERSION.SDK_INT >= 30 && stored != null && !stored.stopped
+                        && Prefs.getAudioMode(this) == 2 && checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+                        == android.content.pm.PackageManager.PERMISSION_GRANTED;
+                if (android.os.Build.VERSION.SDK_INT >= 30 && microphoneForeground) types |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
+                try { startForeground(NOTIF_ID, buildNotification("正在启动…"), types); }
+                catch (SecurityException e) {
+                    microphoneForeground = false;
+                    startForeground(NOTIF_ID, buildNotification("麦克风权限/前台条件受限，继续屏幕"), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+                }
                 int code = intent.getIntExtra(EXTRA_RESULT_CODE, 0);
                 Intent data = intent.getParcelableExtra(EXTRA_RESULT_DATA);
                 if (data == null) {
@@ -252,6 +271,10 @@ public class CaptureService extends Service {
                 if (phase == Phase.RUNNING) {
                     captureHandler.removeCallbacks(tick);
                     phase = Phase.PAUSED;
+                    if (liveAnalyzer != null) liveAnalyzer.invalidateBefore(android.os.SystemClock.elapsedRealtime());
+                    else sessionEpoch++;
+                    if (audioCapture != null) { audioCapture.stop(); audioCapture = null; }
+                    main.post(this::removeReplyOverlay);
                     setState("已暂停（保留采集授权）");
                     notifManager.notify(NOTIF_ID, buildNotification("已暂停 · 点击应用继续"));
                 } else if (phase == Phase.IDLE) {
@@ -262,6 +285,8 @@ public class CaptureService extends Service {
             case ACTION_RESUME: {
                 if (phase == Phase.PAUSED && !tornDown) {
                     phase = Phase.RUNNING;
+                    if (liveAnalyzer != null) liveAnalyzer.invalidateBefore(android.os.SystemClock.elapsedRealtime());
+                    startAudio();
                     setState("已继续");
                     notifManager.notify(NOTIF_ID, buildNotification("采集中 · 间隔 "
                             + (intervalMs / 1000) + " 秒"));
@@ -282,16 +307,17 @@ public class CaptureService extends Service {
     @Override
     public void onDestroy() {
         teardownInternal();
-        if (workExecutor != null) workExecutor.shutdownNow();
+        LiveFrameAnalyzer closingAnalyzer = liveAnalyzer;
+        TextRecognizer closingRecognizer = recognizer;
+        if (workExecutor != null) {
+            workExecutor.execute(() -> {
+                if (closingAnalyzer != null) closingAnalyzer.close();
+                if (closingRecognizer != null) closingRecognizer.close();
+            });
+            workExecutor.shutdown();
+        }
         if (promptExecutor != null) promptExecutor.shutdownNow();
         if (captureThread != null) captureThread.quitSafely();
-        if (recognizer != null) {
-            try {
-                recognizer.close();
-            } catch (Exception ignored) {
-            }
-            recognizer = null;
-        }
         super.onDestroy();
     }
 
@@ -326,7 +352,12 @@ public class CaptureService extends Service {
                 recognizer = TextRecognition.getClient(
                         new ChineseTextRecognizerOptions.Builder().build());
             }
+            final int epoch = sessionEpoch;
+            if (liveSession != null) liveAnalyzer = new LiveFrameAnalyzer(this, recognizer, liveSession,
+                    () -> !tornDown && !uiVisible && phase == Phase.RUNNING && sessionEpoch == epoch, this::setState);
+            lastLiveOcr = 0;
             phase = Phase.RUNNING;
+            startAudio();
             if (liveSession != null) startPromptPolling(liveSession, sessionEpoch);
             setState("已连接 " + serverUrl);
             notifManager.notify(NOTIF_ID, buildNotification("采集中 · 间隔 " + (intervalMs / 1000) + " 秒"));
@@ -343,8 +374,58 @@ public class CaptureService extends Service {
         }
     }
 
+    private void startAudio() {
+        if (liveSession == null || Prefs.getAudioMode(this) == 0 || audioCapture != null) return;
+        if (!audioCompletion.isDone()) {
+            int pendingEpoch = sessionEpoch;
+            setAudioState("上一段音频正在收尾，完成后恢复所选来源");
+            audioCompletion.whenComplete((value,error) -> main.post(() -> {
+                if (!tornDown && phase == Phase.RUNNING && pendingEpoch == sessionEpoch) startAudio();
+            }));
+            return;
+        }
+        int epoch = sessionEpoch;
+        if (Prefs.getAudioMode(this) == 2 && android.os.Build.VERSION.SDK_INT >= 30 && !microphoneForeground) {
+            setAudioState("麦克风前台条件不足，未启动音轨，其他取数继续"); return;
+        }
+        try {
+            audioCapture = new AudioCapture(this, projection, liveSession, Prefs.getAudioMode(this), Prefs.hostConfirmed(this),
+                    message -> { if (epoch == sessionEpoch) setAudioState(message); });
+            audioCompletion = audioCapture.completion;
+        } catch (Exception e) { setAudioState("音频未启动：" + e.getMessage() + "；其他取数继续"); }
+    }
+
+    private void setAudioState(String message) {
+        if (message.equals(audioMessage)) return;
+        audioMessage = message; setState("采集中");
+    }
+
     private void scheduleNext(int epoch) {
-        if (epoch == sessionEpoch) scheduleTick(intervalMs);
+        if (epoch == sessionEpoch) scheduleTick(liveSession == null ? intervalMs : Math.min(intervalMs, 3000));
+    }
+
+    private void liveTick() {
+        int epoch = sessionEpoch;
+        if (!busyEpoch.compareAndSet(-1, epoch)) { scheduleNext(epoch); return; }
+        LiveFrameAnalyzer.Frame frame = null;
+        try (Image image = imageReader.acquireLatestImage()) {
+            if (image != null) {
+                long now = android.os.SystemClock.elapsedRealtime();
+                boolean ocr = now - lastLiveOcr >= intervalMs;
+                frame = LiveFrameAnalyzer.snapshot(this, image, ocr);
+                if (ocr) lastLiveOcr = now;
+            }
+        } catch (Exception e) { setState("屏幕取样失败：" + e.getClass().getSimpleName()); }
+        if (frame == null) { busyEpoch.compareAndSet(epoch, -1); scheduleNext(epoch); return; }
+        LiveFrameAnalyzer.Frame sample = frame;
+        LiveFrameAnalyzer analyzer = liveAnalyzer;
+        workExecutor.execute(() -> {
+            try {
+                if (!tornDown && phase == Phase.RUNNING && epoch == sessionEpoch) analyzer.analyze(sample);
+            } catch (Exception e) {
+                if (!tornDown && epoch == sessionEpoch) setState("本轮观察未取得：" + e.getClass().getSimpleName());
+            } finally { sample.close(); busyEpoch.compareAndSet(epoch, -1); scheduleNext(epoch); }
+        });
     }
 
     /** 依据归一化区域计算帧内像素裁切矩形，含越界钳制；无有效区域返回默认中央区域。 */
@@ -370,7 +451,7 @@ public class CaptureService extends Service {
      * 从整屏 RGBA_8888 Image 中按矩形裁切为 ARGB_8888 Bitmap。
      * 处理 rowStride/pixelStride 与 RGBA->ARGB 字节序，仅在内存完成。
      */
-    private Bitmap cropImage(Image image, Rect r) {
+    static Bitmap cropImage(Image image, Rect r) {
         Image.Plane plane = image.getPlanes()[0];
         ByteBuffer buf = plane.getBuffer();
         int rowStride = plane.getRowStride();
@@ -435,8 +516,9 @@ public class CaptureService extends Service {
         if (fullText.isEmpty()) return;
         main.post(() -> {
             if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch
+                    || uiVisible
                     || expiresAt > 0 && expiresAt <= System.currentTimeMillis()) return;
-            if (replyOverlayView != null && fullText.equals(displayedText)) return;
+            if (fullText.equals(displayedText)) return;
             showOverlay(fullText, epoch, "local", expiresAt);
         });
     }
@@ -528,12 +610,11 @@ public class CaptureService extends Service {
             }
             replyOverlayView = null;
             replyTextView = null;
-            displayedText = "";
         }
     }
 
     private void setState(String message) {
-        lastMessage = message;
+        lastMessage = message + (audioMessage.isEmpty() ? "" : "\n" + audioMessage);
         Intent i = new Intent(Prefs.ACTION_STATE);
         i.setPackage(getPackageName());
         sendBroadcast(i);
@@ -556,20 +637,30 @@ public class CaptureService extends Service {
     /** 完整回收（幂等）：停止轮询、释放采集链、移除悬浮条、退出前台并自毁。 */
     private void teardown(String message) {
         if (tornDown) {
+            if (phase == Phase.STOPPING) return;
             setState(message);
             stopForegroundAndSelf();
             return;
         }
         teardownInternal();
         setState(message);
-        notifManager.cancel(NOTIF_ID);
-        stopForegroundAndSelf();
+        phase = Phase.STOPPING;
+        Runnable finish = () -> {
+            if (phase != Phase.STOPPING) return;
+            phase = Phase.IDLE;
+            setState(message);
+            notifManager.cancel(NOTIF_ID);
+            stopForegroundAndSelf();
+        };
+        audioCompletion.whenComplete((value, error) -> main.post(finish));
+        main.postDelayed(finish, 20000);
     }
 
     private void teardownInternal() {
         tornDown = true;
         phase = Phase.IDLE;
         sessionEpoch++;
+        if (audioCapture != null) { audioCapture.stop(); audioCapture = null; }
         if (captureHandler != null) captureHandler.removeCallbacksAndMessages(null);
         main.removeCallbacks(replyHide);
         main.post(this::removeReplyOverlay);

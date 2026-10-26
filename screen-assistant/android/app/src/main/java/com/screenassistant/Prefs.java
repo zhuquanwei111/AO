@@ -46,7 +46,7 @@ public final class Prefs {
             if (parts.length != 4) return null;
             float[] r = new float[4];
             for (int i = 0; i < 4; i++) r[i] = Float.parseFloat(parts[i]);
-            if (r[0] < r[2] && r[1] < r[3]) return r;
+            if (Regions.valid(r)) return r;
             return null;
         } catch (Exception e) {
             return null;
@@ -76,4 +76,31 @@ public final class Prefs {
 
     public static String getDouyinAccount(Context c) { return sp(c).getString("douyin_account", ""); }
     public static void setDouyinAccount(Context c, String value) { sp(c).edit().putString("douyin_account", value).apply(); }
+
+    public static float[] getRegion(Context c, String kind) {
+        if ("legacy".equals(kind)) return getRegion(c);
+        String raw = sp(c).getString("roi_" + kind, null);
+        if (raw == null) return null;
+        try {
+            String[] parts = raw.split(",");
+            float[] r = new float[parts.length];
+            for (int i = 0; i < parts.length; i++) r[i] = Float.parseFloat(parts[i]);
+            return Regions.valid(r) ? r : null;
+        } catch (RuntimeException e) { return null; }
+    }
+    public static void setRegion(Context c, String kind, float l, float t, float r, float b) {
+        if (!Regions.valid(new float[]{l,t,r,b})) return;
+        if ("legacy".equals(kind)) { setRegion(c,l,t,r,b); return; }
+        sp(c).edit().putString("roi_" + kind, l + "," + t + "," + r + "," + b).apply();
+    }
+    public static void clearRegion(Context c, String kind) {
+        if ("legacy".equals(kind)) clearRegion(c);
+        else sp(c).edit().remove("roi_" + kind).apply();
+    }
+    public static boolean onlineConfirmed(Context c) { return sp(c).getBoolean("online_semantics", false); }
+    public static void setOnlineConfirmed(Context c, boolean value) { sp(c).edit().putBoolean("online_semantics", value).apply(); }
+    public static int getAudioMode(Context c) { return Math.max(0,Math.min(2,sp(c).getInt("audio_mode",0))); }
+    public static void setAudioMode(Context c,int mode) { sp(c).edit().putInt("audio_mode",mode).apply(); }
+    public static boolean hostConfirmed(Context c) { return sp(c).getBoolean("audio_host_confirmed",false); }
+    public static void setHostConfirmed(Context c,boolean value) { sp(c).edit().putBoolean("audio_host_confirmed",value).apply(); }
 }

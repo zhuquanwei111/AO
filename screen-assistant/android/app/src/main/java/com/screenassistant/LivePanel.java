@@ -62,6 +62,8 @@ final class LivePanel {
             CaptureService.requestStop(activity);
             io.execute(() -> {
                 try {
+                    try { CaptureService.audioCompletion.get(20, java.util.concurrent.TimeUnit.SECONDS); }
+                    catch (Exception audioError) { /* 后端stop仍对已收PCM收尾；界面保留音频诊断。 */ }
                     LiveClient.call(session, "stop", new JSONObject());
                     if (!Prefs.saveSession(activity, session.asStopped())) throw new java.io.IOException("停止成功但本地状态保存失败，可重试");
                     activity.runOnUiThread(() -> {

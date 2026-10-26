@@ -53,8 +53,9 @@ public final class LiveClient {
     }
 
     public static Session create(String baseUrl, String description, String account) throws IOException, JSONException {
-        JSONObject result = request(baseUrl, "/v1/live/sessions", "POST", null,
-                new JSONObject().put("description", description).put("douyin_account", account), 15000);
+        JSONObject payload = new JSONObject().put("description", description);
+        if (!account.isEmpty()) payload.put("douyin_account", account);
+        JSONObject result = request(baseUrl, "/v1/live/sessions", "POST", null, payload, 15000);
         return new Session(baseUrl, result.getString("session_id"), result.getString("session_token"),
                 result.getLong("started_at_ms"), false);
     }

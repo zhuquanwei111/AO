@@ -26,12 +26,15 @@ public class MainActivity extends Activity {
     private static final int REQ_MEDIA_PROJECTION = 1001;
     private static final int REQ_OVERLAY = 1002;
     private static final int REQ_POST_NOTIFICATIONS = 1003;
+    private static final int REQ_RECORD_AUDIO = 1004;
 
     private MediaProjectionManager mpm;
     private EditText etUrl, etInterval;
     private TextView tvStatus, tvRegion;
     private Button btnRegion, btnStart, btnPauseResume, btnStop;
     private LivePanel livePanel;
+    private RegionPanel regionPanel;
+    private AudioPanel audioPanel;
 
     private final BroadcastReceiver stateReceiver = new BroadcastReceiver() {
         @Override
@@ -56,7 +59,11 @@ public class MainActivity extends Activity {
 
         etUrl.setText(Prefs.getServerUrl(this));
         etInterval.setText(String.valueOf(Prefs.getIntervalSec(this)));
-        livePanel = new LivePanel(this, findViewById(R.id.main_column), this::onStartClicked);
+        android.widget.LinearLayout column = findViewById(R.id.main_column);
+        regionPanel = new RegionPanel(this, column);
+        audioPanel = new AudioPanel(this, column);
+        livePanel = new LivePanel(this, column, this::onStartClicked);
+        btnRegion.setText("框选所选区域（下方选择用途）");
         btnStart.setText("启动/重试采集（无场次为旧问答）");
         btnStop.setText("停止采集");
 
@@ -70,15 +77,14 @@ public class MainActivity extends Activity {
     protected void onStart() {
         super.onStart();
         IntentFilter f = new IntentFilter(Prefs.ACTION_STATE);
-        if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(stateReceiver, f, Context.RECEIVER_NOT_EXPORTED);
-        } else {
-            registerReceiver(stateReceiver, f);
-        }
+        androidx.core.content.ContextCompat.registerReceiver(this, stateReceiver, f,
+                androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED);
+        CaptureService.uiVisible = true;
     }
 
     @Override
     protected void onStop() {
+        CaptureService.uiVisible = false;
         try {
             unregisterReceiver(stateReceiver);
         } catch (IllegalArgumentException ignored) {
@@ -94,8 +100,10 @@ public class MainActivity extends Activity {
 
     private void refreshUi() {
         if (livePanel != null) livePanel.refresh();
+        if (regionPanel != null) regionPanel.refresh();
         CaptureService.Phase phase = CaptureService.phase;
         boolean busy = phase != CaptureService.Phase.IDLE;
+        if (audioPanel != null) audioPanel.refresh(!busy);
         String msg = CaptureService.lastMessage;
         switch (phase) {
             case RUNNING:
@@ -106,11 +114,14 @@ public class MainActivity extends Activity {
                 tvStatus.setText("状态：已暂停（保持授权，可继续）"
                         + (msg.isEmpty() ? "" : "\n" + msg));
                 break;
+            case STOPPING:
+                tvStatus.setText("状态：正在停止采集并收尾音频" + (msg.isEmpty() ? "" : "\n" + msg));
+                break;
             default:
                 tvStatus.setText("状态：未运行" + (msg.isEmpty() ? "" : "\n" + msg));
         }
         btnStart.setEnabled(!busy);
-        btnPauseResume.setEnabled(busy);
+        btnPauseResume.setEnabled(phase == CaptureService.Phase.RUNNING || phase == CaptureService.Phase.PAUSED);
         btnPauseResume.setText(phase == CaptureService.Phase.PAUSED ? "继续" : "暂停");
         btnStop.setEnabled(busy);
         float[] r = Prefs.getRegion(this);
@@ -129,7 +140,10 @@ public class MainActivity extends Activity {
                     Uri.parse("package:" + getPackageName())), REQ_OVERLAY);
             return;
         }
-        RegionSelectorService.start(this);
+        if (CaptureService.phase != CaptureService.Phase.IDLE) {
+            Toast.makeText(this, "请先停止采集再编辑区域，避免把编辑器作为输入", Toast.LENGTH_LONG).show(); return;
+        }
+        RegionSelectorService.start(this, regionPanel.selected());
         moveTaskToBack(true);
     }
 
@@ -151,6 +165,7 @@ public class MainActivity extends Activity {
         }
         Prefs.setServerUrl(this, url);
         Prefs.setIntervalSec(this, interval);
+        audioPanel.save(this);
         if (!Settings.canDrawOverlays(this)) {
             Toast.makeText(this, "回复悬浮条需要悬浮窗权限，请授权后重试", Toast.LENGTH_LONG).show();
             startActivityForResult(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
@@ -162,7 +177,15 @@ public class MainActivity extends Activity {
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_POST_NOTIFICATIONS);
             return; // 授权回调后继续
         }
-        requestMediaProjection();
+        requestAudioThenProjection();
+    }
+
+    private void requestAudioThenProjection() {
+        LiveClient.Session session = Prefs.getSession(this);
+        if (session != null && !session.stopped && Prefs.getAudioMode(this) != 0
+                && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_RECORD_AUDIO);
+        } else requestMediaProjection();
     }
 
     private static boolean isValidServerUrl(String value) {
@@ -171,7 +194,9 @@ public class MainActivity extends Activity {
 
     private void requestMediaProjection() {
         // Android 14+：每次采集会话必须重新取得用户授权（复用 Intent 会抛 SecurityException）
-        startActivityForResult(mpm.createScreenCaptureIntent(), REQ_MEDIA_PROJECTION);
+        Intent consent = Build.VERSION.SDK_INT >= 34 ? mpm.createScreenCaptureIntent(
+                android.media.projection.MediaProjectionConfig.createConfigForDefaultDisplay()) : mpm.createScreenCaptureIntent();
+        startActivityForResult(consent, REQ_MEDIA_PROJECTION);
     }
 
     @Override
@@ -179,6 +204,10 @@ public class MainActivity extends Activity {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == REQ_POST_NOTIFICATIONS) {
             // 通知权限被拒也可运行（系统仍显示采集标识），不阻塞主链路
+            requestAudioThenProjection();
+        } else if (requestCode == REQ_RECORD_AUDIO) {
+            if (grantResults.length == 0 || grantResults[0] != PackageManager.PERMISSION_GRANTED)
+                Toast.makeText(this, "音频权限未授予，继续屏幕取数", Toast.LENGTH_LONG).show();
             requestMediaProjection();
         }
     }
