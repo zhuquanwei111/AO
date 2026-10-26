@@ -200,17 +200,21 @@ struct ContentView: View {
 
                 Section(header: Text("直播运营"),
                         footer: Text("手动开始/结束本场辅助。评论仅来自 ReplayKit 当前可见 OCR 样本；不代表公屏全量。运营提示使用现有 PiP。")) {
+                    TextField("抖音号（本场后台汇总绑定）", text: $model.douyinAccount)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
                     TextField("本场补充说明（选填）", text: $model.liveDescription)
-                    Button(model.liveActive ? "结束本场辅助" : "开始本场辅助") {
+                    Button(model.liveStarting ? "正在开始…" : (model.liveActive ? "结束本场辅助" : "开始本场辅助")) {
                         if model.liveActive { model.stopLiveSession() }
                         else { model.startLiveSession() }
                     }
+                    .disabled(model.liveStarting)
                     Text(model.liveStatus)
                         .font(.footnote)
                         .foregroundColor(.secondary)
-                    if let summary = model.liveSummary {
+                    if model.liveStopped {
                         NavigationLink("本场概览与事件记录") {
-                            LiveSessionOverviewView(summary: summary, events: model.liveEvents)
+                            LiveSessionOverviewView(model: model)
                         }
                     } else {
                         NavigationLink("当前收到的事件记录") {
@@ -264,11 +268,11 @@ struct ContentView: View {
 }
 
 private struct LiveSessionOverviewView: View {
-    let summary: LiveSessionSummary
-    let events: [LivePrompt]
+    @ObservedObject var model: AppModel
 
     var body: some View {
         List {
+            if let summary = model.liveSummary {
             Section(header: Text("辅助场次")) {
                 dateRow("开始", milliseconds: summary.startedAtMS)
                 if let stopped = summary.stoppedAtMS {
@@ -308,12 +312,21 @@ private struct LiveSessionOverviewView: View {
                     row("缺失／无效样本", labels.joined(separator: "、"))
                 }
             }
-            Section(header: Text("事件记录（\(events.count)条）")) {
-                if events.isEmpty {
+            if let recap = summary.backstageRecap {
+                backstageSection(recap)
+            }
+            } else {
+                Section(header: Text("本场概览")) {
+                    ProgressView("正在读取本场数据…")
+                    Text(model.liveStatus).font(.footnote).foregroundColor(.secondary)
+                }
+            }
+            Section(header: Text("事件记录（\(model.liveEvents.count)条）")) {
+                if model.liveEvents.isEmpty {
                     Text("本场没有已保存的运营事件")
                         .foregroundColor(.secondary)
                 } else {
-                    ForEach(events) { event in
+                    ForEach(model.liveEvents) { event in
                         VStack(alignment: .leading, spacing: 6) {
                             HStack(spacing: 4) {
                                 Text(Date(timeIntervalSince1970: Double(event.startAtMS) / 1000), style: .time)
@@ -333,6 +346,70 @@ private struct LiveSessionOverviewView: View {
             }
         }
         .navigationTitle("本场概览")
+        .task {
+            model.refreshStoppedOverview()
+            for _ in 0..<24 {
+                guard !Task.isCancelled else { break }
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                guard !Task.isCancelled else { break }
+                model.refreshStoppedOverview()
+            }
+        }
+        .refreshable {
+            model.refreshStoppedOverview()
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+    }
+
+    @ViewBuilder
+    private func backstageSection(_ recap: LiveBackstageRecap) -> some View {
+        Section(header: Text("后台五项汇总"),
+                footer: Text("按App结束信号读取的主播后台页面快照，不代表平台最终结算；近似原文按原精度展示。")) {
+            row("任务状态", statusText(recap.status))
+            row("抖音号快照", recap.douyinAccount)
+            if let roomID = recap.roomID, !roomID.isEmpty { row("场次线索", roomID) }
+            if let metrics = recap.metrics {
+                metricRow("累计观众", value: metrics.cumulativeAudience, raw: recap.rawDisplays?["累计观众"], approximate: recap.approximateMetrics.contains("累计观众"), missing: recap.missingFields["累计观众"])
+                metricRow("新增粉丝", value: metrics.newFollowers, raw: recap.rawDisplays?["新增粉丝"], approximate: recap.approximateMetrics.contains("新增粉丝"), missing: recap.missingFields["新增粉丝"])
+                metricRow("评论人数", value: metrics.commentCount, raw: recap.rawDisplays?["评论人数"], approximate: recap.approximateMetrics.contains("评论人数"), missing: recap.missingFields["评论人数"])
+                metricRow("送礼人数", value: metrics.giftGivers, raw: recap.rawDisplays?["送礼人数"], approximate: recap.approximateMetrics.contains("送礼人数"), missing: recap.missingFields["送礼人数"])
+                metricRow("获得音浪", value: metrics.soundEnergy, raw: recap.rawDisplays?["获得音浪"], approximate: recap.approximateMetrics.contains("获得音浪"), missing: recap.missingFields["获得音浪"])
+            } else {
+                row("五项读数", "尚未取得；缺失项保持未知")
+            }
+            if let captured = recap.metricsCapturedAt { row("实际采集时间", captured) }
+            if let received = recap.receivedAtMS { dateRow("服务端收到", milliseconds: received) }
+            if let method = recap.captureMethod { row("读取方式", method) }
+            if !recap.missingFields.isEmpty {
+                let missing = recap.missingFields.sorted { $0.key < $1.key }
+                    .map { "\($0.key)：\($0.value)" }.joined(separator: "；")
+                row("缺失说明", missing)
+            }
+            Text(model.liveStatus).font(.footnote).foregroundColor(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private func metricRow(_ name: String, value: Int?, raw: String?, approximate: Bool, missing: String?) -> some View {
+        if let value {
+            let original = raw.map { "原文：\($0)；" } ?? ""
+            row(name, "\(approximate ? "约" : "")\(value)（\(original)\(approximate ? "按屏幕缩写折算" : "已读数值")）")
+        } else {
+            row(name, "未知\(missing.map { "（\($0)）" } ?? "（未取得）")")
+        }
+    }
+
+    private func statusText(_ status: String) -> String {
+        switch status {
+        case "waiting_for_stop": return "等待结束信号"
+        case "capturing": return "处理中"
+        case "not_connected": return "执行器未连接／待处理"
+        case "captured_locally": return "已取得五项"
+        case "partial": return "部分缺失"
+        case "needs_input": return "需要处理"
+        case "failed": return "失败"
+        default: return status
+        }
     }
 
     private func dateRow(_ title: String, milliseconds: Int64) -> some View {

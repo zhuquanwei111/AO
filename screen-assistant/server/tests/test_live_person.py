@@ -33,9 +33,9 @@ def create(client):
 
 def sample(seq, observed_at, uptime, *, segment="segment-a", people=1,
            box=(0.3, 0.1, 0.4, 0.8), quality="valid", body_vector=None,
-           face_vector=None):
+           face_vector=None, source="ios_replaykit_vision"):
     return {
-        "source": "ios_replaykit_vision", "coverage": "sampled_person_roi",
+        "source": source, "coverage": "sampled_person_roi",
         "segment_id": segment, "sequence": seq,
         "observed_at_ms": observed_at, "uptime_ms": uptime,
         "quality": quality, "person_count": people,
@@ -81,6 +81,33 @@ def test_person_candidate_flows_through_m4_prompt_events_and_summary(tmp_path):
         summary = client.get(url + "/summary", headers=headers).json()
         assert summary["session_id"] == session["session_id"]
         assert summary["online_count"]["status"] == "unknown"
+
+
+def test_android_person_adapter_reuses_m7_policy_and_preserves_source(tmp_path):
+    clock = Clock()
+    with TestClient(create_app(settings(tmp_path / "android-person.sqlite3"), live_clock=clock)) as client:
+        session, headers = create(client)
+        url = f"/v1/live/sessions/{session['session_id']}"
+        started = client.post(url + "/start", headers=headers,
+                              json={"source": "android_app"})
+        assert started.status_code == 200, started.text
+        assert client.post(url + "/person-observations", headers=headers,
+                           json=sample(0, clock.now, 10_000, source="android_vision_person")).status_code == 200
+        clock.now += 3_000
+        edge = sample(1, clock.now, 13_000, box=(0.7, 0.1, 0.3, 0.8),
+                      source="android_vision_person")
+        assert client.post(url + "/person-observations", headers=headers, json=edge).status_code == 200
+        result = None
+        for seq in range(2, 8):
+            clock.now += 3_000
+            result = client.post(url + "/person-observations", headers=headers,
+                                 json=sample(seq, clock.now, 10_000 + seq * 3_000,
+                                             people=0, source="android_vision_person"))
+        assert result.status_code == 200
+        assert result.json()["reason"] == "generated"
+        events = client.get(url + "/events", headers=headers).json()["events"]
+        assert len(events) == 1
+        assert events[0]["sources"][0]["source"] == "android_vision_person"
 
 
 def test_person_observation_auth_validation_replay_segment_and_stop_isolation(tmp_path):

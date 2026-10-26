@@ -26,8 +26,25 @@ struct LiveSessionCredentials: Codable {
     let sessionID: String
     let token: String
     let startedAtMS: Int64
+    let douyinAccount: String?
+    var backstageTaskID: String?
+    var backstageStatus: String?
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id", token = "session_token", startedAtMS = "started_at_ms"
+        case douyinAccount = "douyin_account"
+        case backstageTaskID = "backstage_task_id", backstageStatus = "backstage_status"
+    }
+}
+
+private struct LiveBackstageStart: Decodable {
+    let status: String
+    let sessionID: String
+    let taskID: String?
+    let douyinAccount: String?
+    let taskStatus: String
+    enum CodingKeys: String, CodingKey {
+        case status, sessionID = "session_id", taskID = "task_id"
+        case douyinAccount = "douyin_account", taskStatus = "task_status"
     }
 }
 
@@ -128,14 +145,62 @@ struct LiveOnlineCountSummary: Decodable {
     }
 }
 
+struct LiveBackstageMetrics: Decodable {
+    let cumulativeAudience: Int?
+    let newFollowers: Int?
+    let commentCount: Int?
+    let giftGivers: Int?
+    let soundEnergy: Int?
+    enum CodingKeys: String, CodingKey {
+        case cumulativeAudience = "累计观众"
+        case newFollowers = "新增粉丝"
+        case commentCount = "评论人数"
+        case giftGivers = "送礼人数"
+        case soundEnergy = "获得音浪"
+    }
+}
+
+struct LiveBackstageRecap: Decodable {
+    let taskID: String
+    let status: String
+    let douyinAccount: String
+    let roomID: String?
+    let stopSignalReceived: Bool
+    let startedAtMS: Int64
+    let stoppedAtMS: Int64?
+    let claimedAtMS: Int64?
+    let receivedAtMS: Int64?
+    let metrics: LiveBackstageMetrics?
+    let rawDisplays: [String: String]?
+    let approximateMetrics: [String]
+    let metricsCapturedAt: String?
+    let captureMethod: String?
+    let valueSemantics: String?
+    let missingFields: [String: String]
+    let startSignalSource: String
+    let stopSignalSource: String?
+    enum CodingKeys: String, CodingKey {
+        case taskID = "task_id", status, douyinAccount = "douyin_account"
+        case roomID = "room_id", stopSignalReceived = "stop_signal_received"
+        case startedAtMS = "started_at_ms", stoppedAtMS = "stopped_at_ms"
+        case claimedAtMS = "claimed_at_ms", receivedAtMS = "received_at_ms"
+        case metrics, rawDisplays = "raw_displays", approximateMetrics = "approximate_metrics"
+        case metricsCapturedAt = "metrics_captured_at", captureMethod = "capture_method"
+        case valueSemantics = "value_semantics", missingFields = "missing_fields"
+        case startSignalSource = "start_signal_source", stopSignalSource = "stop_signal_source"
+    }
+}
+
 struct LiveSessionSummary: Decodable {
     let sessionID: String
     let startedAtMS: Int64
     let stoppedAtMS: Int64?
     let onlineCount: LiveOnlineCountSummary
+    let backstageRecap: LiveBackstageRecap?
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id", startedAtMS = "started_at_ms"
         case stoppedAtMS = "stopped_at_ms", onlineCount = "online_count"
+        case backstageRecap = "backstage_recap"
     }
 }
 
@@ -153,13 +218,40 @@ struct LiveOperationsClient {
         self.session = URLSession(configuration: config)
     }
 
-    func create(description: String, completion: @escaping (Result<LiveSessionCredentials, Error>) -> Void) {
+    func create(description: String, douyinAccount: String,
+                completion: @escaping (Result<LiveSessionCredentials, Error>) -> Void) {
         var request = URLRequest(url: endpoint("v1", "live", "sessions"), timeoutInterval: 10)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONEncoder().encode(["description": description])
+        request.httpBody = try? JSONEncoder().encode([
+            "description": description,
+            "douyin_account": douyinAccount
+        ])
         session.dataTask(with: request) { data, response, error in
             completion(Self.decode(LiveSessionCredentials.self, data: data, response: response, error: error))
+        }.resume()
+    }
+
+    func start(_ credentials: LiveSessionCredentials,
+               completion: @escaping (Result<LiveSessionCredentials, Error>) -> Void) {
+        var request = authorized(endpoint("v1", "live", "sessions", credentials.sessionID, "start"),
+                                 token: credentials.token)
+        request.httpMethod = "POST"
+        session.dataTask(with: request) { data, response, error in
+            switch Self.decode(LiveBackstageStart.self, data: data, response: response, error: error) {
+            case .failure(let error): completion(.failure(error))
+            case .success(let started):
+                guard started.sessionID == credentials.sessionID,
+                      started.douyinAccount == credentials.douyinAccount,
+                      started.status == "started" || started.status == "duplicate" else {
+                    completion(.failure(NSError(domain: "LiveOperations", code: -2)))
+                    return
+                }
+                var active = credentials
+                active.backstageTaskID = started.taskID
+                active.backstageStatus = started.taskStatus
+                completion(.success(active))
+            }
         }.resume()
     }
 
@@ -312,19 +404,19 @@ struct LiveOperationsClient {
     }
 }
 
-/// App Group 中仅保存当前场次能力令牌；结束场次时立即清空，不写模型密钥或观测正文。
+/// App Group 中只保存当前场次能力令牌；停止采集后为晚到summary暂留，任务终态后清除。
 enum LiveSessionState {
     private static let enabledKey = "live.enabled"
     private static var fileURL: URL? {
         AppGroup.containerURL?.appendingPathComponent("live-session.json", isDirectory: false)
     }
 
-    static func save(_ value: LiveSessionCredentials) -> Bool {
+    static func save(_ value: LiveSessionCredentials, enableCapture: Bool = true) -> Bool {
         guard let fileURL, let defaults = AppGroup.defaults,
               let data = try? JSONEncoder().encode(value) else { return false }
         do {
             try data.write(to: fileURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
-            defaults.set(true, forKey: enabledKey)
+            defaults.set(enableCapture, forKey: enabledKey)
             return true
         } catch {
             return false
@@ -336,6 +428,9 @@ enum LiveSessionState {
         return try? JSONDecoder().decode(LiveSessionCredentials.self, from: data)
     }
     static func isEnabled() -> Bool { AppGroup.defaults?.bool(forKey: enabledKey) ?? false }
+    static func disableCapturePreservingCredentials() {
+        AppGroup.defaults?.set(false, forKey: enabledKey)
+    }
     static func clear() {
         if let fileURL { try? FileManager.default.removeItem(at: fileURL) }
         AppGroup.defaults?.set(false, forKey: enabledKey)

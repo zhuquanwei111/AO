@@ -147,6 +147,377 @@ def test_real_observation_model_prompt_poll_record_stop_and_isolation(tmp_path):
         assert client.post("/v1/answer", json={"sentence": " "}).status_code == 422
 
 
+def test_backstage_task_late_result_identity_idempotency_and_summary(tmp_path):
+    clock = Clock()
+    config = settings(tmp_path / "live.sqlite3")
+    config = config.__class__(**{
+        **config.__dict__, "backstage_worker_token": "fixture-worker-token",
+    })
+    with TestClient(create_app(config, live_clock=clock)) as client:
+        session, app_headers = create(client, douyin_account="主播号-001")
+        sid = session["session_id"]
+        assert session["douyin_account"] == "主播号-001"
+        assert session["backstage_task_id"] is None
+        assert session["backstage_status"] == "not_started"
+        session_url = f"/v1/live/sessions/{sid}"
+        started = client.post(session_url + "/start", headers=app_headers)
+        assert started.status_code == 200
+        task_id = started.json()["task_id"]
+        assert started.json()["status"] == "started"
+        in_progress = client.get(
+            f"/v1/live/sessions/{sid}/summary", headers=app_headers,
+        ).json()["backstage_recap"]
+        assert in_progress["status"] == "waiting_for_stop"
+        assert in_progress["stop_signal_received"] is False
+        assert in_progress["metrics"] is None and in_progress["metrics_captured_at"] is None
+        duplicate_start = client.post(session_url + "/start", headers=app_headers)
+        assert duplicate_start.json()["status"] == "duplicate"
+        assert duplicate_start.json()["task_id"] == task_id
+        worker_headers = {"X-Backstage-Worker-Token": "fixture-worker-token"}
+        claimed = client.post("/v1/live/sessions/backstage/tasks/claim", headers=worker_headers)
+        assert claimed.status_code == 200
+        assert claimed.json()["task"]["task_id"] == task_id
+        assert claimed.json()["task"]["stop_signal_received"] is False
+        claimed_again = client.post("/v1/live/sessions/backstage/tasks/claim", headers=worker_headers)
+        assert claimed_again.json()["task"]["task_id"] == task_id
+
+        # 单活动任务：另一个主播的App场次不能覆盖当前本场任务。
+        busy = client.post("/v1/live/sessions", json={"douyin_account": "主播号-002"})
+        assert busy.status_code == 201
+        busy_headers = {"X-Live-Session-Token": busy.json()["session_token"]}
+        assert client.post(f"/v1/live/sessions/{busy.json()['session_id']}/start",
+                           headers=busy_headers).status_code == 409
+
+        assert client.post(session_url + "/stop", headers=app_headers).json()["backstage_status"] == "capturing"
+        processing = client.get(session_url + "/summary", headers=app_headers).json()["backstage_recap"]
+        assert processing["status"] == "capturing" and processing["stop_signal_received"] is True
+        assert processing["start_signal_source"] == "ios_app"
+        assert processing["stop_signal_source"] == "ios_app"
+        # stop关闭实时收件，但保留同一task的播后回写通道。
+        assert client.post(session_url + "/comments", headers=app_headers,
+                           json=observation("late-live-comment")).status_code == 409
+
+        assert client.post("/v1/live/sessions/backstage/tasks/claim",
+                           headers={"X-Backstage-Worker-Token": "wrong"}).status_code == 403
+        assert client.get(f"/v1/live/sessions/backstage/tasks/{task_id}",
+                          headers=worker_headers).json()["task"]["session_id"] == sid
+
+        metrics = {
+            "累计观众": 12000, "新增粉丝": 7, "评论人数": None,
+            "送礼人数": 4, "获得音浪": 32000,
+        }
+        result = {
+            "task_id": task_id, "douyin_account": "主播号-001", "status": "partial",
+            "room_id": "room-fixture-7", "metrics": metrics,
+            "raw_displays": {"累计观众": "约1.2万", "获得音浪": "3.2万"},
+            "approximate_metrics": ["累计观众", "获得音浪"],
+            "metrics_captured_at": "2026-10-26T12:30:45+08:00",
+            "stop_signal_received": True, "start_signal_source": "ios_app",
+            "stop_signal_source": "ios_app", "capture_method": "受控fixture",
+            "value_semantics": "App停止信号后读取到的本场页面汇总",
+            "missing_fields": {"评论人数": "页面未读到"},
+        }
+        too_long = {**result, "raw_displays": {"累计观众": "x" * 161}}
+        assert client.post(session_url + "/backstage/result", headers=worker_headers,
+                           json=too_long).status_code == 422
+        missing_timezone = {**result, "metrics_captured_at": "2026-10-26T12:30:45"}
+        assert client.post(session_url + "/backstage/result", headers=worker_headers,
+                           json=missing_timezone).status_code == 422
+        wrong_identity = dict(result, douyin_account="主播号-002")
+        assert client.post(session_url + "/backstage/result", headers=worker_headers,
+                           json=wrong_identity).status_code == 409
+        saved = client.post(session_url + "/backstage/result", headers=worker_headers, json=result)
+        assert saved.status_code == 200 and saved.json()["result_status"] == "partial"
+        assert client.post(session_url + "/backstage/result", headers=worker_headers,
+                           json=result).json()["status"] == "duplicate"
+        changed = {**result, "metrics": {**metrics, "新增粉丝": 8}}
+        assert client.post(session_url + "/backstage/result", headers=worker_headers,
+                           json=changed).status_code == 409
+
+        summary = client.get(session_url + "/summary", headers=app_headers)
+        assert summary.status_code == 200
+        recap = summary.json()["backstage_recap"]
+        assert recap["status"] == "partial"
+        assert recap["douyin_account"] == "主播号-001"
+        assert recap["metrics"] == metrics
+        assert recap["raw_displays"]["累计观众"] == "约1.2万"
+        assert recap["approximate_metrics"] == ["累计观众", "获得音浪"]
+        assert recap["metrics_captured_at"] == result["metrics_captured_at"]
+        assert recap["received_at_ms"] == clock.now
+
+        # 终态后可开始下一场；旧任务令牌不能访问新场summary。
+        next_session, next_headers = create(client, douyin_account="主播号-002")
+        next_start = client.post(f"/v1/live/sessions/{next_session['session_id']}/start",
+                                 headers=next_headers)
+        assert next_start.status_code == 200
+        assert next_start.json()["task_id"] != task_id
+        assert client.get(f"/v1/live/sessions/{next_session['session_id']}/summary",
+                          headers=app_headers).status_code == 403
+        assert client.get(f"/v1/live/sessions/{sid}/summary", headers=next_headers).status_code == 403
+
+
+def test_backstage_worker_unconfigured_and_result_validation(tmp_path):
+    with TestClient(create_app(settings(tmp_path / "live.sqlite3"))) as client:
+        assert client.post("/v1/live/sessions/backstage/tasks/claim").status_code == 503
+        session, headers = create(client, douyin_account="test-account")
+        assert session["backstage_task_id"] is None
+        assert client.post(f"/v1/live/sessions/{session['session_id']}/start",
+                           headers=headers).status_code == 200
+        client.post(f"/v1/live/sessions/{session['session_id']}/stop", headers=headers)
+        summary = client.get(f"/v1/live/sessions/{session['session_id']}/summary",
+                             headers=headers).json()
+        assert summary["backstage_recap"]["status"] == "not_connected"
+        assert summary["backstage_recap"]["metrics"] is None
+        assert summary["backstage_recap"]["douyin_account"] == "test-account"
+
+
+def test_backstage_result_without_metrics_keeps_capture_time_unknown(tmp_path):
+    config = settings(tmp_path / "live.sqlite3")
+    config = config.__class__(**{
+        **config.__dict__, "backstage_worker_token": "fixture-worker-token",
+    })
+    with TestClient(create_app(config)) as client:
+        session, headers = create(client, douyin_account="主播号-003")
+        started = client.post(f"/v1/live/sessions/{session['session_id']}/start",
+                              headers=headers).json()
+        client.post(f"/v1/live/sessions/{session['session_id']}/stop", headers=headers)
+        worker_headers = {"X-Backstage-Worker-Token": "fixture-worker-token"}
+        client.post("/v1/live/sessions/backstage/tasks/claim", headers=worker_headers)
+        keys = ["累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪"]
+        result = {
+            "task_id": started["task_id"], "douyin_account": "主播号-003",
+            "status": "needs_input", "metrics": {key: None for key in keys},
+            "raw_displays": {}, "approximate_metrics": [],
+            "metrics_captured_at": None, "stop_signal_received": True,
+            "start_signal_source": "ios_app", "stop_signal_source": "ios_app",
+            "capture_method": "受控fixture", "value_semantics": "未取得数值",
+            "missing_fields": {key: "未读取" for key in keys},
+        }
+        saved = client.post(
+            f"/v1/live/sessions/{session['session_id']}/backstage/result",
+            headers=worker_headers, json=result,
+        )
+        assert saved.status_code == 200
+        recap = client.get(
+            f"/v1/live/sessions/{session['session_id']}/summary", headers=headers,
+        ).json()["backstage_recap"]
+        assert recap["metrics"] == {key: None for key in keys}
+        assert recap["metrics_captured_at"] is None
+
+
+def test_backstage_success_summary_has_complete_five_metric_response_shape(tmp_path):
+    clock = Clock()
+    config = settings(tmp_path / "backstage-success.sqlite3")
+    config = config.__class__(**{
+        **config.__dict__, "backstage_worker_token": "fixture-worker-token",
+    })
+    with TestClient(create_app(config, live_clock=clock)) as client:
+        session, app_headers = create(client, douyin_account="success-account")
+        sid = session["session_id"]
+        url = f"/v1/live/sessions/{sid}"
+        task = client.post(url + "/start", headers=app_headers).json()
+        worker_headers = {"X-Backstage-Worker-Token": "fixture-worker-token"}
+        client.post("/v1/live/sessions/backstage/tasks/claim", headers=worker_headers)
+        client.post(url + "/stop", headers=app_headers)
+        keys = ["累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪"]
+        metrics = {key: index + 1 for index, key in enumerate(keys)}
+        result = {
+            "task_id": task["task_id"], "douyin_account": "success-account",
+            "status": "captured_locally", "room_id": None, "metrics": metrics,
+            "raw_displays": {key: str(value) for key, value in metrics.items()},
+            "approximate_metrics": [],
+            "metrics_captured_at": "2026-10-27T13:00:08+08:00",
+            "stop_signal_received": True, "start_signal_source": "ios_app",
+            "stop_signal_source": "ios_app", "capture_method": "受控测试输入",
+            "value_semantics": "受控五项完整值", "missing_fields": {},
+        }
+        saved = client.post(url + "/backstage/result", headers=worker_headers, json=result)
+        assert saved.status_code == 200, saved.text
+        recap = client.get(url + "/summary", headers=app_headers).json()["backstage_recap"]
+        assert set(recap) == {
+            "task_id", "status", "douyin_account", "stop_signal_received",
+            "started_at_ms", "stopped_at_ms", "claimed_at_ms", "received_at_ms",
+            "room_id", "metrics", "raw_displays", "approximate_metrics",
+            "metrics_captured_at", "capture_method", "value_semantics", "missing_fields",
+            "start_signal_source", "stop_signal_source",
+        }
+        assert recap["status"] == "captured_locally"
+        assert recap["metrics"] == metrics
+        assert recap["raw_displays"] == result["raw_displays"]
+        assert recap["metrics_captured_at"] == result["metrics_captured_at"]
+
+
+def test_android_app_source_contract_and_typed_observation_allowlist(tmp_path):
+    clock = Clock()
+    config = settings(tmp_path / "android-source.sqlite3")
+    config = config.__class__(**{
+        **config.__dict__, "backstage_worker_token": "fixture-worker-token",
+    })
+    with TestClient(create_app(config, live_clock=clock)) as client:
+        session, app_headers = create(client, douyin_account="android-live-account")
+        sid = session["session_id"]
+        url = f"/v1/live/sessions/{sid}"
+        started = client.post(url + "/start", headers=app_headers,
+                              json={"source": "android_app"})
+        assert started.status_code == 200, started.text
+        task_id = started.json()["task_id"]
+        assert started.json()["signal_source"] == "android_app"
+        duplicate_start = client.post(url + "/start", headers=app_headers,
+                                      json={"source": "android_app"})
+        assert duplicate_start.json()["status"] == "duplicate"
+        assert duplicate_start.json()["task_id"] == task_id
+        assert client.post(url + "/start", headers=app_headers,
+                           json={"source": "ios_app"}).status_code == 409
+
+        worker_headers = {"X-Backstage-Worker-Token": "fixture-worker-token"}
+        claimed = client.post("/v1/live/sessions/backstage/tasks/claim",
+                              headers=worker_headers).json()["task"]
+        assert claimed["start_signal_source"] == "android_app"
+        assert claimed["stop_signal_source"] is None
+
+        comment = {
+            "event_id": "android-comment", "input_mode": "live_observation",
+            "source": "android_media_projection_ocr", "coverage": "ocr_visible_sample",
+            "reliability": "known", "text": "欢迎大家来到直播间",
+            "observed_at_ms": clock.now,
+        }
+        comment_result = client.post(url + "/comments", headers=app_headers, json=comment)
+        assert comment_result.status_code == 200, comment_result.text
+        assert comment_result.json()["reason"] == "not_a_question"
+        count = {
+            "event_id": "android-count", "kind": "online_count",
+            "source": "android_media_projection_ocr", "observed_at_ms": clock.now,
+            "availability": "available", "coverage": "configured_online_region",
+            "reliability": "known", "confidence": 0.91,
+            "content": {"raw_text": "约1.2万", "field_semantics_confirmed": True},
+        }
+        count_result = client.post(url + "/observations", headers=app_headers, json=count)
+        assert count_result.status_code == 200, count_result.text
+        recap = client.get(url + "/summary", headers=app_headers).json()
+        assert recap["online_count"]["peak"]["raw_text"] == "约1.2万"
+
+        missing_kinds = [
+            ("interaction", "android_media_projection_ocr"),
+            ("transcript", "android_audioMic_asr"),
+            ("platform_notice", "android_media_projection_ocr"),
+            ("quality", "android_media_projection_ocr"),
+        ]
+        for kind, source in missing_kinds:
+            observation_body = {
+                "event_id": f"android-{kind}", "kind": kind, "source": source,
+                "observed_at_ms": clock.now, "availability": "missing",
+                "coverage": "source_not_available", "reliability": "unknown", "content": None,
+            }
+            response = client.post(url + "/observations", headers=app_headers,
+                                   json=observation_body)
+            assert response.status_code == 200, response.text
+            assert response.json()["reason"] == "source_missing"
+
+        wrong_source = {**count, "event_id": "android-wrong-source",
+                        "source": "ios_replaykit_online_count_roi"}
+        assert client.post(url + "/observations", headers=app_headers,
+                           json=wrong_source).status_code == 422
+        arbitrary_source = {**count, "event_id": "android-arbitrary-source",
+                            "source": "some_unregistered_client_source"}
+        assert client.post(url + "/observations", headers=app_headers,
+                           json=arbitrary_source).status_code == 422
+
+        assert client.post(url + "/stop", headers=app_headers,
+                           json={"source": "ios_app"}).status_code == 409
+        stopped = client.post(url + "/stop", headers=app_headers,
+                              json={"source": "android_app"})
+        assert stopped.status_code == 200, stopped.text
+        assert stopped.json()["signal_source"] == "android_app"
+        assert client.post(url + "/stop", headers=app_headers,
+                           json={"source": "android_app"}).json() == stopped.json()
+        task = client.get(f"/v1/live/sessions/backstage/tasks/{task_id}",
+                          headers=worker_headers).json()["task"]
+        assert task["start_signal_source"] == "android_app"
+        assert task["stop_signal_source"] == "android_app"
+        recap = client.get(url + "/summary", headers=app_headers).json()["backstage_recap"]
+        assert recap["start_signal_source"] == "android_app"
+        assert recap["stop_signal_source"] == "android_app"
+        metric_keys = ["累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪"]
+        saved_result = {
+            "task_id": task_id, "douyin_account": "android-live-account",
+            "status": "needs_input", "room_id": None,
+            "metrics": {key: None for key in metric_keys}, "raw_displays": {},
+            "approximate_metrics": [], "metrics_captured_at": None,
+            "stop_signal_received": True, "start_signal_source": "android_app",
+            "stop_signal_source": "android_app", "capture_method": "受控fixture",
+            "value_semantics": "无可读后台页面", "missing_fields": {
+                key: "未读取" for key in metric_keys
+            },
+        }
+        wrong_result = {**saved_result, "start_signal_source": "ios_app"}
+        assert client.post(url + "/backstage/result", headers=worker_headers,
+                           json=wrong_result).status_code == 409
+        writeback = client.post(url + "/backstage/result", headers=worker_headers,
+                                json=saved_result)
+        assert writeback.status_code == 200, writeback.text
+        final_recap = client.get(url + "/summary", headers=app_headers).json()["backstage_recap"]
+        assert final_recap["status"] == "needs_input"
+        assert final_recap["metrics"] == {key: None for key in metric_keys}
+
+
+def test_live_store_adds_account_snapshot_to_existing_sqlite_schema(tmp_path):
+    path = tmp_path / "legacy-live.sqlite3"
+    legacy = sqlite3.connect(path)
+    legacy.execute("""CREATE TABLE live_sessions (
+        session_id TEXT PRIMARY KEY, token_hash TEXT NOT NULL,
+        started_at_ms INTEGER NOT NULL, stopped_at_ms INTEGER,
+        description TEXT NOT NULL
+    )""")
+    legacy.commit()
+    legacy.close()
+
+    store = LiveStore(str(path), Clock())
+    session = store.create("legacy database", "snapshot-account")
+    columns = {row["name"] for row in store.db.execute("PRAGMA table_info(live_sessions)")}
+    assert "douyin_account" in columns
+    saved = store.db.execute(
+        "SELECT douyin_account FROM live_sessions WHERE session_id=?",
+        (session["session_id"],),
+    ).fetchone()
+    assert saved["douyin_account"] == "snapshot-account"
+    store.close()
+
+
+def test_live_store_migrates_stopped_legacy_backstage_source_as_ios(tmp_path):
+    path = tmp_path / "legacy-backstage.sqlite3"
+    legacy = sqlite3.connect(path)
+    legacy.executescript("""
+        CREATE TABLE live_sessions (
+            session_id TEXT PRIMARY KEY, token_hash TEXT NOT NULL,
+            started_at_ms INTEGER NOT NULL, stopped_at_ms INTEGER,
+            description TEXT NOT NULL, douyin_account TEXT
+        );
+        CREATE TABLE live_backstage_tasks (
+            task_id TEXT PRIMARY KEY, session_id TEXT NOT NULL UNIQUE,
+            douyin_account TEXT NOT NULL, status TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL, claimed_at_ms INTEGER,
+            stopped_at_ms INTEGER, received_at_ms INTEGER,
+            result_hash TEXT, result_json TEXT
+        );
+    """)
+    legacy.execute(
+        "INSERT INTO live_sessions VALUES ('s','h',1000,2000,'legacy','account')"
+    )
+    legacy.execute(
+        "INSERT INTO live_backstage_tasks VALUES ('t','s','account','needs_input',1000,1100,2000,2100,'r','{}')"
+    )
+    legacy.commit()
+    legacy.close()
+
+    store = LiveStore(str(path), Clock())
+    task = store.db.execute(
+        "SELECT start_signal_source,stop_signal_source FROM live_backstage_tasks WHERE task_id='t'"
+    ).fetchone()
+    assert task["start_signal_source"] == "ios_app"
+    assert task["stop_signal_source"] == "ios_app"
+    store.close()
+
+
 def test_mixed_screen_lines_are_not_sent_as_one_comment_and_identity_stays_unknown(tmp_path):
     clock = Clock()
     config = settings(tmp_path / "live.sqlite3")

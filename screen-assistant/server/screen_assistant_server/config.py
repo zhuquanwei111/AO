@@ -42,6 +42,7 @@ class Settings:
     funasr_mode: str = "online"
     silero_model_path: str = ""
     funasr_model_path: str = ""
+    backstage_worker_token: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -61,4 +62,5 @@ class Settings:
             funasr_mode=os.getenv("FUNASR_MODE", "online"),
             silero_model_path=os.getenv("SILERO_ONNX_PATH", ""),
             funasr_model_path=os.getenv("FUNASR_MODEL_PATH", ""),
+            backstage_worker_token=os.getenv("BACKSTAGE_WORKER_TOKEN", ""),
         )

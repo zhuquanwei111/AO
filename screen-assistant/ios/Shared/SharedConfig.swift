@@ -10,6 +10,7 @@ struct SharedConfig {
 
     private enum Keys {
         static let serverBaseURL = "config.serverBaseURL"
+        static let douyinAccount = "config.douyinAccount"
         static let intervalSeconds = "config.intervalSeconds"
         static let requestTimeoutSeconds = "config.requestTimeoutSeconds"
         static let roiX = "config.roiX"
@@ -62,6 +63,16 @@ struct SharedConfig {
 
     static func setServerBaseURL(_ raw: String) {
         AppGroup.defaults?.set(raw, forKey: Keys.serverBaseURL)
+    }
+
+    static func douyinAccount() -> String {
+        AppGroup.defaults?.string(forKey: Keys.douyinAccount)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    static func setDouyinAccount(_ raw: String) {
+        AppGroup.defaults?.set(raw.trimmingCharacters(in: .whitespacesAndNewlines),
+                               forKey: Keys.douyinAccount)
     }
 
     /// 轮次间隔（秒）。越界时回退默认值。

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .live_rules import (
     FUSION_FUTURE_SKEW_MS, FUSION_SETTLE_MS, MAX_OBSERVATION_AGE_MS,
@@ -20,7 +20,10 @@ from .live_rules import (
 )
 from .live_store import LiveStore, digest
 from .model_client import ModelTimeoutError, ModelUnavailableError
-from .live_fusion import Observation
+from .live_fusion import (
+    Observation, ObservationSource, TEST_COMMENT_FIXTURE_SOURCES,
+    observation_source_allowed,
+)
 from .person_observation import PersonObservation as PersonObservationValue, PersonPolicy
 
 router = APIRouter(prefix="/v1/live/sessions", tags=["live-test-fixture"])
@@ -29,6 +32,69 @@ router = APIRouter(prefix="/v1/live/sessions", tags=["live-test-fixture"])
 class CreateSession(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     description: str = Field(default="", max_length=500)
+    douyin_account: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class SessionSignal(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    source: Literal["ios_app", "android_app"]
+
+
+BACKSTAGE_METRIC_KEYS = ("累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪")
+
+
+class BackstageResultPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, strict=True)
+    task_id: str = Field(min_length=1, max_length=64)
+    douyin_account: str = Field(min_length=1, max_length=128)
+    status: Literal["captured_locally", "partial", "needs_input", "failed"]
+    room_id: str | None = Field(default=None, max_length=128)
+    metrics: dict[str, int | None]
+    raw_displays: dict[str, str] = Field(default_factory=dict, max_length=5)
+    approximate_metrics: list[str] = Field(default_factory=list, max_length=5)
+    metrics_captured_at: str | None = Field(default=None, max_length=64)
+    stop_signal_received: bool
+    start_signal_source: Literal["ios_app", "android_app"]
+    stop_signal_source: Literal["ios_app", "android_app"]
+    capture_method: str = Field(min_length=1, max_length=160)
+    value_semantics: str = Field(min_length=1, max_length=200)
+    missing_fields: dict[str, str] = Field(default_factory=dict, max_length=5)
+
+    @field_validator("raw_displays", "missing_fields")
+    @classmethod
+    def validate_short_field_values(cls, value):
+        if any(len(item) > 160 for item in value.values()):
+            raise ValueError("field text exceeds the recap limit")
+        return value
+
+    @model_validator(mode="after")
+    def validate_result(self):
+        if set(self.metrics) != set(BACKSTAGE_METRIC_KEYS):
+            raise ValueError("metrics must contain exactly the five recap fields")
+        if any(value is not None and (value < 0 or value > 2**53) for value in self.metrics.values()):
+            raise ValueError("metric values must be non-negative integers or null")
+        if any(key not in BACKSTAGE_METRIC_KEYS for key in self.raw_displays):
+            raise ValueError("raw display contains an unknown metric")
+        if any(key not in BACKSTAGE_METRIC_KEYS for key in self.approximate_metrics):
+            raise ValueError("approximation contains an unknown metric")
+        if any(key not in BACKSTAGE_METRIC_KEYS for key in self.missing_fields):
+            raise ValueError("missing-field map contains an unknown metric")
+        if self.status == "captured_locally" and any(value is None for value in self.metrics.values()):
+            raise ValueError("captured_locally requires all five values")
+        if not self.stop_signal_received:
+            raise ValueError("backstage result requires the app stop signal")
+        if any(value is not None for value in self.metrics.values()):
+            if self.metrics_captured_at is None:
+                raise ValueError("captured metrics require a timestamp")
+        if self.metrics_captured_at is not None:
+            from datetime import datetime
+            try:
+                captured = datetime.fromisoformat(self.metrics_captured_at.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValueError("metrics_captured_at must be ISO-8601") from exc
+            if captured.tzinfo is None:
+                raise ValueError("metrics_captured_at must include a timezone")
+        return self
 
 
 class TextPosition(BaseModel):
@@ -43,7 +109,7 @@ class CommentObservation(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     event_id: str = Field(min_length=1, max_length=128)
     input_mode: Literal["test_fixture", "live_observation"]
-    source: str = Field(min_length=1, max_length=64)
+    source: ObservationSource
     coverage: Literal["structured_sample", "ocr_visible_sample", "unknown"]
     reliability: Literal["known", "unknown"] = "unknown"
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -53,11 +119,20 @@ class CommentObservation(BaseModel):
     platform_message_id: str | None = Field(default=None, min_length=1, max_length=128)
     observed_at_ms: int | None = Field(default=None, ge=0, le=2**63-1, strict=True)
 
+    @model_validator(mode="after")
+    def validate_comment_source(self):
+        if self.input_mode == "test_fixture":
+            if self.source not in TEST_COMMENT_FIXTURE_SOURCES:
+                raise ValueError("comment fixture source is not registered")
+        elif self.source not in {"ios_replaykit_ocr", "android_media_projection_ocr"}:
+            raise ValueError("live comment source is not registered")
+        return self
+
 
 class PersonSignal(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     event_id: str = Field(min_length=1, max_length=128)
-    source: Literal["ios_replaykit_vision"]
+    source: Literal["ios_replaykit_vision", "android_vision_person"]
     signal: Literal["head_down"]
     confidence: float = Field(ge=0.5, le=1.0)
     sample_count: int = Field(ge=5, le=100)
@@ -67,7 +142,7 @@ class PersonSignal(BaseModel):
 
 class PersonObservationPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    source: Literal["ios_replaykit_vision"]
+    source: Literal["ios_replaykit_vision", "android_vision_person"]
     coverage: Literal["sampled_person_roi"]
     segment_id: str = Field(min_length=1, max_length=128)
     sequence: int = Field(ge=0, le=2**53)
@@ -149,6 +224,10 @@ class LiveService:
         """Run one bounded numeric sample through a session-owned policy."""
         async with self.lock:
             session = await self.call("audio_access", sid, token)
+            if not observation_source_allowed(
+                "person_state", payload.get("source", ""), session["signal_source"],
+            ):
+                raise HTTPException(422, "person observation source does not match app session")
             item = PersonObservationValue.from_payload(payload)
             if not item.valid():
                 raise HTTPException(422, "invalid person observation")
@@ -297,16 +376,32 @@ def valid_operation_suggestion(value: str | None) -> bool:
 
 @router.post("", status_code=201)
 async def create_session(request: Request, payload: CreateSession | None = None):
-    return await request.app.state.live.run("create", payload.description if payload else "")
+    return await request.app.state.live.run(
+        "create", payload.description if payload else "",
+        payload.douyin_account if payload else None,
+    )
+
+
+@router.post("/{session_id}/start")
+async def start_session(session_id: str, request: Request,
+                        payload: SessionSignal | None = None,
+                        token: str | None = Header(None, alias="X-Live-Session-Token")):
+    return await request.app.state.live.run(
+        "start_backstage", session_id, token, payload.source if payload else "ios_app",
+    )
 
 
 @router.post("/{session_id}/stop")
 async def stop_session(session_id: str, request: Request,
+                       payload: SessionSignal | None = None,
                        token: str | None = Header(None, alias="X-Live-Session-Token")):
     # 幂等stop保留；有音频时先处理已收到的尾窗，再关闭M4收件。
     service = request.app.state.live
     async with service.lock:
         row = await service.call("authorize", session_id, token)
+        app_source = await service.call("session_signal_source", session_id, token)
+        if payload is not None and payload.source != app_source:
+            raise HTTPException(409, "stop signal source does not match app session")
         stopped = row["stopped_at_ms"] is not None
     audio_result = None
     if not stopped:
@@ -315,12 +410,46 @@ async def stop_session(session_id: str, request: Request,
     try:
         if audio_result and audio_result["transcript_count"]:
             await service.deliver_fusion(session_id, token, request)
-        result = await service.run("stop", session_id, token)
+        result = await service.run(
+            "stop", session_id, token, payload.source if payload else None,
+        )
     finally:
         request.app.state.audio.closing.discard(session_id)
     if audio_result is not None and (audio_result["transcript_count"] or audio_result["incomplete"]):
         result["audio"] = audio_result
     return result
+
+
+def _authorize_backstage_worker(request: Request, token: str | None) -> None:
+    expected = request.app.state.settings.backstage_worker_token
+    if not expected:
+        raise HTTPException(503, "backstage worker is not connected")
+    import hmac
+    if not token or not hmac.compare_digest(expected, token):
+        raise HTTPException(403, "backstage worker access denied")
+
+
+@router.post("/backstage/tasks/claim")
+async def claim_backstage_task(request: Request,
+                               token: str | None = Header(None, alias="X-Backstage-Worker-Token")):
+    _authorize_backstage_worker(request, token)
+    return await request.app.state.live.run("claim_backstage_task")
+
+
+@router.get("/backstage/tasks/{task_id}")
+async def get_backstage_task(task_id: str, request: Request,
+                             token: str | None = Header(None, alias="X-Backstage-Worker-Token")):
+    _authorize_backstage_worker(request, token)
+    return await request.app.state.live.run("backstage_task", task_id)
+
+
+@router.post("/{session_id}/backstage/result")
+async def save_backstage_result(session_id: str, payload: BackstageResultPayload, request: Request,
+                               token: str | None = Header(None, alias="X-Backstage-Worker-Token")):
+    _authorize_backstage_worker(request, token)
+    return await request.app.state.live.run(
+        "save_backstage_result", session_id, payload.model_dump(),
+    )
 
 
 @router.get("/{session_id}/events")

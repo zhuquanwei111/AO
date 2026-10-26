@@ -19,7 +19,10 @@ from .live_rules import (
     MAX_PENDING, MAX_WINDOW_OBSERVATIONS, PROMPT_TTL_MS, WINDOW_MS, question,
     FUSION_FUTURE_SKEW_MS,
 )
-from .live_fusion import build_candidate, online_count_details, validate_observation_content
+from .live_fusion import (
+    build_candidate, observation_source_allowed, online_count_details,
+    validate_observation_content,
+)
 
 
 def digest(value: str) -> str:
@@ -41,7 +44,8 @@ class LiveStore:
             CREATE TABLE IF NOT EXISTS live_sessions (
                 session_id TEXT PRIMARY KEY, token_hash TEXT NOT NULL,
                 started_at_ms INTEGER NOT NULL, stopped_at_ms INTEGER,
-                description TEXT NOT NULL
+                description TEXT NOT NULL, douyin_account TEXT,
+                app_source TEXT
             );
             CREATE TABLE IF NOT EXISTS live_observations (
                 session_id TEXT NOT NULL, event_hash TEXT NOT NULL,
@@ -71,6 +75,17 @@ class LiveStore:
                 ON live_events (session_id, seq);
             CREATE INDEX IF NOT EXISTS live_events_topic
                 ON live_events (session_id, topic_hash, generated_at_ms);
+            CREATE TABLE IF NOT EXISTS live_backstage_tasks (
+                task_id TEXT PRIMARY KEY, session_id TEXT NOT NULL UNIQUE,
+                douyin_account TEXT NOT NULL, status TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL, claimed_at_ms INTEGER,
+                stopped_at_ms INTEGER, received_at_ms INTEGER,
+                start_signal_source TEXT NOT NULL DEFAULT 'ios_app', stop_signal_source TEXT,
+                result_hash TEXT, result_json TEXT,
+                FOREIGN KEY(session_id) REFERENCES live_sessions(session_id)
+            );
+            CREATE INDEX IF NOT EXISTS live_backstage_status
+                ON live_backstage_tasks (status, created_at_ms);
         """)
         count_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(live_count_samples)")}
         for column, definition in (
@@ -80,6 +95,24 @@ class LiveStore:
         ):
             if column not in count_columns:
                 self.db.execute(f"ALTER TABLE live_count_samples ADD COLUMN {column} {definition}")
+        session_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(live_sessions)")}
+        if "douyin_account" not in session_columns:
+            self.db.execute("ALTER TABLE live_sessions ADD COLUMN douyin_account TEXT")
+        if "app_source" not in session_columns:
+            self.db.execute("ALTER TABLE live_sessions ADD COLUMN app_source TEXT")
+        task_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(live_backstage_tasks)")}
+        if "start_signal_source" not in task_columns:
+            self.db.execute(
+                "ALTER TABLE live_backstage_tasks ADD COLUMN start_signal_source "
+                "TEXT NOT NULL DEFAULT 'ios_app'"
+            )
+        if "stop_signal_source" not in task_columns:
+            self.db.execute("ALTER TABLE live_backstage_tasks ADD COLUMN stop_signal_source TEXT")
+        with self.db:
+            self.db.execute(
+                "UPDATE live_backstage_tasks SET stop_signal_source=start_signal_source "
+                "WHERE stopped_at_ms IS NOT NULL AND stop_signal_source IS NULL"
+            )
 
     def close(self):
         self.db.close()
@@ -96,7 +129,7 @@ class LiveStore:
             raise HTTPException(403, "live session access denied")
         return row
 
-    def create(self, description: str):
+    def create(self, description: str, douyin_account: str | None = None):
         active = self.db.execute(
             "SELECT COUNT(*) FROM live_sessions WHERE stopped_at_ms IS NULL"
         ).fetchone()[0]
@@ -106,10 +139,77 @@ class LiveStore:
         now = self.clock()
         with self.db:
             self.db.execute(
-                "INSERT INTO live_sessions VALUES (?, ?, ?, NULL, ?)",
-                (sid, digest(token), now, description),
+                "INSERT INTO live_sessions "
+                "(session_id,token_hash,started_at_ms,stopped_at_ms,description,douyin_account) "
+                "VALUES (?, ?, ?, NULL, ?, ?)",
+                (sid, digest(token), now, description, douyin_account),
             )
-        return {"session_id": sid, "session_token": token, "started_at_ms": now}
+        return {
+            "session_id": sid, "session_token": token, "started_at_ms": now,
+            "douyin_account": douyin_account, "backstage_task_id": None,
+            "backstage_status": "not_started" if douyin_account else "not_configured",
+        }
+
+    def _stored_app_source(self, sid: str, session) -> str:
+        if session["app_source"]:
+            return session["app_source"]
+        task = self.db.execute(
+            "SELECT start_signal_source FROM live_backstage_tasks WHERE session_id=?", (sid,)
+        ).fetchone()
+        return task["start_signal_source"] if task else "ios_app"
+
+    def session_signal_source(self, sid: str, token: str | None) -> str:
+        session = self.authorize(sid, token)
+        return self._stored_app_source(sid, session)
+
+    def start_backstage(self, sid: str, token: str | None, signal_source: str = "ios_app"):
+        session = self.authorize(sid, token)
+        if session["stopped_at_ms"] is not None:
+            raise HTTPException(409, "live session stopped")
+        if signal_source not in {"ios_app", "android_app"}:
+            raise HTTPException(422, "invalid app signal source")
+        existing = self.db.execute(
+            "SELECT task_id,status,douyin_account,start_signal_source FROM live_backstage_tasks "
+            "WHERE session_id=?", (sid,),
+        ).fetchone()
+        stored_source = session["app_source"] or (
+            existing["start_signal_source"] if existing else None
+        )
+        if stored_source and stored_source != signal_source:
+            raise HTTPException(409, "start signal source does not match app session")
+        if not session["app_source"]:
+            with self.db:
+                self.db.execute("UPDATE live_sessions SET app_source=? WHERE session_id=?",
+                                (stored_source or signal_source, sid))
+            session = self.authorize(sid, token)
+        account = session["douyin_account"]
+        if not account:
+            return {"status": "not_configured", "session_id": sid, "task_id": None,
+                    "douyin_account": None, "task_status": "not_configured",
+                    "signal_source": signal_source}
+        if existing:
+            if existing["start_signal_source"] != signal_source:
+                raise HTTPException(409, "start signal source does not match existing task")
+            return {"status": "duplicate", "session_id": sid,
+                    "task_id": existing["task_id"], "douyin_account": existing["douyin_account"],
+                    "task_status": existing["status"], "signal_source": signal_source}
+        active = self.db.execute(
+            "SELECT 1 FROM live_backstage_tasks WHERE status IN "
+            "('waiting_for_stop','capturing','not_connected') LIMIT 1"
+        ).fetchone()
+        if active:
+            raise HTTPException(409, "a backstage recap task is already active")
+        task_id = uuid.uuid4().hex
+        with self.db:
+            self.db.execute(
+                "INSERT INTO live_backstage_tasks "
+                "(task_id,session_id,douyin_account,status,created_at_ms,start_signal_source) "
+                "VALUES (?,?,?,'waiting_for_stop',?,?)",
+                (task_id, sid, account, self.clock(), signal_source),
+            )
+        return {"status": "started", "session_id": sid, "task_id": task_id,
+                "douyin_account": account, "task_status": "waiting_for_stop",
+                "signal_source": signal_source}
 
     def description(self, sid: str, token: str | None) -> str:
         return self.authorize(sid, token)["description"]
@@ -118,26 +218,55 @@ class LiveStore:
         row = self.authorize(sid, token)
         if row["stopped_at_ms"] is not None:
             raise HTTPException(409, "live session stopped")
-        return {"started_at_ms": row["started_at_ms"]}
+        return {"started_at_ms": row["started_at_ms"],
+                "signal_source": self._stored_app_source(sid, row)}
 
-    def stop(self, sid: str, token: str | None):
+    def stop(self, sid: str, token: str | None, signal_source: str | None = None):
         row = self.authorize(sid, token)
+        if signal_source is not None and signal_source not in {"ios_app", "android_app"}:
+            raise HTTPException(422, "invalid app signal source")
+        expected_source = self._stored_app_source(sid, row)
+        if signal_source is not None and signal_source != expected_source:
+            raise HTTPException(409, "stop signal source does not match app session")
+        signal_source = signal_source or expected_source
         stopped = row["stopped_at_ms"]
         if stopped is None:
             stopped = max(self.clock(), row["started_at_ms"])
             with self.db:
                 self.db.execute(
-                    "UPDATE live_sessions SET stopped_at_ms = ? WHERE session_id = ?",
-                    (stopped, sid),
+                    "UPDATE live_sessions SET stopped_at_ms = ?,app_source = COALESCE(app_source,?) "
+                    "WHERE session_id = ?",
+                    (stopped, signal_source, sid),
                 )
+                task = self.db.execute(
+                    "SELECT claimed_at_ms FROM live_backstage_tasks WHERE session_id=?", (sid,)
+                ).fetchone()
+                if task:
+                    status = "capturing" if task["claimed_at_ms"] is not None else "not_connected"
+                    self.db.execute(
+                        "UPDATE live_backstage_tasks SET status=?,stopped_at_ms=?,stop_signal_source=? "
+                        "WHERE session_id=?",
+                        (status, stopped, signal_source, sid),
+                    )
         self.windows.pop(sid, None)
         self.fusion_windows.pop(sid, None)
-        return {"session_id": sid, "stopped_at_ms": stopped}
+        task = self.db.execute(
+            "SELECT task_id,status FROM live_backstage_tasks WHERE session_id=?", (sid,)
+        ).fetchone()
+        return {
+            "session_id": sid, "stopped_at_ms": stopped,
+            "backstage_task_id": task["task_id"] if task else None,
+            "backstage_status": task["status"] if task else "not_configured",
+            "signal_source": signal_source,
+        }
 
     def add_observation(self, sid: str, token: str | None, body: dict, received_at_ms: int):
         session = self.authorize(sid, token)
         if session["stopped_at_ms"] is not None:
             raise HTTPException(409, "live session stopped")
+        if not observation_source_allowed(body["kind"], body["source"],
+                                          session["app_source"] or "ios_app"):
+            raise HTTPException(422, "observation source does not match app session")
         event_hash = digest(body["event_id"])
         fingerprint = digest(json.dumps(body, ensure_ascii=False, sort_keys=True))
         prior = self.db.execute(
@@ -365,12 +494,114 @@ class LiveStore:
                 "time_weighted_average": None,
                 "coverage": {"source_count": len(summaries)},
             }
+        task = self.db.execute(
+            "SELECT * FROM live_backstage_tasks WHERE session_id=?", (sid,)
+        ).fetchone()
+        backstage = None
+        if task:
+            result = json.loads(task["result_json"]) if task["result_json"] else None
+            backstage = {
+                "task_id": task["task_id"], "status": task["status"],
+                "douyin_account": task["douyin_account"],
+                "stop_signal_received": task["stopped_at_ms"] is not None,
+                "started_at_ms": session["started_at_ms"],
+                "stopped_at_ms": task["stopped_at_ms"],
+                "claimed_at_ms": task["claimed_at_ms"],
+                "received_at_ms": task["received_at_ms"],
+                "room_id": result.get("room_id") if result else None,
+                "metrics": result.get("metrics") if result else None,
+                "raw_displays": result.get("raw_displays") if result else None,
+                "approximate_metrics": result.get("approximate_metrics") if result else [],
+                "metrics_captured_at": result.get("metrics_captured_at") if result else None,
+                "capture_method": result.get("capture_method") if result else None,
+                "value_semantics": result.get("value_semantics") if result else None,
+                "missing_fields": result.get("missing_fields") if result else {},
+                "start_signal_source": task["start_signal_source"],
+                "stop_signal_source": task["stop_signal_source"],
+            }
         return {
             "session_id": sid, "started_at_ms": session["started_at_ms"],
             "stopped_at_ms": session["stopped_at_ms"],
             "online_count": count_summary,
             "online_count_by_source": summaries,
+            "backstage_recap": backstage,
         }
+
+    def claim_backstage_task(self):
+        task = self.db.execute("""
+            SELECT t.*,s.stopped_at_ms AS session_stopped_at_ms
+            FROM live_backstage_tasks t JOIN live_sessions s USING(session_id)
+            WHERE t.result_hash IS NULL AND t.status IN ('waiting_for_stop','capturing','not_connected')
+            ORDER BY t.created_at_ms LIMIT 1
+        """).fetchone()
+        if task is None:
+            return {"status": "idle", "task": None}
+        now = self.clock()
+        status = "capturing" if task["session_stopped_at_ms"] is not None else "waiting_for_stop"
+        with self.db:
+            updated = self.db.execute(
+                "UPDATE live_backstage_tasks SET claimed_at_ms=COALESCE(claimed_at_ms,?),status=? "
+                "WHERE task_id=? AND result_hash IS NULL",
+                (now, status, task["task_id"]),
+            ).rowcount
+        if not updated:
+            return {"status": "idle", "task": None}
+        return {"status": "claimed", "task": self.backstage_task(task["task_id"])["task"]}
+
+    def backstage_task(self, task_id: str):
+        task = self.db.execute("""
+            SELECT t.*,s.stopped_at_ms AS session_stopped_at_ms
+            FROM live_backstage_tasks t JOIN live_sessions s USING(session_id)
+            WHERE t.task_id=?
+        """, (task_id,)).fetchone()
+        if task is None:
+            raise HTTPException(404, "backstage task not found")
+        result = json.loads(task["result_json"]) if task["result_json"] else None
+        return {"status": "ok", "task": {
+            "task_id": task["task_id"], "session_id": task["session_id"],
+            "douyin_account": task["douyin_account"], "status": task["status"],
+            "start_signal_source": task["start_signal_source"],
+            "stop_signal_source": task["stop_signal_source"],
+            "stop_signal_received": task["session_stopped_at_ms"] is not None,
+            "stopped_at_ms": task["session_stopped_at_ms"],
+            "result_status": result.get("status") if result else None,
+        }}
+
+    def save_backstage_result(self, sid: str, payload: dict):
+        task = self.db.execute(
+            "SELECT * FROM live_backstage_tasks WHERE session_id=?", (sid,)
+        ).fetchone()
+        if task is None:
+            raise HTTPException(404, "backstage task not found")
+        session = self.db.execute(
+            "SELECT stopped_at_ms FROM live_sessions WHERE session_id=?", (sid,)
+        ).fetchone()
+        if (payload["task_id"] != task["task_id"]
+                or payload["douyin_account"] != task["douyin_account"]):
+            raise HTTPException(409, "backstage task identity mismatch")
+        if (payload["start_signal_source"] != task["start_signal_source"]
+                or payload["stop_signal_source"] != task["stop_signal_source"]):
+            raise HTTPException(409, "backstage app signal source mismatch")
+        result_hash = digest(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        if task["result_hash"]:
+            if task["result_hash"] == result_hash:
+                return {"status": "duplicate", "task_id": task["task_id"],
+                        "result_status": task["status"]}
+            raise HTTPException(409, "backstage task already has a different result")
+        if session["stopped_at_ms"] is None:
+            raise HTTPException(409, "backstage result requires stopped session")
+        if task["claimed_at_ms"] is None or task["status"] != "capturing":
+            raise HTTPException(409, "backstage task has not been claimed")
+        received_at = self.clock()
+        with self.db:
+            self.db.execute(
+                "UPDATE live_backstage_tasks SET status=?,received_at_ms=?,result_hash=?,result_json=? "
+                "WHERE task_id=?",
+                (payload["status"], received_at, result_hash,
+                 json.dumps(payload, ensure_ascii=False, sort_keys=True), task["task_id"]),
+            )
+        return {"status": "accepted", "task_id": task["task_id"],
+                "result_status": payload["status"], "received_at_ms": received_at}
 
     def fusion_candidate(self, sid: str, token: str | None):
         session = self.authorize(sid, token)
@@ -732,6 +963,10 @@ class LiveStore:
         session = self.authorize(sid, token)
         if session["stopped_at_ms"] is not None:
             raise HTTPException(409, "live session stopped")
+        if not observation_source_allowed(
+            "person_state", body["source"], session["app_source"] or "ios_app",
+        ):
+            raise HTTPException(422, "person signal source does not match app session")
         if not (session["started_at_ms"] <= body["started_at_ms"] <= body["observed_at_ms"] <= received_at_ms):
             raise HTTPException(422, "signal time outside live session")
         key = digest(body["event_id"])

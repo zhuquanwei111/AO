@@ -222,7 +222,8 @@ class AudioService:
                     await track.job
                 if track.job_error:
                     raise HTTPException(503, "audio analysis failed before end")
-                await self.analyze(sid, token, packet.source, track, transcripts)
+                await self.analyze(sid, token, packet.source, track, transcripts,
+                                   app_source=session["signal_source"])
                 transcripts.extend(track.transcripts)
                 track.transcripts.clear()
                 return {"status": "accepted", "gaps": gaps, "continuity_id": track.continuity_id,
@@ -278,7 +279,8 @@ class AudioService:
                 # 输入包<=600ms，达到6秒前先清窗，内存上限严格为6秒。
                 pcm = packet.pcm()
                 if len(track.pending)+len(pcm) > WINDOW_FRAMES*2:
-                    if not await self.schedule(sid, token, packet.source, track):
+                    if not await self.schedule(sid, token, packet.source, track,
+                                               session["signal_source"]):
                         gaps.append("analysis_backpressure")
                 if not track.pending:
                     track.window_start = spans[0].pts.seconds()
@@ -286,7 +288,8 @@ class AudioService:
                 track.pending.extend(pcm)
                 track.last_span = spans[-1].model_dump()
                 if packet.final or len(track.pending) >= WINDOW_FRAMES*2:
-                    if not await self.schedule(sid, token, packet.source, track):
+                    if not await self.schedule(sid, token, packet.source, track,
+                                               session["signal_source"]):
                         gaps.append("analysis_backpressure")
                 if packet.final and track.job:
                     await track.job
@@ -321,7 +324,7 @@ class AudioService:
         return anchor["observed_at_ms"] + round(
             (media-Fraction(anchor["pts"]["value"], anchor["pts"]["timescale"])) * 1000)
 
-    async def schedule(self, sid, token, source, track):
+    async def schedule(self, sid, token, source, track, app_source):
         if not track.pending:
             return True
         if track.job and not track.job.done():
@@ -339,7 +342,8 @@ class AudioService:
         async def work():
             try:
                 async with asyncio.timeout(15):
-                    await self.analyze(sid, token, source, snapshot, track.transcripts, owner=track)
+                    await self.analyze(sid, token, source, snapshot, track.transcripts,
+                                       app_source=app_source, owner=track)
                 if hasattr(self, "deliver"):
                     await self.deliver(sid, token)
             except asyncio.CancelledError:
@@ -350,7 +354,7 @@ class AudioService:
         track.job = asyncio.create_task(work())
         return True
 
-    async def analyze(self, sid, token, source, track, output, owner=None):
+    async def analyze(self, sid, token, source, track, output, *, app_source="ios_app", owner=None):
         if not track.pending:
             return
         pcm = bytes(track.pending)
@@ -380,7 +384,8 @@ class AudioService:
                 event_id = f"asr-{segment_id}-{revision}"
                 body = {
                     "kind": "transcript", "event_id": event_id,
-                    "source": "ios_replaykit_"+source+"_asr",
+                    "source": ("ios_replaykit_" if app_source == "ios_app" else "android_")
+                              + source + "_asr",
                     "observed_at_ms": end_ms, "started_at_ms": start_ms, "ended_at_ms": end_ms,
                     "availability": "available", "coverage": "continuous",
                     "reliability": "known" if track.host_confirmed and end_ms is not None else "unknown",
@@ -410,7 +415,7 @@ class AudioService:
             await self.asr.transcribe(pcm[left*2:right*2], segment_id, emit)
 
     async def finish_session(self, sid, token):
-        await self.access(sid, token)
+        session = await self.access(sid, token)
         if sid in self.closing:
             raise HTTPException(409, "audio session already closing")
         self.closing.add(sid)
@@ -425,7 +430,8 @@ class AudioService:
                     track.busy = True
                     if track.job:
                         await asyncio.shield(track.job)
-                    await self.analyze(sid, token, key[1], track, output)
+                    await self.analyze(sid, token, key[1], track, output,
+                                       app_source=session["signal_source"])
                     incomplete = incomplete or track.job_error
             except (Exception, asyncio.CancelledError):
                 incomplete = True

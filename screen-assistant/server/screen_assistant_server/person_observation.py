@@ -15,6 +15,7 @@ class PersonObservation:
     observed_at_ms: int
     uptime_ms: int
     quality: str
+    source: str = "ios_replaykit_vision"
     person_count: int | None = None
     confidence: float | None = None
     person_box: tuple[float, ...] | None = None  # 可靠人体框，左上归一化；脸框不代替。
@@ -40,6 +41,7 @@ class PersonObservation:
                 and all(type(x) is int and 0 <= x <= 2**53 for x in
                         (self.sequence, self.observed_at_ms, self.uptime_ms))
                 and isinstance(self.quality, str) and len(self.quality) <= 64
+                and self.source in {"ios_replaykit_vision", "android_vision_person"}
                 and (self.person_count is None or type(self.person_count) is int
                      and 0 <= self.person_count <= 10)
                 and (self.confidence is None or number(self.confidence, 0, 1))
@@ -178,7 +180,8 @@ class PersonPolicy:
         candidate = PersonCandidate(
             "person_not_visible_candidate", self._absence_start.observed_at_ms,
             item.observed_at_ms, self._absence_count, None,
-            "采样画面里持续暂未看到人物（候选）", "画面里暂未看到你，确认一下镜头位置。")
+            "采样画面里持续暂未看到人物（候选）", "画面里暂未看到你，确认一下镜头位置。",
+            source=item.source)
         self._last_prompt_uptime = item.uptime_ms
         self._exit_at = None  # 新的退出证据前不重复提醒。
         return PersonDecision("not_visible_candidate", candidate=candidate)

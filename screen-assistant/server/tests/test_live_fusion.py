@@ -30,7 +30,7 @@ def test_user_selected_count_region_accepts_bare_digits_and_marks_approximate_un
 def test_typed_observation_keeps_missing_unreliable_and_confidence_unknown_distinct():
     adapter = TypeAdapter(Observation)
     missing = adapter.validate_python({
-        "event_id": "missing-1", "kind": "online_count", "source": "ios_screen_roi",
+        "event_id": "missing-1", "kind": "online_count", "source": "ios_replaykit_online_count_roi",
         "observed_at_ms": 1000, "availability": "missing", "coverage": "dedicated_region",
         "reliability": "unknown", "confidence": None, "content": None,
     })

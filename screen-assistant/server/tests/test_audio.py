@@ -127,6 +127,26 @@ def test_final_revisions_enter_m4_once_then_short_prompt_and_record(tmp_path):
         assert "pcm_base64" not in "\n".join(app.state.live.store.db.iterdump())
 
 
+def test_android_app_pcm_track_uses_android_asr_source(tmp_path):
+    clock = Clock()
+    app, configure = fixture_app(tmp_path, clock)
+    with TestClient(app) as client:
+        configure()
+        session, headers = create(client, douyin_account="android-audio-account")
+        url = f"/v1/live/sessions/{session['session_id']}"
+        started = client.post(url + "/start", headers=headers,
+                              json={"source": "android_app"})
+        assert started.status_code == 200, started.text
+        clock.now += 10000
+        response = client.post(url + "/audio", headers=headers,
+                               json=packet(source="audioMic", final=True))
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "accepted"
+        assert [row["source"] for row in response.json()["transcripts"]] == [
+            "android_audioMic_asr", "android_audioMic_asr"
+        ]
+
+
 @pytest.mark.parametrize("regions,changes", [([], {}), (None, {"host_confirmed": False}),
     (None, {"clock_anchor": None})])
 def test_no_valid_host_or_clock_or_vad_is_quiet(tmp_path, regions, changes):

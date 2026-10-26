@@ -11,6 +11,69 @@ from .live_rules import COUNT_TREND_SAMPLES, INTERACTION_SPARSE_MAX, question
 from .audio import AudioSpan, OriginalFormat
 
 
+ObservationSource = Literal[
+    "ios_replaykit_ocr", "ios_replaykit_online_count_roi",
+    "ios_replaykit_platform_notice_roi", "ios_replaykit_vision",
+    "ios_replaykit_audioMic_asr", "ios_replaykit_audioApp_asr",
+    "android_media_projection_ocr", "android_vision_person",
+    "android_audioMic_asr", "android_audioApp_asr", "audio:mic",
+    "fixture:chat", "fixture:ocr_comment", "fixture:confirmed-count",
+    "fixture:confirmed_online_region", "fixture:calibrated_online_field",
+    "fixture:interaction_counter", "fixture:host_asr", "fixture:vision_person",
+    "fixture:platform_notice_region",
+]
+
+_REAL_OBSERVATION_SOURCES = {
+    "ios_app": {
+        "comment": {"ios_replaykit_ocr"},
+        "online_count": {"ios_replaykit_online_count_roi"},
+        "interaction": {"ios_replaykit_ocr", "ios_replaykit_online_count_roi"},
+        "transcript": {"ios_replaykit_audioMic_asr", "ios_replaykit_audioApp_asr"},
+        "person_state": {"ios_replaykit_vision"},
+        "platform_notice": {"ios_replaykit_platform_notice_roi"},
+        "quality": {
+            "ios_replaykit_ocr", "ios_replaykit_online_count_roi",
+            "ios_replaykit_platform_notice_roi", "ios_replaykit_vision",
+            "ios_replaykit_audioMic_asr", "ios_replaykit_audioApp_asr", "audio:mic",
+        },
+    },
+    "android_app": {
+        "comment": {"android_media_projection_ocr"},
+        "online_count": {"android_media_projection_ocr"},
+        "interaction": {"android_media_projection_ocr"},
+        "transcript": {"android_audioMic_asr", "android_audioApp_asr"},
+        "person_state": {"android_vision_person"},
+        "platform_notice": {"android_media_projection_ocr"},
+        "quality": {
+            "android_media_projection_ocr", "android_vision_person",
+            "android_audioMic_asr", "android_audioApp_asr",
+        },
+    },
+}
+
+_FIXTURE_OBSERVATION_SOURCES = {
+    "comment": {"fixture:ocr_comment"},
+    "online_count": {
+        "fixture:confirmed-count", "fixture:confirmed_online_region",
+        "fixture:calibrated_online_field",
+    },
+    "interaction": {"fixture:interaction_counter"},
+    "transcript": {"fixture:host_asr"},
+    "person_state": {"fixture:vision_person"},
+    "platform_notice": {"fixture:platform_notice_region"},
+    "quality": set(),
+}
+
+TEST_COMMENT_FIXTURE_SOURCES = frozenset({"fixture:chat"})
+
+
+def observation_source_allowed(kind: str, source: str, app_source: str) -> bool:
+    """Require a registered source for the observation kind and app session."""
+    if source in _FIXTURE_OBSERVATION_SOURCES.get(kind, set()):
+        return True
+    return source in _REAL_OBSERVATION_SOURCES.get(app_source, {}).get(kind, set())
+
+
 class Position(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     x: float = Field(ge=0.0, le=1.0)
@@ -120,7 +183,7 @@ class QualityContent(BaseModel):
 class ObservationBase(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     event_id: str = Field(min_length=1, max_length=128)
-    source: str = Field(min_length=1, max_length=64)
+    source: ObservationSource
     observed_at_ms: int | None = Field(default=None, ge=0, le=2**63 - 1, strict=True)
     started_at_ms: int | None = Field(default=None, ge=0, le=2**63 - 1, strict=True)
     ended_at_ms: int | None = Field(default=None, ge=0, le=2**63 - 1, strict=True)
