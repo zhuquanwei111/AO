@@ -31,6 +31,7 @@ public class MainActivity extends Activity {
     private EditText etUrl, etInterval;
     private TextView tvStatus, tvRegion;
     private Button btnRegion, btnStart, btnPauseResume, btnStop;
+    private LivePanel livePanel;
 
     private final BroadcastReceiver stateReceiver = new BroadcastReceiver() {
         @Override
@@ -55,6 +56,9 @@ public class MainActivity extends Activity {
 
         etUrl.setText(Prefs.getServerUrl(this));
         etInterval.setText(String.valueOf(Prefs.getIntervalSec(this)));
+        livePanel = new LivePanel(this, findViewById(R.id.main_column), this::onStartClicked);
+        btnStart.setText("启动/重试采集（无场次为旧问答）");
+        btnStop.setText("停止采集");
 
         btnRegion.setOnClickListener(v -> startRegionSelector());
         btnStart.setOnClickListener(v -> onStartClicked());
@@ -89,6 +93,7 @@ public class MainActivity extends Activity {
     }
 
     private void refreshUi() {
+        if (livePanel != null) livePanel.refresh();
         CaptureService.Phase phase = CaptureService.phase;
         boolean busy = phase != CaptureService.Phase.IDLE;
         String msg = CaptureService.lastMessage;
@@ -161,17 +166,7 @@ public class MainActivity extends Activity {
     }
 
     private static boolean isValidServerUrl(String value) {
-        if (value == null || value.isEmpty() || value.matches(".*\\s.*")) {
-            return false;
-        }
-        Uri uri = Uri.parse(value);
-        String scheme = uri.getScheme();
-        String host = uri.getHost();
-        int port = uri.getPort();
-        return ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))
-                && host != null && !host.isEmpty()
-                && uri.getEncodedUserInfo() == null
-                && (port == -1 || (port > 0 && port <= 65535));
+        return LiveClient.validBaseUrl(value);
     }
 
     private void requestMediaProjection() {
@@ -212,5 +207,10 @@ public class MainActivity extends Activity {
         } else if (CaptureService.phase == CaptureService.Phase.RUNNING) {
             CaptureService.requestPause(this);
         }
+    }
+
+    @Override protected void onDestroy() {
+        if (livePanel != null) livePanel.close();
+        super.onDestroy();
     }
 }

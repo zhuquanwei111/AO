@@ -24,6 +24,8 @@
             </intent-filter>
         </activity>
 
+        <activity android:name=".RecapActivity" android:exported="false" />
+
         <service
             android:name=".CaptureService"
             android:exported="false"

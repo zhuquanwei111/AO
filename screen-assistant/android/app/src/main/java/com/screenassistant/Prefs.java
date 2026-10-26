@@ -60,4 +60,20 @@ public final class Prefs {
     public static void clearRegion(Context c) {
         sp(c).edit().remove(K_REGION).apply();
     }
+
+    public static LiveClient.Session getSession(Context c) {
+        try {
+            String raw = sp(c).getString("live_session", null);
+            return raw == null ? null : LiveClient.Session.from(new org.json.JSONObject(raw));
+        } catch (org.json.JSONException e) { return null; }
+    }
+
+    /** 私有SharedPreferences；同步落盘后才报告创建成功，避免进程退出丢凭证。 */
+    public static boolean saveSession(Context c, LiveClient.Session session) {
+        try { return sp(c).edit().putString("live_session", session.json().toString()).commit(); }
+        catch (org.json.JSONException e) { return false; }
+    }
+
+    public static String getDouyinAccount(Context c) { return sp(c).getString("douyin_account", ""); }
+    public static void setDouyinAccount(Context c, String value) { sp(c).edit().putString("douyin_account", value).apply(); }
 }

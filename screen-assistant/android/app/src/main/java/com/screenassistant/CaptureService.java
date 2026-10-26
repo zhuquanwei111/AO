@@ -83,6 +83,9 @@ public class CaptureService extends Service {
     private Handler captureHandler;
     private final Handler main = new Handler(Looper.getMainLooper());
     private ExecutorService workExecutor;
+    private ExecutorService promptExecutor;
+    private LiveClient.Session liveSession;
+    private String displayedText = "";
 
     private final AtomicInteger busyEpoch = new AtomicInteger(-1);
     private volatile boolean tornDown = true;
@@ -152,6 +155,7 @@ public class CaptureService extends Service {
                                 scheduleNext(epoch);
                                 return;
                             }
+                            if (liveSession != null) return; // 运营模式不以旧问答冒充运营提示
                             AnswerClient.Result result =
                                     AnswerClient.post(requestUrl, sentence, CONNECT_TIMEOUT_MS, READ_TIMEOUT_MS);
                             android.util.Log.i("CaptureService", "answer response status=" + result.httpStatus
@@ -224,6 +228,7 @@ public class CaptureService extends Service {
         captureThread.start();
         captureHandler = new Handler(captureThread.getLooper());
         workExecutor = Executors.newSingleThreadExecutor();
+        promptExecutor = Executors.newSingleThreadExecutor();
     }
 
     @Override
@@ -278,6 +283,7 @@ public class CaptureService extends Service {
     public void onDestroy() {
         teardownInternal();
         if (workExecutor != null) workExecutor.shutdownNow();
+        if (promptExecutor != null) promptExecutor.shutdownNow();
         if (captureThread != null) captureThread.quitSafely();
         if (recognizer != null) {
             try {
@@ -300,6 +306,9 @@ public class CaptureService extends Service {
             tornDown = false;
             sessionEpoch++;
             serverUrl = Prefs.getServerUrl(this);
+            LiveClient.Session stored = Prefs.getSession(this);
+            liveSession = stored != null && !stored.stopped ? stored : null;
+            if (liveSession != null) serverUrl = liveSession.baseUrl;
             intervalMs = Prefs.getIntervalSec(this) * 1000;
             int[] size = ScreenMetrics.realSizeDpi(this);
             screenSize = size;
@@ -318,6 +327,7 @@ public class CaptureService extends Service {
                         new ChineseTextRecognizerOptions.Builder().build());
             }
             phase = Phase.RUNNING;
+            if (liveSession != null) startPromptPolling(liveSession, sessionEpoch);
             setState("已连接 " + serverUrl);
             notifManager.notify(NOTIF_ID, buildNotification("采集中 · 间隔 " + (intervalMs / 1000) + " 秒"));
             scheduleTick(800);
@@ -389,6 +399,49 @@ public class CaptureService extends Service {
     }
 
     private void showReply(String reply, int epoch, String requestId) {
+        showMessage("问答", reply, epoch, 0);
+    }
+
+    private void startPromptPolling(LiveClient.Session session, int epoch) {
+        promptExecutor.execute(() -> {
+            String cursor = "";
+            while (!tornDown && epoch == sessionEpoch && !Thread.currentThread().isInterrupted()) {
+                try {
+                    org.json.JSONObject page = LiveClient.poll(session, cursor);
+                    org.json.JSONArray prompts = page.getJSONArray("prompts");
+                    for (int i = 0; i < prompts.length(); i++) {
+                        org.json.JSONObject prompt = prompts.getJSONObject(i);
+                        long expires = prompt.optLong("expires_at_ms");
+                        if (expires > System.currentTimeMillis()) showMessage("运营", prompt.optString("display_text"), epoch, expires);
+                    }
+                    cursor = page.getString("next_cursor");
+                    if (page.optBoolean("stopped")) {
+                        Prefs.saveSession(this, session.asStopped());
+                        main.post(() -> { if (epoch == sessionEpoch) teardown("共享场次已结束"); });
+                        return;
+                    }
+                } catch (Exception e) {
+                    if (tornDown || epoch != sessionEpoch) return;
+                    setState("运营收件暂不可用：" + e.getMessage() + "；自动重试，未显示新提示");
+                    try { Thread.sleep(2000); }
+                    catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); return; }
+                }
+            }
+        });
+    }
+
+    private void showMessage(String purpose, String reply, int epoch, long expiresAt) {
+        String fullText = DisplayText.labeled(purpose, reply);
+        if (fullText.isEmpty()) return;
+        main.post(() -> {
+            if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch
+                    || expiresAt > 0 && expiresAt <= System.currentTimeMillis()) return;
+            if (replyOverlayView != null && fullText.equals(displayedText)) return;
+            showOverlay(fullText, epoch, "local", expiresAt);
+        });
+    }
+
+    private void showOverlay(String reply, int epoch, String requestId, long expiresAt) {
         android.util.Log.i("CaptureService", "reply dispatch queued request_id=" + safeId(requestId)
                 + " reply_chars=" + (reply == null ? 0 : reply.length()) + " epoch=" + epoch);
         main.post(() -> {
@@ -425,6 +478,7 @@ public class CaptureService extends Service {
                             WindowManager.LayoutParams.WRAP_CONTENT,
                             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                    | WindowManager.LayoutParams.FLAG_SECURE
                                     | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
                                     | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                             PixelFormat.TRANSLUCENT);
@@ -435,13 +489,15 @@ public class CaptureService extends Service {
                     wm.addView(replyOverlayView, lp);
                 }
                 replyTextView.setText(reply);
+                displayedText = reply;
                 replyOverlayView.setVisibility(View.VISIBLE);
                 android.util.Log.i("CaptureService", "reply overlay visible request_id=" + safeId(requestId)
                         + " added=" + added + " attached=" + replyOverlayView.isAttachedToWindow()
                         + " shown=" + replyOverlayView.isShown() + " reply_chars=" + reply.length()
                         + " focusable=false touchable=false");
                 main.removeCallbacks(replyHide);
-                main.postDelayed(replyHide, REPLY_AUTO_HIDE_MS);
+                main.postDelayed(replyHide, expiresAt > 0
+                        ? Math.max(1, Math.min(REPLY_AUTO_HIDE_MS, expiresAt - System.currentTimeMillis())) : REPLY_AUTO_HIDE_MS);
             } catch (Exception e) {
                 android.util.Log.w("CaptureService", "reply overlay failed request_id=" + safeId(requestId)
                         + " error_type=" + e.getClass().getSimpleName());
@@ -472,6 +528,7 @@ public class CaptureService extends Service {
             }
             replyOverlayView = null;
             replyTextView = null;
+            displayedText = "";
         }
     }
 
