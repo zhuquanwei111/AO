@@ -399,6 +399,7 @@ def test_android_app_source_contract_and_typed_observation_allowlist(tmp_path):
         missing_kinds = [
             ("interaction", "android_media_projection_ocr"),
             ("transcript", "android_audioMic_asr"),
+            ("person_state", "android_mediaprojection_mlkit_pose"),
             ("platform_notice", "android_media_projection_ocr"),
             ("quality", "android_media_projection_ocr"),
         ]

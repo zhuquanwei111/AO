@@ -132,7 +132,10 @@ class CommentObservation(BaseModel):
 class PersonSignal(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     event_id: str = Field(min_length=1, max_length=128)
-    source: Literal["ios_replaykit_vision", "android_vision_person"]
+    source: Literal[
+        "ios_replaykit_vision", "android_vision_person",
+        "android_mediaprojection_mlkit_pose",
+    ]
     signal: Literal["head_down"]
     confidence: float = Field(ge=0.5, le=1.0)
     sample_count: int = Field(ge=5, le=100)
@@ -142,7 +145,10 @@ class PersonSignal(BaseModel):
 
 class PersonObservationPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    source: Literal["ios_replaykit_vision", "android_vision_person"]
+    source: Literal[
+        "ios_replaykit_vision", "android_vision_person",
+        "android_mediaprojection_mlkit_pose",
+    ]
     coverage: Literal["sampled_person_roi"]
     segment_id: str = Field(min_length=1, max_length=128)
     sequence: int = Field(ge=0, le=2**53)

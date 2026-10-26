@@ -41,7 +41,10 @@ class PersonObservation:
                 and all(type(x) is int and 0 <= x <= 2**53 for x in
                         (self.sequence, self.observed_at_ms, self.uptime_ms))
                 and isinstance(self.quality, str) and len(self.quality) <= 64
-                and self.source in {"ios_replaykit_vision", "android_vision_person"}
+                and self.source in {
+                    "ios_replaykit_vision", "android_vision_person",
+                    "android_mediaprojection_mlkit_pose",
+                }
                 and (self.person_count is None or type(self.person_count) is int
                      and 0 <= self.person_count <= 10)
                 and (self.confidence is None or number(self.confidence, 0, 1))

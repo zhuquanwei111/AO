@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from screen_assistant_server.app import create_app
@@ -83,7 +84,11 @@ def test_person_candidate_flows_through_m4_prompt_events_and_summary(tmp_path):
         assert summary["online_count"]["status"] == "unknown"
 
 
-def test_android_person_adapter_reuses_m7_policy_and_preserves_source(tmp_path):
+@pytest.mark.parametrize("person_source", [
+    "android_vision_person",
+    "android_mediaprojection_mlkit_pose",
+])
+def test_android_person_adapter_reuses_m7_policy_and_preserves_source(tmp_path, person_source):
     clock = Clock()
     with TestClient(create_app(settings(tmp_path / "android-person.sqlite3"), live_clock=clock)) as client:
         session, headers = create(client)
@@ -92,22 +97,22 @@ def test_android_person_adapter_reuses_m7_policy_and_preserves_source(tmp_path):
                               json={"source": "android_app"})
         assert started.status_code == 200, started.text
         assert client.post(url + "/person-observations", headers=headers,
-                           json=sample(0, clock.now, 10_000, source="android_vision_person")).status_code == 200
+                           json=sample(0, clock.now, 10_000, source=person_source)).status_code == 200
         clock.now += 3_000
         edge = sample(1, clock.now, 13_000, box=(0.7, 0.1, 0.3, 0.8),
-                      source="android_vision_person")
+                      source=person_source)
         assert client.post(url + "/person-observations", headers=headers, json=edge).status_code == 200
         result = None
         for seq in range(2, 8):
             clock.now += 3_000
             result = client.post(url + "/person-observations", headers=headers,
                                  json=sample(seq, clock.now, 10_000 + seq * 3_000,
-                                             people=0, source="android_vision_person"))
+                                             people=0, source=person_source))
         assert result.status_code == 200
         assert result.json()["reason"] == "generated"
         events = client.get(url + "/events", headers=headers).json()["events"]
         assert len(events) == 1
-        assert events[0]["sources"][0]["source"] == "android_vision_person"
+        assert events[0]["sources"][0]["source"] == person_source
 
 
 def test_person_observation_auth_validation_replay_segment_and_stop_isolation(tmp_path):
