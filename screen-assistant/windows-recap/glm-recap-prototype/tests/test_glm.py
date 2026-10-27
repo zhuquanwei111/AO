@@ -96,6 +96,8 @@ class GLMTests(unittest.TestCase):
         from glm_desktop import GLMDesktop
         with tempfile.TemporaryDirectory() as folder:
             scenario=Scenario(folder); original_call=scenario.call
+            for window in (scenario.window,scenario.room):
+                window['raw_rect']=list(window['rect']); window['maximized']=False
             def call(tool,**args):
                 if tool=='ControlStatus': return {'content':[{'text':'{"state":"ai","generation":7}'}]}
                 return original_call(tool,**args)

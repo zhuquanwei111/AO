@@ -16,31 +16,40 @@ class EntryTests(unittest.TestCase):
         d.click=Mock(); d.confirm_portal=Mock(return_value='confirmed')
         d.type_replacement=Mock(); d.mcp=Mock()
         d.recover_clipped_entry=Mock(side_effect=lambda window: window)
+        d.observe=Mock(return_value='view')
         d.portal_url='https://union.bytedance.com/open/portal/index'
         return d
 
     def test_existing_local_edge_bookmark_preferred(self):
         d=self.driver(); window={'title':'新建标签页 - Microsoft Edge'}
-        self.assertEqual(d.open_entry(window,True),'confirmed')
+        with patch('glm_desktop.visible_bookmark',return_value='bookmark'):
+            self.assertEqual(d.open_entry(window,True),'confirmed')
         d.click.assert_called_once_with('view','bookmark')
         d.type_replacement.assert_not_called()
         self.assertNotIn('ctrl+t',[q.args[1] for q in d.key.call_args_list])
 
     def test_missing_bookmark_uses_explicit_index(self):
-        d=self.driver(); d.target.side_effect=[RecapError('visual_missing'),('view','address')]
-        self.assertEqual(d.open_entry({'title':'新建标签页'},True),'confirmed')
-        d.type_replacement.assert_called_once_with('view','address','https://union.bytedance.com/open/portal/index')
+        d=self.driver()
+        with patch('glm_desktop.visible_bookmark',side_effect=RecapError('bookmark_missing')):
+            self.assertEqual(d.open_entry({'title':'新建标签页'},True),'confirmed')
+        d.type_replacement.assert_called_once_with('view','bookmark','https://union.bytedance.com/open/portal/index')
         d.click.assert_not_called()
 
-    def test_ambiguous_or_user_control_never_falls_back(self):
-        for reason in ('visual_ambiguous','USER_CONTROL','control_generation_changed'):
-            d=self.driver(); d.target.side_effect=RecapError(reason)
+    def test_ambiguous_bookmark_does_not_fallback(self):
+        d=self.driver()
+        with patch('glm_desktop.visible_bookmark',side_effect=RecapError('bookmark_ambiguous')):
             with self.assertRaises(RecapError): d.open_entry({'title':'新建标签页'},True)
-            self.assertEqual(d.target.call_count,1)
+        d.target.assert_not_called(); d.click.assert_not_called(); d.type_replacement.assert_not_called()
+
+    def test_ambiguous_or_user_control_never_falls_back(self):
+        for reason in ('bookmark_ambiguous','USER_CONTROL','control_generation_changed'):
+            d=self.driver(); d.observe.side_effect=RecapError(reason)
+            with self.assertRaises(RecapError): d.open_entry({'title':'新建标签页'},True)
             d.type_replacement.assert_not_called(); d.click.assert_not_called()
 
     def test_focus_recovery_discards_observation_once(self):
         d=self.driver(); d.guard=Mock(); d.focus=Mock(return_value={'handle':1})
+        del d.observe
         with patch('llm_desktop.LLMDesktop.observe',side_effect=[RecapError('foreground_changed'),'fresh']) as observe:
             self.assertEqual(d.observe({'handle':1}),'fresh')
             self.assertEqual(observe.call_count,2)
@@ -48,6 +57,7 @@ class EntryTests(unittest.TestCase):
 
     def test_repeated_ordinary_focus_changes_reobserve_and_resume(self):
         d=self.driver(); d.guard=Mock(); d.focus=Mock(return_value={'handle':1})
+        del d.observe
         with patch('llm_desktop.LLMDesktop.observe',side_effect=[
                 RecapError('foreground_changed'),RecapError('foreground_changed'),'fresh']) as observe:
             self.assertEqual(d.observe({'handle':1}),'fresh')
@@ -57,6 +67,7 @@ class EntryTests(unittest.TestCase):
 
     def test_focus_recovery_stops_for_user_or_repeated_loss(self):
         d=self.driver(); d.guard=Mock(side_effect=RecapError('USER_CONTROL')); d.focus=Mock()
+        del d.observe
         with patch('llm_desktop.LLMDesktop.observe',side_effect=RecapError('foreground_changed')):
             with self.assertRaises(RecapError) as caught: d.observe({'handle':1})
         self.assertEqual(caught.exception.reason,'USER_CONTROL'); d.focus.assert_not_called()
