@@ -96,6 +96,41 @@ def test_audio_disabled_auth_size_gap_and_stop(tmp_path):
         assert not app.state.audio.tracks
 
 
+def test_internal_gap_resets_pending_window_before_next_packet(tmp_path):
+    clock = Clock()
+    app, configure = fixture_app(tmp_path, clock)
+    with TestClient(app) as client:
+        configure()
+        session, headers = create(client)
+        clock.now += 10000
+        url = f"/v1/live/sessions/{session['session_id']}/audio"
+
+        first = client.post(url, headers=headers, json=packet(0, start=0)).json()
+        assert first["buffered_ms"] == 600
+
+        internal_gap = packet(1, start=600, spans=[
+            dict(sequence=1, pts=dict(value=600 * 48, timescale=48000, epoch=0),
+                 frames=14400),
+            dict(sequence=3, pts=dict(value=1200 * 48, timescale=48000, epoch=0),
+                 frames=14400),
+        ])
+        gap_response = client.post(url, headers=headers, json=internal_gap)
+        assert gap_response.status_code == 200, gap_response.text
+        gap = gap_response.json()
+        assert "original_sequence_gap" in gap["gaps"]
+        assert "pts_gap" in gap["gaps"]
+        assert gap["continuity_id"] != first["continuity_id"]
+        assert gap["buffered_ms"] == 0
+
+        next_packet = packet(2, start=1500, spans=[
+            dict(sequence=4, pts=dict(value=1500 * 48, timescale=48000, epoch=0),
+                 frames=28800),
+        ])
+        next_result = client.post(url, headers=headers, json=next_packet).json()
+        assert next_result["continuity_id"] == gap["continuity_id"]
+        assert next_result["buffered_ms"] == 600
+
+
 def test_final_revisions_enter_m4_once_then_short_prompt_and_record(tmp_path):
     clock = Clock()
     app, configure = fixture_app(tmp_path, clock)

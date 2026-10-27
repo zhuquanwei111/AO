@@ -255,6 +255,7 @@ class AudioService:
                 > Fraction(2, fmt["sample_rate"])
                 for left, right in zip(spans, spans[1:])
             )
+            # 上面的span校验会将相同断点写入gaps；前面的分支已清空pending并推进continuity_id。
             if gaps:
                 if track.job and not track.job.done():
                     track.job.cancel()
