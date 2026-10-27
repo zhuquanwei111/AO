@@ -46,7 +46,7 @@ public final class Prefs {
             if (parts.length != 4) return null;
             float[] r = new float[4];
             for (int i = 0; i < 4; i++) r[i] = Float.parseFloat(parts[i]);
-            if (r[0] < r[2] && r[1] < r[3]) return r;
+            if (Regions.valid(r)) return r;
             return null;
         } catch (Exception e) {
             return null;
@@ -59,5 +59,65 @@ public final class Prefs {
 
     public static void clearRegion(Context c) {
         sp(c).edit().remove(K_REGION).apply();
+    }
+
+    public static LiveClient.Session getSession(Context c) {
+        try {
+            String raw = sp(c).getString("live_session", null);
+            return raw == null ? null : LiveClient.Session.from(new org.json.JSONObject(raw));
+        } catch (org.json.JSONException e) { return null; }
+    }
+
+    /** 私有SharedPreferences；同步落盘后才报告创建成功，避免进程退出丢凭证。 */
+    public static boolean saveSession(Context c, LiveClient.Session session) {
+        try { return sp(c).edit().putString("live_session", session.json().toString()).commit(); }
+        catch (org.json.JSONException e) { return false; }
+    }
+
+    public static String getDouyinAccount(Context c) { return sp(c).getString("douyin_account", ""); }
+    public static void setDouyinAccount(Context c, String value) { sp(c).edit().putString("douyin_account", value).apply(); }
+
+    public static float[] getRegion(Context c, String kind) {
+        if ("legacy".equals(kind)) return getRegion(c);
+        String raw = sp(c).getString("roi_" + kind, null);
+        if (raw == null) return null;
+        try {
+            String[] parts = raw.split(",");
+            float[] r = new float[parts.length];
+            for (int i = 0; i < parts.length; i++) r[i] = Float.parseFloat(parts[i]);
+            return Regions.valid(r) ? r : null;
+        } catch (RuntimeException e) { return null; }
+    }
+    public static void setRegion(Context c, String kind, float l, float t, float r, float b) {
+        if (!Regions.valid(new float[]{l,t,r,b})) return;
+        if ("legacy".equals(kind)) { setRegion(c,l,t,r,b); return; }
+        sp(c).edit().putString("roi_" + kind, l + "," + t + "," + r + "," + b).apply();
+    }
+    public static void clearRegion(Context c, String kind) {
+        if ("legacy".equals(kind)) clearRegion(c);
+        else sp(c).edit().remove("roi_" + kind).apply();
+    }
+    public static boolean onlineConfirmed(Context c) { return sp(c).getBoolean("online_semantics", false); }
+    public static void setOnlineConfirmed(Context c, boolean value) { sp(c).edit().putBoolean("online_semantics", value).apply(); }
+    public static int getAudioMode(Context c) { return Math.max(0,Math.min(2,sp(c).getInt("audio_mode",0))); }
+    public static void setAudioMode(Context c,int mode) { sp(c).edit().putInt("audio_mode",mode).apply(); }
+    public static boolean hostConfirmed(Context c) { return sp(c).getBoolean("audio_host_confirmed",false); }
+    public static void setHostConfirmed(Context c,boolean value) { sp(c).edit().putBoolean("audio_host_confirmed",value).apply(); }
+
+    public static org.json.JSONObject getCachedRecap(Context c) {
+        try {
+            String raw=sp(c).getString("last_recap",null);
+            return raw==null?null:new org.json.JSONObject(raw);
+        } catch (org.json.JSONException e) { return null; }
+    }
+    public static boolean hasCachedRecap(Context c) { return sp(c).contains("last_recap"); }
+    public static boolean cacheTerminalRecap(Context c,LiveClient.Session session,
+                                            org.json.JSONObject summary,org.json.JSONArray events) {
+        LiveClient.Session current=getSession(c);
+        if (current==null || !current.id.equals(session.id) || !RecapText.terminal(summary)) return false;
+        try {
+            String raw=new org.json.JSONObject().put("summary",summary).put("events",events).toString();
+            return sp(c).edit().putString("last_recap",raw).remove("live_session").commit();
+        } catch (org.json.JSONException e) { return false; }
     }
 }

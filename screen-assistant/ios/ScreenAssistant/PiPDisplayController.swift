@@ -52,7 +52,28 @@ final class PiPDisplayController: NSObject, ObservableObject {
     private let transport = ReplyTransportFactory.make()
     private var audioSessionActive = false
     private var lastRenderedCGImage: CGImage?
+    private var lastDisplayedText: String?
+    private var lastDisplayedKind: DisplayKind?
     private var isPlaying = true
+
+    private enum DisplayKind: Equatable {
+        case quickAnswer
+        case operation
+
+        var label: String {
+            switch self {
+            case .quickAnswer: return "问答"
+            case .operation: return "运营"
+            }
+        }
+
+        var tint: UIColor {
+            switch self {
+            case .quickAnswer: return .systemBlue
+            case .operation: return .systemOrange
+            }
+        }
+    }
 
     /// host view：必须真实附着在 window 上 PiP 才能启动。
     /// 1x1pt 尺寸会让系统无法计算 PiP 收缩动画导致 startPictureInPicture
@@ -163,6 +184,8 @@ final class PiPDisplayController: NSObject, ObservableObject {
         hostView.removeFromSuperview()
         pipController = nil
         lastRenderedCGImage = nil
+        lastDisplayedText = nil
+        lastDisplayedKind = nil
         displayLayer.flushAndRemoveImage()
         if audioSessionActive {
             try? AVAudioSession.sharedInstance().setActive(false,
@@ -207,16 +230,34 @@ final class PiPDisplayController: NSObject, ObservableObject {
     private func consumeReply() {
         guard state == .running || state == .starting else { return }
         guard let reply = transport.takeLatestReply() else { return }
-        let image = renderReplyFrame(reply)
-        lastRenderedCGImage = image
-        if isPlaying {
-            enqueue(image)
+        showContent(reply, kind: .quickAnswer)
+    }
+
+    /// M4 的行动建议统一走同一显示入口，并明确标为运营内容。
+    func showLivePrompt(_ text: String) {
+        showContent(text, kind: .operation)
+    }
+
+    private func showContent(_ rawText: String, kind: DisplayKind) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.pipController != nil else { return }
+            let text = PiPTextFormatter.plainText(rawText)
+            guard !text.isEmpty else { return }
+            let comparisonText = text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+            guard comparisonText != self.lastDisplayedText || kind != self.lastDisplayedKind else {
+                return
+            }
+            let image = self.renderReplyFrame(text, kind: kind)
+            self.lastRenderedCGImage = image
+            self.lastDisplayedText = comparisonText
+            self.lastDisplayedKind = kind
+            if self.isPlaying { self.enqueue(image) }
+            self.lastReplyAt = Date()
         }
-        lastReplyAt = Date()
     }
 
     /// 把回复文本渲染为 640×360 帧图（内存态，不落盘）。
-    private func renderReplyFrame(_ reply: String) -> CGImage {
+    private func renderReplyFrame(_ reply: String, kind: DisplayKind) -> CGImage {
         let size = CGSize(width: 640, height: 360)
         let renderer = UIGraphicsImageRenderer(size: size)
         let uiImage = renderer.image { context in
@@ -231,11 +272,31 @@ final class PiPDisplayController: NSObject, ObservableObject {
             ]
             (title as NSString).draw(at: CGPoint(x: 24, y: 18), withAttributes: titleAttrs)
 
+            let tagRect = CGRect(x: size.width - 112, y: 14, width: 88, height: 38)
+            let tagBackground = tagRect.insetBy(dx: -6, dy: -3)
+            let tagPath = UIBezierPath(roundedRect: tagBackground, cornerRadius: 9)
+            cg.setFillColor(kind.tint.withAlphaComponent(0.24).cgColor)
+            cg.addPath(tagPath.cgPath)
+            cg.fillPath()
+            cg.setStrokeColor(kind.tint.withAlphaComponent(0.85).cgColor)
+            cg.setLineWidth(1.5)
+            cg.addPath(tagPath.cgPath)
+            cg.strokePath()
+            let tagAttrs: [NSAttributedString.Key: Any] = [
+                .font: UIFont.boldSystemFont(ofSize: 20),
+                .foregroundColor: kind.tint
+            ]
+            (kind.label as NSString).draw(in: tagRect, withAttributes: tagAttrs)
+
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.lineBreakMode = .byWordWrapping
+            paragraph.lineSpacing = 4
             let bodyAttrs: [NSAttributedString.Key: Any] = [
                 .font: UIFont.systemFont(ofSize: 26),
-                .foregroundColor: UIColor.white
+                .foregroundColor: UIColor.white,
+                .paragraphStyle: paragraph
             ]
-            let textRect = CGRect(x: 24, y: 58, width: size.width - 48, height: size.height - 80)
+            let textRect = CGRect(x: 24, y: 68, width: size.width - 48, height: size.height - 86)
             (reply as NSString).draw(in: textRect, withAttributes: bodyAttrs)
         }
         return uiImage.cgImage ?? placeholderFrame()
@@ -267,6 +328,9 @@ final class PiPDisplayController: NSObject, ObservableObject {
         // 以实际 SDK 警告为准）；iOS 15/16 须用本路径。刻意不引入
         // sampleBufferRenderer 门控：该符号在旧 Xcode SDK 不存在，会给 Mac
         // 构建者增加编译失败风险；enqueue 弃用≠移除，待真机验证后再迁移。
+        // 同一张快照替换待显示帧，避免心跳或短时间连续收件在 layer 中排成长队。
+        // flush() 保留当前已显示图像，待新样本就绪后再替换，减少空白闪烁。
+        displayLayer.flush()
         displayLayer.enqueue(buffer)
     }
 
@@ -410,5 +474,63 @@ private extension PiPDisplayController {
     final class HostView: UIView {
         override class var layerClass: AnyClass { AVSampleBufferDisplayLayer.self }
         var displayLayer: AVSampleBufferDisplayLayer { layer as! AVSampleBufferDisplayLayer }
+    }
+}
+
+/// 清理用于排版的常见 Markdown 外壳，不改写正文语义或标点。
+private enum PiPTextFormatter {
+    static func plainText(_ source: String) -> String {
+        var text = source.replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+
+        // 暂存围栏正文，避免把其中合法的 #、列表符等当作排版前缀清掉。
+        var fencedBlocks: [String: String] = [:]
+        let fencePattern = #"(?ms)^[ \t]*```[^\n]*\n(.*?)^[ \t]*```[ \t]*$"#
+        if let expression = try? NSRegularExpression(pattern: fencePattern) {
+            let nsText = text as NSString
+            let matches = expression.matches(in: text, range: NSRange(location: 0, length: nsText.length))
+            for (index, match) in matches.enumerated().reversed() {
+                let token = "PIPFENCEDBLOCK\(index)END"
+                fencedBlocks[token] = nsText.substring(with: match.range(at: 1))
+                text = (text as NSString).replacingCharacters(in: match.range, with: token)
+            }
+        }
+        text = replacing(#"(?m)^[ \t]*```[^\n]*[ \t]*$"#, in: text, with: "")
+        text = replacing(#"(?m)^[ \t]{0,3}#{1,6}[ \t]+"#, in: text, with: "")
+        text = replacing(#"(?m)^[ \t]{0,3}>[ \t]?"#, in: text, with: "")
+        text = replacing(#"(?m)^[ \t]*(?:[-+*]|[0-9]{1,3}[.)])[ \t]+"#, in: text, with: "")
+
+        text = replacing(#"!\[([^\]\n]*)\]\([^\)\n]*\)"#, in: text, with: "$1")
+        text = replacing(#"\[([^\]\n]+)\]\([^\)\n]*\)"#, in: text, with: "$1")
+        text = replacing(#"`([^`\n]+)`"#, in: text, with: "$1")
+        text = replacing(#"\*\*([^*\n]+)\*\*"#, in: text, with: "$1")
+        text = replacing(#"__([^_\n]+)__"#, in: text, with: "$1")
+        text = replacing(#"(?<![\p{L}\p{N}])\*([^\s*](?:[^*\n]*?[^\s*])?)\*(?![\p{L}\p{N}])"#,
+                         in: text, with: "$1")
+        text = replacing(#"(?<![\p{L}\p{N}])_([^_\n]+)_(?![\p{L}\p{N}])"#,
+                         in: text, with: "$1")
+
+        let lines = text.components(separatedBy: "\n").map {
+            $0.trimmingCharacters(in: .whitespaces)
+        }
+        var compactLines: [String] = []
+        var previousWasBlank = false
+        for line in lines {
+            let isBlank = line.isEmpty
+            if isBlank && previousWasBlank { continue }
+            compactLines.append(line)
+            previousWasBlank = isBlank
+        }
+        text = compactLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        for (token, block) in fencedBlocks {
+            text = text.replacingOccurrences(of: token, with: block)
+        }
+        return text
+    }
+
+    private static func replacing(_ pattern: String, in text: String, with template: String) -> String {
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return text }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return expression.stringByReplacingMatches(in: text, range: range, withTemplate: template)
     }
 }

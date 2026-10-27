@@ -3,19 +3,35 @@ import CoreGraphics
 
 /// 运行配置：主 App 写入，广播扩展每轮开始前**重新读取**（保证即时生效、不留过期快照）。
 ///
-/// 隐私约束（PRD）：App Group 仅存本文件中的配置项与 ControlState 中的控制/状态标志；
+/// 隐私约束（PRD）：App Group 仅存配置项、ControlState 控制标志及 InputDiagnostics 数值摘要；
 /// 严禁写入识别句子、回复文本、画面数据或任何历史记录。
 struct SharedConfig {
     // MARK: - 键（全部限定在受控清单内）
 
     private enum Keys {
         static let serverBaseURL = "config.serverBaseURL"
+        static let douyinAccount = "config.douyinAccount"
         static let intervalSeconds = "config.intervalSeconds"
         static let requestTimeoutSeconds = "config.requestTimeoutSeconds"
         static let roiX = "config.roiX"
         static let roiY = "config.roiY"
         static let roiWidth = "config.roiWidth"
         static let roiHeight = "config.roiHeight"
+        static let onlineCountROIEnabled = "config.onlineCountROI.enabled"
+        static let onlineCountROIX = "config.onlineCountROI.x"
+        static let onlineCountROIY = "config.onlineCountROI.y"
+        static let onlineCountROIWidth = "config.onlineCountROI.width"
+        static let onlineCountROIHeight = "config.onlineCountROI.height"
+        static let platformNoticeROIEnabled = "config.platformNoticeROI.enabled"
+        static let platformNoticeROIX = "config.platformNoticeROI.x"
+        static let platformNoticeROIY = "config.platformNoticeROI.y"
+        static let platformNoticeROIWidth = "config.platformNoticeROI.width"
+        static let platformNoticeROIHeight = "config.platformNoticeROI.height"
+        static let personROIEnabled = "config.personROI.enabled"
+        static let personROIX = "config.personROI.x"
+        static let personROIY = "config.personROI.y"
+        static let personROIWidth = "config.personROI.width"
+        static let personROIHeight = "config.personROI.height"
     }
 
     // MARK: - 边界常量
@@ -47,6 +63,16 @@ struct SharedConfig {
 
     static func setServerBaseURL(_ raw: String) {
         AppGroup.defaults?.set(raw, forKey: Keys.serverBaseURL)
+    }
+
+    static func douyinAccount() -> String {
+        AppGroup.defaults?.string(forKey: Keys.douyinAccount)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    static func setDouyinAccount(_ raw: String) {
+        AppGroup.defaults?.set(raw.trimmingCharacters(in: .whitespacesAndNewlines),
+                               forKey: Keys.douyinAccount)
     }
 
     /// 轮次间隔（秒）。越界时回退默认值。
@@ -101,4 +127,82 @@ struct SharedConfig {
         d?.set(h, forKey: Keys.roiHeight)
     }
 
+    static func onlineCountROI() -> CGRect? {
+        configuredROI(enabledKey: Keys.onlineCountROIEnabled, xKey: Keys.onlineCountROIX,
+                      yKey: Keys.onlineCountROIY, widthKey: Keys.onlineCountROIWidth,
+                      heightKey: Keys.onlineCountROIHeight)
+    }
+
+    static func setOnlineCountROI(_ roi: CGRect?) {
+        setConfiguredROI(roi, enabledKey: Keys.onlineCountROIEnabled, xKey: Keys.onlineCountROIX,
+                         yKey: Keys.onlineCountROIY, widthKey: Keys.onlineCountROIWidth,
+                         heightKey: Keys.onlineCountROIHeight)
+    }
+
+    static func platformNoticeROI() -> CGRect? {
+        configuredROI(enabledKey: Keys.platformNoticeROIEnabled, xKey: Keys.platformNoticeROIX,
+                      yKey: Keys.platformNoticeROIY, widthKey: Keys.platformNoticeROIWidth,
+                      heightKey: Keys.platformNoticeROIHeight)
+    }
+
+    static func setPlatformNoticeROI(_ roi: CGRect?) {
+        setConfiguredROI(roi, enabledKey: Keys.platformNoticeROIEnabled, xKey: Keys.platformNoticeROIX,
+                         yKey: Keys.platformNoticeROIY, widthKey: Keys.platformNoticeROIWidth,
+                         heightKey: Keys.platformNoticeROIHeight)
+    }
+
+    /// 直播人物采样区域；未设置时人物观察器继续沿用既有输入诊断区域。
+    static func personROI() -> CGRect? {
+        configuredROI(enabledKey: Keys.personROIEnabled, xKey: Keys.personROIX,
+                      yKey: Keys.personROIY, widthKey: Keys.personROIWidth,
+                      heightKey: Keys.personROIHeight)
+    }
+
+    static func setPersonROI(_ roi: CGRect?) {
+        setConfiguredROI(roi, enabledKey: Keys.personROIEnabled, xKey: Keys.personROIX,
+                         yKey: Keys.personROIY, widthKey: Keys.personROIWidth,
+                         heightKey: Keys.personROIHeight)
+    }
+
+    private static func configuredROI(enabledKey: String, xKey: String, yKey: String,
+                                      widthKey: String, heightKey: String) -> CGRect? {
+        guard let defaults = AppGroup.defaults, defaults.bool(forKey: enabledKey) else { return nil }
+        let x = defaults.double(forKey: xKey)
+        let y = defaults.double(forKey: yKey)
+        let width = defaults.double(forKey: widthKey)
+        let height = defaults.double(forKey: heightKey)
+        guard x.isFinite, y.isFinite, width.isFinite, height.isFinite,
+              x >= 0, y >= 0, width > 0, height > 0, x + width <= 1, y + height <= 1 else { return nil }
+        return CGRect(x: x, y: y, width: width, height: height)
+    }
+
+    private static func setConfiguredROI(_ roi: CGRect?, enabledKey: String, xKey: String, yKey: String,
+                                         widthKey: String, heightKey: String) {
+        guard let defaults = AppGroup.defaults else { return }
+        guard let roi else {
+            defaults.set(false, forKey: enabledKey)
+            defaults.removeObject(forKey: xKey)
+            defaults.removeObject(forKey: yKey)
+            defaults.removeObject(forKey: widthKey)
+            defaults.removeObject(forKey: heightKey)
+            return
+        }
+        let x = min(max(roi.minX, 0), 1)
+        let y = min(max(roi.minY, 0), 1)
+        let width = min(max(roi.width, 0.01), 1 - x)
+        let height = min(max(roi.height, 0.01), 1 - y)
+        defaults.set(x, forKey: xKey)
+        defaults.set(y, forKey: yKey)
+        defaults.set(width, forKey: widthKey)
+        defaults.set(height, forKey: heightKey)
+        defaults.set(true, forKey: enabledKey)
+    }
+
+}
+
+/// 用户确认后可一次应用；归一化坐标使用竖屏满屏左上原点。
+enum LiveAreaPresets {
+    static let comments = CGRect(x: 0.03, y: 0.69, width: 0.82, height: 0.25)
+    static let onlineCount = CGRect(x: 0.80, y: 0.055, width: 0.10, height: 0.045)
+    static let person = CGRect(x: 0.00, y: 0.14, width: 1.00, height: 0.80)
 }

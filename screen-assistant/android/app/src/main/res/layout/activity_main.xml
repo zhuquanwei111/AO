@@ -5,6 +5,7 @@
     android:fillViewport="true">
 
     <LinearLayout
+        android:id="@+id/main_column"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="vertical"
@@ -21,93 +22,137 @@
             android:id="@+id/tv_status"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:text="@string/status_idle"
-            android:textSize="16sp" />
+            android:layout_marginTop="16dp"
+            android:text="尚未开始"
+            android:textSize="17sp" />
 
         <TextView
-            android:id="@+id/tv_region"
+            android:id="@+id/tv_permissions"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:textSize="13sp" />
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="20dp"
-            android:text="@string/label_server"
-            android:textSize="14sp" />
-
-        <EditText
-            android:id="@+id/et_url"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:hint="@string/hint_url"
-            android:inputType="textUri"
-            android:maxLines="1"
-            android:textSize="14sp" />
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:text="@string/label_interval"
-            android:textSize="14sp" />
-
-        <EditText
-            android:id="@+id/et_interval"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:hint="@string/hint_interval"
-            android:inputType="number"
-            android:maxLines="1"
+            android:layout_marginTop="8dp"
             android:textSize="14sp" />
 
         <Button
-            android:id="@+id/btn_region"
+            android:id="@+id/btn_main_action"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="20dp"
-            android:text="@string/btn_region" />
+            android:minHeight="56dp"
+            android:text="开始辅助"
+            android:textSize="18sp" />
 
-        <LinearLayout
+        <Button
+            android:id="@+id/btn_recap"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="查看复盘" />
+
+        <Button
+            android:id="@+id/btn_settings_toggle"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
-            android:orientation="horizontal">
+            android:text="连接与识别设置" />
 
-            <Button
-                android:id="@+id/btn_start"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="@string/btn_start" />
-
-            <Button
-                android:id="@+id/btn_pause_resume"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:enabled="false"
-                android:text="@string/btn_pause" />
-
-            <Button
-                android:id="@+id/btn_stop"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:enabled="false"
-                android:text="@string/btn_stop" />
-        </LinearLayout>
-
-        <TextView
-            android:id="@+id/tv_hint"
+        <LinearLayout
+            android:id="@+id/settings_panel"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="24dp"
-            android:text="@string/hint_steps"
-            android:textColor="#FF666666"
-            android:textSize="12sp" />
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="连接地址"
+                android:textStyle="bold" />
+
+            <EditText
+                android:id="@+id/et_url"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="http://192.168.1.10:8000"
+                android:inputType="textUri"
+                android:maxLines="1" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="识别间隔（秒）" />
+
+            <EditText
+                android:id="@+id/et_interval"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="number"
+                android:maxLines="1" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="识别区域、音频和场次选项会在这里设置；默认不采集音频。"
+                android:textSize="13sp" />
+
+            <Button
+                android:id="@+id/btn_region"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="编辑识别区域" />
+
+            <LinearLayout
+                android:id="@+id/region_panel_container"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical" />
+
+            <LinearLayout
+                android:id="@+id/audio_panel_container"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical" />
+
+            <LinearLayout
+                android:id="@+id/live_panel_container"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical" />
+
+            <Button
+                android:id="@+id/btn_advanced_toggle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="高级功能" />
+
+            <LinearLayout
+                android:id="@+id/advanced_panel"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:visibility="gone">
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="兼容入口与暂停控制，仅供需要旧问答模式的用户使用。" />
+
+                <Button
+                    android:id="@+id/btn_legacy_answer"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="启动旧问答兼容模式" />
+
+                <Button
+                    android:id="@+id/btn_pause_resume"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:enabled="false"
+                    android:text="暂停屏幕辅助" />
+            </LinearLayout>
+        </LinearLayout>
     </LinearLayout>
 </ScrollView>

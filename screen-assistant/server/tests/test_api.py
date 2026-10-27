@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import contextmanager
 from typing import Iterator
 
@@ -23,7 +24,7 @@ from screen_assistant_server.model_client import (
     ModelUnavailableError,
 )
 
-TEST_REDIS_URL = "redis://127.0.0.1:6390/9"
+TEST_REDIS_URL = os.getenv("TEST_REDIS_URL", "redis://127.0.0.1:6390/9")
 
 
 def make_settings(**overrides) -> Settings:
@@ -36,6 +37,7 @@ def make_settings(**overrides) -> Settings:
         max_sentence_chars=50,
         model_timeout_seconds=30.0,
         model_connect_timeout_seconds=5.0,
+        live_db_path=":memory:",
     )
     base.update(overrides)
     return Settings(**base)

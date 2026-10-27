@@ -20,4 +20,8 @@ enum AppGroup {
     static var defaults: UserDefaults? {
         UserDefaults(suiteName: identifier)
     }
+
+    static var containerURL: URL? {
+        FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: identifier)
+    }
 }

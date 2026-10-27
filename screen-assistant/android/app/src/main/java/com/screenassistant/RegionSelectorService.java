@@ -27,6 +27,7 @@ public class RegionSelectorService extends Service {
     private WindowManager wm;
     private View bubble;
     private View overlay;
+    private String regionKind = "legacy";
     private final Handler main = new Handler(Looper.getMainLooper());
 
     private final Runnable longPressExit = () -> {
@@ -36,6 +37,16 @@ public class RegionSelectorService extends Service {
 
     public static void start(Context ctx) {
         ctx.startService(new Intent(ctx, RegionSelectorService.class));
+    }
+
+    public static void start(Context ctx, String kind) {
+        ctx.startService(new Intent(ctx, RegionSelectorService.class).putExtra("region_kind", kind));
+    }
+
+    @Override public int onStartCommand(Intent intent, int flags, int startId) {
+        String kind = intent == null ? null : intent.getStringExtra("region_kind");
+        regionKind = java.util.Arrays.asList(Regions.KEYS).contains(kind) ? kind : "legacy";
+        return START_NOT_STICKY;
     }
 
     @Override
@@ -63,7 +74,7 @@ public class RegionSelectorService extends Service {
 
     private void showBubble() {
         TextView tv = new TextView(this);
-        tv.setText("框选区域");
+        tv.setText("框选" + Regions.LABELS[java.util.Arrays.asList(Regions.KEYS).indexOf(regionKind)]);
         tv.setTextColor(0xFFFFFFFF);
         tv.setBackgroundResource(R.drawable.bg_bubble);
         int pad = (int) (12 * getResources().getDisplayMetrics().density);
@@ -163,7 +174,7 @@ public class RegionSelectorService extends Service {
                 Toast.makeText(this, "区域太小，请拖动放大", Toast.LENGTH_SHORT).show();
                 return;
             }
-            Prefs.setRegion(this, l, t, r, b);
+            Prefs.setRegion(this, regionKind, l, t, r, b);
             Toast.makeText(this, "识别区域已保存", Toast.LENGTH_SHORT).show();
             broadcastState();
             stopSelf();

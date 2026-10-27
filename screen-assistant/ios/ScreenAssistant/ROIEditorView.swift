@@ -5,7 +5,11 @@ import SwiftUI
 /// 扩展侧换算为像素（CIImage 左下原点）后裁剪。
 struct ROIEditorView: View {
     @Binding var roi: CGRect
+    var title: String = "编辑识别区域"
+    var showsPresets: Bool = true
+    var allowsNewSelection: Bool = false
     @State private var dragStart: CGRect?
+    @State private var selectionStart: CGPoint?
 
     var body: some View {
         GeometryReader { proxy in
@@ -20,6 +24,25 @@ struct ROIEditorView: View {
                 Rectangle()
                     .fill(Color(.systemGray6))
                     .frame(width: w, height: h)
+                    .contentShape(Rectangle())
+                    .gesture(
+                        DragGesture()
+                            .onChanged { value in
+                                guard allowsNewSelection, roi.isEmpty || selectionStart != nil else { return }
+                                let start = selectionStart ?? CGPoint(
+                                    x: min(max(value.startLocation.x / w, 0), 1),
+                                    y: min(max(value.startLocation.y / h, 0), 1))
+                                selectionStart = start
+                                let current = CGPoint(x: min(max(value.location.x / w, 0), 1),
+                                                      y: min(max(value.location.y / h, 0), 1))
+                                let minX = min(start.x, current.x)
+                                let minY = min(start.y, current.y)
+                                let width = min(max(abs(current.x - start.x), 0.05), 1 - minX)
+                                let height = min(max(abs(current.y - start.y), 0.05), 1 - minY)
+                                roi = CGRect(x: minX, y: minY, width: width, height: height)
+                            }
+                            .onEnded { _ in selectionStart = nil }
+                    )
 
                 // 框外暗化
                 Path { p in
@@ -77,9 +100,10 @@ struct ROIEditorView: View {
             .frame(width: box.width, height: box.height)
             .position(x: proxy.size.width / 2, y: proxy.size.height / 2)
         }
-        .navigationTitle("编辑识别区域")
+        .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            if showsPresets {
             ToolbarItem(placement: .navigationBarTrailing) {
                 Menu {
                     Button("整屏") { roi = CGRect(x: 0.05, y: 0.05, width: 0.90, height: 0.90) }
@@ -90,6 +114,7 @@ struct ROIEditorView: View {
                 } label: {
                     Text("预设")
                 }
+            }
             }
         }
     }

@@ -22,6 +22,8 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>连接你配置的局域网屏识AI服务。</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>仅在你于系统广播面板手动开启麦克风后，分析系统交付的音轨。</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>

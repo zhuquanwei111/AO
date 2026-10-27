@@ -16,6 +16,7 @@ import logging
 import sys
 import time
 import uuid
+from types import SimpleNamespace
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -25,6 +26,8 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from .config import Settings
+from .live import LiveService, router as live_router, utc_ms
+from .audio import AudioService, router as audio_router
 from .dedup import AnswerDeduper, DedupStoreUnavailableError
 from .model_client import (
     MAX_OUTPUT_TOKENS,
@@ -62,11 +65,16 @@ def _diagnostic_value(value: object) -> object:
     return "unknown" if value is None else value
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, *, live_clock=None) -> FastAPI:
     cfg = settings or Settings.from_env()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        app.state.live = LiveService(cfg.live_db_path, live_clock or utc_ms)
+        app.state.audio = AudioService(cfg, app.state.live)
+        async def deliver_audio(sid, token):
+            return await app.state.live.deliver_fusion(sid, token, SimpleNamespace(app=app))
+        app.state.audio.deliver = deliver_audio
         redis = Redis.from_url(cfg.redis_url, decode_responses=True)
         app.state.redis = redis
         app.state.dedup = AnswerDeduper(
@@ -91,10 +99,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             yield
         finally:
+            await app.state.audio.close()
+            await app.state.live.run("close")
             await app.state.model.aclose()
             await redis.aclose()
 
     app = FastAPI(title="screen-assistant server", version="1.0.0", lifespan=lifespan)
+    app.include_router(live_router)
+    app.include_router(audio_router)
 
     @app.middleware("http")
     async def answer_request_id(request: Request, call_next):

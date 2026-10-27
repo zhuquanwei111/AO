@@ -11,8 +11,8 @@ android {
         applicationId "com.screenassistant"
         minSdk 29
         targetSdk 34
-        versionCode 1
-        versionName "0.1.0"
+        versionCode 3
+        versionName "0.2.1"
     }
 
     buildTypes {
@@ -28,6 +28,19 @@ android {
 }
 
 dependencies {
+    implementation platform('org.jetbrains.kotlin:kotlin-bom:1.8.22')
+    implementation 'androidx.core:core:1.13.1'
     // ML Kit 文字识别 v2（中文，bundled 模型，端上真实推理）
     implementation 'com.google.mlkit:text-recognition-chinese:16.0.1'
+    implementation 'com.google.mlkit:pose-detection:18.0.0-beta5'
+    implementation 'com.google.mlkit:face-detection:16.1.7'
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20240303'
+}
+
+tasks.register('verifyLiveContract', JavaExec) {
+    dependsOn 'compileDebugUnitTestJavaWithJavac'
+    classpath = tasks.named('testDebugUnitTest').get().classpath
+    mainClass = 'com.screenassistant.LiveContractProbe'
+    args providers.gradleProperty('liveContractBase').getOrElse('')
 }
