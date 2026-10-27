@@ -359,12 +359,16 @@ class BackstageBridge:
         return bool(record.get("binding_evidence"))
 
     @staticmethod
-    def _has_valid_binding_evidence(record: dict) -> bool:
+    def _binding_evidence_problem(record: dict) -> str | None:
         evidence = record.get("binding_evidence")
         if not isinstance(evidence, dict):
-            return False
-        return all(isinstance(evidence.get(key), str) and evidence[key].strip()
-                   for key in ("room_id", "observed_at", "locator"))
+            return "cli_binding_evidence_missing"
+        if not all(isinstance(evidence.get(key), str) and evidence[key].strip()
+                   for key in ("room_id", "observed_at", "locator")):
+            return "cli_binding_evidence_missing"
+        if evidence.get("douyin_account") != record.get("douyin_account"):
+            return "cli_binding_account_mismatch"
+        return None
 
     @staticmethod
     def _reason(invocation: CliInvocation, default: str) -> str:
@@ -515,8 +519,9 @@ class BackstageBridge:
 
         if (start_record and start_status == "waiting_for_stop"
                 and start.returncode == 0):
-            if not self._has_valid_binding_evidence(start_record):
-                self._write_cli_failure(task, identity, "cli_binding_evidence_missing")
+            binding_problem = self._binding_evidence_problem(start_record)
+            if binding_problem:
+                self._write_cli_failure(task, identity, binding_problem)
                 return True
             task = self._wait_for_app_stop(task, identity)
         else:

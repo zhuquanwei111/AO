@@ -15,12 +15,83 @@ def accepted(payload):
             "result_status": payload["status"]}
 
 
-def binding_evidence(room_id="room-test"):
+def binding_evidence(douyin_account, room_id="room-test"):
     return {
+        "douyin_account": douyin_account,
         "room_id": room_id,
         "observed_at": "2026-10-27T12:00:00+08:00",
         "locator": "synthetic same-session binding evidence",
     }
+
+
+def test_binding_evidence_account_must_match_record_identity():
+    record = {
+        "douyin_account": "expected-account",
+        "binding_evidence": {
+            "douyin_account": "different-account",
+            "room_id": "room-test",
+            "observed_at": "2026-10-27T12:00:00+08:00",
+            "locator": "synthetic same-session binding evidence",
+        },
+    }
+
+    assert BackstageBridge._binding_evidence_problem(record) == "cli_binding_account_mismatch"
+
+
+def test_binding_evidence_requires_nested_observed_at():
+    record = {
+        "douyin_account": "expected-account",
+        "binding_observed_at": "2026-10-27T12:00:00+08:00",
+        "binding_evidence": {
+            "douyin_account": "expected-account",
+            "room_id": "room-test",
+            "locator": "synthetic same-session binding evidence",
+        },
+    }
+
+    assert BackstageBridge._binding_evidence_problem(record) == "cli_binding_evidence_missing"
+
+
+def test_bridge_rejects_binding_account_mismatch_after_real_app_stop():
+    task = {
+        "task_id": "task-binding-account", "session_id": "session-binding-account",
+        "douyin_account": "expected-account", "status": "capturing",
+        "start_signal_source": "ios_app", "stop_signal_source": "ios_app",
+        "stop_signal_received": True, "stopped_at_ms": 100,
+    }
+    calls = []
+    cli_calls = []
+
+    def http(method, path, payload=None):
+        calls.append((method, path, payload))
+        if method == "POST" and path.endswith("/backstage/tasks/claim"):
+            return {"status": "claimed", "task": task}
+        if method == "POST" and path.endswith("/backstage/result"):
+            return accepted(payload)
+        raise AssertionError((method, path))
+
+    def cli(command, claimed_task):
+        cli_calls.append(command)
+        assert command == "start"
+        return {"record": {
+            "session_id": claimed_task["session_id"],
+            "douyin_account": claimed_task["douyin_account"],
+            "status": "waiting_for_stop",
+            "start_signal_source": "ios_app",
+            "binding_evidence": binding_evidence("different-account"),
+        }}
+
+    bridge = BackstageBridge(
+        BridgeConfig("http://localhost", "worker", "python", "recap.py"),
+        http=http, cli=cli, sleep=lambda _: None,
+    )
+    assert bridge.run_once() is True
+    assert cli_calls == ["start"]
+    payload = calls[-1][2]
+    assert payload["status"] == "needs_input"
+    assert payload["metrics"] == {key: None for key in payload["metrics"]}
+    assert all("cli_binding_account_mismatch" in reason
+               for reason in payload["missing_fields"].values())
 
 
 def test_bridge_uses_one_cli_task_and_posts_result_to_origin_session():
@@ -75,7 +146,7 @@ def test_bridge_uses_one_cli_task_and_posts_result_to_origin_session():
                 "status": "waiting_for_stop", "session_id": claimed_task["session_id"],
                 "douyin_account": claimed_task["douyin_account"],
                 "start_signal_source": claimed_task["start_signal_source"],
-                "binding_evidence": binding_evidence(),
+                "binding_evidence": binding_evidence(claimed_task["douyin_account"]),
             }}
         return {"record": {
             "status": "waiting_for_stop", "session_id": claimed_task["session_id"],
@@ -276,7 +347,7 @@ def test_bound_needs_input_is_not_stopped_or_recaptured_after_app_stop():
                "metrics": None, "raw_displays": None, "approximate_metrics": None,
                "missing_reasons": {"累计观众": "outcome_unknown"},
                "start_signal_source": "ios_app", "stop_signal_source": None,
-               "binding_evidence": binding_evidence()}
+               "binding_evidence": binding_evidence("account")}
 
     def http(method, path, payload=None):
         calls.append((method, path, payload))
@@ -370,7 +441,7 @@ def test_nonzero_start_with_active_record_cannot_enter_success_path():
 
     active = {"session_id": "session-contradiction", "douyin_account": "account",
               "status": "waiting_for_stop", "start_signal_source": "ios_app",
-              "binding_evidence": binding_evidence()}
+              "binding_evidence": binding_evidence("account")}
     cli_calls = []
 
     def cli(command, _task):
@@ -421,7 +492,7 @@ def test_nonzero_stop_preserves_same_task_failure_record_without_result_call():
                 "douyin_account": claimed_task["douyin_account"],
                 "status": "waiting_for_stop",
                 "start_signal_source": "android_app",
-                "binding_evidence": binding_evidence(),
+                "binding_evidence": binding_evidence(claimed_task["douyin_account"]),
             }}
         return CliInvocation({"record": failure_record}, 2)
 
@@ -582,7 +653,7 @@ def test_android_app_task_uses_existing_bridge_and_posts_to_same_session():
                 "status": "waiting_for_stop", "session_id": task_snapshot["session_id"],
                 "douyin_account": task_snapshot["douyin_account"],
                 "start_signal_source": task_snapshot["start_signal_source"],
-                "binding_evidence": binding_evidence(),
+                "binding_evidence": binding_evidence(task_snapshot["douyin_account"]),
             }}
         return {"record": {
             "status": "waiting_for_stop", "session_id": task_snapshot["session_id"],
@@ -635,7 +706,7 @@ def test_bridge_converts_cli_result_identity_drift_to_task_null_result():
                 "status": "waiting_for_stop", "session_id": task["session_id"],
                 "douyin_account": task["douyin_account"],
                 "start_signal_source": task["start_signal_source"],
-                "binding_evidence": binding_evidence(),
+                "binding_evidence": binding_evidence(task["douyin_account"]),
             }}
         return {"record": {
             "status": "waiting_for_stop", "session_id": task["session_id"],
@@ -686,7 +757,7 @@ def test_bridge_discards_simulated_record_for_real_app_task_and_posts_null():
                 "status": "waiting_for_stop", "session_id": claimed_task["session_id"],
                 "douyin_account": claimed_task["douyin_account"],
                 "start_signal_source": claimed_task["start_signal_source"],
-                "binding_evidence": binding_evidence(),
+                "binding_evidence": binding_evidence(claimed_task["douyin_account"]),
             }}
         return {"record": {
             "session_id": claimed_task["session_id"],
@@ -727,7 +798,7 @@ def test_http_200_with_wrong_result_ack_is_service_protocol_failure():
             return {"record": {"session_id": "s", "douyin_account": "a",
                                 "status": "waiting_for_stop",
                                 "start_signal_source": "ios_app",
-                                "binding_evidence": binding_evidence()}}
+                                "binding_evidence": binding_evidence("a")}}
         record = {"session_id": "s", "douyin_account": "a",
                   "status": "needs_input", "metrics": {},
                   "start_signal_source": "ios_app", "stop_signal_source": "ios_app"}
@@ -761,7 +832,7 @@ def test_read_only_result_must_exit_zero_even_when_record_says_failed():
             return {"record": {
                 "session_id": task["session_id"], "douyin_account": "account",
                 "status": "waiting_for_stop", "start_signal_source": "ios_app",
-                "binding_evidence": binding_evidence(),
+                "binding_evidence": binding_evidence(task["douyin_account"]),
             }}
         if command == "stop":
             return {"record": {
@@ -854,7 +925,7 @@ def test_task_failure_does_not_stop_loop_from_claiming_next_task():
             return {"record": {"session_id": "s2", "douyin_account": "a2",
                                 "status": "waiting_for_stop",
                                 "start_signal_source": "ios_app",
-                                "binding_evidence": binding_evidence()}}
+                                "binding_evidence": binding_evidence("a2")}}
         if command == "stop":
             return {"record": {"session_id": "s2", "douyin_account": "a2",
                                 "status": "waiting_for_stop",
