@@ -7,26 +7,10 @@ import json
 sys.path.insert(0,str(Path(__file__).resolve().parent.parent/'llm-recap-prototype'))
 from llm_desktop import LLMDesktop
 from glm_runtime import MODEL
-from core import RecapError, compact, MIN_SCORE
+from core import RecapError
 from transport import check_reply
 
 ENTRY_URL='https://union.bytedance.com/open/portal/index'
-
-
-def visible_bookmark(view):
-    """只选择当前截图中与收藏栏锚点同排的唯一机构收藏。"""
-    width,height=view.size
-    valid=[q for q in view.tokens if q.score>=MIN_SCORE and
-           0<=q.box[0]<q.box[2]<=width and 0<=q.box[1]<q.box[3]<=height]
-    anchors=[q for q in valid if compact(q.text)=='导入收藏夹' and q.y<height*.18]
-    candidates=[q for q in valid if compact(q.text).startswith('直播服务平台·机构') and q.y<height*.18]
-    if not anchors: raise RecapError('bookmark_bar_unconfirmed')
-    if len(anchors)!=1: raise RecapError('bookmark_ambiguous')
-    anchor=anchors[0]
-    matches=[q for q in candidates if q.x>anchor.x and abs(q.y-anchor.y)<=max(q.h,anchor.h)]
-    if len(matches)!=1:
-        raise RecapError('bookmark_missing' if not matches else 'bookmark_ambiguous')
-    return matches[0]
 
 
 class TrackedMCP:
@@ -85,19 +69,19 @@ class GLMDesktop(LLMDesktop):
         if not any(word in window.get('title','').casefold() for word in ('新建标签页','new tab')):
             self.key(window,'ctrl+t')
         self.key(window,'esc')
-        view=self.observe(window,False)
         try:
-            bookmark=visible_bookmark(view)
+            view,bookmark=self.target(window,
+                'Edge顶部收藏栏中的“直播服务平台·机构版”书签，可能显示为“直播服务平台·机构...”或“直播后台平台”；不要选网页快捷方式',True)
         except RecapError as error:
-            if error.reason not in ('bookmark_missing','bookmark_bar_unconfirmed'): raise
-            # 收藏栏不可用时沿既有用户指定网址与地址框核对路径。
+            if error.reason!='visual_missing': raise
+            # 只有书签确实未找到才走用户明确给定网址；歧义／接管绝不切备用路径。
             view,address=self.target(window,'浏览器顶部网址地址输入框内部，不能选网页搜索框',True)
             self.key(window,'ctrl+l')
             self.type_replacement(view,address,ENTRY_URL)
             self.mcp.note('entry_route',route='explicit_index_url')
         else:
             self.click(view,bookmark)
-            self.mcp.note('entry_route',route='current_ocr_verified_favorite')
+            self.mcp.note('entry_route',route='existing_edge_favorite')
         time.sleep(1)  # 一次正常页面加载等待，不采样直播指标。
         return self.confirm_portal(window)
 
