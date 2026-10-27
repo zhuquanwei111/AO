@@ -11,7 +11,11 @@ class Probe:
         self.callback=ctypes.WINFUNCTYPE(w.BOOL,w.HWND,w.LPARAM)
         signatures=[(self.u.EnumWindows,[self.callback,w.LPARAM],w.BOOL),
             (self.u.IsWindowVisible,[w.HWND],w.BOOL),(self.u.IsIconic,[w.HWND],w.BOOL),
+            (self.u.IsZoomed,[w.HWND],w.BOOL),
             (self.u.GetForegroundWindow,[],w.HWND),(self.u.GetWindowRect,[w.HWND,ctypes.POINTER(w.RECT)],w.BOOL),
+            (self.u.GetWindow,[w.HWND,w.UINT],w.HWND),
+            (self.u.IsWindowEnabled,[w.HWND],w.BOOL),
+            (self.u.GetWindowLongPtrW,[w.HWND,ctypes.c_int],ctypes.c_ssize_t),
             (self.u.GetWindowTextW,[w.HWND,w.LPWSTR,ctypes.c_int],ctypes.c_int),
             (self.u.GetWindowThreadProcessId,[w.HWND,ctypes.POINTER(w.DWORD)],w.DWORD),
             (self.k.OpenProcess,[w.DWORD,w.BOOL,w.DWORD],w.HANDLE),
@@ -46,13 +50,36 @@ class Probe:
                 vx,vy,vw,vh=[self.u.GetSystemMetrics(i) for i in (76,77,78,79)]
                 visible=[max(vx,rect.left),max(vy,rect.top),min(vx+vw,rect.right),min(vy+vh,rect.bottom)]
                 rows.append({'handle':int(hwnd),'pid':pid.value,'process_created':born,
-                    'title':title.value,'rect':visible,
+                    'title':title.value,'rect':visible,'raw_rect':[rect.left,rect.top,rect.right,rect.bottom],
+                    'maximized':bool(self.u.IsZoomed(hwnd)),
                     'minimized':bool(self.u.IsIconic(hwnd))})
             finally: self.k.CloseHandle(process)
             return True
         callback=self.callback(inspect)
         self.u.EnumWindows(callback,0)
         return rows
+
+    def initial_browser_candidates(self,windows):
+        """只归并明确由前台根窗口拥有、不能激活的同进程工具窗口。"""
+        if len(windows)<=1: return windows
+        try:
+            foreground=int(self.u.GetForegroundWindow() or 0)
+            roots=[row for row in windows if row['handle']==foreground]
+            if len(roots)!=1: return windows
+            root=roots[0]; handle=root['handle']
+            if (root.get('minimized') or not self.u.IsWindowEnabled(handle)
+                    or self.u.GetWindow(handle,4)):  # GW_OWNER
+                return windows
+            for row in windows:
+                if row is root: continue
+                flags=self.u.GetWindowLongPtrW(row['handle'],-20)&0xffffffff  # GWL_EXSTYLE
+                if (row['pid']!=root['pid'] or row['process_created']!=root['process_created']
+                        or int(self.u.GetWindow(row['handle'],4) or 0)!=handle
+                        or flags&0x08000080!=0x08000080):  # NOACTIVATE | TOOLWINDOW
+                    return windows
+            return [root]
+        except (KeyError,TypeError,ValueError,OSError):
+            return windows
 
     def get(self,signature):
         found=[row for row in self.windows() if all(row.get(k)==signature.get(k)

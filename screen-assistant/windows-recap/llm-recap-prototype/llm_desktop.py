@@ -111,6 +111,14 @@ class LLMDesktop(Desktop):
         if data['account']!=account: raise RecapError('wrong_identity')
         if live and '已开播' not in (data['live_status'] or ''): raise RecapError('live_status_unconfirmed')
 
+    def initial_browser_candidates(self,windows):
+        if len(windows)<=1: return windows
+        selector=getattr(self.probe,'initial_browser_candidates',None)
+        if not callable(selector): return windows
+        selected=selector(windows)
+        if not isinstance(selected,list): return windows
+        return selected if len(selected)==1 and selected[0] in windows else windows
+
     def launch_edge(self):
         began=time.monotonic()
         self.mcp.call('App',mode='launch',name='Microsoft Edge')
@@ -120,16 +128,18 @@ class LLMDesktop(Desktop):
         while not windows and time.monotonic()<deadline:
             time.sleep(.5); self.guard()
             windows=self.probe.windows(); counts.append(len(windows))
+        selected=self.initial_browser_candidates(windows)
         self.mcp.note('edge_launch_diagnostics',candidate_count=len(windows),
+            selected_candidate_count=len(selected),
             candidate_counts=counts,source='current_Win32_Edge_windows',
             candidates=[{key:window.get(key) for key in
                 ('handle','pid','process_created','title','rect','minimized')} for window in windows],
             elapsed_ms=round((time.monotonic()-began)*1000))
-        if len(windows)!=1: raise RecapError('edge_launch_unconfirmed')
-        return windows
+        if len(selected)!=1: raise RecapError('edge_launch_unconfirmed')
+        return selected
 
     def bind(self,account):
-        self.guard(); windows=self.probe.windows()
+        self.guard(); windows=self.initial_browser_candidates(self.probe.windows())
         portals=[w for w in windows if '直播服务平台' in w['title']]
         if len(portals)>1 or (not portals and len(windows)>1): raise RecapError('edge_window_ambiguous')
         if not windows:
