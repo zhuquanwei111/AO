@@ -17,8 +17,23 @@ from urllib.request import Request, urlopen
 METRIC_KEYS = ("累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪")
 
 
-class BackstageStartError(RuntimeError):
-    """CLI start 未绑定到已领取的 App 场次，必须显式停止桥接。"""
+class BackstageFatalError(RuntimeError):
+    """服务鉴权或API协议错误，必须停止桥进程等待运维处理。"""
+
+
+class BackstageTransientError(RuntimeError):
+    """暂时性网络或服务故障，可沿用轮询间隔重试。"""
+
+
+class BackstageCliRecordError(ValueError):
+    """CLI record不属于当前场次或不符合当前回写契约。"""
+
+
+@dataclass(frozen=True)
+class CliInvocation:
+    output: dict | None
+    returncode: int | None
+    failure_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -89,11 +104,19 @@ class BackstageBridge:
         })
         try:
             with urlopen(request, timeout=self.config.request_timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
+                try:
+                    payload = json.loads(response.read().decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    raise BackstageFatalError("backstage API returned invalid JSON") from None
+                if not isinstance(payload, dict):
+                    raise BackstageFatalError("backstage API response must be an object")
+                return payload
         except HTTPError as exc:
-            raise RuntimeError(f"backstage HTTP status {exc.code}") from None
-        except (URLError, TimeoutError, json.JSONDecodeError):
-            raise RuntimeError("backstage HTTP request failed") from None
+            if exc.code in {408, 429, 502, 504}:
+                raise BackstageTransientError(f"backstage HTTP temporary status {exc.code}") from None
+            raise BackstageFatalError(f"backstage HTTP rejected request: {exc.code}") from None
+        except (URLError, TimeoutError):
+            raise BackstageTransientError("backstage HTTP request temporarily unavailable") from None
 
     def _cli_args(self, command: str, task: dict) -> list[str]:
         args = [self.config.cli_python, self.config.cli_entry, command,
@@ -118,7 +141,7 @@ class BackstageBridge:
                 args.extend((flag, value))
         return args
 
-    def _cli(self, command: str, task: dict) -> dict:
+    def _cli(self, command: str, task: dict) -> CliInvocation:
         entry = Path(self.config.cli_entry)
         child_env = {key: value for key, value in os.environ.items()
                      if key != "BACKSTAGE_WORKER_TOKEN" and not key.startswith("AO_")}
@@ -137,18 +160,16 @@ class BackstageBridge:
                 stdout, _ = process.communicate(timeout=self.config.cli_timeout)
             except subprocess.TimeoutExpired:
                 self._terminate_process_tree(process)
-                return {"status": "needs_input", "reason": "cli_timeout"}
+                return CliInvocation(None, getattr(process, "returncode", None), "cli_timeout")
         except OSError:
-            return {"status": "needs_input", "reason": "cli_execution_unavailable"}
+            return CliInvocation(None, None, "cli_execution_unavailable")
         try:
             output = json.loads(stdout)
         except (json.JSONDecodeError, TypeError):
-            return {"status": "needs_input", "reason": "cli_result_unavailable"}
-        if isinstance(output, dict) and isinstance(output.get("record"), dict):
-            return output
-        return output if isinstance(output, dict) else {
-            "status": "needs_input", "reason": "cli_result_unavailable"
-        }
+            return CliInvocation(None, process.returncode, "cli_result_unavailable")
+        if not isinstance(output, dict):
+            return CliInvocation(None, process.returncode, "cli_result_unavailable")
+        return CliInvocation(output, process.returncode)
 
     @staticmethod
     def _terminate_process_tree(process: subprocess.Popen) -> None:
@@ -183,27 +204,42 @@ class BackstageBridge:
                 pass
 
     @staticmethod
-    def result_payload(task: dict, result: dict) -> dict:
-        record = result.get("record") if isinstance(result.get("record"), dict) else result
-        if record.get("session_id") not in (None, task["session_id"]):
-            raise ValueError("backstage session identity mismatch")
-        if record.get("douyin_account") not in (None, task["douyin_account"]):
-            raise ValueError("backstage account identity mismatch")
+    def result_payload(task: dict, result: dict, *, allow_missing_stop_source: bool = False) -> dict:
+        record = result.get("record") if isinstance(result, dict) else None
+        if not isinstance(record, dict) and isinstance(result, dict):
+            record = result
+        if not isinstance(record, dict):
+            raise BackstageCliRecordError("cli_record_missing")
+        if (record.get("session_id") != task.get("session_id")
+                or record.get("douyin_account") != task.get("douyin_account")):
+            raise BackstageCliRecordError("cli_record_identity_mismatch")
 
-        start_source = task.get("start_signal_source") or "ios_app"
-        stop_source = task.get("stop_signal_source") or start_source
-        if (start_source not in {"ios_app", "android_app"} or stop_source != start_source):
-            raise ValueError("backstage app signal source mismatch")
-        if (record.get("start_signal_source") != start_source
-                or record.get("stop_signal_source") != stop_source):
-            raise ValueError("backstage record signal source mismatch")
+        start_source = task.get("start_signal_source")
+        stop_source = task.get("stop_signal_source")
+        if (task.get("stop_signal_received") is not True
+                or start_source not in {"ios_app", "android_app"}
+                or stop_source != start_source):
+            raise BackstageFatalError("backstage task stop/source contract mismatch")
+        if record.get("start_signal_source") != start_source:
+            raise BackstageCliRecordError("cli_record_source_mismatch")
+        record_stop_source = record.get("stop_signal_source")
+        if (record_stop_source != stop_source
+                and not (allow_missing_stop_source and record_stop_source is None)):
+            raise BackstageCliRecordError("cli_record_source_mismatch")
 
         status = record.get("status")
         if status not in {"captured_locally", "partial", "needs_input", "failed"}:
-            status = "needs_input"
+            raise BackstageCliRecordError("cli_record_status_invalid")
         metrics_in = record.get("metrics")
-        metrics_in = metrics_in if isinstance(metrics_in, dict) else {}
+        if metrics_in is None:
+            metrics_in = {}
+        elif not isinstance(metrics_in, dict):
+            raise BackstageCliRecordError("cli_metrics_invalid")
         metrics = {key: metrics_in.get(key) for key in METRIC_KEYS}
+        if any(value is not None and
+               (type(value) is not int or value < 0 or value > 2**53)
+               for value in metrics.values()):
+            raise BackstageCliRecordError("cli_metrics_invalid")
         if status == "captured_locally" and any(value is None for value in metrics.values()):
             status = "partial"
 
@@ -215,74 +251,331 @@ class BackstageBridge:
                        if key in METRIC_KEYS}
         else:
             missing = {}
+        record_reason = record.get("reason")
+        if isinstance(record_reason, str) and record_reason.strip():
+            for key, value in metrics.items():
+                if value is None:
+                    if key not in missing or missing[key] == "未读取":
+                        missing[key] = record_reason.strip()[:160]
         for key, value in metrics.items():
             if value is None:
                 missing.setdefault(key, "执行器未提供该项")
 
+        raw_in = record.get("raw_displays", {})
+        approximate_in = record.get("approximate_metrics", [])
+        if raw_in is None:
+            raw_in = {}
+        if approximate_in is None:
+            approximate_in = []
+        if not isinstance(raw_in, dict) or not isinstance(approximate_in, list):
+            raise BackstageCliRecordError("cli_metric_metadata_invalid")
+        raw_displays = {key: str(value)[:160] for key, value in raw_in.items()
+                        if key in METRIC_KEYS and isinstance(value, (str, int, float))}
+        approximate = [key for key in approximate_in if key in METRIC_KEYS]
+        if any(not isinstance(key, str) for key in approximate_in):
+            raise BackstageCliRecordError("cli_metric_metadata_invalid")
+
         captured_at = record.get("metrics_captured_at")
-        if any(value is not None for value in metrics.values()) and not captured_at:
-            raise ValueError("backstage metric timestamp missing")
+        if captured_at is not None and (
+                not isinstance(captured_at, str) or len(captured_at) > 64):
+            raise BackstageCliRecordError("cli_metric_timestamp_invalid")
+        if any(value is not None for value in metrics.values()):
+            if not captured_at:
+                raise BackstageCliRecordError("cli_metric_timestamp_missing")
+            try:
+                from datetime import datetime
+                parsed = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+            except ValueError:
+                raise BackstageCliRecordError("cli_metric_timestamp_invalid") from None
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise BackstageCliRecordError("cli_metric_timestamp_invalid")
+
+        capture_method = record.get("capture_method") or "现有后台取数 CLI"
+        value_semantics = record.get("value_semantics") or "下播信号后读取的本场后台左侧汇总，不代表平台最终结算"
+        if not isinstance(capture_method, str) or not isinstance(value_semantics, str):
+            raise BackstageCliRecordError("cli_record_text_invalid")
+        if (status in {"needs_input", "failed"}
+                and isinstance(record_reason, str) and record_reason.strip()
+                and any(value is not None for value in metrics.values())):
+            value_semantics = f"CLI失败原因：{record_reason.strip()[:160]}；{value_semantics}"
+        room_id = record.get("room_id")
+        if room_id is not None and (not isinstance(room_id, str) or len(room_id) > 128):
+            raise BackstageCliRecordError("cli_record_text_invalid")
         return {
             "task_id": task["task_id"], "douyin_account": task["douyin_account"],
-            "status": status, "room_id": record.get("room_id"), "metrics": metrics,
-            "raw_displays": {key: str(value)[:160] for key, value in
-                             (record.get("raw_displays") or {}).items() if key in METRIC_KEYS},
-            "approximate_metrics": [key for key in record.get("approximate_metrics", [])
-                                    if key in METRIC_KEYS],
-            "metrics_captured_at": captured_at,
-            "stop_signal_received": True,
+            "status": status, "room_id": room_id, "metrics": metrics,
+            "raw_displays": raw_displays, "approximate_metrics": approximate,
+            "metrics_captured_at": captured_at, "stop_signal_received": True,
             "start_signal_source": start_source, "stop_signal_source": stop_source,
-            "capture_method": str(record.get("capture_method") or "现有后台取数 CLI")[:160],
-            "value_semantics": str(record.get("value_semantics") or
-                                   "下播信号后读取的本场后台左侧汇总，不代表平台最终结算")[:200],
-            "missing_fields": missing,
+            "capture_method": capture_method[:160],
+            "value_semantics": value_semantics[:200], "missing_fields": missing,
         }
 
     def _task(self, task_id: str) -> dict:
         response = self.http("GET", f"v1/live/sessions/backstage/tasks/{task_id}")
+        if not isinstance(response, dict) or response.get("status") != "ok":
+            raise BackstageFatalError("backstage task response is invalid")
         task = response.get("task")
         if not isinstance(task, dict) or task.get("task_id") != task_id:
-            raise ValueError("backstage task identity mismatch")
+            raise BackstageFatalError("backstage task identity mismatch")
         return task
 
     @staticmethod
-    def _require_bound_start(task: dict, result: dict) -> None:
-        record = result.get("record") if isinstance(result, dict) else None
+    def _invocation(value) -> CliInvocation:
+        if isinstance(value, CliInvocation):
+            return value
+        if isinstance(value, dict):
+            # Injected test/adapter callables use the established dict shape;
+            # the real subprocess path always supplies its actual exit code.
+            return CliInvocation(value, 0)
+        return CliInvocation(None, None, "cli_result_unavailable")
+
+    @staticmethod
+    def _record(invocation: CliInvocation) -> dict | None:
+        if not isinstance(invocation.output, dict):
+            return None
+        record = invocation.output.get("record")
+        return record if isinstance(record, dict) else None
+
+    @staticmethod
+    def _record_problem(task: dict, record: dict | None, *, allow_missing_stop_source: bool) -> str | None:
+        if record is None:
+            return "cli_record_missing"
+        if (record.get("session_id") != task.get("session_id")
+                or record.get("douyin_account") != task.get("douyin_account")):
+            return "cli_record_identity_mismatch"
+        expected_source = task.get("start_signal_source")
+        if record.get("start_signal_source") != expected_source:
+            return "cli_record_source_mismatch"
+        record_stop_source = record.get("stop_signal_source")
+        if (record_stop_source != expected_source
+                and not (allow_missing_stop_source and record_stop_source is None)):
+            return "cli_record_source_mismatch"
+        return None
+
+    @staticmethod
+    def _has_binding_candidate(record: dict) -> bool:
+        """A present binding object is unresolved state even if malformed; do not rerun capture."""
+        return bool(record.get("binding_evidence"))
+
+    @staticmethod
+    def _has_valid_binding_evidence(record: dict) -> bool:
+        evidence = record.get("binding_evidence")
+        if not isinstance(evidence, dict):
+            return False
+        return all(isinstance(evidence.get(key), str) and evidence[key].strip()
+                   for key in ("room_id", "observed_at", "locator"))
+
+    @staticmethod
+    def _reason(invocation: CliInvocation, default: str) -> str:
+        output = invocation.output if isinstance(invocation.output, dict) else {}
+        record = output.get("record") if isinstance(output.get("record"), dict) else {}
+        for value in (record.get("reason"), output.get("reason"), invocation.failure_reason):
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:160]
+        return default[:160]
+
+    @classmethod
+    def _payload_record(cls, invocation: CliInvocation) -> dict | None:
+        record = cls._record(invocation)
+        if record is None:
+            return None
+        result = dict(record)
+        output = invocation.output or {}
+        if not result.get("reason") and isinstance(output.get("reason"), str):
+            result["reason"] = output["reason"]
+        return result
+
+    @classmethod
+    def _null_failure_payload(cls, task: dict, reason: str) -> dict:
         source = task.get("start_signal_source")
-        if (not isinstance(record, dict)
-                or record.get("status") != "waiting_for_stop"
-                or record.get("session_id") != task["session_id"]
-                or record.get("douyin_account") != task["douyin_account"]
-                or record.get("start_signal_source") != source):
-            raise BackstageStartError("backstage CLI start did not bind the claimed session")
+        if (task.get("stop_signal_received") is not True
+                or source not in {"ios_app", "android_app"}
+                or task.get("stop_signal_source") != source):
+            raise BackstageFatalError("backstage task stop/source contract mismatch")
+        reason = (reason or "CLI未返回可验证结果").strip()[:160]
+        return {
+            "task_id": task["task_id"], "douyin_account": task["douyin_account"],
+            "status": "needs_input", "room_id": None,
+            "metrics": {key: None for key in METRIC_KEYS}, "raw_displays": {},
+            "approximate_metrics": [], "metrics_captured_at": None,
+            "stop_signal_received": True,
+            "start_signal_source": source, "stop_signal_source": source,
+            "capture_method": "后台取数 CLI 未取得可核验结果",
+            "value_semantics": "本场后台数据未知；" + reason[:160],
+            "missing_fields": {key: reason for key in METRIC_KEYS},
+        }
+
+    def _post_result(self, task: dict, payload: dict) -> None:
+        response = self.http(
+            "POST", f"v1/live/sessions/{task['session_id']}/backstage/result", payload,
+        )
+        if not isinstance(response, dict):
+            raise BackstageFatalError("backstage result acknowledgement is invalid")
+        if (response.get("status") not in {"accepted", "duplicate"}
+                or response.get("task_id") != task["task_id"]
+                or response.get("result_status") != payload["status"]):
+            raise BackstageFatalError("backstage result acknowledgement mismatch")
+
+    def _write_cli_failure(self, task: dict, identity: tuple[str, str], reason: str) -> None:
+        task = self._wait_for_app_stop(task, identity)
+        self._post_result(task, self._null_failure_payload(task, reason))
+
+    def _wait_for_app_stop(self, task: dict, identity: tuple[str, str]) -> dict:
+        """等待原 App 场次 stop；校验身份/source 后返回终态 task。"""
+        current = task
+        while current.get("stop_signal_received") is not True:
+            current = self._task(task["task_id"])
+            if (current.get("session_id"), current.get("douyin_account")) != identity:
+                raise BackstageFatalError("backstage task identity mismatch")
+            if current.get("start_signal_source") != task.get("start_signal_source"):
+                raise BackstageFatalError("backstage task source changed")
+            if current.get("stop_signal_received") is not True:
+                self.sleep(self.config.poll_seconds)
+
+        expected_source = task.get("start_signal_source")
+        if current.get("stop_signal_source") != expected_source:
+            raise BackstageFatalError("backstage task source mismatch")
+        return current
 
     def run_once(self) -> bool:
         claimed = self.http("POST", "v1/live/sessions/backstage/tasks/claim")
+        if not isinstance(claimed, dict):
+            raise BackstageFatalError("backstage claim response is invalid")
         task = claimed.get("task")
-        if claimed.get("status") == "idle" or task is None:
+        if claimed.get("status") == "idle" and task is None:
             return False
         if (claimed.get("status") != "claimed" or not isinstance(task, dict)
                 or not all(isinstance(task.get(key), str) and task[key]
                            for key in ("task_id", "session_id", "douyin_account"))
                 or task.get("start_signal_source") not in {"ios_app", "android_app"}):
-            raise ValueError("invalid claimed backstage task")
+            raise BackstageFatalError("invalid claimed backstage task")
+        if task.get("stop_signal_received") is True and (
+                task.get("stop_signal_source") != task.get("start_signal_source")):
+            raise BackstageFatalError("claimed backstage task source mismatch")
 
         identity = (task["session_id"], task["douyin_account"])
-        start_result = self.cli("start", task)
-        self._require_bound_start(task, start_result)
-        while True:
-            current = self._task(task["task_id"])
-            if (current.get("session_id"), current.get("douyin_account")) != identity:
-                raise ValueError("backstage task identity mismatch")
-            if current.get("stop_signal_received") is True:
-                task = current
-                break
-            self.sleep(self.config.poll_seconds)
+        start = self._invocation(self.cli("start", task))
+        start_record = self._record(start)
+        start_problem = self._record_problem(
+            task, start_record, allow_missing_stop_source=True,
+        )
+        if start_problem and start_record is not None:
+            self._write_cli_failure(task, identity, start_problem)
+            return True
 
-        self.cli("stop", task)
-        result = self.cli("result", task)
-        payload = self.result_payload(task, result)
-        self.http("POST", f"v1/live/sessions/{task['session_id']}/backstage/result", payload)
+        start_status = start_record.get("status") if start_record else None
+        if start_record and start_status in {"needs_input", "failed"}:
+            task = self._wait_for_app_stop(task, identity)
+            start_reason = self._reason(start, "cli_start_failed")
+            if start_status == "needs_input" and self._has_binding_candidate(start_record):
+                # A bound but unresolved record may cause CLI stop to re-enter capture.
+                # Keep it isolated and report unknown values after the real App stop.
+                if start.returncode != 2:
+                    payload = self._null_failure_payload(
+                        task, f"cli_start_exit_status_mismatch: {start_reason}",
+                    )
+                else:
+                    try:
+                        payload = self.result_payload(
+                            task, {"record": self._payload_record(start)},
+                            allow_missing_stop_source=True,
+                        )
+                    except BackstageCliRecordError as exc:
+                        payload = self._null_failure_payload(task, str(exc))
+                self._post_result(task, payload)
+                return True
+
+            # For an unbound needs_input or terminal failed record, persist the
+            # real App stop through the CLI. The CLI's stop path closes the local
+            # record without starting another desktop capture for an unbound task.
+            stop = self._invocation(self.cli("stop", task))
+            stop_record = self._record(stop)
+            stop_problem = self._record_problem(
+                task, stop_record, allow_missing_stop_source=False,
+            )
+            stop_status = stop_record.get("status") if stop_record else None
+            if start.returncode != 2:
+                reason = f"cli_start_exit_status_mismatch: {start_reason}"
+                payload = self._null_failure_payload(task, reason)
+            elif stop_problem:
+                reason = (f"{stop_problem}: {self._reason(stop, start_reason)}"
+                          if stop_record else self._reason(stop, start_reason))
+                payload = self._null_failure_payload(task, reason)
+            elif stop.returncode != 2 or stop_status not in {"needs_input", "failed"}:
+                reason = f"cli_stop_finalization_mismatch: {self._reason(stop, start_reason)}"
+                payload = self._null_failure_payload(task, reason)
+            else:
+                try:
+                    payload = self.result_payload(task, {"record": self._payload_record(stop)})
+                except BackstageCliRecordError as exc:
+                    payload = self._null_failure_payload(task, str(exc))
+            self._post_result(task, payload)
+            return True
+
+        if (start_record and start_status == "waiting_for_stop"
+                and start.returncode == 0):
+            if not self._has_valid_binding_evidence(start_record):
+                self._write_cli_failure(task, identity, "cli_binding_evidence_missing")
+                return True
+            task = self._wait_for_app_stop(task, identity)
+        else:
+            reason = self._reason(start, "cli_start_no_bound_record")
+            if start_record and start_status == "waiting_for_stop":
+                reason = "cli_exit_status_mismatch"
+            elif start_record and start_status not in {"needs_input", "failed"}:
+                reason = "cli_start_status_invalid"
+            self._write_cli_failure(task, identity, reason)
+            return True
+
+        stop = self._invocation(self.cli("stop", task))
+        stop_record = self._record(stop)
+        stop_problem = self._record_problem(task, stop_record, allow_missing_stop_source=False)
+        if stop_problem:
+            reason = stop_problem if stop_record else self._reason(stop, stop_problem)
+            self._post_result(task, self._null_failure_payload(task, reason))
+            return True
+        stop_status = stop_record.get("status")
+        if stop_status in {"needs_input", "failed"}:
+            if stop.returncode != 2:
+                payload = self._null_failure_payload(
+                    task, f"cli_stop_exit_status_mismatch: {self._reason(stop, stop_status)}",
+                )
+            else:
+                try:
+                    payload = self.result_payload(task, {"record": self._payload_record(stop)})
+                except BackstageCliRecordError as exc:
+                    payload = self._null_failure_payload(task, str(exc))
+            self._post_result(task, payload)
+            return True
+        if (stop.returncode != 0 or stop_status not in
+                {"waiting_for_stop", "captured_locally", "partial"}):
+            reason = "cli_exit_status_mismatch" if stop_record else self._reason(
+                stop, "cli_stop_no_record",
+            )
+            self._post_result(task, self._null_failure_payload(task, reason))
+            return True
+
+        result = self._invocation(self.cli("result", task))
+        result_record = self._record(result)
+        result_problem = self._record_problem(task, result_record, allow_missing_stop_source=False)
+        if result_problem:
+            reason = result_problem if result_record else self._reason(result, result_problem)
+            self._post_result(task, self._null_failure_payload(task, reason))
+            return True
+        result_status = result_record.get("status")
+        if (result.returncode != 0
+                or result_status not in {"captured_locally", "partial", "needs_input", "failed"}):
+            self._post_result(task, self._null_failure_payload(
+                task, "cli_exit_status_mismatch" if result_record else
+                self._reason(result, "cli_result_no_record"),
+            ))
+            return True
+        try:
+            payload = self.result_payload(task, {"record": self._payload_record(result)})
+        except BackstageCliRecordError as exc:
+            payload = self._null_failure_payload(task, str(exc))
+        self._post_result(task, payload)
         return True
 
     def serve_forever(self) -> None:
@@ -290,12 +583,10 @@ class BackstageBridge:
             try:
                 if not self.run_once():
                     self.sleep(self.config.poll_seconds)
-            except BackstageStartError:
-                # 不重领同一个未绑定任务，也不输出 CLI 正文或本场身份。
-                print("backstage bridge stopped: cli_start_not_bound", file=sys.stderr)
+            except BackstageFatalError as exc:
+                print(f"backstage bridge stopped: {exc}", file=sys.stderr)
                 raise SystemExit(2) from None
-            except (OSError, RuntimeError, ValueError) as exc:
-                # 不输出任务账号、令牌、原始截图或结果正文。
+            except BackstageTransientError as exc:
                 print(f"backstage bridge paused: {type(exc).__name__}", file=sys.stderr)
                 self.sleep(self.config.poll_seconds)
 
