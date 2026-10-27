@@ -19,6 +19,7 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.view.Gravity;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -31,6 +32,7 @@ import com.google.mlkit.vision.text.TextRecognizer;
 import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions;
 
 import java.nio.ByteBuffer;
+import java.lang.ref.WeakReference;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -61,6 +63,7 @@ public class CaptureService extends Service {
     public static volatile Phase phase = Phase.IDLE;
     public static volatile String lastMessage = "";
     public static volatile boolean uiVisible;
+    private static volatile WeakReference<CaptureService> serviceReference = new WeakReference<>(null);
 
     private static final String EXTRA_RESULT_CODE = "result_code";
     private static final String EXTRA_RESULT_DATA = "result_data";
@@ -86,7 +89,6 @@ public class CaptureService extends Service {
     private ExecutorService workExecutor;
     private ExecutorService promptExecutor;
     private LiveClient.Session liveSession;
-    private String displayedText = "";
     private LiveFrameAnalyzer liveAnalyzer;
     private long lastLiveOcr;
     private long lastLivePerson, lastFrameTimestamp;
@@ -102,15 +104,19 @@ public class CaptureService extends Service {
     private int intervalMs = 5000;
     private String serverUrl = "";
     private int[] screenSize = new int[2];
+    private String setupStage = "idle";
+    private volatile String teardownReason = "none";
+    private final OverlayMessageState overlayState = new OverlayMessageState();
 
     private View replyOverlayView;
     private TextView replyTextView;
-    private final Runnable replyHide = () -> removeReplyOverlay();
+    private final Runnable replyHide = () -> renderOverlay(sessionEpoch);
 
     private final MediaProjection.Callback projectionCallback = new MediaProjection.Callback() {
         @Override
         public void onStop() {
-            main.post(() -> teardown("采集已被系统或用户停止"));
+            logEvent("projection_on_stop", "prior_teardown=" + teardownReason);
+            main.post(() -> teardown("屏幕采集已停止。Android 未提供具体原因；回到应用后可重新开始。若再次发生，请保留诊断日志。", "projection_on_stop"));
         }
     };
 
@@ -121,7 +127,7 @@ public class CaptureService extends Service {
             if (uiVisible) { main.post(CaptureService.this::removeReplyOverlay); scheduleTick(intervalMs); return; }
             if (ScreenMetrics.rotation(CaptureService.this) != rotationAtStart) {
                 // 回主线程执行teardown（内部有 stopForeground/stopSelf）
-                main.post(() -> teardown("屏幕方向已变化，会话已停止，请重新框选并启动"));
+                main.post(() -> teardown("屏幕方向已变化，会话已停止，请重新框选并开始辅助", "rotation_changed"));
                 return;
             }
             if (busyEpoch.get() == sessionEpoch) {
@@ -202,6 +208,7 @@ public class CaptureService extends Service {
     };
 
     public static void requestStart(Context ctx, int resultCode, Intent data) {
+        logEvent("service_start_requested", "consent=accepted");
         Intent i = new Intent(ctx, CaptureService.class);
         i.setAction(ACTION_START);
         i.putExtra(EXTRA_RESULT_CODE, resultCode);
@@ -220,13 +227,28 @@ public class CaptureService extends Service {
     }
 
     public static void requestStop(Context ctx) {
+        logEvent("service_stop_requested", "source=app_action");
         Intent i = new Intent(ctx, CaptureService.class).setAction(ACTION_STOP);
         ctx.startService(i);
+    }
+
+    public static void setAssistantUiVisible(boolean visible) {
+        uiVisible = visible;
+        WeakReference<CaptureService> reference = serviceReference;
+        CaptureService service = reference == null ? null : reference.get();
+        if (service != null) service.main.post(() -> service.renderOverlay(service.sessionEpoch));
+    }
+
+    private static void logEvent(String event, String fields) {
+        android.util.Log.i("CaptureService", "t=" + SystemClock.elapsedRealtime()
+                + " event=" + event + " " + fields);
     }
 
     @Override
     public void onCreate() {
         super.onCreate();
+        serviceReference = new WeakReference<>(this);
+        logEvent("service_created", "phase=" + phase);
         mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
         notifManager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         wm = getSystemService(WindowManager.class);
@@ -244,6 +266,8 @@ public class CaptureService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent == null ? ACTION_STOP : intent.getAction();
+        logEvent("service_start_command", "action=" + (action == null ? "missing" : action.substring(action.lastIndexOf('.') + 1))
+                + " phase=" + phase);
         switch (action == null ? "" : action) {
             case ACTION_START: {
                 if (!tornDown) return START_NOT_STICKY;
@@ -254,15 +278,30 @@ public class CaptureService extends Service {
                         && Prefs.getAudioMode(this) == 2 && checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
                         == android.content.pm.PackageManager.PERMISSION_GRANTED;
                 if (android.os.Build.VERSION.SDK_INT >= 30 && microphoneForeground) types |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
-                try { startForeground(NOTIF_ID, buildNotification("正在启动…"), types); }
-                catch (SecurityException e) {
-                    microphoneForeground = false;
-                    startForeground(NOTIF_ID, buildNotification("麦克风权限/前台条件受限，继续屏幕"), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+                try {
+                    try {
+                        startForeground(NOTIF_ID, buildNotification("正在启动…"), types);
+                        setupStage = "foreground_service_started";
+                        logEvent("foreground_service_started", "types=" + types);
+                    } catch (SecurityException e) {
+                        if (!microphoneForeground) throw e;
+                        microphoneForeground = false;
+                        logEvent("foreground_service_microphone_type_denied", "error=" + e.getClass().getSimpleName());
+                        startForeground(NOTIF_ID, buildNotification("麦克风条件受限，继续屏幕"), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+                        setupStage = "foreground_service_started_without_microphone";
+                        logEvent("foreground_service_started", "types=" + ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+                    }
+                } catch (RuntimeException e) {
+                    setupStage = "foreground_service_start";
+                    logEvent("foreground_service_start_failed", "stage=" + setupStage + " error=" + e.getClass().getSimpleName());
+                    teardown("启动失败（前台服务阶段，" + e.getClass().getSimpleName()
+                            + "）。请检查屏幕采集权限与系统设置后重新开始。", "foreground_service_start_failed");
+                    break;
                 }
                 int code = intent.getIntExtra(EXTRA_RESULT_CODE, 0);
                 Intent data = intent.getParcelableExtra(EXTRA_RESULT_DATA);
                 if (data == null) {
-                    teardown("启动参数缺失");
+                    teardown("启动失败：未收到屏幕授权数据。请回到应用重新开始并完成系统授权。", "start_data_missing");
                 } else {
                     setup(code, data);
                 }
@@ -272,6 +311,7 @@ public class CaptureService extends Service {
                 if (phase == Phase.RUNNING) {
                     captureHandler.removeCallbacks(tick);
                     phase = Phase.PAUSED;
+                    overlayState.stop();
                     if (liveAnalyzer != null) liveAnalyzer.invalidateBefore(android.os.SystemClock.elapsedRealtime());
                     else sessionEpoch++;
                     if (audioCapture != null) { audioCapture.stop(); audioCapture = null; }
@@ -286,11 +326,13 @@ public class CaptureService extends Service {
             case ACTION_RESUME: {
                 if (phase == Phase.PAUSED && !tornDown) {
                     phase = Phase.RUNNING;
+                    overlayState.start();
                     if (liveAnalyzer != null) liveAnalyzer.invalidateBefore(android.os.SystemClock.elapsedRealtime());
                     startAudio();
                     setState("已继续");
                     notifManager.notify(NOTIF_ID, buildNotification("采集中 · 间隔 "
                             + (intervalMs / 1000) + " 秒"));
+                    renderOverlay(sessionEpoch);
                     scheduleTick(300);
                 } else if (phase == Phase.IDLE) {
                     stopSelf();
@@ -299,7 +341,7 @@ public class CaptureService extends Service {
             }
             case ACTION_STOP:
             default:
-                teardown("已停止");
+                teardown("已结束辅助", "app_stop_action");
                 break;
         }
         return START_NOT_STICKY;
@@ -307,6 +349,7 @@ public class CaptureService extends Service {
 
     @Override
     public void onDestroy() {
+        logEvent("service_destroyed", "phase=" + phase + " teardown_reason=" + teardownReason);
         teardownInternal();
         LiveFrameAnalyzer closingAnalyzer = liveAnalyzer;
         TextRecognizer closingRecognizer = recognizer;
@@ -319,6 +362,8 @@ public class CaptureService extends Service {
         }
         if (promptExecutor != null) promptExecutor.shutdownNow();
         if (captureThread != null) captureThread.quitSafely();
+        WeakReference<CaptureService> reference = serviceReference;
+        if (reference != null && reference.get() == this) serviceReference = new WeakReference<>(null);
         super.onDestroy();
     }
 
@@ -328,10 +373,16 @@ public class CaptureService extends Service {
     }
 
     private void setup(int resultCode, Intent data) {
+        setupStage = "setup_entered";
+        logEvent("projection_setup_started", "phase=" + phase);
         try {
-            if (!tornDown) teardownInternal();
+            if (!tornDown) {
+                teardownReason = "setup_replaced_previous_session";
+                teardownInternal();
+            }
             tornDown = false;
             sessionEpoch++;
+            setupStage = "display_metrics";
             serverUrl = Prefs.getServerUrl(this);
             LiveClient.Session stored = Prefs.getSession(this);
             liveSession = stored != null && !stored.stopped ? stored : null;
@@ -340,15 +391,23 @@ public class CaptureService extends Service {
             int[] size = ScreenMetrics.realSizeDpi(this);
             screenSize = size;
             rotationAtStart = ScreenMetrics.rotation(this);
+            logEvent("display_metrics_ready", "width=" + size[0] + " height=" + size[1] + " rotation=" + rotationAtStart);
 
+            setupStage = "image_reader";
             imageReader = ImageReader.newInstance(size[0], size[1], PixelFormat.RGBA_8888, 3);
+            setupStage = "get_media_projection";
             projection = mpm.getMediaProjection(resultCode, data);
+            logEvent("media_projection_acquired", "api=" + android.os.Build.VERSION.SDK_INT);
             // Android14：createVirtualDisplay 前必须注册 onStop 回调
+            setupStage = "register_projection_callback";
             projection.registerCallback(projectionCallback, captureHandler);
+            setupStage = "create_virtual_display";
             virtualDisplay = projection.createVirtualDisplay(
                     "screen-assistant", size[0], size[1], size[2],
                     android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                     imageReader.getSurface(), null, captureHandler);
+            logEvent("virtual_display_created", "result=" + (virtualDisplay == null ? "null" : "created"));
+            setupStage = "recognizer";
             if (recognizer == null) {
                 recognizer = TextRecognition.getClient(
                         new ChineseTextRecognizerOptions.Builder().build());
@@ -358,16 +417,21 @@ public class CaptureService extends Service {
                     () -> !tornDown && !uiVisible && phase == Phase.RUNNING && sessionEpoch == epoch, this::setState);
             lastLiveOcr = 0;
             lastLivePerson = 0; lastFrameTimestamp = 0;
-            displayedText = "";
+            overlayState.start();
             phase = Phase.RUNNING;
+            setupStage = "running";
             startAudio();
             if (liveSession != null) startPromptPolling(liveSession, sessionEpoch);
-            setState("已连接 " + serverUrl);
-            notifManager.notify(NOTIF_ID, buildNotification("采集中 · 间隔 " + (intervalMs / 1000) + " 秒"));
+            logEvent("capture_running", "session=" + (liveSession == null ? "answer_compatibility" : "operation"));
+            setState("辅助中，等待内容");
+            notifManager.notify(NOTIF_ID, buildNotification("辅助中，等待内容"));
+            renderOverlay(sessionEpoch);
             scheduleTick(800);
         } catch (Exception e) {
-            android.util.Log.e("CaptureService", "setup failed", e);
-            teardown("启动失败：" + e.getMessage());
+            logEvent("projection_setup_failed", "stage=" + setupStage + " error=" + e.getClass().getSimpleName());
+            android.util.Log.e("CaptureService", "projection setup failed at stage=" + setupStage, e);
+            teardown("启动失败（" + setupStage + "，" + e.getClass().getSimpleName()
+                    + "）。请确认权限后重新开始。", "setup_exception");
         }
     }
 
@@ -509,7 +573,7 @@ public class CaptureService extends Service {
                     cursor = page.getString("next_cursor");
                     if (page.optBoolean("stopped")) {
                         Prefs.saveSession(this, session.asStopped());
-                        main.post(() -> { if (epoch == sessionEpoch) teardown("共享场次已结束"); });
+                        main.post(() -> { if (epoch == sessionEpoch) teardown("共享场次已结束", "live_session_end"); });
                         return;
                     }
                 } catch (Exception e) {
@@ -526,82 +590,80 @@ public class CaptureService extends Service {
         String fullText = DisplayText.labeled(purpose, reply);
         if (fullText.isEmpty()) return;
         main.post(() -> {
-            if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch
-                    || uiVisible
-                    || expiresAt > 0 && expiresAt <= System.currentTimeMillis()) return;
-            if (fullText.equals(displayedText)) return;
-            showOverlay(fullText, epoch, "local", expiresAt);
+            if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch) return;
+            long now = System.currentTimeMillis();
+            if (expiresAt > 0 && expiresAt <= now) return;
+            if (overlayState.update(fullText, expiresAt, now, REPLY_AUTO_HIDE_MS)) renderOverlay(epoch);
         });
     }
 
-    private void showOverlay(String reply, int epoch, String requestId, long expiresAt) {
-        android.util.Log.i("CaptureService", "reply dispatch queued request_id=" + safeId(requestId)
-                + " reply_chars=" + (reply == null ? 0 : reply.length()) + " epoch=" + epoch);
-        main.post(() -> {
-            if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch || uiVisible
-                    || expiresAt > 0 && expiresAt <= System.currentTimeMillis()) {
-                android.util.Log.i("CaptureService", "reply dispatch rejected request_id=" + safeId(requestId)
-                        + " phase=" + phase + " torn_down=" + tornDown + " epoch=" + epoch
-                        + " current_epoch=" + sessionEpoch);
-                return;
-            }
-            if (reply.equals(displayedText)) return;
-            if (android.os.Build.VERSION.SDK_INT >= 23 && !android.provider.Settings.canDrawOverlays(this)) {
-                android.util.Log.w("CaptureService", "reply overlay denied request_id=" + safeId(requestId));
-                return;
-            }
-            try {
-                boolean added = replyOverlayView == null;
-                if (replyOverlayView == null) {
-                    replyOverlayView = LayoutInflater.from(this).inflate(R.layout.overlay_reply, null);
-                    replyTextView = replyOverlayView.findViewById(R.id.tv_reply);
-                    replyOverlayView.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
-                        @Override
-                        public void onViewAttachedToWindow(View view) {
-                            android.util.Log.i("CaptureService", "reply overlay attached request_id="
-                                    + safeId(requestId) + " shown=" + view.isShown());
-                        }
+    private void renderOverlay(int epoch) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            main.post(() -> renderOverlay(epoch));
+            return;
+        }
+        main.removeCallbacks(replyHide);
+        if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch || uiVisible) {
+            removeReplyOverlay();
+            return;
+        }
+        if (android.os.Build.VERSION.SDK_INT >= 23 && !android.provider.Settings.canDrawOverlays(this)) {
+            removeReplyOverlay();
+            setState("辅助正在运行，但悬浮窗权限不可用。回到应用打开悬浮窗权限后重新开始。");
+            notifManager.notify(NOTIF_ID, buildNotification("悬浮窗权限不可用，点此查看"));
+            logEvent("overlay_permission_missing", "phase=" + phase);
+            return;
+        }
+        try {
+            if (replyOverlayView == null) {
+                replyOverlayView = LayoutInflater.from(this).inflate(R.layout.overlay_reply, null);
+                replyTextView = replyOverlayView.findViewById(R.id.tv_reply);
+                replyOverlayView.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+                    @Override
+                    public void onViewAttachedToWindow(View view) {
+                        logEvent("overlay_attached", "shown=" + view.isShown());
+                    }
 
-                        @Override
-                        public void onViewDetachedFromWindow(View view) {
-                            android.util.Log.i("CaptureService", "reply overlay detached request_id="
-                                    + safeId(requestId));
-                        }
-                    });
-                    WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                            WindowManager.LayoutParams.WRAP_CONTENT,
-                            WindowManager.LayoutParams.WRAP_CONTENT,
-                            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                                    | WindowManager.LayoutParams.FLAG_SECURE
-                                    | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                                    | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-                            PixelFormat.TRANSLUCENT);
-                    lp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
-                    // Android12+不可信覆盖层的触摸穿透必须满足系统最大遮挡透明度。
-                    lp.alpha = android.os.Build.VERSION.SDK_INT >= 31
-                            ? Math.min(.8f, getSystemService(android.hardware.input.InputManager.class).getMaximumObscuringOpacityForTouch()) : .8f;
-                    lp.y = (int) (64 * getResources().getDisplayMetrics().density);
-                    lp.width = Math.max(200, screenSize[0]
-                            - (int) (32 * getResources().getDisplayMetrics().density));
-                    wm.addView(replyOverlayView, lp);
-                }
-                replyTextView.setText(reply);
-                displayedText = reply;
-                replyOverlayView.setVisibility(View.VISIBLE);
-                android.util.Log.i("CaptureService", "reply overlay visible request_id=" + safeId(requestId)
-                        + " added=" + added + " attached=" + replyOverlayView.isAttachedToWindow()
-                        + " shown=" + replyOverlayView.isShown() + " reply_chars=" + reply.length()
-                        + " focusable=false touchable=false");
-                main.removeCallbacks(replyHide);
-                main.postDelayed(replyHide, expiresAt > 0
-                        ? Math.max(1, Math.min(REPLY_AUTO_HIDE_MS, expiresAt - System.currentTimeMillis())) : REPLY_AUTO_HIDE_MS);
-            } catch (Exception e) {
-                android.util.Log.w("CaptureService", "reply overlay failed request_id=" + safeId(requestId)
-                        + " error_type=" + e.getClass().getSimpleName());
-                removeReplyOverlay();
+                    @Override
+                    public void onViewDetachedFromWindow(View view) {
+                        logEvent("overlay_detached", "phase=" + phase);
+                    }
+                });
+                WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                        WindowManager.LayoutParams.WRAP_CONTENT,
+                        WindowManager.LayoutParams.WRAP_CONTENT,
+                        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                | WindowManager.LayoutParams.FLAG_SECURE
+                                | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                                | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                        PixelFormat.TRANSLUCENT);
+                lp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+                // Android12+不可信覆盖层的触摸穿透必须满足系统最大遮挡透明度。
+                lp.alpha = android.os.Build.VERSION.SDK_INT >= 31
+                        ? Math.min(.8f, getSystemService(android.hardware.input.InputManager.class).getMaximumObscuringOpacityForTouch()) : .8f;
+                lp.y = (int) (64 * getResources().getDisplayMetrics().density);
+                lp.width = Math.max(200, screenSize[0]
+                        - (int) (32 * getResources().getDisplayMetrics().density));
+                wm.addView(replyOverlayView, lp);
             }
-        });
+            long now = System.currentTimeMillis();
+            String text = overlayState.textAt(now);
+            replyTextView.setText(text);
+            replyOverlayView.setVisibility(View.VISIBLE);
+            logEvent("overlay_visible", "kind=" + (OverlayMessageState.WAITING_TEXT.equals(text) ? "waiting" : "message")
+                    + " attached=" + replyOverlayView.isAttachedToWindow());
+            if (overlayState.isMessageActive(now)) {
+                main.postDelayed(replyHide, Math.max(1, overlayState.expiresAtMs() - now));
+            }
+        } catch (Exception e) {
+            logEvent("overlay_attach_failed", "error=" + e.getClass().getSimpleName());
+            android.util.Log.w("CaptureService", "overlay attach failed: " + e.getClass().getSimpleName());
+            removeReplyOverlay();
+            setState("辅助正在运行，但悬浮提示未显示（" + e.getClass().getSimpleName()
+                    + "）。请回到应用检查悬浮窗权限后重新开始。");
+            notifManager.notify(NOTIF_ID, buildNotification("悬浮提示未显示，点此检查"));
+        }
     }
 
     private static String safeId(String id) {
@@ -652,6 +714,12 @@ public class CaptureService extends Service {
 
     /** 完整回收（幂等）：停止轮询、释放采集链、移除悬浮条、退出前台并自毁。 */
     private void teardown(String message) {
+        teardown(message, "unspecified");
+    }
+
+    private void teardown(String message, String reason) {
+        teardownReason = reason;
+        logEvent("teardown_requested", "reason=" + reason + " phase=" + phase + " already_torn_down=" + tornDown);
         if (tornDown) {
             if (phase == Phase.STOPPING) return;
             setState(message);
@@ -676,6 +744,7 @@ public class CaptureService extends Service {
         tornDown = true;
         phase = Phase.IDLE;
         sessionEpoch++;
+        overlayState.stop();
         if (audioCapture != null) { audioCapture.stop(); audioCapture = null; }
         if (captureHandler != null) captureHandler.removeCallbacksAndMessages(null);
         main.removeCallbacks(replyHide);
@@ -696,6 +765,7 @@ public class CaptureService extends Service {
         }
         if (projection != null) {
             try {
+                logEvent("projection_stop_requested", "reason=" + teardownReason);
                 projection.unregisterCallback(projectionCallback);
                 projection.stop();
             } catch (Exception ignored) {

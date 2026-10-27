@@ -11,18 +11,16 @@ import android.media.projection.MediaProjectionManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.provider.Settings;
+import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.LinearLayout;
 import android.widget.TextView;
-import android.widget.Toast;
 
-/**
- * 主界面：服务地址/间隔配置、区域框选入口、启动（采集授权）、暂停/继续、停止。
- * 纯框架控件，简洁中文界面。
- */
+/** Single entry point for the assistant; implementation details stay in expandable settings. */
 public class MainActivity extends Activity {
-
     private static final int REQ_MEDIA_PROJECTION = 1001;
     private static final int REQ_OVERLAY = 1002;
     private static final int REQ_POST_NOTIFICATIONS = 1003;
@@ -30,144 +28,159 @@ public class MainActivity extends Activity {
 
     private MediaProjectionManager mpm;
     private EditText etUrl, etInterval;
-    private TextView tvStatus, tvRegion;
-    private Button btnRegion, btnStart, btnPauseResume, btnStop;
+    private TextView tvStatus, tvPermissions;
+    private Button btnMain, btnSettings, btnAdvanced, btnRecap, btnLegacy, btnPause;
+    private View settingsPanel, advancedPanel;
     private LivePanel livePanel;
     private RegionPanel regionPanel;
     private AudioPanel audioPanel;
+    private boolean settingsExpanded, advancedExpanded, pendingStart, pendingLegacyStart;
+    private String transientStatus = "";
 
     private final BroadcastReceiver stateReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            refreshUi();
-        }
+        @Override public void onReceive(Context context, Intent intent) { refreshUi(); }
     };
 
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
+    @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
         mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
         etUrl = findViewById(R.id.et_url);
         etInterval = findViewById(R.id.et_interval);
         tvStatus = findViewById(R.id.tv_status);
-        tvRegion = findViewById(R.id.tv_region);
-        btnRegion = findViewById(R.id.btn_region);
-        btnStart = findViewById(R.id.btn_start);
-        btnPauseResume = findViewById(R.id.btn_pause_resume);
-        btnStop = findViewById(R.id.btn_stop);
+        tvPermissions = findViewById(R.id.tv_permissions);
+        btnMain = findViewById(R.id.btn_main_action);
+        btnSettings = findViewById(R.id.btn_settings_toggle);
+        btnAdvanced = findViewById(R.id.btn_advanced_toggle);
+        btnRecap = findViewById(R.id.btn_recap);
+        btnLegacy = findViewById(R.id.btn_legacy_answer);
+        btnPause = findViewById(R.id.btn_pause_resume);
+        settingsPanel = findViewById(R.id.settings_panel);
+        advancedPanel = findViewById(R.id.advanced_panel);
 
         etUrl.setText(Prefs.getServerUrl(this));
         etInterval.setText(String.valueOf(Prefs.getIntervalSec(this)));
-        android.widget.LinearLayout column = findViewById(R.id.main_column);
-        regionPanel = new RegionPanel(this, column);
-        audioPanel = new AudioPanel(this, column);
-        livePanel = new LivePanel(this, column, this::onStartClicked);
-        btnRegion.setText("框选所选区域（下方选择用途）");
-        btnStart.setText("启动/重试采集（无场次为旧问答）");
-        btnStop.setText("停止采集");
+        LinearLayout regionContainer = findViewById(R.id.region_panel_container);
+        LinearLayout audioContainer = findViewById(R.id.audio_panel_container);
+        LinearLayout sessionContainer = findViewById(R.id.live_panel_container);
+        regionPanel = new RegionPanel(this, regionContainer);
+        audioPanel = new AudioPanel(this, audioContainer);
+        livePanel = new LivePanel(this, sessionContainer, this::refreshUi);
 
-        btnRegion.setOnClickListener(v -> startRegionSelector());
-        btnStart.setOnClickListener(v -> onStartClicked());
-        btnPauseResume.setOnClickListener(v -> onPauseResumeClicked());
-        btnStop.setOnClickListener(v -> CaptureService.requestStop(this));
+        btnMain.setOnClickListener(v -> onMainAction());
+        btnSettings.setOnClickListener(v -> {
+            settingsExpanded = !settingsExpanded;
+            settingsPanel.setVisibility(settingsExpanded ? View.VISIBLE : View.GONE);
+            btnSettings.setText(settingsExpanded ? "收起设置" : "连接与识别设置");
+        });
+        btnAdvanced.setOnClickListener(v -> {
+            advancedExpanded = !advancedExpanded;
+            advancedPanel.setVisibility(advancedExpanded ? View.VISIBLE : View.GONE);
+            btnAdvanced.setText(advancedExpanded ? "收起高级功能" : "高级功能");
+        });
+        btnRecap.setOnClickListener(v -> livePanel.openRecap());
+        btnLegacy.setOnClickListener(v -> startCapture(true));
+        btnPause.setOnClickListener(v -> onPauseResumeClicked());
+        findViewById(R.id.btn_region).setOnClickListener(v -> startRegionSelector());
+        refreshUi();
     }
 
-    @Override
-    protected void onStart() {
+    @Override protected void onStart() {
         super.onStart();
         IntentFilter f = new IntentFilter(Prefs.ACTION_STATE);
         androidx.core.content.ContextCompat.registerReceiver(this, stateReceiver, f,
                 androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED);
-        CaptureService.uiVisible = true;
+        CaptureService.setAssistantUiVisible(true);
     }
 
-    @Override
-    protected void onStop() {
-        CaptureService.uiVisible = false;
-        try {
-            unregisterReceiver(stateReceiver);
-        } catch (IllegalArgumentException ignored) {
-        }
+    @Override protected void onStop() {
+        CaptureService.setAssistantUiVisible(false);
+        try { unregisterReceiver(stateReceiver); } catch (IllegalArgumentException ignored) { }
         super.onStop();
     }
 
-    @Override
-    protected void onResume() {
-        super.onResume();
-        refreshUi();
-    }
+    @Override protected void onResume() { super.onResume(); refreshUi(); }
 
     private void refreshUi() {
         if (livePanel != null) livePanel.refresh();
         if (regionPanel != null) regionPanel.refresh();
         CaptureService.Phase phase = CaptureService.phase;
-        boolean busy = phase != CaptureService.Phase.IDLE;
-        if (audioPanel != null) audioPanel.refresh(!busy);
-        String msg = CaptureService.lastMessage;
+        boolean capturing = phase != CaptureService.Phase.IDLE;
+        if (audioPanel != null) audioPanel.refresh(!capturing);
+
+        String status;
         switch (phase) {
             case RUNNING:
-                tvStatus.setText("状态：采集中 · 间隔 " + Prefs.getIntervalSec(this) + " 秒"
-                        + (msg.isEmpty() ? "" : "\n" + msg));
+                status = "辅助中。切换到目标应用后，提示会显示在悬浮条中。";
+                if (!CaptureService.lastMessage.isEmpty()) status += "\n" + CaptureService.lastMessage;
                 break;
             case PAUSED:
-                tvStatus.setText("状态：已暂停（保持授权，可继续）"
-                        + (msg.isEmpty() ? "" : "\n" + msg));
+                status = "辅助已暂停。屏幕授权仍保留，可从高级功能继续或结束。";
                 break;
             case STOPPING:
-                tvStatus.setText("状态：正在停止采集并收尾音频" + (msg.isEmpty() ? "" : "\n" + msg));
+                status = "正在结束屏幕辅助…";
                 break;
             default:
-                tvStatus.setText("状态：未运行" + (msg.isEmpty() ? "" : "\n" + msg));
+                status = livePanel != null ? livePanel.getSummary() : "尚未开始";
+                if (!transientStatus.isEmpty()) status = transientStatus;
+                else if (!CaptureService.lastMessage.isEmpty()
+                        && !"已结束辅助".equals(CaptureService.lastMessage)) status = CaptureService.lastMessage;
+                break;
         }
-        btnStart.setEnabled(!busy);
-        btnPauseResume.setEnabled(phase == CaptureService.Phase.RUNNING || phase == CaptureService.Phase.PAUSED);
-        btnPauseResume.setText(phase == CaptureService.Phase.PAUSED ? "继续" : "暂停");
-        btnStop.setEnabled(busy);
-        float[] r = Prefs.getRegion(this);
-        if (r == null) {
-            tvRegion.setText("识别区域：未框选（默认屏幕中央）");
+        tvStatus.setText(status);
+        tvPermissions.setText("悬浮窗权限：" + (Settings.canDrawOverlays(this) ? "已允许" : "需要允许")
+                + "\n屏幕采集：开始时由 Android 再次确认");
+
+        boolean busy = livePanel != null && livePanel.isWorking();
+        if (phase == CaptureService.Phase.RUNNING || phase == CaptureService.Phase.PAUSED) {
+            btnMain.setText("结束辅助");
+            btnMain.setEnabled(!busy);
+        } else if (phase == CaptureService.Phase.STOPPING) {
+            btnMain.setText("正在结束…");
+            btnMain.setEnabled(false);
         } else {
-            tvRegion.setText(String.format("识别区域：宽%.0f%% 高%.0f%%（左%.0f%% 上%.0f%%）",
-                    (r[2] - r[0]) * 100f, (r[3] - r[1]) * 100f, r[0] * 100f, r[1] * 100f));
+            btnMain.setText(livePanel != null && livePanel.hasActiveSession() ? "继续辅助" : "开始辅助");
+            btnMain.setEnabled(!busy);
+        }
+        btnPause.setEnabled(phase == CaptureService.Phase.RUNNING || phase == CaptureService.Phase.PAUSED);
+        btnPause.setText(phase == CaptureService.Phase.PAUSED ? "继续屏幕辅助" : "暂停屏幕辅助");
+        btnLegacy.setEnabled(!capturing && !busy && !livePanel.hasActiveSession());
+        btnRecap.setEnabled(true);
+    }
+
+    private void onMainAction() {
+        if (CaptureService.phase == CaptureService.Phase.RUNNING || CaptureService.phase == CaptureService.Phase.PAUSED) {
+            endAssistance();
+        } else if (CaptureService.phase == CaptureService.Phase.IDLE) {
+            startCapture(false);
         }
     }
 
-    private void startRegionSelector() {
-        if (!Settings.canDrawOverlays(this)) {
-            Toast.makeText(this, "框选需要悬浮窗权限，请授权后重试", Toast.LENGTH_LONG).show();
-            startActivityForResult(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                    Uri.parse("package:" + getPackageName())), REQ_OVERLAY);
-            return;
-        }
-        if (CaptureService.phase != CaptureService.Phase.IDLE) {
-            Toast.makeText(this, "请先停止采集再编辑区域，避免把编辑器作为输入", Toast.LENGTH_LONG).show(); return;
-        }
-        RegionSelectorService.start(this, regionPanel.selected());
-        moveTaskToBack(true);
-    }
-
-    private void onStartClicked() {
+    private void startCapture(boolean legacyAnswer) {
+        transientStatus = "";
+        logFlow("assist_start_clicked", "entry=" + (legacyAnswer ? "advanced_legacy" : "primary"));
+        if (CaptureService.phase != CaptureService.Phase.IDLE || livePanel.isWorking()) return;
         String url = etUrl.getText().toString().trim();
         int interval;
-        try {
-            interval = Integer.parseInt(etInterval.getText().toString().trim());
-        } catch (NumberFormatException e) {
-            interval = -1;
-        }
-        if (!isValidServerUrl(url)) {
-            Toast.makeText(this, "服务地址无效，示例：http://192.168.1.10:8000", Toast.LENGTH_LONG).show();
-            return;
-        }
-        if (interval < 1 || interval > 3600) {
-            Toast.makeText(this, "间隔需为 1~3600 秒", Toast.LENGTH_SHORT).show();
-            return;
+        try { interval = Integer.parseInt(etInterval.getText().toString().trim()); }
+        catch (NumberFormatException e) { interval = -1; }
+        if (!LiveClient.validBaseUrl(url)) { showStartError("连接设置阶段：服务地址无效。请在连接与识别设置中检查地址后重试。"); return; }
+        if (interval < 1 || interval > 3600) { showStartError("连接设置阶段：识别间隔须为 1 至 3600 秒。"); return; }
+        if (legacyAnswer && livePanel.hasActiveSession()) {
+            showStartError("旧问答兼容入口不可用于正在进行的辅助场次。请先结束该场次。"); return;
         }
         Prefs.setServerUrl(this, url);
         Prefs.setIntervalSec(this, interval);
         audioPanel.save(this);
+        pendingStart = true;
+        pendingLegacyStart = legacyAnswer;
+        continuePermissionFlow();
+    }
+
+    private void continuePermissionFlow() {
+        if (!pendingStart) return;
         if (!Settings.canDrawOverlays(this)) {
-            Toast.makeText(this, "回复悬浮条需要悬浮窗权限，请授权后重试", Toast.LENGTH_LONG).show();
+            logFlow("overlay_permission_required", "stage=window_permission");
             startActivityForResult(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
                     Uri.parse("package:" + getPackageName())), REQ_OVERLAY);
             return;
@@ -175,67 +188,130 @@ public class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= 33
                 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_POST_NOTIFICATIONS);
-            return; // 授权回调后继续
+            return;
         }
-        requestAudioThenProjection();
-    }
-
-    private void requestAudioThenProjection() {
-        LiveClient.Session session = Prefs.getSession(this);
-        if (session != null && !session.stopped && Prefs.getAudioMode(this) != 0
+        if (!pendingLegacyStart && Prefs.getAudioMode(this) == 2
                 && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_RECORD_AUDIO);
-        } else requestMediaProjection();
+            return;
+        }
+        requestMediaProjection();
     }
 
-    private static boolean isValidServerUrl(String value) {
-        return LiveClient.validBaseUrl(value);
+    private void startRegionSelector() {
+        if (!Settings.canDrawOverlays(this)) {
+            showStartError("区域选择阶段：需要悬浮窗权限。允许后再点选择区域。");
+            startActivityForResult(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:" + getPackageName())), REQ_OVERLAY);
+            return;
+        }
+        if (CaptureService.phase != CaptureService.Phase.IDLE) {
+            showStartError("区域选择阶段：请先结束屏幕辅助，再编辑识别区域。");
+            return;
+        }
+        RegionSelectorService.start(this, regionPanel.selected());
+        moveTaskToBack(true);
     }
 
     private void requestMediaProjection() {
-        // Android 14+：每次采集会话必须重新取得用户授权（复用 Intent 会抛 SecurityException）
-        Intent consent = Build.VERSION.SDK_INT >= 34 ? mpm.createScreenCaptureIntent(
-                android.media.projection.MediaProjectionConfig.createConfigForDefaultDisplay()) : mpm.createScreenCaptureIntent();
-        startActivityForResult(consent, REQ_MEDIA_PROJECTION);
+        logFlow("projection_consent_requested", "api=" + Build.VERSION.SDK_INT);
+        try {
+            Intent consent = Build.VERSION.SDK_INT >= 34 ? mpm.createScreenCaptureIntent(
+                    android.media.projection.MediaProjectionConfig.createConfigForDefaultDisplay()) : mpm.createScreenCaptureIntent();
+            startActivityForResult(consent, REQ_MEDIA_PROJECTION);
+        } catch (RuntimeException e) {
+            pendingStart = false;
+            logFlow("projection_consent_launch_failed", "error=" + e.getClass().getSimpleName());
+            showStartError("屏幕授权界面阶段失败（" + e.getClass().getSimpleName()
+                    + "）。请回到应用检查系统屏幕采集功能后重试。");
+        }
     }
 
-    @Override
-    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+    @Override public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == REQ_POST_NOTIFICATIONS) {
-            // 通知权限被拒也可运行（系统仍显示采集标识），不阻塞主链路
-            requestAudioThenProjection();
+            boolean granted = grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+            logFlow("notification_permission_result", "granted=" + granted);
+            continuePermissionFlow(); // denied notifications do not block Android's foreground-service indicator
         } else if (requestCode == REQ_RECORD_AUDIO) {
-            if (grantResults.length == 0 || grantResults[0] != PackageManager.PERMISSION_GRANTED)
-                Toast.makeText(this, "音频权限未授予，继续屏幕取数", Toast.LENGTH_LONG).show();
+            boolean granted = grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+            logFlow("microphone_permission_result", "granted=" + granted);
+            if (!granted) showStartError("麦克风权限未授予；本次继续屏幕辅助，不采集音频。" );
             requestMediaProjection();
         }
     }
 
-    @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+    @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == REQ_MEDIA_PROJECTION) {
-            if (resultCode == RESULT_OK && data != null) {
-                stopService(new Intent(this, RegionSelectorService.class));
-                CaptureService.requestStart(this, resultCode, data);
-                moveTaskToBack(true); // 回到目标应用，避免把自己画面识别进去
+            boolean accepted = resultCode == RESULT_OK && data != null;
+            logFlow("projection_consent_result", "accepted=" + accepted);
+            if (!accepted) {
+                pendingStart = false;
+                showStartError("屏幕授权阶段：未允许屏幕采集，因此没有启动辅助。可重新点击开始并允许授权。");
+                return;
+            }
+            stopService(new Intent(this, RegionSelectorService.class));
+            Runnable startService = () -> {
+                pendingStart = false;
+                try {
+                    CaptureService.requestStart(this, resultCode, data);
+                    refreshUi();
+                    moveTaskToBack(true);
+                } catch (RuntimeException e) {
+                    showStartError("前台服务启动阶段失败（" + e.getClass().getSimpleName()
+                            + "）。场次可能已启动；请检查权限后重试，或在设置中结束当前场次。");
+                    logFlow("foreground_service_start_failed", "error=" + e.getClass().getSimpleName());
+                }
+            };
+            if (pendingLegacyStart) {
+                startService.run();
             } else {
-                Toast.makeText(this, "未授权屏幕采集，无法启动", Toast.LENGTH_LONG).show();
+                pendingStart = false;
+                livePanel.beginOrResume(startService, this::showStartError);
             }
         } else if (requestCode == REQ_OVERLAY) {
+            boolean granted = Settings.canDrawOverlays(this);
+            logFlow("overlay_permission_result", "granted=" + granted);
+            if (granted && pendingStart) continuePermissionFlow();
+            else if (!granted) {
+                pendingStart = false;
+                showStartError("悬浮窗权限阶段：未允许显示悬浮提示。请到系统“显示在其他应用上层”允许本应用，再点开始辅助。");
+            }
             refreshUi();
-            Toast.makeText(this, Settings.canDrawOverlays(this)
-                    ? "悬浮窗权限已授权" : "未授予悬浮窗权限，功能受限", Toast.LENGTH_SHORT).show();
         }
     }
 
-    private void onPauseResumeClicked() {
-        if (CaptureService.phase == CaptureService.Phase.PAUSED) {
-            CaptureService.requestResume(this);
-        } else if (CaptureService.phase == CaptureService.Phase.RUNNING) {
-            CaptureService.requestPause(this);
+    private void endAssistance() {
+        logFlow("assist_end_clicked", "phase=" + CaptureService.phase);
+        CaptureService.requestStop(this);
+        if (livePanel.hasActiveSession()) {
+            livePanel.stopOperationSession(livePanel::openRecap, this::showStartError);
         }
+        refreshUi();
+    }
+
+    private void onPauseResumeClicked() {
+        if (CaptureService.phase == CaptureService.Phase.PAUSED) CaptureService.requestResume(this);
+        else if (CaptureService.phase == CaptureService.Phase.RUNNING) CaptureService.requestPause(this);
+    }
+
+    private void showStartError(String message) {
+        transientStatus = message;
+        tvStatus.setText(message);
+        refreshControlsOnly();
+    }
+
+    private void refreshControlsOnly() {
+        CaptureService.Phase phase = CaptureService.phase;
+        if (phase == CaptureService.Phase.IDLE) {
+            btnMain.setText(livePanel != null && livePanel.hasActiveSession() ? "继续辅助" : "开始辅助");
+            btnMain.setEnabled(livePanel == null || !livePanel.isWorking());
+        }
+    }
+
+    private static void logFlow(String event, String fields) {
+        android.util.Log.i("AssistFlow", "t=" + SystemClock.elapsedRealtime() + " event=" + event + " " + fields);
     }
 
     @Override protected void onDestroy() {

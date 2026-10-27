@@ -19,7 +19,6 @@ final class AudioPanel {
                 new String[]{"关闭音频","仅尝试抖音播放捕获","麦克风（同机开播可能受限）"}));
         mode.setSelection(Prefs.getAudioMode(activity)); parent.addView(mode);
         host=new CheckBox(activity); host.setText("已实际核对选定音轨为本场主播声音"); parent.addView(host);
-        Prefs.setHostConfirmed(activity,false);
     }
     void save(Activity activity) { Prefs.setAudioMode(activity,mode.getSelectedItemPosition()); Prefs.setHostConfirmed(activity,host.isChecked()); }
     void refresh(boolean enabled) { mode.setEnabled(enabled); host.setEnabled(enabled); }
