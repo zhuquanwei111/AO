@@ -182,6 +182,8 @@ class Desktop:
         if len(paths)!=1 or not paths[0].is_file(): raise RecapError('screenshot_missing')
         image=paths[0]
         with Image.open(image) as img: size=img.size
+        if hasattr(self.mcp,'note'):
+            self.mcp.note('screenshot_geometry',requested_region=region,image_size=list(size))
         uia=uia_tokens(text,live['title']) if use_uia else []
         tokens=self.ocr.read(image)
         if hasattr(self.mcp,'note'):

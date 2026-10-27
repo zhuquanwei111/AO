@@ -61,6 +61,7 @@ class GLMDesktop(LLMDesktop):
 
     def open_entry(self,window,need_open):
         # App仍是本机现有Edge，保留正常用户配置；没有AO浏览器／新浏览器配置。
+        window=self.recover_clipped_entry(window)
         if not need_open:
             self.key(window,'esc')
             return self.confirm_portal(window)
@@ -83,6 +84,38 @@ class GLMDesktop(LLMDesktop):
             self.mcp.note('entry_route',route='existing_edge_favorite')
         time.sleep(1)  # 一次正常页面加载等待，不采样直播指标。
         return self.confirm_portal(window)
+
+    def recover_clipped_entry(self,window):
+        live=self.guard(window)
+        raw=live.get('raw_rect'); rect=live.get('rect')
+        if not (isinstance(raw,list) and isinstance(rect,list) and len(raw)==len(rect)==4):
+            raise RecapError('window_geometry_missing')
+        rw,rh=raw[2]-raw[0],raw[3]-raw[1]
+        vw,vh=rect[2]-rect[0],rect[3]-rect[1]
+        if min(rw,rh,vw,vh)<=0: raise RecapError('window_geometry_invalid')
+        clipped=(vw*2<rw or vh*2<rh)
+        self.mcp.note('entry_window_geometry',window_handle=live['handle'],raw_rect=raw,
+                      visible_rect=rect,maximized=live.get('maximized'),severely_clipped=clipped)
+        if not clipped: return live
+        selected=self.initial_browser_candidates(self.probe.windows())
+        u=self.probe.u
+        if (len(selected)!=1 or selected[0]['handle']!=live['handle']
+                or not u.IsWindowEnabled(live['handle']) or u.GetWindow(live['handle'],4)):
+            raise RecapError('window_recovery_ambiguous')
+        self.key(live,'win+up')
+        current=self.guard(live)
+        if not current.get('maximized'): raise RecapError('window_maximize_unconfirmed')
+        new_raw=current.get('raw_rect'); new_rect=current.get('rect')
+        if not (isinstance(new_raw,list) and isinstance(new_rect,list) and len(new_raw)==len(new_rect)==4):
+            raise RecapError('window_geometry_missing')
+        nrw,nrh=new_raw[2]-new_raw[0],new_raw[3]-new_raw[1]
+        nvw,nvh=new_rect[2]-new_rect[0],new_rect[3]-new_rect[1]
+        if min(nrw,nrh,nvw,nvh)<=0 or nvw*2<nrw or nvh*2<nrh:
+            raise RecapError('window_still_clipped')
+        if not u.IsWindowEnabled(current['handle']): raise RecapError('window_recovery_ambiguous')
+        self.mcp.note('entry_window_recovered',window_handle=current['handle'],
+                      raw_rect=current.get('raw_rect'),visible_rect=current['rect'])
+        return current
 
     def observe(self,window,use_uia=False):
         for attempt in range(5):

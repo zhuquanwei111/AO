@@ -15,6 +15,7 @@ class EntryTests(unittest.TestCase):
         d.key=Mock(); d.target=Mock(return_value=('view','bookmark'))
         d.click=Mock(); d.confirm_portal=Mock(return_value='confirmed')
         d.type_replacement=Mock(); d.mcp=Mock()
+        d.recover_clipped_entry=Mock(side_effect=lambda window: window)
         d.portal_url='https://union.bytedance.com/open/portal/index'
         return d
 
