@@ -51,6 +51,10 @@ final class AppModel: ObservableObject {
     @Published var liveActive = false
     @Published var liveStopped = false
     @Published var liveStarting = false
+    @Published var liveStopping = false
+    @Published var broadcastStatusText = "系统屏幕广播状态尚未确认"
+    @Published var serviceStatusText = "服务连接尚未通过请求核验"
+    @Published var overviewLoading = false
     @Published var audioSettings: AudioCaptureSettings {
         didSet { AudioCaptureSettings.save(audioSettings) }
     }
@@ -62,6 +66,7 @@ final class AppModel: ObservableObject {
     private var livePollTask: URLSessionDataTask?
     private var liveCursor = ""
     private var summaryRefreshInFlight = false
+    private var lastServiceConnection = ControlState.serviceConnection()
 
     init() {
         serverURLString = SharedConfig.serverBaseURLRaw() ?? ""
@@ -77,6 +82,12 @@ final class AppModel: ObservableObject {
                                                        width: CGFloat(diagnosticRegion.width),
                                                        height: CGFloat(diagnosticRegion.height))
         captureWanted = ControlState.userWantsCapture()
+        broadcastStatusText = Self.broadcastStatusDescription(
+            activity: ControlState.broadcastActivity(),
+            captureWanted: captureWanted,
+            now: Date()
+        )
+        serviceStatusText = Self.serviceStatusDescription(ControlState.serviceConnection(), now: Date())
         audioSettings = AudioCaptureSettings.load()
         if LiveSessionState.credentials() == nil {
             audioSettings.appHostConfirmed = false
@@ -103,6 +114,12 @@ final class AppModel: ObservableObject {
                 if want != self.captureWanted {
                     self.captureWanted = want
                 }
+                self.broadcastStatusText = Self.broadcastStatusDescription(
+                    activity: ControlState.broadcastActivity(),
+                    captureWanted: self.captureWanted,
+                    now: Date()
+                )
+                self.refreshServiceConnectionStatus()
             }
 
         if liveActive, let credentials = Self.savedCredentials() {
@@ -132,14 +149,20 @@ final class AppModel: ObservableObject {
     }
 
     func startLiveSession() {
-        guard !liveStarting else { return }
+        guard !liveStarting, !liveStopping else { return }
         let account = douyinAccount.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !account.isEmpty else {
             liveStatus = "请先填写本场抖音号"
             return
         }
-        guard !liveActive, let base = SharedConfig.serverBaseURL(),
+        guard !liveActive else {
+            liveStatus = "本场辅助已运行"
+            return
+        }
+        guard let base = SharedConfig.serverBaseURL(),
               let client = LiveOperationsClient(baseURL: base) else {
+            ControlState.setServiceConnection(.configurationInvalid)
+            refreshServiceConnectionStatus()
             liveStatus = "请先配置有效服务地址"
             return
         }
@@ -162,39 +185,63 @@ final class AppModel: ObservableObject {
                             self.liveStarting = false
                             switch startResult {
                             case .success(let activeCredentials):
-                                guard activeCredentials.backstageTaskID != nil,
-                                      LiveSessionState.save(activeCredentials) else {
+                                guard activeCredentials.backstageTaskID != nil else {
                                     client.stop(activeCredentials) { _ in }
                                     LiveSessionState.clear()
                                     self.liveStatus = "后台任务未创建成功，已请求取消场次"
                                     return
                                 }
-                                self.liveCredentials = activeCredentials
-                                self.liveClient = client
-                                self.liveActive = true
-                                self.liveStopped = false
-                                self.liveStatus = "本场已绑定后台任务；请启动 PiP 与ReplayKit广播"
-                                self.liveEvents = []
-                                self.liveSummary = nil
-                                self.liveCursor = ""
-                                self.captureWanted = true
-                                self.pollLivePrompts()
-                            case .failure:
-                                client.stop(credentials) { _ in }
-                                LiveSessionState.clear()
-                                self.liveStatus = "后台任务启动失败，未开始采集；请检查服务或活动任务"
+                                self.activateLivePromptSession(
+                                    activeCredentials,
+                                    client: client,
+                                    status: "后台场次已就绪；请按下方步骤启动本机提示与屏幕广播"
+                                )
+                            case .failure(let error):
+                                if (error as? LiveOperationsHTTPError)?.isBackstageTaskBusy == true {
+                                    self.activateLivePromptSession(
+                                        credentials,
+                                        client: client,
+                                        status: "后台复盘任务繁忙；本场实时提示仍可继续，五项汇总可能缺失"
+                                    )
+                                } else {
+                                    client.stop(credentials) { _ in }
+                                    LiveSessionState.clear()
+                                    self.liveStatus = Self.operationFailureMessage(error, action: "后台任务启动")
+                                }
                             }
                         }
                     }
-                case .failure:
+                case .failure(let error):
                     self.liveStarting = false
-                    self.liveStatus = "场次创建失败，请检查服务连接"
+                    self.liveStatus = Self.operationFailureMessage(error, action: "场次创建")
                 }
             }
         }
     }
 
+    private func activateLivePromptSession(_ credentials: LiveSessionCredentials,
+                                           client: LiveOperationsClient,
+                                           status: String) {
+        guard LiveSessionState.save(credentials) else {
+            client.stop(credentials) { _ in }
+            LiveSessionState.clear()
+            liveStatus = "无法安全保存本场授权，已请求取消场次"
+            return
+        }
+        liveCredentials = credentials
+        liveClient = client
+        liveActive = true
+        liveStopped = false
+        liveStatus = status
+        liveEvents = []
+        liveSummary = nil
+        liveCursor = ""
+        captureWanted = true
+        pollLivePrompts()
+    }
+
     func stopLiveSession() {
+        guard !liveStopping else { return }
         guard let credentials = liveCredentials ?? Self.savedCredentials(),
               let client = liveClient ?? SharedConfig.serverBaseURL().flatMap({ LiveOperationsClient(baseURL: $0) }) else {
             liveStatus = "没有可停止的场次"
@@ -203,12 +250,14 @@ final class AppModel: ObservableObject {
         livePollTask?.cancel()
         livePollTask = nil
         captureWanted = false
+        liveStopping = true
         liveStatus = "正在结束场次…"
         client.stop(credentials) { [weak self] ok in
             DispatchQueue.main.async {
                 guard let self else { return }
+                self.liveStopping = false
                 guard ok else {
-                    self.liveStatus = "停止请求未确认；可重试结束"
+                    self.liveStatus = "服务未确认结束场次；检查网络后可重试，当前场次授权仍保留"
                     return
                 }
                 self.audioSettings.appHostConfirmed = false
@@ -247,7 +296,9 @@ final class AppModel: ObservableObject {
                         self.audioSettings.micHostConfirmed = false
                         self.loadStoppedOverview(credentials, client: client)
                     } else {
-                        self.liveStatus = "直播辅助运行中"
+                        if self.liveStatus == "后台收件暂不可用，正在重试" {
+                            self.liveStatus = "后台场次已就绪；运营收件已恢复"
+                        }
                         self.pollLivePrompts()
                     }
                 case .failure:
@@ -260,10 +311,146 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private static func operationFailureMessage(_ error: Error, action: String) -> String {
+        if let httpError = error as? LiveOperationsHTTPError {
+            if httpError.isBackstageTaskBusy {
+                return "已有后台复盘任务运行；本场实时提示仍可继续，五项复盘不可用"
+            }
+            switch httpError.statusCode {
+            case 401, 403:
+                return "\(action)失败：本场授权未通过，请重新开始场次"
+            case 409:
+                return "\(action)失败：场次或任务状态冲突，请检查后重试"
+            case 422:
+                return "\(action)失败：场次信息或来源不符合要求，请检查后重试"
+            case -1:
+                return "\(action)失败：没有收到服务响应，请检查网络和服务地址"
+            default:
+                if (100...599).contains(httpError.statusCode) {
+                    return "\(action)失败：服务返回 HTTP \(httpError.statusCode)，请检查场次状态后重试"
+                }
+                return "\(action)失败：服务响应无法读取，请检查服务版本"
+            }
+        }
+        let failure = error as NSError
+        if failure.domain == NSURLErrorDomain {
+            return "\(action)失败：无法连接服务，请检查网络和服务地址"
+        }
+        guard failure.domain == "LiveOperations" else {
+            return "\(action)失败：操作未完成，请检查服务状态后重试"
+        }
+        switch failure.code {
+        case 401, 403:
+            return "\(action)失败：本场授权未通过，请重新开始场次"
+        case 409:
+            return "\(action)失败：已有活动后台任务，请先结束或处理上一场"
+        case 422:
+            return "\(action)失败：场次信息或状态不符合要求，请检查后重试"
+        case -2:
+            return "\(action)失败：服务响应无法读取，请检查服务版本"
+        case -1:
+            return "\(action)失败：没有收到服务响应，请检查网络和服务地址"
+        default:
+            if (100...599).contains(failure.code) {
+                return "\(action)失败：服务返回 HTTP \(failure.code)，请检查场次状态后重试"
+            }
+            return "\(action)失败：操作未完成，请检查服务状态后重试"
+        }
+    }
+
+    private static func broadcastStatusDescription(
+        activity: ControlState.BroadcastActivity,
+        captureWanted: Bool,
+        now: Date
+    ) -> String {
+        let nowMs = Int64(now.timeIntervalSince1970 * 1000)
+        let stateAge = activity.stateChangedAtMs > 0
+            ? max(0, nowMs - activity.stateChangedAtMs) / 1000
+            : Int64.max
+        let sampleAge = activity.lastVideoSampleAtMs > 0
+            ? max(0, nowMs - activity.lastVideoSampleAtMs) / 1000
+            : Int64.max
+
+        switch activity.phase {
+        case .unknown:
+            return captureWanted
+                ? "识别已启用，但尚无广播状态回报；请通过系统按钮启动屏幕广播"
+                : "系统屏幕广播状态尚未确认"
+        case .waitingForVideo:
+            return stateAge > 10
+                ? "系统广播尚未送来视频帧；请查看系统广播状态，原因未知"
+                : "系统广播已启动，等待首个屏幕视频帧…"
+        case .receivingVideo:
+            if sampleAge > 10 {
+                return "超过 10 秒未收到新视频帧；请检查系统广播状态，原因未知"
+            }
+            return captureWanted
+                ? "已收到屏幕视频帧；不代表 OCR 一定识别到文字"
+                : "最近收到屏幕视频帧，但识别开关当前已关闭"
+        case .paused:
+            return "系统报告屏幕广播已暂停"
+        case .finished:
+            return "系统报告屏幕广播已结束"
+        }
+    }
+
+    private func refreshServiceConnectionStatus() {
+        let current = ControlState.serviceConnection()
+        serviceStatusText = Self.serviceStatusDescription(current, now: Date())
+        if current != lastServiceConnection {
+            let previous = lastServiceConnection
+            lastServiceConnection = current
+            if current.phase == .connected && Self.isServiceFailure(previous.phase) {
+                PiPDisplayController.shared.showConnectionStatus("服务请求已恢复")
+            }
+        }
+        if Self.isServiceFailure(current.phase) {
+            PiPDisplayController.shared.showConnectionStatus(Self.pipServiceStatus(current))
+        }
+    }
+
+    private static func isServiceFailure(_ phase: ControlState.ServicePhase) -> Bool {
+        phase == .unreachable || phase == .respondedWithError || phase == .configurationInvalid
+    }
+
+    private static func serviceStatusDescription(_ status: ControlState.ServiceConnection, now: Date) -> String {
+        guard status.phase != .unknown else { return "服务连接尚未通过请求核验" }
+        let ageMs = Int64(now.timeIntervalSince1970 * 1000) - status.observedAtMs
+        let stale = status.observedAtMs == 0 || ageMs > 30_000
+        switch status.phase {
+        case .unknown:
+            return "服务连接尚未通过请求核验"
+        case .connected:
+            return stale ? "最近连接记录已过期，等待新请求确认" : "最近请求已收到服务响应"
+        case .unreachable:
+            return stale ? "最近请求未收到服务响应；尚未通过新请求确认恢复" : "最近请求未收到服务响应；新请求会重试"
+        case .respondedWithError:
+            let code = status.httpStatusCode > 0 ? "（HTTP \(status.httpStatusCode)）" : ""
+            return stale ? "服务曾响应但请求失败\(code)；等待新请求确认" : "服务已响应但请求失败\(code)"
+        case .configurationInvalid:
+            return "服务地址无效；请到采集与服务设置检查"
+        }
+    }
+
+    private static func pipServiceStatus(_ status: ControlState.ServiceConnection) -> String {
+        switch status.phase {
+        case .unreachable:
+            return "最近一次实时请求未连接到服务；下一次请求会重试"
+        case .respondedWithError:
+            return "服务已响应但请求失败（HTTP \(status.httpStatusCode)）；下一次请求会重试"
+        case .configurationInvalid:
+            return "服务地址配置无效，请检查采集与服务设置"
+        case .unknown, .connected:
+            return "服务连接状态待核验"
+        }
+    }
+
     private func loadStoppedOverview(_ credentials: LiveSessionCredentials, client: LiveOperationsClient) {
         let group = DispatchGroup()
         var fetchedEvents: LiveEventPage?
         var fetchedSummary: LiveSessionSummary?
+        overviewLoading = true
+        summaryRefreshInFlight = true
         group.enter()
         client.events(credentials) { result in
             DispatchQueue.main.async {
@@ -280,6 +467,8 @@ final class AppModel: ObservableObject {
         }
         group.notify(queue: .main) { [weak self] in
             guard let self else { return }
+            self.overviewLoading = false
+            self.summaryRefreshInFlight = false
             self.liveEvents = fetchedEvents?.events ?? []
             self.liveSummary = fetchedSummary
             self.finishCredentialRetentionIfTerminal(fetchedSummary?.backstageRecap?.status)
@@ -287,14 +476,16 @@ final class AppModel: ObservableObject {
             case let (.some(page), .some(_)):
                 self.liveStatus = "本场结束，已读取 \(page.events.count) 条记录"
             case (.some, .none):
-                self.liveStatus = "本场结束；人数概览暂不可读，事件记录已读取"
+                self.liveStatus = "本场概览暂不可读；事件记录已读取"
             case (.none, .some):
-                self.liveStatus = "本场结束；人数概览已读取，事件记录暂不可读"
+                self.liveStatus = "本场概览已读取；事件记录暂不可读"
             case (.none, .none):
                 self.liveStatus = "本场已结束；概览和记录暂不可读取"
             }
             if let recap = fetchedSummary?.backstageRecap {
                 self.liveStatus = self.backstageStatusText(recap.status)
+            } else if fetchedSummary != nil {
+                self.liveStatus = "本场事件记录已读取；服务未返回后台五项任务记录，结果保持未知"
             }
         }
     }
@@ -306,15 +497,24 @@ final class AppModel: ObservableObject {
             return
         }
         summaryRefreshInFlight = true
+        overviewLoading = true
         client.summary(credentials) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.summaryRefreshInFlight = false
-                guard case .success(let summary) = result else { return }
+                self.overviewLoading = false
+                guard case .success(let summary) = result else {
+                    if self.liveSummary == nil {
+                        self.liveStatus = "本场后台汇总暂不可读，可重试；事件记录独立保留"
+                    }
+                    return
+                }
                 self.liveSummary = summary
                 if let recap = summary.backstageRecap {
                     self.liveStatus = self.backstageStatusText(recap.status)
                     self.finishCredentialRetentionIfTerminal(recap.status)
+                } else {
+                    self.liveStatus = "服务未返回后台五项任务记录，结果保持未知"
                 }
             }
         }

@@ -48,6 +48,19 @@ private struct LiveBackstageStart: Decodable {
     }
 }
 
+struct LiveOperationsHTTPError: Error {
+    let statusCode: Int
+    let detail: String?
+
+    var isBackstageTaskBusy: Bool {
+        statusCode == 409 && detail == "a backstage recap task is already active"
+    }
+}
+
+private struct LiveOperationsErrorPayload: Decodable {
+    let detail: String?
+}
+
 struct LivePrompt: Codable, Identifiable {
     let promptID: String
     let inputMode: String
@@ -259,6 +272,7 @@ struct LiveOperationsClient {
         var request = authorized(endpoint("v1", "live", "sessions", credentials.sessionID, "stop"), token: credentials.token)
         request.httpMethod = "POST"
         session.dataTask(with: request) { _, response, error in
+            ControlState.recordServiceResponse(error: error, response: response)
             completion(error == nil && (response as? HTTPURLResponse)?.statusCode == 200)
         }.resume()
     }
@@ -327,7 +341,10 @@ struct LiveOperationsClient {
             "observed_at_ms": observedAtMS
         ]
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        let task = session.dataTask(with: request) { _, _, _ in completion() }
+        let task = session.dataTask(with: request) { _, response, error in
+            ControlState.recordServiceResponse(error: error, response: response)
+            completion()
+        }
         task.resume()
         return task
     }
@@ -349,7 +366,8 @@ struct LiveOperationsClient {
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try? JSONSerialization.data(withJSONObject: payloads[index])
-            let task = session.dataTask(with: request) { _, _, _ in
+            let task = session.dataTask(with: request) { _, response, error in
+                ControlState.recordServiceResponse(error: error, response: response)
                 guard shouldContinue() else {
                     onTask(nil)
                     completion()
@@ -379,7 +397,10 @@ struct LiveOperationsClient {
             "observed_at_ms": observedAtMS
         ]
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        let task = session.dataTask(with: request) { _, _, _ in completion() }
+        let task = session.dataTask(with: request) { _, response, error in
+            ControlState.recordServiceResponse(error: error, response: response)
+            completion()
+        }
         task.resume()
         return task
     }
@@ -395,10 +416,17 @@ struct LiveOperationsClient {
     }
 
     private static func decode<T: Decodable>(_ type: T.Type, data: Data?, response: URLResponse?, error: Error?) -> Result<T, Error> {
-        if let error { return .failure(error) }
-        guard (response as? HTTPURLResponse)?.statusCode == 200, let data else {
-            return .failure(NSError(domain: "LiveOperations", code: (response as? HTTPURLResponse)?.statusCode ?? -1))
+        if let error {
+            ControlState.recordServiceResponse(error: error, response: response)
+            return .failure(error)
         }
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+        guard statusCode == 200, let data else {
+            ControlState.recordServiceResponse(error: nil, response: response)
+            let detail = data.flatMap { try? JSONDecoder().decode(LiveOperationsErrorPayload.self, from: $0).detail }
+            return .failure(LiveOperationsHTTPError(statusCode: statusCode, detail: detail))
+        }
+        ControlState.recordServiceResponse(error: nil, response: response)
         do { return .success(try JSONDecoder().decode(type, from: data)) }
         catch { return .failure(error) }
     }

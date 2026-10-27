@@ -57,6 +57,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     // MARK: - 生命周期
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
+        ControlState.setBroadcastPhase(.waitingForVideo, resetVideoSample: true)
         resetPersonObservationTransport()
         continuousAudio.transition(running: true)
         inputDiagnostics.transition(to: .running)
@@ -70,6 +71,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     override func broadcastPaused() {
+        ControlState.setBroadcastPhase(.paused)
         resetPersonObservationTransport()
         continuousAudio.transition(running: false)
         inputDiagnostics.transition(to: .paused)
@@ -82,6 +84,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     override func broadcastResumed() {
+        ControlState.setBroadcastPhase(.waitingForVideo, resetVideoSample: true)
         resetPersonObservationTransport()
         continuousAudio.transition(running: true)
         inputDiagnostics.transition(to: .running)
@@ -95,6 +98,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     override func broadcastFinished() {
+        ControlState.setBroadcastPhase(.finished)
         resetPersonObservationTransport()
         continuousAudio.transition(running: false)
         inputDiagnostics.transition(to: .finished)
@@ -115,6 +119,9 @@ final class SampleHandler: RPBroadcastSampleHandler {
         inputDiagnostics.observe(sampleBuffer, type: sampleBufferType)
         continuousAudio.observe(sampleBuffer, type: sampleBufferType)
         guard sampleBufferType == .video else { return }
+        if CMSampleBufferDataIsReady(sampleBuffer), CMSampleBufferGetImageBuffer(sampleBuffer) != nil {
+            ControlState.noteVideoSample()
+        }
         livePersonObserver.observe(sampleBuffer)
 
         // 闸门：正在处理、暂停或间隔未到时丢弃当前帧；控制开关每帧读取，
@@ -237,6 +244,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
             // 7) 服务未配置 → 本轮丢弃（主 App 设置页有明确提示）
             guard let endpoint = AnswerEndpoint(timeout: SharedConfig.requestTimeoutSeconds()) else {
+                ControlState.setServiceConnection(.configurationInvalid)
                 self.endRound(generation: generation)
                 return
             }

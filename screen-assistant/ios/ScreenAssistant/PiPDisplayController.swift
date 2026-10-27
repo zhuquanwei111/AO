@@ -59,11 +59,13 @@ final class PiPDisplayController: NSObject, ObservableObject {
     private enum DisplayKind: Equatable {
         case quickAnswer
         case operation
+        case connection
 
         var label: String {
             switch self {
             case .quickAnswer: return "问答"
             case .operation: return "运营"
+            case .connection: return "连接"
             }
         }
 
@@ -71,6 +73,7 @@ final class PiPDisplayController: NSObject, ObservableObject {
             switch self {
             case .quickAnswer: return .systemBlue
             case .operation: return .systemOrange
+            case .connection: return .systemYellow
             }
         }
     }
@@ -236,6 +239,13 @@ final class PiPDisplayController: NSObject, ObservableObject {
     /// M4 的行动建议统一走同一显示入口，并明确标为运营内容。
     func showLivePrompt(_ text: String) {
         showContent(text, kind: .operation)
+    }
+
+    /// 只在用户已启动 PiP 时显示最近真实请求的服务状态；不尝试启动系统 PiP。
+    func showConnectionStatus(_ text: String) {
+        guard pipController != nil,
+              state == .starting || state == .running || state == .suspended else { return }
+        showContent(text, kind: .connection)
     }
 
     private func showContent(_ rawText: String, kind: DisplayKind) {
