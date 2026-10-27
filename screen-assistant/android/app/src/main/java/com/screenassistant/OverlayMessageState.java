@@ -5,11 +5,17 @@ final class OverlayMessageState {
     static final String WAITING_TEXT = "辅助中，等待内容";
 
     private boolean running;
+    private String status = WAITING_TEXT;
     private String message = "";
     private long expiresAtMs;
 
     void start() {
+        start(WAITING_TEXT);
+    }
+
+    void start(String initialStatus) {
         running = true;
+        status = initialStatus;
         message = "";
         expiresAtMs = 0;
     }
@@ -22,6 +28,7 @@ final class OverlayMessageState {
 
     boolean update(String value, long sourceExpiryMs, long nowMs, long maxVisibleMs) {
         if (!running || value == null || value.isEmpty()) return false;
+        if (sourceExpiryMs > 0 && sourceExpiryMs <= nowMs) return false;
         if (value.equals(message) && !isExpired(nowMs)) return false;
         message = value;
         long localExpiry = nowMs + maxVisibleMs;
@@ -35,7 +42,16 @@ final class OverlayMessageState {
             message = "";
             expiresAtMs = 0;
         }
-        return message.isEmpty() ? WAITING_TEXT : message;
+        return message.isEmpty() ? status : message;
+    }
+
+    void setStatus(String value, boolean discardMessage) {
+        status = value;
+        if (discardMessage) { message = ""; expiresAtMs = 0; }
+    }
+
+    boolean shouldDisplay(boolean overlayAllowed, boolean assistantVisible) {
+        return running && overlayAllowed && !assistantVisible;
     }
 
     long expiresAtMs() {

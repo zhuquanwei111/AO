@@ -6,12 +6,14 @@ public final class DisplayText {
     public static String observed(String raw) { return raw == null ? "" : raw.trim().replaceAll("\\s+", " "); }
     public static String plain(String raw) {
         if (raw == null) return "";
-        return raw.replaceAll("(?m)^\\s*```[^\\n]*$", "")
+        String value = raw.replaceAll("(?m)^\\s*(?:`{3,}|~{3,})[^\\n]*$", "")
                 .replaceAll("!?(?:\\[([^]\\n]+)\\])\\([^\\n)]*\\)", "$1")
-                .replaceAll("(?m)^\\s*(?:#{1,6}\\s+|>\\s*|[-*+]\\s+|\\d+[.)]\\s+)", "")
-                .replace("**", "").replace("__", "").replace("`", "")
+                .replaceAll("(?m)^\\s*(?:#{1,6}\\s+|>\\s*|[-*+]\\s+|\\d+[.)]\\s+)+", "")
+                .replace("**", "").replace("__", "").replace("~~", "").replace("`", "")
                 .replaceAll("(?<!\\w)[*_]([^*_\\n]+)[*_](?!\\w)", "$1")
                 .replaceAll("\\s+", " ").trim();
+        int length = value.codePointCount(0, value.length());
+        return length <= 600 ? value : value.substring(0, value.offsetByCodePoints(0, 600)) + "…";
     }
 
     public static String labeled(String purpose, String raw) {

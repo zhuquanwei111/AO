@@ -60,4 +60,9 @@ public class LiveClientTest {
         assertEquals("问答\n你好", DisplayText.labeled("问答", "*你好*"));
         assertEquals("", DisplayText.labeled("运营", "  "));
     }
+
+    @Test public void nestedMarkdownIsPlainAndPurposeSwitchIsExplicit() {
+        assertEquals("运营\n建议 保持节奏", DisplayText.labeled("运营", "> ## **建议**\n> - 保持节奏"));
+        assertEquals("问答\n继续", DisplayText.labeled("问答", "~~继续~~"));
+    }
 }
