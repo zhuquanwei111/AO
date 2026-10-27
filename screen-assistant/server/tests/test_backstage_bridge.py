@@ -52,6 +52,12 @@ def test_bridge_uses_one_cli_task_and_posts_result_to_origin_session():
         cli_calls.append((command, claimed_task["task_id"], claimed_task["session_id"]))
         if command == "result":
             return {"record": result_record}
+        if command == "start":
+            return {"record": {
+                "status": "waiting_for_stop", "session_id": claimed_task["session_id"],
+                "douyin_account": claimed_task["douyin_account"],
+                "start_signal_source": claimed_task["start_signal_source"],
+            }}
         return {"record": {"status": "waiting_for_stop"}}
 
     bridge = BackstageBridge(
@@ -73,6 +79,101 @@ def test_bridge_uses_one_cli_task_and_posts_result_to_origin_session():
     assert posted["stop_signal_received"] is True
     assert posted["start_signal_source"] == posted["stop_signal_source"] == "ios_app"
     assert posted["missing_fields"] == {"评论人数": "页面未显示"}
+
+
+def test_bridge_aborts_unbound_start_without_waiting_or_posting():
+    task = {
+        "task_id": "task-unbound", "session_id": "session-unbound",
+        "douyin_account": "test-account", "status": "waiting_for_stop",
+        "start_signal_source": "android_app", "stop_signal_source": None,
+        "stop_signal_received": False,
+    }
+    http_calls = []
+    cli_calls = []
+
+    def http(method, path, payload=None):
+        http_calls.append((method, path, payload))
+        if method == "POST" and path.endswith("/backstage/tasks/claim"):
+            return {"status": "claimed", "task": dict(task)}
+        raise AssertionError((method, path))
+
+    def cli(command, claimed_task):
+        cli_calls.append((command, claimed_task["task_id"],
+                          claimed_task["start_signal_source"]))
+        return {"status": "needs_input", "reason": "edge_launch_unconfirmed"}
+
+    bridge = BackstageBridge(
+        BridgeConfig("http://localhost", "worker", "python", "recap.py"),
+        http=http, cli=cli, sleep=lambda _: None,
+    )
+
+    with pytest.raises(RuntimeError, match="start did not bind"):
+        bridge.run_once()
+
+    assert len(http_calls) == 1 and http_calls[0][0] == "POST"
+    assert cli_calls == [("start", "task-unbound", "android_app")]
+    assert task["start_signal_source"] == "android_app"
+
+
+def test_bridge_exits_worker_after_unbound_start_instead_of_reclaiming(capsys):
+    task = {
+        "task_id": "task-unbound", "session_id": "session-unbound",
+        "douyin_account": "test-account", "status": "waiting_for_stop",
+        "start_signal_source": "android_app", "stop_signal_source": None,
+        "stop_signal_received": False,
+    }
+    claims = []
+    sleeps = []
+
+    def http(method, path, payload=None):
+        if method == "POST" and path.endswith("/backstage/tasks/claim"):
+            claims.append(path)
+            return {"status": "claimed", "task": dict(task)}
+        raise AssertionError((method, path))
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        raise AssertionError("failed start must stop the worker loop")
+
+    bridge = BackstageBridge(
+        BridgeConfig("http://localhost", "worker", "python", "recap.py"),
+        http=http,
+        cli=lambda command, _: {"status": "needs_input", "reason": "cli_result_unavailable"},
+        sleep=sleep,
+    )
+
+    with pytest.raises(SystemExit) as exited:
+        bridge.serve_forever()
+
+    assert exited.value.code == 2
+    assert len(claims) == 1
+    assert sleeps == []
+    stderr = capsys.readouterr().err
+    assert "cli_start_not_bound" in stderr
+    assert "cli_result_unavailable" not in stderr
+
+
+def test_bridge_rejects_start_record_for_wrong_session_or_source():
+    task = {
+        "task_id": "task-bound", "session_id": "session-bound",
+        "douyin_account": "test-account", "status": "waiting_for_stop",
+        "start_signal_source": "android_app", "stop_signal_source": None,
+        "stop_signal_received": False,
+    }
+    bad_start = {"record": {
+        "status": "waiting_for_stop", "session_id": "other-session",
+        "douyin_account": "test-account", "start_signal_source": "ios_app",
+    }}
+
+    bridge = BackstageBridge(
+        BridgeConfig("http://localhost", "worker", "python", "recap.py"),
+        http=lambda method, path, payload=None: {"status": "claimed", "task": task},
+        cli=lambda command, _: bad_start,
+        sleep=lambda _: None,
+    )
+
+    with pytest.raises(RuntimeError, match="start did not bind"):
+        bridge.run_once()
 
 
 def test_bridge_preserves_unknown_capture_time_for_empty_result():
@@ -135,6 +236,12 @@ def test_android_app_task_uses_existing_bridge_and_posts_to_same_session():
                                "status": "needs_input", "metrics": {},
                                "start_signal_source": "android_app",
                                "stop_signal_source": "android_app"}}
+        if command == "start":
+            return {"record": {
+                "status": "waiting_for_stop", "session_id": task_snapshot["session_id"],
+                "douyin_account": task_snapshot["douyin_account"],
+                "start_signal_source": task_snapshot["start_signal_source"],
+            }}
         return {"record": {"status": "waiting_for_stop"}}
 
     bridge = BackstageBridge(
@@ -173,6 +280,12 @@ def test_bridge_rejects_cli_result_identity_drift_before_posting():
                                "status": "needs_input", "metrics": {},
                                "start_signal_source": "ios_app",
                                "stop_signal_source": "ios_app"}}
+        if command == "start":
+            return {"record": {
+                "status": "waiting_for_stop", "session_id": task["session_id"],
+                "douyin_account": task["douyin_account"],
+                "start_signal_source": task["start_signal_source"],
+            }}
         return {"record": {"status": "waiting_for_stop"}}
 
     bridge = BackstageBridge(
@@ -210,6 +323,12 @@ def test_bridge_rejects_simulated_record_for_real_app_task_before_posting():
                 "session_id": "s", "douyin_account": "a", "status": "partial",
                 "metrics": {}, "start_signal_source": "test_simulated",
                 "stop_signal_source": "test_simulated",
+            }}
+        if command == "start":
+            return {"record": {
+                "status": "waiting_for_stop", "session_id": claimed_task["session_id"],
+                "douyin_account": claimed_task["douyin_account"],
+                "start_signal_source": claimed_task["start_signal_source"],
             }}
         return {"record": {"status": "waiting_for_stop"}}
 

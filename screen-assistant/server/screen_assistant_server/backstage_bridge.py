@@ -17,6 +17,10 @@ from urllib.request import Request, urlopen
 METRIC_KEYS = ("累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪")
 
 
+class BackstageStartError(RuntimeError):
+    """CLI start 未绑定到已领取的 App 场次，必须显式停止桥接。"""
+
+
 @dataclass(frozen=True)
 class BridgeConfig:
     server_url: str
@@ -241,6 +245,17 @@ class BackstageBridge:
             raise ValueError("backstage task identity mismatch")
         return task
 
+    @staticmethod
+    def _require_bound_start(task: dict, result: dict) -> None:
+        record = result.get("record") if isinstance(result, dict) else None
+        source = task.get("start_signal_source")
+        if (not isinstance(record, dict)
+                or record.get("status") != "waiting_for_stop"
+                or record.get("session_id") != task["session_id"]
+                or record.get("douyin_account") != task["douyin_account"]
+                or record.get("start_signal_source") != source):
+            raise BackstageStartError("backstage CLI start did not bind the claimed session")
+
     def run_once(self) -> bool:
         claimed = self.http("POST", "v1/live/sessions/backstage/tasks/claim")
         task = claimed.get("task")
@@ -253,7 +268,8 @@ class BackstageBridge:
             raise ValueError("invalid claimed backstage task")
 
         identity = (task["session_id"], task["douyin_account"])
-        self.cli("start", task)
+        start_result = self.cli("start", task)
+        self._require_bound_start(task, start_result)
         while True:
             current = self._task(task["task_id"])
             if (current.get("session_id"), current.get("douyin_account")) != identity:
@@ -274,6 +290,10 @@ class BackstageBridge:
             try:
                 if not self.run_once():
                     self.sleep(self.config.poll_seconds)
+            except BackstageStartError:
+                # 不重领同一个未绑定任务，也不输出 CLI 正文或本场身份。
+                print("backstage bridge stopped: cli_start_not_bound", file=sys.stderr)
+                raise SystemExit(2) from None
             except (OSError, RuntimeError, ValueError) as exc:
                 # 不输出任务账号、令牌、原始截图或结果正文。
                 print(f"backstage bridge paused: {type(exc).__name__}", file=sys.stderr)
