@@ -7,9 +7,12 @@ public final class DisplayText {
     public static String plain(String raw) {
         if (raw == null) return "";
         String value = raw.replaceAll("(?m)^\\s*(?:`{3,}|~{3,})[^\\n]*$", "")
+                .replaceAll("(?m)^\\s*(?:[-*_]\\s*){3,}$", "")
+                .replaceAll("(?m)^\\s*\\|?\\s*:?-{3,}:?\\s*(?:\\|\\s*:?-{3,}:?\\s*)+\\|?\\s*$", "")
                 .replaceAll("!?(?:\\[([^]\\n]+)\\])\\([^\\n)]*\\)", "$1")
                 .replaceAll("(?m)^\\s*(?:#{1,6}\\s+|>\\s*|[-*+]\\s+|\\d+[.)]\\s+)+", "")
                 .replace("**", "").replace("__", "").replace("~~", "").replace("`", "")
+                .replace('|', ' ')
                 .replaceAll("(?<!\\w)[*_]([^*_\\n]+)[*_](?!\\w)", "$1")
                 .replaceAll("\\s+", " ").trim();
         int length = value.codePointCount(0, value.length());

@@ -78,6 +78,22 @@ public final class LiveClient {
         return call(s, "prompts?after=" + encode(cursor) + "&wait_ms=15000", null);
     }
 
+    static LiveConnection.Remote remote(String base, String description, String account) {
+        return new LiveConnection.Remote() {
+            private boolean firstPoll = true;
+            public Session create() throws Exception { return LiveClient.create(base, description, account); }
+            public JSONObject summary(Session s) throws Exception { return call(s, "summary", null); }
+            public JSONObject start(Session s) throws Exception { return LiveClient.start(s); }
+            public JSONObject poll(Session s, String cursor) throws Exception {
+                JSONObject page = firstPoll ? call(s, "prompts?after=" + encode(cursor) + "&wait_ms=0", null)
+                        : LiveClient.poll(s, cursor);
+                firstPoll = false;
+                return page;
+            }
+            public void stop(Session s) throws Exception { LiveClient.stop(s); }
+        };
+    }
+
     public static JSONArray events(Session s) throws IOException, JSONException {
         JSONArray all = new JSONArray();
         String cursor = "";

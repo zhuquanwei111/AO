@@ -62,4 +62,14 @@ public class OverlayMessageStateTest {
         state.stop();
         assertFalse(state.shouldDisplay(true, false));
     }
+
+    @Test public void purposeSwitchReplacesWholeTextAndNormalizedDuplicateDoesNotRefresh() {
+        OverlayMessageState state = new OverlayMessageState(); state.start();
+        state.update(DisplayText.labeled("问答", "旧内容"), 0, 1000, 6000);
+        state.update(DisplayText.labeled("运营", "**新建议**"), 0, 1100, 6000);
+        assertEquals("运营\n新建议", state.textAt(1100));
+        assertFalse(state.update(DisplayText.labeled("运营", "# 新建议"), 0, 1200, 6000));
+        assertEquals(7100, state.expiresAtMs());
+        assertEquals(OverlayMessageState.WAITING_TEXT, state.textAt(7100));
+    }
 }

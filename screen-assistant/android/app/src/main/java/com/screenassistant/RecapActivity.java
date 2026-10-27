@@ -35,7 +35,10 @@ public class RecapActivity extends Activity {
         ScrollView scroll = new ScrollView(this); scroll.addView(column); setContentView(scroll);
         TextView title = text(column); title.setText("本场复盘"); title.setTextSize(22);
         Button reload = new Button(this); reload.setText("刷新本场"); column.addView(reload);
-        reload.setOnClickListener(v -> { rounds = 0; load(true); });
+        reload.setOnClickListener(v -> {
+            if (session == null) session = Prefs.getSession(this);
+            rounds = 0; load(true);
+        });
         status = text(column); summary = text(column); events = text(column);
     }
 
@@ -43,15 +46,17 @@ public class RecapActivity extends Activity {
         TextView t = new TextView(this); t.setTextSize(16); t.setPadding(0, 12, 0, 12);
         t.setTextIsSelectable(true); parent.addView(t); return t;
     }
-    @Override protected void onStart() { super.onStart(); CaptureService.uiVisible = true; visible = true; rounds = 0; load(true); }
-    @Override protected void onStop() { CaptureService.uiVisible = false; visible = false; main.removeCallbacks(refresh); super.onStop(); }
+    @Override protected void onStart() { super.onStart(); CaptureService.setAssistantUiVisible(true); visible = true; rounds = 0; load(true); }
+    @Override protected void onStop() { CaptureService.setAssistantUiVisible(false); visible = false; main.removeCallbacks(refresh); super.onStop(); }
     @Override protected void onDestroy() { io.shutdown(); super.onDestroy(); }
 
     private void load(boolean includeEvents) {
         if (!visible || busy) return;
         if (session == null) {
             JSONObject cache=Prefs.getCachedRecap(this);
-            if (cache==null) status.setText("尚无场次");
+            if (cache==null) status.setText(Prefs.createPending(this)
+                    ? "场次创建未确认，复盘不可用；没有重复创建。"
+                    : "尚无已确认场次；服务未连接时不会生成复盘或模型建议。");
             else {
                 status.setText("最近场次已完成；显示已保存复盘（已清理场次令牌）。");
                 JSONObject saved=cache.optJSONObject("summary"); JSONArray savedEvents=cache.optJSONArray("events");
@@ -78,7 +83,8 @@ public class RecapActivity extends Activity {
             main.post(() -> {
                 busy = false;
                 if (!visible) return;
-                status.setText(message.isEmpty() ? "已读取本场；在线统计是屏幕采样，后台五项另列。" : message);
+                status.setText(message.isEmpty() ? "已读取本场；在线统计是屏幕采样，后台五项另列。"
+                        : "复盘读取不可用；本地辅助保持原状态。\n" + message);
                 if (data != null) summary.setText(renderSummary(data));
                 if (eventRows != null) { loadedEvents=eventRows; events.setText(renderEvents(eventRows)); }
                 if (cached) session=null;

@@ -35,6 +35,7 @@ public class MainActivity extends Activity {
     private RegionPanel regionPanel;
     private AudioPanel audioPanel;
     private boolean settingsExpanded, advancedExpanded, pendingStart, pendingLegacyStart;
+    private final StartPermissions startPermissions = new StartPermissions();
     private String transientStatus = "";
 
     private final BroadcastReceiver stateReceiver = new BroadcastReceiver() {
@@ -120,6 +121,9 @@ public class MainActivity extends Activity {
             case STOPPING:
                 status = "正在结束屏幕辅助…";
                 break;
+            case STARTING:
+                status = "正在启动本地屏幕采集…";
+                break;
             default:
                 status = livePanel != null ? livePanel.getSummary() : "尚未开始";
                 if (!transientStatus.isEmpty()) status = transientStatus;
@@ -138,9 +142,12 @@ public class MainActivity extends Activity {
         } else if (phase == CaptureService.Phase.STOPPING) {
             btnMain.setText("正在结束…");
             btnMain.setEnabled(false);
+        } else if (phase == CaptureService.Phase.STARTING) {
+            btnMain.setText("正在启动…");
+            btnMain.setEnabled(false);
         } else {
             btnMain.setText(livePanel != null && livePanel.hasActiveSession() ? "继续辅助" : "开始辅助");
-            btnMain.setEnabled(!busy);
+            btnMain.setEnabled(!busy && !pendingStart);
         }
         btnPause.setEnabled(phase == CaptureService.Phase.RUNNING || phase == CaptureService.Phase.PAUSED);
         btnPause.setText(phase == CaptureService.Phase.PAUSED ? "继续屏幕辅助" : "暂停屏幕辅助");
@@ -159,7 +166,7 @@ public class MainActivity extends Activity {
     private void startCapture(boolean legacyAnswer) {
         transientStatus = "";
         logFlow("assist_start_clicked", "entry=" + (legacyAnswer ? "advanced_legacy" : "primary"));
-        if (CaptureService.phase != CaptureService.Phase.IDLE || livePanel.isWorking()) return;
+        if (pendingStart || CaptureService.phase != CaptureService.Phase.IDLE || livePanel.isWorking()) return;
         String url = etUrl.getText().toString().trim();
         int interval;
         try { interval = Integer.parseInt(etInterval.getText().toString().trim()); }
@@ -174,24 +181,29 @@ public class MainActivity extends Activity {
         audioPanel.save(this);
         pendingStart = true;
         pendingLegacyStart = legacyAnswer;
+        startPermissions.reset();
+        refreshUi();
         continuePermissionFlow();
     }
 
     private void continuePermissionFlow() {
         if (!pendingStart) return;
-        if (!Settings.canDrawOverlays(this)) {
+        boolean needsNotifications = Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED;
+        boolean needsMicrophone = !pendingLegacyStart && Prefs.getAudioMode(this) == 2
+                && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED;
+        StartPermissions.Step step = startPermissions.next(Settings.canDrawOverlays(this), needsNotifications, needsMicrophone);
+        if (step == StartPermissions.Step.OVERLAY) {
             logFlow("overlay_permission_required", "stage=window_permission");
             startActivityForResult(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
                     Uri.parse("package:" + getPackageName())), REQ_OVERLAY);
             return;
         }
-        if (Build.VERSION.SDK_INT >= 33
-                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+        if (step == StartPermissions.Step.NOTIFICATIONS && Build.VERSION.SDK_INT >= 33) {
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_POST_NOTIFICATIONS);
             return;
         }
-        if (!pendingLegacyStart && Prefs.getAudioMode(this) == 2
-                && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+        if (step == StartPermissions.Step.MICROPHONE) {
             requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_RECORD_AUDIO);
             return;
         }
@@ -214,6 +226,7 @@ public class MainActivity extends Activity {
     }
 
     private void requestMediaProjection() {
+        if (!pendingStart) return;
         logFlow("projection_consent_requested", "api=" + Build.VERSION.SDK_INT);
         try {
             Intent consent = Build.VERSION.SDK_INT >= 34 ? mpm.createScreenCaptureIntent(
@@ -251,24 +264,18 @@ public class MainActivity extends Activity {
                 showStartError("屏幕授权阶段：未允许屏幕采集，因此没有启动辅助。可重新点击开始并允许授权。");
                 return;
             }
+            if (!pendingStart) return; // Activity 已取消/重建时不使用迟到授权结果。
             stopService(new Intent(this, RegionSelectorService.class));
-            Runnable startService = () -> {
-                pendingStart = false;
-                try {
-                    CaptureService.requestStart(this, resultCode, data);
-                    refreshUi();
-                    moveTaskToBack(true);
-                } catch (RuntimeException e) {
-                    showStartError("前台服务启动阶段失败（" + e.getClass().getSimpleName()
-                            + "）。场次可能已启动；请检查权限后重试，或在设置中结束当前场次。");
-                    logFlow("foreground_service_start_failed", "error=" + e.getClass().getSimpleName());
-                }
-            };
-            if (pendingLegacyStart) {
-                startService.run();
-            } else {
-                pendingStart = false;
-                livePanel.beginOrResume(startService, this::showStartError);
+            pendingStart = false;
+            try {
+                livePanel.saveInputs();
+                CaptureService.requestStart(this, resultCode, data, pendingLegacyStart);
+                refreshUi();
+                moveTaskToBack(true);
+            } catch (RuntimeException e) {
+                showStartError("前台服务启动阶段失败（" + e.getClass().getSimpleName()
+                        + "）。请检查权限后重新开始；尚未确认屏幕采集运行。");
+                logFlow("foreground_service_start_failed", "error=" + e.getClass().getSimpleName());
             }
         } else if (requestCode == REQ_OVERLAY) {
             boolean granted = Settings.canDrawOverlays(this);
@@ -285,9 +292,7 @@ public class MainActivity extends Activity {
     private void endAssistance() {
         logFlow("assist_end_clicked", "phase=" + CaptureService.phase);
         CaptureService.requestStop(this);
-        if (livePanel.hasActiveSession()) {
-            livePanel.stopOperationSession(livePanel::openRecap, this::showStartError);
-        }
+        livePanel.openRecap();
         refreshUi();
     }
 
@@ -306,7 +311,7 @@ public class MainActivity extends Activity {
         CaptureService.Phase phase = CaptureService.phase;
         if (phase == CaptureService.Phase.IDLE) {
             btnMain.setText(livePanel != null && livePanel.hasActiveSession() ? "继续辅助" : "开始辅助");
-            btnMain.setEnabled(livePanel == null || !livePanel.isWorking());
+            btnMain.setEnabled(!pendingStart && (livePanel == null || !livePanel.isWorking()));
         }
     }
 

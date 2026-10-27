@@ -64,5 +64,9 @@ public class LiveClientTest {
     @Test public void nestedMarkdownIsPlainAndPurposeSwitchIsExplicit() {
         assertEquals("运营\n建议 保持节奏", DisplayText.labeled("运营", "> ## **建议**\n> - 保持节奏"));
         assertEquals("问答\n继续", DisplayText.labeled("问答", "~~继续~~"));
+        assertEquals("建议 操作 保持节奏 看向镜头", DisplayText.plain("| 建议 | 操作 |\n| --- | :---: |\n| 保持节奏 | 看向镜头 |\n***"));
+        String bounded = DisplayText.plain("😀".repeat(700));
+        assertEquals(601, bounded.codePointCount(0, bounded.length()));
+        assertTrue(bounded.endsWith("…"));
     }
 }

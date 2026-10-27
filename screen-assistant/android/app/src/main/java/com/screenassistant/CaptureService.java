@@ -52,7 +52,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class CaptureService extends Service {
 
-    public enum Phase { IDLE, RUNNING, PAUSED, STOPPING }
+    public enum Phase { IDLE, STARTING, RUNNING, PAUSED, STOPPING }
 
     public static final String ACTION_START = "com.screenassistant.START";
     public static final String ACTION_PAUSE = "com.screenassistant.PAUSE";
@@ -63,10 +63,12 @@ public class CaptureService extends Service {
     public static volatile Phase phase = Phase.IDLE;
     public static volatile String lastMessage = "";
     public static volatile boolean uiVisible;
+    private static final AtomicInteger visibleAssistantPages = new AtomicInteger();
     private static volatile WeakReference<CaptureService> serviceReference = new WeakReference<>(null);
 
     private static final String EXTRA_RESULT_CODE = "result_code";
     private static final String EXTRA_RESULT_DATA = "result_data";
+    private static final String EXTRA_LEGACY = "legacy_answer";
     private static final int NOTIF_ID = 100;
     private static final String CHANNEL_ID = "capture";
 
@@ -88,8 +90,11 @@ public class CaptureService extends Service {
     private final Handler main = new Handler(Looper.getMainLooper());
     private ExecutorService workExecutor;
     private ExecutorService promptExecutor;
-    private LiveClient.Session liveSession;
-    private LiveFrameAnalyzer liveAnalyzer;
+    private volatile LiveClient.Session liveSession;
+    private boolean operationMode;
+    private volatile LiveConnection liveConnection;
+    private volatile String connectionStatus = "";
+    private volatile LiveFrameAnalyzer liveAnalyzer;
     private long lastLiveOcr;
     private long lastLivePerson, lastFrameTimestamp;
     private AudioCapture audioCapture;
@@ -100,6 +105,7 @@ public class CaptureService extends Service {
     private final AtomicInteger busyEpoch = new AtomicInteger(-1);
     private volatile boolean tornDown = true;
     private volatile int sessionEpoch = 0;
+    private volatile int messageGeneration;
     private int rotationAtStart;
     private int intervalMs = 5000;
     private String serverUrl = "";
@@ -112,13 +118,7 @@ public class CaptureService extends Service {
     private TextView replyTextView;
     private final Runnable replyHide = () -> renderOverlay(sessionEpoch);
 
-    private final MediaProjection.Callback projectionCallback = new MediaProjection.Callback() {
-        @Override
-        public void onStop() {
-            logEvent("projection_on_stop", "prior_teardown=" + teardownReason);
-            main.post(() -> teardown("屏幕采集已停止。Android 未提供具体原因；回到应用后可重新开始。若再次发生，请保留诊断日志。", "projection_on_stop"));
-        }
-    };
+    private MediaProjection.Callback projectionCallback;
 
     private final Runnable tick = new Runnable() {
         @Override
@@ -127,14 +127,27 @@ public class CaptureService extends Service {
             if (uiVisible) { main.post(CaptureService.this::removeReplyOverlay); scheduleTick(intervalMs); return; }
             if (ScreenMetrics.rotation(CaptureService.this) != rotationAtStart) {
                 // 回主线程执行teardown（内部有 stopForeground/stopSelf）
-                main.post(() -> teardown("屏幕方向已变化，会话已停止，请重新框选并开始辅助", "rotation_changed"));
+                int rotationEpoch = sessionEpoch;
+                main.post(() -> {
+                    if (!tornDown && rotationEpoch == sessionEpoch)
+                        teardown("屏幕方向已变化，会话已停止，请重新框选并开始辅助", "rotation_changed");
+                });
                 return;
             }
             if (busyEpoch.get() == sessionEpoch) {
                 scheduleTick(intervalMs);
                 return;
             }
-            if (liveSession != null) { liveTick(); return; }
+            if (operationMode) {
+                if (liveAnalyzer != null) liveTick();
+                else {
+                    // 等待连接时丢弃旧帧；恢复时不把积压画面当成当前观察。
+                    try (Image ignored = imageReader.acquireLatestImage()) { }
+                    catch (RuntimeException ignored) { }
+                    scheduleTick(intervalMs);
+                }
+                return;
+            }
             Image image = null;
             Bitmap crop = null;
             try {
@@ -171,7 +184,7 @@ public class CaptureService extends Service {
                                 scheduleNext(epoch);
                                 return;
                             }
-                            if (liveSession != null) return; // 运营模式不以旧问答冒充运营提示
+                            if (operationMode) return; // 运营模式不以旧问答冒充运营提示
                             AnswerClient.Result result =
                                     AnswerClient.post(requestUrl, sentence, CONNECT_TIMEOUT_MS, READ_TIMEOUT_MS);
                             android.util.Log.i("CaptureService", "answer response status=" + result.httpStatus
@@ -207,13 +220,18 @@ public class CaptureService extends Service {
         }
     };
 
-    public static void requestStart(Context ctx, int resultCode, Intent data) {
+    public static void requestStart(Context ctx, int resultCode, Intent data, boolean legacyAnswer) {
+        if (phase != Phase.IDLE) return;
         logEvent("service_start_requested", "consent=accepted");
         Intent i = new Intent(ctx, CaptureService.class);
         i.setAction(ACTION_START);
         i.putExtra(EXTRA_RESULT_CODE, resultCode);
         i.putExtra(EXTRA_RESULT_DATA, data);
-        ctx.startForegroundService(i);
+        i.putExtra(EXTRA_LEGACY, legacyAnswer);
+        phase = Phase.STARTING;
+        lastMessage = "正在启动本地屏幕采集";
+        try { ctx.startForegroundService(i); }
+        catch (RuntimeException e) { phase = Phase.IDLE; throw e; }
     }
 
     public static void requestPause(Context ctx) {
@@ -233,7 +251,8 @@ public class CaptureService extends Service {
     }
 
     public static void setAssistantUiVisible(boolean visible) {
-        uiVisible = visible;
+        int count = visibleAssistantPages.updateAndGet(value -> visible ? value + 1 : Math.max(0, value - 1));
+        uiVisible = count > 0;
         WeakReference<CaptureService> reference = serviceReference;
         CaptureService service = reference == null ? null : reference.get();
         if (service != null) service.main.post(() -> service.renderOverlay(service.sessionEpoch));
@@ -271,10 +290,10 @@ public class CaptureService extends Service {
         switch (action == null ? "" : action) {
             case ACTION_START: {
                 if (!tornDown) return START_NOT_STICKY;
+                operationMode = !intent.getBooleanExtra(EXTRA_LEGACY, false);
                 // Android14：必须先成为 mediaProjection 前台服务，才允许 getMediaProjection()
                 int types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION;
-                LiveClient.Session stored = Prefs.getSession(this);
-                microphoneForeground = android.os.Build.VERSION.SDK_INT >= 30 && stored != null && !stored.stopped
+                microphoneForeground = android.os.Build.VERSION.SDK_INT >= 30 && operationMode
                         && Prefs.getAudioMode(this) == 2 && checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
                         == android.content.pm.PackageManager.PERMISSION_GRANTED;
                 if (android.os.Build.VERSION.SDK_INT >= 30 && microphoneForeground) types |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
@@ -309,11 +328,12 @@ public class CaptureService extends Service {
             }
             case ACTION_PAUSE: {
                 if (phase == Phase.RUNNING) {
+                    messageGeneration++;
                     captureHandler.removeCallbacks(tick);
                     phase = Phase.PAUSED;
                     overlayState.stop();
                     if (liveAnalyzer != null) liveAnalyzer.invalidateBefore(android.os.SystemClock.elapsedRealtime());
-                    else sessionEpoch++;
+                    else if (!operationMode) sessionEpoch++;
                     if (audioCapture != null) { audioCapture.stop(); audioCapture = null; }
                     main.post(this::removeReplyOverlay);
                     setState("已暂停（保留采集授权）");
@@ -326,7 +346,7 @@ public class CaptureService extends Service {
             case ACTION_RESUME: {
                 if (phase == Phase.PAUSED && !tornDown) {
                     phase = Phase.RUNNING;
-                    overlayState.start();
+                    overlayState.start(operationMode ? connectionStatus : OverlayMessageState.WAITING_TEXT);
                     if (liveAnalyzer != null) liveAnalyzer.invalidateBefore(android.os.SystemClock.elapsedRealtime());
                     startAudio();
                     setState("已继续");
@@ -341,6 +361,7 @@ public class CaptureService extends Service {
             }
             case ACTION_STOP:
             default:
+                if (liveConnection != null) liveConnection.close(true);
                 teardown("已结束辅助", "app_stop_action");
                 break;
         }
@@ -360,7 +381,8 @@ public class CaptureService extends Service {
             });
             workExecutor.shutdown();
         }
-        if (promptExecutor != null) promptExecutor.shutdownNow();
+        // 保住迟到创建凭证并幂等结束旧场，再由连接线程自行退出。
+        if (promptExecutor != null) promptExecutor.shutdown();
         if (captureThread != null) captureThread.quitSafely();
         WeakReference<CaptureService> reference = serviceReference;
         if (reference != null && reference.get() == this) serviceReference = new WeakReference<>(null);
@@ -384,9 +406,7 @@ public class CaptureService extends Service {
             sessionEpoch++;
             setupStage = "display_metrics";
             serverUrl = Prefs.getServerUrl(this);
-            LiveClient.Session stored = Prefs.getSession(this);
-            liveSession = stored != null && !stored.stopped ? stored : null;
-            if (liveSession != null) serverUrl = liveSession.baseUrl;
+            liveSession = null; // 实际场次/收件校验后才绑定，不从本地存储推断在线。
             intervalMs = Prefs.getIntervalSec(this) * 1000;
             int[] size = ScreenMetrics.realSizeDpi(this);
             screenSize = size;
@@ -400,6 +420,16 @@ public class CaptureService extends Service {
             logEvent("media_projection_acquired", "api=" + android.os.Build.VERSION.SDK_INT);
             // Android14：createVirtualDisplay 前必须注册 onStop 回调
             setupStage = "register_projection_callback";
+            final int projectionEpoch = sessionEpoch;
+            projectionCallback = new MediaProjection.Callback() {
+                @Override public void onStop() {
+                    logEvent("projection_on_stop", "prior_teardown=" + teardownReason);
+                    main.post(() -> {
+                        if (!tornDown && sessionEpoch == projectionEpoch)
+                            teardown("屏幕采集已停止。Android 未提供具体原因；回到应用可重新开始。", "projection_on_stop");
+                    });
+                }
+            };
             projection.registerCallback(projectionCallback, captureHandler);
             setupStage = "create_virtual_display";
             virtualDisplay = projection.createVirtualDisplay(
@@ -407,24 +437,23 @@ public class CaptureService extends Service {
                     android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                     imageReader.getSurface(), null, captureHandler);
             logEvent("virtual_display_created", "result=" + (virtualDisplay == null ? "null" : "created"));
+            if (virtualDisplay == null) throw new IllegalStateException("VirtualDisplay unavailable");
             setupStage = "recognizer";
             if (recognizer == null) {
                 recognizer = TextRecognition.getClient(
                         new ChineseTextRecognizerOptions.Builder().build());
             }
-            final int epoch = sessionEpoch;
-            if (liveSession != null) liveAnalyzer = new LiveFrameAnalyzer(this, recognizer, liveSession,
-                    () -> !tornDown && !uiVisible && phase == Phase.RUNNING && sessionEpoch == epoch, this::setState);
             lastLiveOcr = 0;
             lastLivePerson = 0; lastFrameTimestamp = 0;
-            overlayState.start();
+            connectionStatus = operationMode ? LiveConnection.CONNECTING : OverlayMessageState.WAITING_TEXT;
+            overlayState.start(connectionStatus);
             phase = Phase.RUNNING;
             setupStage = "running";
             startAudio();
-            if (liveSession != null) startPromptPolling(liveSession, sessionEpoch);
-            logEvent("capture_running", "session=" + (liveSession == null ? "answer_compatibility" : "operation"));
-            setState("辅助中，等待内容");
-            notifManager.notify(NOTIF_ID, buildNotification("辅助中，等待内容"));
+            if (operationMode) startLiveConnection(sessionEpoch);
+            logEvent("capture_running", "session=" + (operationMode ? "operation_connecting" : "answer_compatibility"));
+            setState(connectionStatus);
+            notifManager.notify(NOTIF_ID, buildNotification(connectionStatus));
             renderOverlay(sessionEpoch);
             scheduleTick(800);
         } catch (Exception e) {
@@ -558,39 +587,77 @@ public class CaptureService extends Service {
         showMessage("问答", reply, epoch, 0);
     }
 
-    private void startPromptPolling(LiveClient.Session session, int epoch) {
-        promptExecutor.execute(() -> {
-            String cursor = "";
-            while (!tornDown && epoch == sessionEpoch && !Thread.currentThread().isInterrupted()) {
-                try {
-                    org.json.JSONObject page = LiveClient.poll(session, cursor);
-                    org.json.JSONArray prompts = page.getJSONArray("prompts");
-                    for (int i = 0; i < prompts.length(); i++) {
-                        org.json.JSONObject prompt = prompts.getJSONObject(i);
+    private void startLiveConnection(int epoch) {
+        LiveConnection connection = new LiveConnection(Prefs.liveStore(this),
+                LiveClient.remote(serverUrl, Prefs.getLiveDescription(this), Prefs.getDouyinAccount(this)),
+                new LiveConnection.Listener() {
+                    @Override public void status(String text, boolean discard) {
+                        main.post(() -> {
+                            if (tornDown || epoch != sessionEpoch || text.equals(connectionStatus)) return;
+                            connectionStatus = text;
+                            overlayState.setStatus(text, discard);
+                            setState(text);
+                            notifManager.notify(NOTIF_ID, buildNotification(text));
+                            renderOverlay(epoch);
+                        });
+                    }
+                    @Override public void session(LiveClient.Session session) {
+                        main.post(() -> {
+                            if (tornDown || epoch != sessionEpoch) return;
+                            try (Image ignored = imageReader.acquireLatestImage()) { }
+                            catch (RuntimeException ignored) { }
+                            liveSession = session;
+                            liveAnalyzer = new LiveFrameAnalyzer(CaptureService.this, recognizer, session,
+                                    () -> !tornDown && !uiVisible && phase == Phase.RUNNING && sessionEpoch == epoch,
+                                    message -> main.post(() -> {
+                                        if (!tornDown && epoch == sessionEpoch) setState(message);
+                                    }));
+                            if (phase == Phase.RUNNING) startAudio();
+                        });
+                    }
+                    @Override public void prompt(org.json.JSONObject prompt) {
                         long expires = prompt.optLong("expires_at_ms");
-                        if (expires > System.currentTimeMillis()) showMessage("运营", prompt.optString("display_text"), epoch, expires);
+                        if (expires > System.currentTimeMillis())
+                            showMessage("运营", prompt.optString("display_text"), epoch, expires);
                     }
-                    cursor = page.getString("next_cursor");
-                    if (page.optBoolean("stopped")) {
-                        Prefs.saveSession(this, session.asStopped());
-                        main.post(() -> { if (epoch == sessionEpoch) teardown("共享场次已结束", "live_session_end"); });
-                        return;
+                    @Override public void ended() {
+                        main.post(() -> {
+                            if (!tornDown && epoch == sessionEpoch) teardown("共享场次已结束", "live_session_end");
+                        });
                     }
-                } catch (Exception e) {
-                    if (tornDown || epoch != sessionEpoch) return;
-                    setState("运营收件暂不可用：" + e.getMessage() + "；自动重试，未显示新提示");
-                    try { Thread.sleep(2000); }
-                    catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); return; }
+                });
+        liveConnection = connection;
+        promptExecutor.execute(() -> {
+            boolean prepared = false;
+            try {
+                while (!tornDown && epoch == sessionEpoch && !connection.isClosed()) {
+                    if (!prepared) prepared = connection.connect();
+                    boolean received = prepared && connection.poll();
+                    if (!received && !connection.isClosed()) {
+                        try { Thread.sleep(2000); }
+                        catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
+                    }
+                }
+            } finally {
+                if (connection.shouldEnd()) {
+                    try { audioCompletion.get(20, java.util.concurrent.TimeUnit.SECONDS); }
+                    catch (Exception ignored) { /* 仍请求幂等结束 */ }
+                    try { connection.finishStop(); }
+                    catch (Exception e) { logEvent("session_stop_unconfirmed", "error=" + e.getClass().getSimpleName()); }
+                    Intent changed = new Intent(Prefs.ACTION_STATE).setPackage(getPackageName());
+                    sendBroadcast(changed);
                 }
             }
         });
     }
 
     private void showMessage(String purpose, String reply, int epoch, long expiresAt) {
+        if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch) return;
+        int generation = messageGeneration;
         String fullText = DisplayText.labeled(purpose, reply);
         if (fullText.isEmpty()) return;
         main.post(() -> {
-            if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch) return;
+            if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch || generation != messageGeneration) return;
             long now = System.currentTimeMillis();
             if (expiresAt > 0 && expiresAt <= now) return;
             if (overlayState.update(fullText, expiresAt, now, REPLY_AUTO_HIDE_MS)) renderOverlay(epoch);
@@ -603,7 +670,7 @@ public class CaptureService extends Service {
             return;
         }
         main.removeCallbacks(replyHide);
-        if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch || uiVisible) {
+        if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch) {
             removeReplyOverlay();
             return;
         }
@@ -614,6 +681,7 @@ public class CaptureService extends Service {
             logEvent("overlay_permission_missing", "phase=" + phase);
             return;
         }
+        if (!overlayState.shouldDisplay(true, uiVisible)) { removeReplyOverlay(); return; }
         try {
             if (replyOverlayView == null) {
                 replyOverlayView = LayoutInflater.from(this).inflate(R.layout.overlay_reply, null);
@@ -649,7 +717,7 @@ public class CaptureService extends Service {
             }
             long now = System.currentTimeMillis();
             String text = overlayState.textAt(now);
-            replyTextView.setText(text);
+            if (!text.contentEquals(replyTextView.getText())) replyTextView.setText(text);
             replyOverlayView.setVisibility(View.VISIBLE);
             logEvent("overlay_visible", "kind=" + (OverlayMessageState.WAITING_TEXT.equals(text) ? "waiting" : "message")
                     + " attached=" + replyOverlayView.isAttachedToWindow());
@@ -692,6 +760,9 @@ public class CaptureService extends Service {
     }
 
     private void setState(String message) {
+        if (operationMode && (phase == Phase.RUNNING || phase == Phase.PAUSED)
+                && !connectionStatus.isEmpty() && !message.equals(connectionStatus))
+            message = connectionStatus + "\n" + message;
         lastMessage = message + (audioMessage.isEmpty() ? "" : "\n" + audioMessage);
         Intent i = new Intent(Prefs.ACTION_STATE);
         i.setPackage(getPackageName());
@@ -722,6 +793,7 @@ public class CaptureService extends Service {
         logEvent("teardown_requested", "reason=" + reason + " phase=" + phase + " already_torn_down=" + tornDown);
         if (tornDown) {
             if (phase == Phase.STOPPING) return;
+            phase = Phase.IDLE;
             setState(message);
             stopForegroundAndSelf();
             return;
@@ -741,9 +813,11 @@ public class CaptureService extends Service {
     }
 
     private void teardownInternal() {
+        if (liveConnection != null) liveConnection.close(false);
         tornDown = true;
         phase = Phase.IDLE;
         sessionEpoch++;
+        messageGeneration++;
         overlayState.stop();
         if (audioCapture != null) { audioCapture.stop(); audioCapture = null; }
         if (captureHandler != null) captureHandler.removeCallbacksAndMessages(null);
