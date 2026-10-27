@@ -29,10 +29,15 @@ struct LiveSessionCredentials: Codable {
     let douyinAccount: String?
     var backstageTaskID: String?
     var backstageStatus: String?
+    /// Local-only markers; neither field is sent to the server.
+    var backstageStartPending: Bool?
+    var liveConnectionPending: Bool?
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id", token = "session_token", startedAtMS = "started_at_ms"
         case douyinAccount = "douyin_account"
         case backstageTaskID = "backstage_task_id", backstageStatus = "backstage_status"
+        case backstageStartPending = "backstage_start_pending"
+        case liveConnectionPending = "live_connection_pending"
     }
 }
 
@@ -241,7 +246,8 @@ struct LiveOperationsClient {
             "douyin_account": douyinAccount
         ])
         session.dataTask(with: request) { data, response, error in
-            completion(Self.decode(LiveSessionCredentials.self, data: data, response: response, error: error))
+            completion(Self.decode(LiveSessionCredentials.self, data: data, response: response, error: error,
+                                   acceptedStatusCodes: [200, 201]))
         }.resume()
     }
 
@@ -256,13 +262,16 @@ struct LiveOperationsClient {
             case .success(let started):
                 guard started.sessionID == credentials.sessionID,
                       started.douyinAccount == credentials.douyinAccount,
-                      started.status == "started" || started.status == "duplicate" else {
+                      (started.status == "started" || started.status == "duplicate"),
+                      let taskID = started.taskID, !taskID.isEmpty else {
                     completion(.failure(NSError(domain: "LiveOperations", code: -2)))
                     return
                 }
                 var active = credentials
-                active.backstageTaskID = started.taskID
+                active.backstageTaskID = taskID
                 active.backstageStatus = started.taskStatus
+                active.backstageStartPending = false
+                active.liveConnectionPending = false
                 completion(.success(active))
             }
         }.resume()
@@ -283,7 +292,15 @@ struct LiveOperationsClient {
         components.queryItems = [URLQueryItem(name: "after", value: after), URLQueryItem(name: "wait_ms", value: "15000")]
         let request = authorized(components.url!, token: credentials.token)
         let task = session.dataTask(with: request) { data, response, error in
-            completion(Self.decode(LivePromptPage.self, data: data, response: response, error: error))
+            switch Self.decode(LivePromptPage.self, data: data, response: response, error: error) {
+            case .failure(let error): completion(.failure(error))
+            case .success(let page):
+                guard page.sessionID == credentials.sessionID else {
+                    completion(.failure(NSError(domain: "LiveOperations", code: -3)))
+                    return
+                }
+                completion(.success(page))
+            }
         }
         task.resume()
         return task
@@ -415,13 +432,14 @@ struct LiveOperationsClient {
         components.reduce(baseURL) { $0.appendingPathComponent($1, isDirectory: false) }
     }
 
-    private static func decode<T: Decodable>(_ type: T.Type, data: Data?, response: URLResponse?, error: Error?) -> Result<T, Error> {
+    private static func decode<T: Decodable>(_ type: T.Type, data: Data?, response: URLResponse?, error: Error?,
+                                             acceptedStatusCodes: Set<Int> = [200]) -> Result<T, Error> {
         if let error {
             ControlState.recordServiceResponse(error: error, response: response)
             return .failure(error)
         }
         let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
-        guard statusCode == 200, let data else {
+        guard acceptedStatusCodes.contains(statusCode), let data else {
             ControlState.recordServiceResponse(error: nil, response: response)
             let detail = data.flatMap { try? JSONDecoder().decode(LiveOperationsErrorPayload.self, from: $0).detail }
             return .failure(LiveOperationsHTTPError(statusCode: statusCode, detail: detail))

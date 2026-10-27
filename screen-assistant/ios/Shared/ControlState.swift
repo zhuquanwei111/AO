@@ -79,10 +79,8 @@ struct ControlState {
 
     /// 保存最近服务请求结果的类别与HTTP码，不保存URL、令牌或正文。
     static func recordServiceResponse(error: Error?, response: URLResponse?) {
-        if error != nil {
-            setServiceConnection(.unreachable)
-            return
-        }
+        // URLSession may return both an HTTP response and a transfer error.
+        // A received HTTP status is stronger evidence of server reachability.
         guard let code = (response as? HTTPURLResponse)?.statusCode else {
             setServiceConnection(.unreachable)
             return

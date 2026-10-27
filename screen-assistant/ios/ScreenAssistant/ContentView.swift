@@ -56,6 +56,11 @@ struct ContentView: View {
                 if model.liveActive {
                     Section(header: Text("本机提示与屏幕广播"),
                             footer: Text("系统控制广播授权与开始/停止；屏识不能静默开启广播。PiP 和广播是否在同机正常运行仍需真机确认。")) {
+                        if model.liveConnectionPending {
+                            Text("同一场实时服务尚未确认，本机采集暂缓；不会自动重发后台启动或创建新场次。")
+                                .font(.footnote)
+                                .foregroundColor(.secondary)
+                        }
                         Label("步骤 1：启动悬浮提示窗", systemImage: "1.circle")
                         Label(pipStatusText, systemImage: pipIsActive ? "pip.fill" : "pip")
                             .foregroundColor(pipStatusColor)
@@ -71,6 +76,7 @@ struct ContentView: View {
                             BroadcastPickerSection(showsMicrophoneButton: model.audioSettings.enabled &&
                                 model.audioSettings.includes("audioMic"))
                                 .frame(width: 52, height: 44)
+                                .disabled(model.liveConnectionPending)
                         }
                         Label(model.broadcastStatusText, systemImage: broadcastStatusIcon)
                             .font(.footnote)
