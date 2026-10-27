@@ -485,4 +485,3 @@ def build_candidate(observations: list[dict]) -> dict | None:
         return _candidate("person:head_down", 20, "画面中可见人物持续低头",
                           "抬头看一下镜头，接住观众的互动。", [person])
     return None
-
