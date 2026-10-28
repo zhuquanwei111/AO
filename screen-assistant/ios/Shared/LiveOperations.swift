@@ -235,13 +235,13 @@ struct LiveOperationsClient {
     private let baseURL: URL
     private let session: URLSession
 
-    init?(baseURL: URL) {
+    init?(baseURL: URL, session: URLSession? = nil) {
         guard baseURL.scheme == "http" || baseURL.scheme == "https" else { return nil }
         self.baseURL = baseURL
         let config = URLSessionConfiguration.ephemeral
         config.waitsForConnectivity = false
         config.timeoutIntervalForRequest = 35
-        self.session = URLSession(configuration: config)
+        self.session = session ?? URLSession(configuration: config)
     }
 
     func create(description: String, douyinAccount: String,
