@@ -254,6 +254,14 @@ final class AppModel: ObservableObject {
                                            captureImmediately: Bool = true) {
         var activeCredentials = credentials
         if !captureImmediately { activeCredentials.liveConnectionPending = true }
+        liveEvents = []
+        overviewLoading = false
+        summaryRefreshInFlight = false
+        liveDelivery.clear()
+        liveDisplayedUntilMS = nil
+        PiPDisplayController.shared.endLiveContent()
+        liveSummary = nil
+        liveCursor = ""
         guard LiveSessionState.save(activeCredentials) else {
             activeCredentials.backstageStartPending = true
             activeCredentials.liveConnectionPending = true
@@ -273,12 +281,6 @@ final class AppModel: ObservableObject {
         liveStopped = false
         liveStatus = status
         liveConnectionPending = activeCredentials.liveConnectionPending == true
-        liveEvents = []
-        liveDelivery.clear()
-        liveDisplayedUntilMS = nil
-        PiPDisplayController.shared.endLiveContent()
-        liveSummary = nil
-        liveCursor = ""
         captureWanted = captureImmediately && !liveConnectionPending
         pollLivePrompts()
     }
@@ -566,7 +568,8 @@ final class AppModel: ObservableObject {
             }
         }
         group.notify(queue: .main) { [weak self] in
-            guard let self else { return }
+            guard let self, !self.liveActive,
+                  Self.savedCredentials()?.sessionID == credentials.sessionID else { return }
             self.overviewLoading = false
             self.summaryRefreshInFlight = false
             if let events = fetchedEvents?.events { self.liveEvents = events }
@@ -600,7 +603,8 @@ final class AppModel: ObservableObject {
         overviewLoading = true
         client.summary(credentials) { [weak self] result in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, !self.liveActive,
+                      Self.savedCredentials()?.sessionID == credentials.sessionID else { return }
                 self.summaryRefreshInFlight = false
                 self.overviewLoading = false
                 guard case .success(let summary) = result else {
