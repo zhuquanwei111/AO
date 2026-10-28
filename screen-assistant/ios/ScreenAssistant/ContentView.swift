@@ -6,10 +6,14 @@ import ReplayKit
 /// 用户点击后在系统弹窗中确认。
 struct BroadcastPickerSection: UIViewRepresentable {
     static let extensionBundleID = "com.screenassistant.ios.broadcast"
+    static let buttonSize: CGFloat = 50
     var showsMicrophoneButton = false
 
     func makeUIView(context: Context) -> RPSystemBroadcastPickerView {
-        let view = RPSystemBroadcastPickerView()
+        let view = RPSystemBroadcastPickerView(
+            frame: CGRect(x: 0, y: 0, width: Self.buttonSize, height: Self.buttonSize)
+        )
+        view.tintColor = .label
         view.preferredExtension = Self.extensionBundleID
         view.showsMicrophoneButton = showsMicrophoneButton
         return view
@@ -75,7 +79,8 @@ struct ContentView: View {
                             Spacer()
                             BroadcastPickerSection(showsMicrophoneButton: model.audioSettings.enabled &&
                                 model.audioSettings.includes("audioMic"))
-                                .frame(width: 52, height: 44)
+                                .frame(width: BroadcastPickerSection.buttonSize,
+                                       height: BroadcastPickerSection.buttonSize)
                                 .disabled(model.liveConnectionPending)
                         }
                         Label(model.broadcastStatusText, systemImage: broadcastStatusIcon)
@@ -309,6 +314,8 @@ private struct AdvancedSettingsView: View {
                         Toggle("识别开关（扩展按此决定是否处理）", isOn: $model.captureWanted)
                         BroadcastPickerSection(showsMicrophoneButton: model.audioSettings.enabled &&
                             model.audioSettings.includes("audioMic"))
+                            .frame(width: BroadcastPickerSection.buttonSize,
+                                   height: BroadcastPickerSection.buttonSize)
                     }
                     HStack {
                         Text("已处理轮次")
