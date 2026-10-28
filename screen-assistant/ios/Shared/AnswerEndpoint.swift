@@ -65,7 +65,8 @@ struct AnswerEndpoint {
         }
         request.httpBody = httpBody
 
-        let task = Self.session.dataTask(with: request) { data, response, _ in
+        let task = Self.session.dataTask(with: request) { data, response, error in
+            ControlState.recordServiceResponse(error: error, response: response)
             let outcome = Self.map(data: data, response: response)
             completionQueue.async { completion(outcome) }
         }

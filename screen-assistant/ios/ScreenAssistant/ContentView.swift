@@ -6,10 +6,14 @@ import ReplayKit
 /// 用户点击后在系统弹窗中确认。
 struct BroadcastPickerSection: UIViewRepresentable {
     static let extensionBundleID = "com.screenassistant.ios.broadcast"
+    static let buttonSize: CGFloat = 50
     var showsMicrophoneButton = false
 
     func makeUIView(context: Context) -> RPSystemBroadcastPickerView {
-        let view = RPSystemBroadcastPickerView()
+        let view = RPSystemBroadcastPickerView(
+            frame: CGRect(x: 0, y: 0, width: Self.buttonSize, height: Self.buttonSize)
+        )
+        view.tintColor = .label
         view.preferredExtension = Self.extensionBundleID
         view.showsMicrophoneButton = showsMicrophoneButton
         return view
@@ -23,11 +27,152 @@ struct BroadcastPickerSection: UIViewRepresentable {
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
     @ObservedObject private var pip = PiPDisplayController.shared
-    @State private var confirmsLiveAreaPreset = false
 
     var body: some View {
         NavigationView {
             Form {
+                Section(header: Text("本场直播辅助"),
+                        footer: Text("先开始本场后台任务；随后按步骤启动本机提示和系统屏幕广播。屏幕采集必须由你在系统弹窗确认。")) {
+                    TextField("抖音号（本场汇总绑定）", text: $model.douyinAccount)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .disabled(model.liveActive || model.liveStarting || model.liveStopping)
+                    TextField("本场补充说明（选填）", text: $model.liveDescription)
+                        .disabled(model.liveActive || model.liveStarting || model.liveStopping)
+                    Button(model.liveStarting ? "正在准备…" : (model.liveStopping ? "正在结束…" : (model.liveActive ? "结束本场辅助" : "开始本场辅助"))) {
+                        if model.liveActive { model.stopLiveSession() }
+                        else { model.startLiveSession() }
+                    }
+                    .disabled(model.liveStarting || model.liveStopping)
+                    if model.liveStarting || model.liveStopping {
+                        ProgressView(model.liveStarting ? "正在创建后台场次…" : "正在结束本场…")
+                    }
+                    Text(model.liveStatus)
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                    Label(model.serviceStatusText, systemImage: "network")
+                        .font(.footnote)
+                        .foregroundColor(model.serviceStatusText.contains("未收到") ||
+                                         model.serviceStatusText.contains("失败") ||
+                                         model.serviceStatusText.contains("无效") ? .orange : .secondary)
+                }
+
+                if model.liveActive {
+                    Section(header: Text("本机提示与屏幕广播"),
+                            footer: Text("系统控制广播授权与开始/停止；屏识不能静默开启广播。PiP 和广播是否在同机正常运行仍需真机确认。")) {
+                        if model.liveConnectionPending {
+                            Text("同一场实时服务尚未确认，本机采集暂缓；不会自动重发后台启动或创建新场次。")
+                                .font(.footnote)
+                                .foregroundColor(.secondary)
+                        }
+                        Label("步骤 1：启动悬浮提示窗", systemImage: "1.circle")
+                        Label(pipStatusText, systemImage: pipIsActive ? "pip.fill" : "pip")
+                            .foregroundColor(pipStatusColor)
+                        Button(pipIsActive ? "停止悬浮提示窗" : "启动悬浮提示窗") {
+                            if pipIsActive { pip.stop() } else { pip.start() }
+                        }
+                        .disabled(!pip.isSupported)
+
+                        Label("步骤 2：开始系统屏幕广播", systemImage: "2.circle")
+                        HStack {
+                            Text("点击系统广播按钮并确认")
+                            Spacer()
+                            BroadcastPickerSection(showsMicrophoneButton: model.audioSettings.enabled &&
+                                model.audioSettings.includes("audioMic"))
+                                .frame(width: BroadcastPickerSection.buttonSize,
+                                       height: BroadcastPickerSection.buttonSize)
+                                .disabled(model.liveConnectionPending)
+                        }
+                        Label(model.broadcastStatusText, systemImage: broadcastStatusIcon)
+                            .font(.footnote)
+                            .foregroundColor(broadcastStatusColor)
+                        HStack {
+                            Text("已完成 OCR 轮次")
+                            Spacer()
+                            Text("\(model.roundCounter)")
+                                .foregroundColor(.secondary)
+                        }
+                        if let t = model.lastUpdated {
+                            Text("最近完成：\(t, style: .time)")
+                                .font(.footnote)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+
+                    Section {
+                        NavigationLink("当前收到的运营事件记录") {
+                            LiveEventListView(events: model.liveEvents)
+                        }
+                    }
+                }
+
+                if model.liveStopped {
+                    Section(header: Text("本场复盘"),
+                            footer: Text("结束辅助不会替你关闭 iOS 系统广播；如果系统仍显示正在广播，请从系统广播状态栏停止。")) {
+                        NavigationLink("场次概览与事件记录") {
+                            LiveSessionOverviewView(model: model)
+                        }
+                    }
+                }
+
+                Section(header: Text("更多功能")) {
+                    NavigationLink {
+                        AdvancedSettingsView()
+                    } label: {
+                        Label("采集与服务设置", systemImage: "slider.horizontal.3")
+                    }
+                }
+            }
+            .navigationTitle("屏识AI助手")
+        }
+    }
+
+    private var pipIsActive: Bool {
+        pip.state == .running || pip.state == .starting || pip.state == .suspended
+    }
+
+    private var pipStatusText: String {
+        switch pip.state {
+        case .running: return "PiP 已由系统确认运行"
+        case .starting: return "正在请求系统启动 PiP"
+        case .suspended: return "PiP 被系统暂时暂停"
+        case .failed(let reason): return "PiP 启动失败：\(reason)"
+        case .unsupported: return "设备不支持 PiP"
+        case .stopped: return "PiP 已停止"
+        case .idle: return "PiP 未启动"
+        }
+    }
+
+    private var pipStatusColor: Color {
+        switch pip.state {
+        case .running: return .green
+        case .starting: return .blue
+        case .suspended, .failed, .unsupported: return .orange
+        case .idle, .stopped: return .secondary
+        }
+    }
+
+    private var broadcastStatusIcon: String {
+        if model.broadcastStatusText.contains("已收到") { return "checkmark.circle" }
+        if model.broadcastStatusText.contains("结束") || model.broadcastStatusText.contains("暂停") { return "pause.circle" }
+        if model.broadcastStatusText.contains("原因未知") { return "exclamationmark.triangle" }
+        return "hourglass"
+    }
+
+    private var broadcastStatusColor: Color {
+        if model.broadcastStatusText.contains("已收到") { return .green }
+        if model.broadcastStatusText.contains("原因未知") { return .orange }
+        return .secondary
+    }
+}
+
+private struct AdvancedSettingsView: View {
+    @EnvironmentObject private var model: AppModel
+    @ObservedObject private var pip = PiPDisplayController.shared
+    @State private var confirmsLiveAreaPreset = false
+
+    var body: some View {
+        Form {
                 Section(header: Text("服务端")) {
                     TextField("http://192.168.1.10:8000", text: $model.serverURLString)
                         .keyboardType(.URL)
@@ -117,7 +262,11 @@ struct ContentView: View {
 
                 Section(header: Text("悬浮展示（PiP）"),
                         footer: Text(pipFooter)) {
-                    if !pip.isSupported {
+                    if model.liveActive {
+                        Text("直播辅助期间请回到首页查看 PiP 状态并使用启动控制。")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                    } else if !pip.isSupported {
                         Label("本设备不支持画中画", systemImage: "exclamationmark.triangle")
                             .foregroundColor(.orange)
                     } else {
@@ -157,9 +306,17 @@ struct ContentView: View {
 
                 Section(header: Text("采集"),
                         footer: Text(startGuide)) {
-                    Toggle("识别开关（扩展按此决定是否处理）", isOn: $model.captureWanted)
-                    BroadcastPickerSection(showsMicrophoneButton: model.audioSettings.enabled &&
-                        model.audioSettings.includes("audioMic"))
+                    if model.liveActive {
+                        Text("本场辅助已启用识别；系统广播状态见首页。结束后可在此单独使用旧问答采集。")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                    } else {
+                        Toggle("识别开关（扩展按此决定是否处理）", isOn: $model.captureWanted)
+                        BroadcastPickerSection(showsMicrophoneButton: model.audioSettings.enabled &&
+                            model.audioSettings.includes("audioMic"))
+                            .frame(width: BroadcastPickerSection.buttonSize,
+                                   height: BroadcastPickerSection.buttonSize)
+                    }
                     HStack {
                         Text("已处理轮次")
                         Spacer()
@@ -198,31 +355,6 @@ struct ContentView: View {
                     }
                 }
 
-                Section(header: Text("直播运营"),
-                        footer: Text("手动开始/结束本场辅助。评论仅来自 ReplayKit 当前可见 OCR 样本；不代表公屏全量。运营提示使用现有 PiP。")) {
-                    TextField("抖音号（本场后台汇总绑定）", text: $model.douyinAccount)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    TextField("本场补充说明（选填）", text: $model.liveDescription)
-                    Button(model.liveStarting ? "正在开始…" : (model.liveActive ? "结束本场辅助" : "开始本场辅助")) {
-                        if model.liveActive { model.stopLiveSession() }
-                        else { model.startLiveSession() }
-                    }
-                    .disabled(model.liveStarting)
-                    Text(model.liveStatus)
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-                    if model.liveStopped {
-                        NavigationLink("本场概览与事件记录") {
-                            LiveSessionOverviewView(model: model)
-                        }
-                    } else {
-                        NavigationLink("当前收到的事件记录") {
-                            LiveEventListView(events: model.liveEvents)
-                        }
-                    }
-                }
-
                 Section(header: Text("测试工具")) {
                     NavigationLink("输入检查（测试）") {
                         InputDiagnosticsView()
@@ -234,7 +366,8 @@ struct ContentView: View {
                         .font(.footnote)
                 }
             }
-            .navigationTitle("屏识AI助手")
+            .navigationTitle("采集与服务设置")
+            .navigationBarTitleDisplayMode(.inline)
             .alert("应用参考直播区域预设？", isPresented: $confirmsLiveAreaPreset) {
                 Button("应用并替换评论、人数、人物区域", role: .destructive) {
                     model.applyLiveAreaPreset()
@@ -243,7 +376,6 @@ struct ContentView: View {
             } message: {
                 Text("将设置评论 x=0.03 y=0.69 w=0.82 h=0.25、人数 x=0.80 y=0.055 w=0.10 h=0.045、人物 x=0 y=0.14 w=1 h=0.80。已有这三类自定义框会被替换；平台提醒区域保持原样（默认未配置）。请在主播界面核对后再开始采集。")
             }
-        }
     }
 
     private var roiSummary: String {
@@ -261,7 +393,7 @@ struct ContentView: View {
         "主展示路径：在前台启动 PiP，再开广播并切到目标应用；主 App listener 随 PiP 启停，回复通过 App Group UDS 短通道到 PiP。PiP 启动时使用系统要求的 playback 音频会话并混音，不播放静音内容；后台实际存活仍需真机验证，系统仍可能挂起进程或暂时暂停 PiP。关闭 PiP 后扩展无法连接时会有限重试并丢弃回复，不写文件或转通知。广播停止则停止识别。广播采集整个屏幕（含 PiP），请把 PiP 拖离识别区域以降低回声风险；公开 API 无法读取 PiP 位置或保证覆盖区域触摸穿透。"
 
     private let startGuide =
-        "启动步骤：1) 打开识别开关；2) 在前台启动 PiP（建立短回复 listener）；3) 点“开始直播”并在系统弹窗确认；4) 切到目标应用。暂停/继续可切换识别开关或使用系统广播控制；停止广播由系统状态栏操作。关闭 PiP 会停止 listener，通道不可达时回复丢弃。采集授权、状态栏提示与受保护画面限制均由系统承载；广播不能由 App 静默启动。"
+        "旧快问快答：打开识别开关，在前台启动 PiP，再点系统广播按钮并确认，最后切到目标应用。直播辅助：先在首页开始本场，再按首页步骤启动 PiP 和系统广播。暂停可关闭识别开关；停止系统广播由系统状态栏操作。关闭 PiP 会停止回复 listener，通道不可达时短回复会丢弃。采集授权、状态栏提示与受保护画面限制均由系统承载；广播不能由 App 静默启动。"
 
     private let guideText =
         "本 App 与“屏识AI广播”扩展通过 App Group 共享配置与控制开关，并通过 UDS 传递短回复；句子和回复正文仅在进程内存及 socket 内核缓冲短暂存在，不写文件或偏好设置。识别与请求在广播扩展进程内完成，画面仅内存处理。"
@@ -314,16 +446,28 @@ private struct LiveSessionOverviewView: View {
             }
             if let recap = summary.backstageRecap {
                 backstageSection(recap)
+            } else {
+                Section(header: Text("后台五项汇总"),
+                        footer: Text("服务未返回本场后台任务记录，五项结果保持未知；运营事件记录单独保留。")) {
+                    row("任务状态", "未返回后台任务记录")
+                    Text(model.liveStatus).font(.footnote).foregroundColor(.secondary)
+                }
             }
             } else {
                 Section(header: Text("本场概览")) {
-                    ProgressView("正在读取本场数据…")
-                    Text(model.liveStatus).font(.footnote).foregroundColor(.secondary)
+                    if model.overviewLoading {
+                        ProgressView("正在读取本场数据…")
+                    } else {
+                        Text(model.liveStatus).font(.footnote).foregroundColor(.secondary)
+                        Button("重试读取后台汇总") {
+                            model.refreshStoppedOverview()
+                        }
+                    }
                 }
             }
             Section(header: Text("事件记录（\(model.liveEvents.count)条）")) {
                 if model.liveEvents.isEmpty {
-                    Text("本场没有已保存的运营事件")
+                    Text("当前没有可显示的运营事件")
                         .foregroundColor(.secondary)
                 } else {
                     ForEach(model.liveEvents) { event in
