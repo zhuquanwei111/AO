@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from screen_assistant_server.app import create_app
 from screen_assistant_server.audio import AudioPacket, AudioService
 from screen_assistant_server.asr import FunASRConnection
-from test_live import Clock, create, settings
+from test_live import Clock, create, settings, wait_for_fusion
 
 
 def packet(seq=0, *, source="audioMic", start=0, frames=9600, final=False,
@@ -152,6 +152,7 @@ def test_final_revisions_enter_m4_once_then_short_prompt_and_record(tmp_path):
         windows = app.state.live.store.fusion_windows[session['session_id']]
         finals = [row for row in windows if row['kind'] == 'transcript' and row['content']['is_final']]
         assert len(finals) == 3
+        wait_for_fusion(client)
         events = client.get(url + "/events", headers=headers).json()["events"]
         assert len(events) == 1
         assert "稍快" in events[0]["suggestion"] and len(events[0]["suggestion"]) <= 80

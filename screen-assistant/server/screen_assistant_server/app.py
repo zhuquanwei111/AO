@@ -70,10 +70,12 @@ def create_app(settings: Settings | None = None, *, live_clock=None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.live = LiveService(cfg.live_db_path, live_clock or utc_ms)
+        app.state.live = LiveService(cfg.live_db_path, live_clock or utc_ms,
+                                     concurrency=cfg.live_fusion_concurrency,
+                                     queue_limit=cfg.live_fusion_queue_limit)
         app.state.audio = AudioService(cfg, app.state.live)
         async def deliver_audio(sid, token):
-            return await app.state.live.deliver_fusion(sid, token, SimpleNamespace(app=app))
+            app.state.live.schedule_fusion(sid, token, SimpleNamespace(app=app))
         app.state.audio.deliver = deliver_audio
         redis = Redis.from_url(cfg.redis_url, decode_responses=True)
         app.state.redis = redis
@@ -100,6 +102,7 @@ def create_app(settings: Settings | None = None, *, live_clock=None) -> FastAPI:
             yield
         finally:
             await app.state.audio.close()
+            await app.state.live.close_fusion()
             await app.state.live.run("close")
             await app.state.model.aclose()
             await redis.aclose()

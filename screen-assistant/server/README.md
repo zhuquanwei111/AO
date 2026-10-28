@@ -43,6 +43,10 @@ agent/RAG/历史上下文/个性化；不持久化句子或回复日志。
 | `MAX_SENTENCE_CHARS` | `2000` | 规范化后句子长度上限，超出 422 |
 | `MODEL_TIMEOUT_SECONDS` | `30` | 模型请求总超时（超时映射 504） |
 | `MODEL_CONNECT_TIMEOUT_SECONDS` | `5` | 模型连接超时 |
+| `LIVE_FUSION_CONCURRENCY` | `2` | 每个服务进程内普通融合执行上限，允许 1–16 |
+| `LIVE_FUSION_QUEUE_LIMIT` | `16` | 每个服务进程内等待分析的不同场次上限，允许 1–256 |
+
+实时观察已保存并安排分析时返回 `status=accepted`、`reason=scheduled`、`prompt_id=null`；队列满而观察已保存时 `reason=analysis_busy`，本次不安排分析。结果仍通过 `/prompts` 获取，`scheduled` 不表示已生成提示。上述上限是进程内保护值，不是性能保证；进程退出后未完成的内存调度不会自动恢复。
 
 ## 启动路径
 

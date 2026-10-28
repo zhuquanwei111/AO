@@ -39,6 +39,14 @@ def create(client, **body):
     return data, {"X-Live-Session-Token": data["session_token"]}
 
 
+def wait_for_fusion(client):
+    async def idle():
+        async with asyncio.timeout(3):
+            while client.app.state.live.fusion_active or client.app.state.live.fusion_queue:
+                await asyncio.sleep(0.005)
+    client.portal.call(idle)
+
+
 def test_session_auth_stop_and_reopen(tmp_path):
     path = tmp_path / "live.sqlite3"
     clock = Clock()
@@ -118,7 +126,8 @@ def test_real_observation_model_prompt_poll_record_stop_and_isolation(tmp_path):
         generated = client.post(url + "/comments", headers=headers, json=body)
         assert generated.status_code == 200, generated.text
         result = generated.json()
-        assert result["reason"] == "generated" and result["prompt_id"]
+        assert result["reason"] == "scheduled" and result["prompt_id"] is None
+        wait_for_fusion(client)
         assert model.observations == [(body["text"], "", "ios_replaykit_ocr", clock.now, "")]
         # bbox 每帧会轻微漂移，但同题同来源同时间桶仍会抑制重放。
         replay = dict(body, event_id="ocr-observation-replay",
@@ -383,7 +392,7 @@ def test_android_app_source_contract_and_typed_observation_allowlist(tmp_path):
         }
         comment_result = client.post(url + "/comments", headers=app_headers, json=comment)
         assert comment_result.status_code == 200, comment_result.text
-        assert comment_result.json()["reason"] == "not_a_question"
+        assert comment_result.json()["reason"] == "scheduled"
         count = {
             "event_id": "android-count", "kind": "online_count",
             "source": "android_media_projection_ocr", "observed_at_ms": clock.now,
@@ -541,7 +550,8 @@ def test_mixed_screen_lines_are_not_sent_as_one_comment_and_identity_stays_unkno
                 "observed_at_ms": clock.now,
             })
             assert response.status_code == 200
-            assert response.json()["reason"] == "not_a_question"
+            assert response.json()["reason"] == "scheduled"
+        wait_for_fusion(client)
         assert model.observations == []
 
         # 单独候选的问题行带bbox和来源/时刻，不臆造昵称或平台消息ID。
@@ -553,7 +563,8 @@ def test_mixed_screen_lines_are_not_sent_as_one_comment_and_identity_stays_unkno
             "observed_at_ms": clock.now,
         }
         response = client.post(url + "/comments", headers=headers, json=question_body)
-        assert response.status_code == 200 and response.json()["reason"] == "generated"
+        assert response.status_code == 200 and response.json()["reason"] == "scheduled"
+        wait_for_fusion(client)
         assert model.observations == [(
             question_body["text"], "", "ios_replaykit_ocr", clock.now, ""
         )]
@@ -577,10 +588,12 @@ def test_person_signal_candidate_is_recorded_with_confidence_and_cooldown(tmp_pa
         clock.now += 16_000
         first = client.post(url + "/signals", headers=headers, json=signal)
         assert first.status_code == 200, first.text
-        assert first.json()["reason"] == "generated"
+        assert first.json()["reason"] == "scheduled"
+        wait_for_fusion(client)
         repeat = dict(signal, event_id="vision-head-down-2", started_at_ms=clock.now-15_000,
                       observed_at_ms=clock.now)
-        assert client.post(url + "/signals", headers=headers, json=repeat).json()["reason"] == "cooldown"
+        assert client.post(url + "/signals", headers=headers, json=repeat).json()["reason"] == "scheduled"
+        wait_for_fusion(client)
         events = client.get(url + "/events", headers=headers).json()["events"]
         assert len(events) == 1
         assert events[0]["phenomenon"] == "画面中可见人物持续低头"
@@ -648,6 +661,11 @@ def test_typed_observations_fuse_by_time_and_platform_notice_preempts(tmp_path):
                     post(url, headers, payload)
                     for payload in [count_payloads[0], count_payloads[1], count_payloads[2], interaction, transcript]
                 ])
+                async def wait_idle():
+                    async with asyncio.timeout(3):
+                        while app.state.live.fusion_active or app.state.live.fusion_queue:
+                            await asyncio.sleep(0.005)
+                await wait_idle()
                 events = (await client.get(url + "/events", headers=headers)).json()["events"]
                 assert len(events) == 1
                 event = events[0]
@@ -696,6 +714,7 @@ def test_typed_observations_fuse_by_time_and_platform_notice_preempts(tmp_path):
                                 "author_id": None, "platform_message_id": None},
                 }
                 await asyncio.gather(post(u2, h2, person), post(u2, h2, comment))
+                await wait_idle()
                 fused = (await client.get(u2 + "/events", headers=h2)).json()["events"]
                 assert len(fused) == 1 and "持续低头" in fused[0]["phenomenon"]
                 assert len(fused[0]["sources"]) == 2
@@ -711,6 +730,7 @@ def test_typed_observations_fuse_by_time_and_platform_notice_preempts(tmp_path):
                                              "author_id": None, "platform_message_id": None})
                                for index in range(2)]
                 await asyncio.gather(*(post(ur, hr, row) for row in repeat_rows))
+                await wait_idle()
                 repeated = (await client.get(ur + "/events", headers=hr)).json()["events"]
                 assert len(repeated) == 1 and "重复出现同一问题主题" in repeated[0]["phenomenon"]
                 assert len(repeated[0]["sources"]) == 2
@@ -777,15 +797,15 @@ def test_stopped_session_online_count_peak_weighted_average_and_gaps(tmp_path):
             assert response.status_code == 200, response.text
             return response.json()
 
-        assert submit("count-100", "在线人数 100人")["reason"] == "windowed"
+        assert submit("count-100", "在线人数 100人")["reason"] == "scheduled"
         clock.now += 2_000
-        assert submit("count-200", "在线人数 200人")["reason"] == "windowed"
+        assert submit("count-200", "在线人数 200人")["reason"] == "scheduled"
         clock.now += 6_000
-        assert submit("count-400", "在线人数约0.4千")["reason"] == "windowed"
+        assert submit("count-400", "在线人数约0.4千")["reason"] == "scheduled"
         clock.now += 2_000
         assert submit("count-missing", availability="missing")["reason"] == "source_missing"
         clock.now += 16_000
-        assert submit("count-500", "0.5千", evidence=True)["reason"] == "windowed"
+        assert submit("count-500", "0.5千", evidence=True)["reason"] == "scheduled"
         assert client.post(url + "/stop", headers=headers).status_code == 200
 
         summary = client.get(url + "/summary", headers=headers)
