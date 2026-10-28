@@ -65,6 +65,7 @@ final class AppModel: ObservableObject {
     private var liveCredentials: LiveSessionCredentials?
     private var liveClient: LiveOperationsClient?
     private var livePollTask: URLSessionDataTask?
+    private var livePollGeneration = 0
     private var liveCursor = ""
     private var liveDelivery = LivePromptDelivery()
     private var liveDisplayedUntilMS: Int64?
@@ -254,6 +255,9 @@ final class AppModel: ObservableObject {
                                            captureImmediately: Bool = true) {
         var activeCredentials = credentials
         if !captureImmediately { activeCredentials.liveConnectionPending = true }
+        livePollGeneration &+= 1
+        livePollTask?.cancel()
+        livePollTask = nil
         liveEvents = []
         overviewLoading = false
         summaryRefreshInFlight = false
@@ -292,6 +296,7 @@ final class AppModel: ObservableObject {
             liveStatus = "没有可停止的场次"
             return
         }
+        livePollGeneration &+= 1
         livePollTask?.cancel()
         livePollTask = nil
         liveDelivery.clear()
@@ -327,10 +332,18 @@ final class AppModel: ObservableObject {
 
     private func pollLivePrompts() {
         guard liveActive, let credentials = liveCredentials, let client = liveClient else { return }
-        livePollTask = client.poll(credentials, after: liveCursor) { [weak self] result in
+        livePollGeneration &+= 1
+        let generation = livePollGeneration
+        livePollTask = client.poll(credentials, after: liveCursor) { [weak self] result, response, transportError in
             DispatchQueue.main.async {
-                guard let self, self.liveActive, !self.liveStopping,
-                      self.liveCredentials?.sessionID == credentials.sessionID else { return }
+                guard let self else { return }
+                guard PollCallbackGate.commitIfCurrent(
+                    sessionID: credentials.sessionID, generation: generation,
+                    currentSessionID: self.liveCredentials?.sessionID,
+                    currentGeneration: self.livePollGeneration,
+                    active: self.liveActive, stopping: self.liveStopping,
+                    commit: { ControlState.recordServiceResponse(error: transportError, response: response) }
+                ) else { return }
                 switch result {
                 case .success(let page):
                     self.liveCursor = page.nextCursor
@@ -370,7 +383,7 @@ final class AppModel: ObservableObject {
                             confirmedCredentials.liveConnectionPending = false
                             guard LiveSessionState.save(confirmedCredentials) else {
                                 self.liveStatus = "同场实时收件已响应，但授权状态无法保存；暂未启用采集"
-                                self.scheduleLivePromptRetry(sessionID: credentials.sessionID)
+                                self.scheduleLivePromptRetry(sessionID: credentials.sessionID, generation: generation)
                                 return
                             }
                             self.liveCredentials = confirmedCredentials
@@ -388,7 +401,7 @@ final class AppModel: ObservableObject {
                     self.liveStatus = self.liveConnectionPending
                         ? Self.liveVerificationFailureMessage(error)
                         : "运营收件暂不可用，正在重试"
-                    self.scheduleLivePromptRetry(sessionID: credentials.sessionID)
+                    self.scheduleLivePromptRetry(sessionID: credentials.sessionID, generation: generation)
                 }
             }
         }
@@ -412,10 +425,11 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func scheduleLivePromptRetry(sessionID: String) {
+    private func scheduleLivePromptRetry(sessionID: String, generation: Int) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
             guard let self, self.liveActive, !self.liveStopping,
-                  self.liveCredentials?.sessionID == sessionID else { return }
+                  self.liveCredentials?.sessionID == sessionID,
+                  self.livePollGeneration == generation else { return }
             self.pollLivePrompts()
         }
     }

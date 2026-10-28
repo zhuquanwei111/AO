@@ -295,19 +295,20 @@ struct LiveOperationsClient {
     }
 
     func poll(_ credentials: LiveSessionCredentials, after: String,
-              completion: @escaping (Result<LivePromptPage, Error>) -> Void) -> URLSessionDataTask {
+              completion: @escaping (Result<LivePromptPage, Error>, URLResponse?, Error?) -> Void) -> URLSessionDataTask {
         var components = URLComponents(url: endpoint("v1", "live", "sessions", credentials.sessionID, "prompts"), resolvingAgainstBaseURL: false)!
         components.queryItems = [URLQueryItem(name: "after", value: after), URLQueryItem(name: "wait_ms", value: "15000")]
         let request = authorized(components.url!, token: credentials.token)
         let task = session.dataTask(with: request) { data, response, error in
-            switch Self.decode(LivePromptPage.self, data: data, response: response, error: error) {
-            case .failure(let error): completion(.failure(error))
+            switch Self.decode(LivePromptPage.self, data: data, response: response, error: error,
+                               recordResponse: false) {
+            case .failure(let failure): completion(.failure(failure), response, error)
             case .success(let page):
                 guard page.sessionID == credentials.sessionID else {
-                    completion(.failure(NSError(domain: "LiveOperations", code: -3)))
+                    completion(.failure(NSError(domain: "LiveOperations", code: -3)), response, error)
                     return
                 }
-                completion(.success(page))
+                completion(.success(page), response, error)
             }
         }
         task.resume()
@@ -441,18 +442,19 @@ struct LiveOperationsClient {
     }
 
     private static func decode<T: Decodable>(_ type: T.Type, data: Data?, response: URLResponse?, error: Error?,
-                                             acceptedStatusCodes: Set<Int> = [200]) -> Result<T, Error> {
+                                             acceptedStatusCodes: Set<Int> = [200],
+                                             recordResponse: Bool = true) -> Result<T, Error> {
         if let error {
-            ControlState.recordServiceResponse(error: error, response: response)
+            if recordResponse { ControlState.recordServiceResponse(error: error, response: response) }
             return .failure(error)
         }
         let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard acceptedStatusCodes.contains(statusCode), let data else {
-            ControlState.recordServiceResponse(error: nil, response: response)
+            if recordResponse { ControlState.recordServiceResponse(error: nil, response: response) }
             let detail = data.flatMap { try? JSONDecoder().decode(LiveOperationsErrorPayload.self, from: $0).detail }
             return .failure(LiveOperationsHTTPError(statusCode: statusCode, detail: detail))
         }
-        ControlState.recordServiceResponse(error: nil, response: response)
+        if recordResponse { ControlState.recordServiceResponse(error: nil, response: response) }
         do { return .success(try JSONDecoder().decode(type, from: data)) }
         catch { return .failure(error) }
     }
