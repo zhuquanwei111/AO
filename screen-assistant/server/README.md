@@ -48,6 +48,8 @@ agent/RAG/历史上下文/个性化；不持久化句子或回复日志。
 
 实时观察已保存并安排分析时返回 `status=accepted`、`reason=scheduled`、`prompt_id=null`；队列满而观察已保存时 `reason=analysis_busy`，本次不安排分析。结果仍通过 `/prompts` 获取，`scheduled` 不表示已生成提示。上述上限是进程内保护值，不是性能保证；进程退出后未完成的内存调度不会自动恢复。
 
+音频响应含 `transcripts` 时，`fusion_schedule` 标记本次融合触发为 `scheduled` 或 `analysis_busy`；该字段不表示提示已生成，也不概括后台音频作业的其他触发。没有返回转写时不提供该字段。
+
 ## 启动路径
 
 ### 非 Docker（Windows 本机已验证）

@@ -358,6 +358,28 @@ def test_empty_end_packet_flushes_existing_pcm_and_retired_capture_stays_out(tmp
         assert client.post(url, headers=headers, json=end).status_code == 409
 
 
+@pytest.mark.parametrize("scheduled, expected", [(True, "scheduled"), (False, "analysis_busy")])
+def test_audio_reports_transcript_fusion_schedule(tmp_path, scheduled, expected):
+    clock = Clock()
+    app, configure = fixture_app(tmp_path, clock)
+    with TestClient(app) as client:
+        configure()
+        app.state.live.schedule_fusion = lambda sid, token, request: scheduled
+        session, headers = create(client)
+        clock.now += 20_000
+        url = f"/v1/live/sessions/{session['session_id']}/audio"
+        assert client.post(url, headers=headers, json=packet()).status_code == 200
+        response = client.post(url, headers=headers,
+                               json=packet(1, pcm_base64='', spans=[], final=True))
+        assert response.status_code == 200
+        result = response.json()
+        assert result['status'] == 'accepted' and len(result['transcripts']) == 2
+        assert result['fusion_schedule'] == expected
+        assert app.state.live.store.db.execute(
+            'SELECT COUNT(*) FROM live_observations WHERE session_id=?', (session['session_id'],)
+        ).fetchone()[0] == 2
+
+
 def test_abandoned_capture_pcm_expires_without_a_new_request(tmp_path):
     async def run():
         from screen_assistant_server.live import LiveService

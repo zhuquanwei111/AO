@@ -494,5 +494,6 @@ async def audio_packet(session_id: str, request: Request,
         raise HTTPException(422, "invalid bounded PCM packet") from None
     result = await service.ingest(session_id, token, packet)
     if result["transcripts"]:
-        request.app.state.live.schedule_fusion(session_id, token, request)
+        scheduled = request.app.state.live.schedule_fusion(session_id, token, request)
+        result["fusion_schedule"] = "scheduled" if scheduled else "analysis_busy"
     return result
