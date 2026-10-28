@@ -54,6 +54,7 @@ final class PiPDisplayController: NSObject, ObservableObject {
     private var lastRenderedCGImage: CGImage?
     private var lastDisplayedText: String?
     private var lastDisplayedKind: DisplayKind?
+    private var liveContentActive = false
     private var isPlaying = true
 
     private enum DisplayKind: Equatable {
@@ -241,9 +242,65 @@ final class PiPDisplayController: NSObject, ObservableObject {
         showContent(text, kind: .operation)
     }
 
+    /// 必须在主线程调用；仅表示选中并生成帧，不代表系统 PiP 已显示。
+    func showLiveFrame(_ items: [LivePromptDelivery.Item]) -> Bool {
+        guard pipController != nil, !items.isEmpty else { return false }
+        var text = liveFrameText(items)
+        if !liveTextFits(text) {
+            let characters = Array(text)
+            var low = 0
+            var high = characters.count
+            while low < high {
+                let middle = (low + high + 1) / 2
+                if liveTextFits(String(characters.prefix(middle)) + "…") { low = middle }
+                else { high = middle - 1 }
+            }
+            text = String(characters.prefix(low)) + "…"
+        }
+        let image = renderReplyFrame(text, kind: .operation)
+        lastRenderedCGImage = image
+        lastDisplayedText = text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        lastDisplayedKind = .operation
+        liveContentActive = true
+        if isPlaying { enqueue(image) }
+        lastReplyAt = Date()
+        return true
+    }
+
+    func liveFrameFits(_ items: [LivePromptDelivery.Item]) -> Bool {
+        liveTextFits(liveFrameText(items))
+    }
+
+    var canShowLiveFrame: Bool { pipController != nil }
+
+    func endLiveContent() {
+        guard liveContentActive else { return }
+        liveContentActive = false
+        lastDisplayedText = nil
+        lastDisplayedKind = nil
+        lastRenderedCGImage = placeholderFrame()
+        if isPlaying, let image = lastRenderedCGImage { enqueue(image) }
+    }
+
+    private func liveFrameText(_ items: [LivePromptDelivery.Item]) -> String {
+        items.map { PiPTextFormatter.plainText($0.text) }.joined(separator: "\n")
+    }
+
+    private func liveTextFits(_ text: String) -> Bool {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byWordWrapping
+        paragraph.lineSpacing = 4
+        let bounds = (text as NSString).boundingRect(
+            with: CGSize(width: 592, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: UIFont.systemFont(ofSize: 26), .paragraphStyle: paragraph],
+            context: nil)
+        return ceil(bounds.height) <= 274
+    }
+
     /// 只在用户已启动 PiP 时显示最近真实请求的服务状态；不尝试启动系统 PiP。
     func showConnectionStatus(_ text: String) {
-        guard pipController != nil,
+        guard !liveContentActive, pipController != nil,
               state == .starting || state == .running || state == .suspended else { return }
         showContent(text, kind: .connection)
     }
@@ -251,6 +308,7 @@ final class PiPDisplayController: NSObject, ObservableObject {
     private func showContent(_ rawText: String, kind: DisplayKind) {
         DispatchQueue.main.async { [weak self] in
             guard let self, self.pipController != nil else { return }
+            guard !self.liveContentActive || kind == .operation else { return }
             let text = PiPTextFormatter.plainText(rawText)
             guard !text.isEmpty else { return }
             let comparisonText = text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")

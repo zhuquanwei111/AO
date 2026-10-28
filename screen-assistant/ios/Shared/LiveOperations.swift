@@ -75,13 +75,21 @@ struct LivePrompt: Codable, Identifiable {
     let suggestion: String
     let displayText: String
     let observationCount: Int
+    let expiresAtMS: Int64?
+    let priority: Int?
+    let sources: [LivePromptSource]?
     var id: String { promptID }
     enum CodingKeys: String, CodingKey {
         case promptID = "prompt_id", inputMode = "input_mode"
         case startAtMS = "start_at_ms", endAtMS = "end_at_ms"
         case phenomenon, suggestion, displayText = "display_text"
         case observationCount = "observation_count"
+        case expiresAtMS = "expires_at_ms", priority, sources
     }
+}
+
+struct LivePromptSource: Codable {
+    let kind: String?
 }
 
 struct LivePromptPage: Decodable {

@@ -66,6 +66,8 @@ final class AppModel: ObservableObject {
     private var liveClient: LiveOperationsClient?
     private var livePollTask: URLSessionDataTask?
     private var liveCursor = ""
+    private var liveDelivery = LivePromptDelivery()
+    private var liveDisplayedUntilMS: Int64?
     private var summaryRefreshInFlight = false
     private var lastServiceConnection = ControlState.serviceConnection()
 
@@ -124,6 +126,7 @@ final class AppModel: ObservableObject {
                     now: Date()
                 )
                 self.refreshServiceConnectionStatus()
+                self.deliverLivePrompts()
             }
 
         if liveActive, let credentials = Self.savedCredentials() {
@@ -271,6 +274,9 @@ final class AppModel: ObservableObject {
         liveStatus = status
         liveConnectionPending = activeCredentials.liveConnectionPending == true
         liveEvents = []
+        liveDelivery.clear()
+        liveDisplayedUntilMS = nil
+        PiPDisplayController.shared.endLiveContent()
         liveSummary = nil
         liveCursor = ""
         captureWanted = captureImmediately && !liveConnectionPending
@@ -286,6 +292,9 @@ final class AppModel: ObservableObject {
         }
         livePollTask?.cancel()
         livePollTask = nil
+        liveDelivery.clear()
+        liveDisplayedUntilMS = nil
+        PiPDisplayController.shared.endLiveContent()
         captureWanted = false
         liveConnectionPending = false
         var stoppingCredentials = credentials
@@ -323,14 +332,28 @@ final class AppModel: ObservableObject {
                 switch result {
                 case .success(let page):
                     self.liveCursor = page.nextCursor
-                    let known = Set(self.liveEvents.map(\.promptID))
-                    let fresh = page.prompts.filter { !known.contains($0.promptID) }
-                    self.liveEvents.insert(contentsOf: fresh, at: 0)
-                    self.liveEvents = Array(self.liveEvents.prefix(100))
-                    if let prompt = fresh.last {
-                        PiPDisplayController.shared.showLivePrompt(prompt.displayText)
+                    let now = Int64(Date().timeIntervalSince1970 * 1000)
+                    let items = page.prompts.map { prompt in
+                        let label = prompt.sources?.contains(where: { $0.kind == "comment" }) == true ? "问答" : "运营"
+                        return LivePromptDelivery.Item(id: prompt.promptID,
+                            text: "【\(label)】" + prompt.displayText,
+                            expiresAtMS: prompt.expiresAtMS ?? 0,
+                            priority: prompt.priority ?? 0)
                     }
+                    let beforeOverflow = self.liveDelivery.overflowCount
+                    let beforeExpired = self.liveDelivery.expiredCount
+                    var acceptedIDs = Set(self.liveDelivery.receive(items, nowMS: now).map(\.id))
+                    let fresh = page.prompts.filter { acceptedIDs.remove($0.promptID) != nil }
+                    self.liveEvents.insert(contentsOf: fresh, at: 0)
+                    if !fresh.isEmpty { NSLog("Live prompt delivery: received=%d", fresh.count) }
+                    if self.liveDelivery.overflowCount != beforeOverflow || self.liveDelivery.expiredCount != beforeExpired {
+                        NSLog("Live prompt delivery: overflow=%d expired=%d", self.liveDelivery.overflowCount, self.liveDelivery.expiredCount)
+                    }
+                    if !page.stopped { self.deliverLivePrompts() }
                     if page.stopped {
+                        self.liveDelivery.clear()
+                        self.liveDisplayedUntilMS = nil
+                        PiPDisplayController.shared.endLiveContent()
                         self.liveStatus = "服务端场次已停止"
                         self.liveActive = false
                         self.liveStopped = true
@@ -345,7 +368,7 @@ final class AppModel: ObservableObject {
                             confirmedCredentials.liveConnectionPending = false
                             guard LiveSessionState.save(confirmedCredentials) else {
                                 self.liveStatus = "同场实时收件已响应，但授权状态无法保存；暂未启用采集"
-                                self.scheduleLivePromptRetry()
+                                self.scheduleLivePromptRetry(sessionID: credentials.sessionID)
                                 return
                             }
                             self.liveCredentials = confirmedCredentials
@@ -363,15 +386,34 @@ final class AppModel: ObservableObject {
                     self.liveStatus = self.liveConnectionPending
                         ? Self.liveVerificationFailureMessage(error)
                         : "运营收件暂不可用，正在重试"
-                    self.scheduleLivePromptRetry()
+                    self.scheduleLivePromptRetry(sessionID: credentials.sessionID)
                 }
             }
         }
     }
 
-    private func scheduleLivePromptRetry() {
+    private func deliverLivePrompts() {
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        if let expiry = liveDisplayedUntilMS, expiry <= now {
+            PiPDisplayController.shared.endLiveContent()
+            liveDisplayedUntilMS = nil
+        }
+        guard liveActive, !liveStopping, PiPDisplayController.shared.canShowLiveFrame else { return }
+        let beforeExpired = liveDelivery.expiredCount
+        let frame = liveDelivery.take(nowMS: now) { PiPDisplayController.shared.liveFrameFits($0) }
+        if liveDelivery.expiredCount != beforeExpired {
+            NSLog("Live prompt delivery: expired=%d", liveDelivery.expiredCount)
+        }
+        if !frame.isEmpty, PiPDisplayController.shared.showLiveFrame(frame) {
+            liveDisplayedUntilMS = frame.map(\.expiresAtMS).min()
+            NSLog("Live prompt delivery: selected=%d", frame.count)
+        }
+    }
+
+    private func scheduleLivePromptRetry(sessionID: String) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            guard let self, self.liveActive, !self.liveStopping else { return }
+            guard let self, self.liveActive, !self.liveStopping,
+                  self.liveCredentials?.sessionID == sessionID else { return }
             self.pollLivePrompts()
         }
     }
@@ -527,7 +569,7 @@ final class AppModel: ObservableObject {
             guard let self else { return }
             self.overviewLoading = false
             self.summaryRefreshInFlight = false
-            self.liveEvents = fetchedEvents?.events ?? []
+            if let events = fetchedEvents?.events { self.liveEvents = events }
             self.liveSummary = fetchedSummary
             self.finishCredentialRetentionIfTerminal(fetchedSummary?.backstageRecap?.status)
             switch (fetchedEvents, fetchedSummary) {
