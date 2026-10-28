@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 import time
@@ -74,8 +75,15 @@ def create_app(settings: Settings | None = None, *, live_clock=None) -> FastAPI:
                                      concurrency=cfg.live_fusion_concurrency,
                                      queue_limit=cfg.live_fusion_queue_limit)
         app.state.audio = AudioService(cfg, app.state.live)
-        async def deliver_audio(sid, token):
-            app.state.live.schedule_fusion(sid, token, SimpleNamespace(app=app))
+        async def deliver_audio(sid, token, has_transcripts):
+            scheduled = app.state.live.schedule_fusion(sid, token, SimpleNamespace(app=app))
+            if not scheduled and has_transcripts:
+                record = asyncio.create_task(app.state.live.run("record_audio_fusion_busy", sid, token))
+                try:
+                    await asyncio.shield(record)
+                except asyncio.CancelledError:
+                    await record
+                    raise
         app.state.audio.deliver = deliver_audio
         redis = Redis.from_url(cfg.redis_url, decode_responses=True)
         app.state.redis = redis

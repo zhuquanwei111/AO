@@ -380,6 +380,59 @@ def test_audio_reports_transcript_fusion_schedule(tmp_path, scheduled, expected)
         ).fetchone()[0] == 2
 
 
+def test_background_audio_busy_is_durable_and_session_scoped(tmp_path):
+    clock = Clock()
+    app, configure = fixture_app(tmp_path, clock)
+    with TestClient(app) as client:
+        configure()
+        app.state.live.schedule_fusion = lambda sid, token, request: False
+        session, headers = create(client)
+        other, other_headers = create(client)
+        url = f"/v1/live/sessions/{session['session_id']}"
+        clock.now += 10_000
+        for seq in range(10):
+            response = client.post(url + "/audio", headers=headers, json=packet(seq, start=seq * 600))
+            assert response.status_code == 200
+        async def wait_job():
+            track = app.state.audio.tracks[(session['session_id'], 'audioMic')]
+            await asyncio.wait_for(track.job, 2)
+        client.portal.call(wait_job)
+        summary = client.get(url + "/summary", headers=headers).json()
+        assert summary['audio_fusion']['background_analysis_busy_count'] == 1
+        other_url = f"/v1/live/sessions/{other['session_id']}"
+        assert client.get(other_url + "/summary", headers=other_headers).json()['audio_fusion']['background_analysis_busy_count'] == 0
+        assert client.get(url + "/summary", headers=other_headers).status_code == 403
+        assert client.post(url + "/stop", headers=headers).status_code == 200
+    reopened = create_app(settings(tmp_path / "live.sqlite3"), live_clock=clock)
+    with TestClient(reopened) as client:
+        assert client.get(url + "/summary", headers=headers).json()['audio_fusion']['background_analysis_busy_count'] == 1
+
+
+def test_background_busy_record_survives_cancellation(tmp_path):
+    import httpx
+    async def run():
+        clock = Clock()
+        app = create_app(settings(tmp_path / "cancel.sqlite3"), live_clock=clock)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fixture") as client:
+                session = (await client.post("/v1/live/sessions", json={})).json()
+                sid, token = session['session_id'], session['session_token']
+                app.state.live.schedule_fusion = lambda *args: False
+                await app.state.live.lock.acquire()
+                try:
+                    task = asyncio.create_task(app.state.audio.deliver(sid, token, True))
+                    await asyncio.sleep(0)
+                    task.cancel()
+                finally:
+                    app.state.live.lock.release()
+                result = await asyncio.gather(task, return_exceptions=True)
+                assert isinstance(result[0], asyncio.CancelledError)
+                summary = await client.get(f"/v1/live/sessions/{sid}/summary",
+                                           headers={"X-Live-Session-Token": token})
+                assert summary.json()['audio_fusion']['background_analysis_busy_count'] == 1
+    asyncio.run(run())
+
+
 def test_abandoned_capture_pcm_expires_without_a_new_request(tmp_path):
     async def run():
         from screen_assistant_server.live import LiveService

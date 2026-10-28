@@ -50,6 +50,8 @@ agent/RAG/历史上下文/个性化；不持久化句子或回复日志。
 
 音频响应含 `transcripts` 时，`fusion_schedule` 标记本次融合触发为 `scheduled` 或 `analysis_busy`；该字段不表示提示已生成，也不概括后台音频作业的其他触发。没有返回转写时不提供该字段。
 
+后台音频转写保存后若融合触发因容量或关闭门禁未安排，场次 `/summary` 的 `audio_fusion.background_analysis_busy_count` 持久累计这类后台触发次数，初始为 0。计数不含转写正文、不自动重试，也不表示某条提示的最终状态。
+
 ## 启动路径
 
 ### 非 Docker（Windows 本机已验证）

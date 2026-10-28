@@ -343,10 +343,10 @@ class AudioService:
         async def work():
             try:
                 async with asyncio.timeout(15):
-                    await self.analyze(sid, token, source, snapshot, track.transcripts,
-                                       app_source=app_source, owner=track)
+                    emitted = await self.analyze(sid, token, source, snapshot, track.transcripts,
+                                                 app_source=app_source, owner=track)
                 if hasattr(self, "deliver"):
-                    await self.deliver(sid, token)
+                    await self.deliver(sid, token, emitted > 0)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -357,7 +357,8 @@ class AudioService:
 
     async def analyze(self, sid, token, source, track, output, *, app_source="ios_app", owner=None):
         if not track.pending:
-            return
+            return 0
+        emitted = 0
         pcm = bytes(track.pending)
         track.pending.clear()
         start = track.window_start
@@ -377,7 +378,7 @@ class AudioService:
             segment_start, segment_end = start+Fraction(left, RATE), start+Fraction(right, RATE)
             start_ms, end_ms = self.mapped_ms(track, segment_start), self.mapped_ms(track, segment_end)
             async def emit(text, final, mode):
-                nonlocal revision, previous_id
+                nonlocal revision, previous_id, emitted
                 if owner and owner.continuity_id != track.continuity_id:
                     raise AudioEngineUnavailable("audio continuity changed during recognition")
                 if revision > 99:
@@ -412,8 +413,10 @@ class AudioService:
                 # 复用M4观察去重/时间窗/提示；原始音频不进入此路径。
                 await self.live.run("add_observation", sid, token, body, self.live.clock())
                 output.append(body)
+                emitted += 1
                 previous_id, revision = event_id, revision+1
             await self.asr.transcribe(pcm[left*2:right*2], segment_id, emit)
+        return emitted
 
     async def finish_session(self, sid, token):
         session = await self.access(sid, token)
