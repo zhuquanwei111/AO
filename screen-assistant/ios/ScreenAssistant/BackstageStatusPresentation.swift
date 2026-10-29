@@ -14,7 +14,7 @@ enum BackstageStatusPresentation {
         case "capturing":
             return "取数任务已领取，等待本场结果"
         case "not_connected":
-            return "本场后台取数不可用，未取得本场复盘；不自动补领"
+            return "后台当前未连接，暂无本场复盘；后续状态以服务端回报为准。此状态不代表实时辅助已停用。"
         case "captured_locally":
             return receivedMetricCount == 5 ? "后台五项汇总已收到" : "后台结果状态已返回，五项读数待确认"
         case "partial":
