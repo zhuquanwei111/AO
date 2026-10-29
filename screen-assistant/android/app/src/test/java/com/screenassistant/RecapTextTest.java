@@ -22,11 +22,29 @@ public class RecapTextTest {
         assertFalse(text.contains("1793077210500"));
         assertTrue(RecapText.terminal(new JSONObject().put("stopped_at_ms",123).put("backstage_recap",recap)));
     }
-    @Test public void notConnectedRemainsPendingAndDoesNotShowInventedZero() throws Exception {
+    @Test public void notConnectedIsUnavailableNotPendingAndDoesNotShowInventedZero() throws Exception {
         JSONObject data=new JSONObject().put("stopped_at_ms",123).put("backstage_recap",
                 new JSONObject().put("status","not_connected").put("metrics",JSONObject.NULL));
-        assertTrue(RecapText.pending(data)); assertFalse(RecapText.terminal(data));
+        assertFalse(RecapText.pending(data)); assertTrue(RecapText.terminal(data));
+        assertTrue(RecapText.backstage(data.getJSONObject("backstage_recap")).contains("本场后台复盘不可取数"));
         assertTrue(RecapText.backstage(data.getJSONObject("backstage_recap")).contains("新增粉丝：未取得"));
         assertFalse(RecapText.backstage(data.getJSONObject("backstage_recap")).contains("新增粉丝：0"));
+        data.put("stopped_at_ms",JSONObject.NULL);
+        assertFalse(RecapText.pending(data)); assertFalse(RecapText.terminal(data));
+    }
+
+    @Test public void activeWorkWaitsAndFailedOrCapturedRemainTerminal() throws Exception {
+        for (String status : new String[]{"waiting_for_stop", "capturing"}) {
+            JSONObject data=new JSONObject().put("stopped_at_ms",123)
+                    .put("backstage_recap",new JSONObject().put("status",status));
+            assertTrue(status,RecapText.pending(data)); assertFalse(status,RecapText.terminal(data));
+        }
+        for (String status : new String[]{"failed", "captured_locally", "partial"}) {
+            JSONObject data=new JSONObject().put("stopped_at_ms",123)
+                    .put("backstage_recap",new JSONObject().put("status",status));
+            assertFalse(status,RecapText.pending(data)); assertTrue(status,RecapText.terminal(data));
+        }
+        assertTrue(RecapText.backstage(new JSONObject().put("status","failed")).contains("取数失败"));
+        assertTrue(RecapText.backstage(new JSONObject().put("status","captured_locally")).contains("已读取五项"));
     }
 }

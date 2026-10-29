@@ -24,6 +24,7 @@ public class LiveConnectionTest {
     static class Remote implements LiveConnection.Remote {
         int creates, starts, stops, polls;
         Exception createError, startError, pollError, stopError, summaryError;
+        String startStatus = "failed", summaryStatus = "failed";
         Runnable duringCreate, duringPoll;
         String lastCursor;
         String stoppedId;
@@ -39,12 +40,12 @@ public class LiveConnectionTest {
             assertEquals(SESSION.id, s.id);
             assertEquals(SESSION.baseUrl, s.baseUrl);
             return new JSONObject().put("session_id", s.id).put("stopped_at_ms", JSONObject.NULL)
-                    .put("backstage_recap", new JSONObject().put("status", "failed"));
+                    .put("backstage_recap", new JSONObject().put("status", summaryStatus));
         }
         public JSONObject start(LiveClient.Session s) throws Exception {
             starts++;
             if (startError != null) throw startError;
-            return new JSONObject().put("task_status", "failed");
+            return new JSONObject().put("task_status", startStatus);
         }
         public JSONObject poll(LiveClient.Session s, String cursor) throws Exception {
             polls++; lastCursor = cursor;
@@ -96,6 +97,22 @@ public class LiveConnectionTest {
         assertEquals(0, remote.creates); assertEquals(0, remote.stops);
         assertEquals(1, display.bindings); assertEquals("实际运营建议", display.messages.get(0));
         assertTrue(display.overlay.textAt(1000).contains("复盘登记未确认"));
+    }
+
+    @Test public void busyRecapIsUnavailableButRealPromptStillArrivesWithoutRequeue() throws Exception {
+        Memory store = new Memory(); store.session = SESSION;
+        Remote remote = new Remote(); Display display = new Display();
+        java.util.concurrent.atomic.AtomicLong clock = new java.util.concurrent.atomic.AtomicLong();
+        remote.startStatus = "not_connected"; remote.summaryStatus = "not_connected";
+        remote.page.getJSONArray("prompts").put(new JSONObject().put("display_text", "实际运营建议"));
+        LiveConnection connection = new LiveConnection(store, remote, display, clock::get);
+        assertTrue(connection.connect()); assertTrue(connection.poll());
+        assertEquals(1, display.bindings); assertEquals("实际运营建议", display.messages.get(0));
+        assertTrue(display.overlay.textAt(1000).contains("本场复盘不可取数"));
+        assertEquals(0, remote.stops); assertEquals(0, display.ended);
+        clock.set(30001); assertTrue(connection.poll());
+        assertEquals(1, remote.starts); assertEquals(0, remote.creates);
+        assertEquals(0, remote.stops); assertEquals(0, display.ended);
     }
 
     @Test public void pollingRecoversSameCredentialsAndCursorWithoutCreatingAgain() throws Exception {

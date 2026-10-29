@@ -10,14 +10,14 @@ final class RecapText {
         JSONObject recap=summary.optJSONObject("backstage_recap");
         if (recap==null) return false;
         String status=recap.optString("status");
-        return status.equals("waiting_for_stop") || status.equals("not_connected") || status.equals("capturing");
+        return status.equals("waiting_for_stop") || status.equals("capturing");
     }
     static boolean terminal(JSONObject summary) {
         JSONObject recap=summary.optJSONObject("backstage_recap");
         if (recap==null || summary.isNull("stopped_at_ms")) return false;
         String status=recap.optString("status");
         return status.equals("captured_locally") || status.equals("partial") || status.equals("needs_input")
-                || status.equals("failed") || status.equals("not_configured");
+                || status.equals("failed") || status.equals("not_configured") || status.equals("not_connected");
     }
     static String backstage(JSONObject recap) {
         if (recap==null) return "后台五项：服务尚未提供，未取得数据";
@@ -42,7 +42,7 @@ final class RecapText {
         s.append("\n采集时间：").append(value(recap,"metrics_captured_at"));
         if (!recap.isNull("capture_method")) s.append("\n采集方式：").append(value(recap,"capture_method"));
         if (!recap.isNull("value_semantics")) s.append("\n口径：").append(value(recap,"value_semantics"));
-        s.append("\n这是停止信号后读到的页面汇总；音浪不换算金额，评论人数不是弹幕条数。");
+        s.append("\n后台五项按停止信号后的页面汇总口径；音浪不换算金额，评论人数不是弹幕条数。");
         return s.toString();
     }
     private static String value(JSONObject o,String key) { return !o.has(key)||o.isNull(key)?"未提供":o.optString(key); }
@@ -51,7 +51,7 @@ final class RecapText {
             case "not_configured": return "未配置抖音号";
             case "not_started": return "后台任务尚未启动";
             case "waiting_for_stop": return "等待本场结束";
-            case "not_connected": return "已结束，后台取数执行器尚未连接";
+            case "not_connected": return "本场后台复盘不可取数";
             case "capturing": return "后台正在取数";
             case "captured_locally": return "已读取五项";
             case "partial": return "部分数据缺失";

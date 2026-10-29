@@ -210,7 +210,7 @@ final class LiveConnection {
             case "not_configured": return "复盘未配置抖音号";
             case "waiting_for_stop": return "复盘等待本场结束";
             case "capturing": return "复盘取数中";
-            case "not_connected": return "复盘执行器未连接";
+            case "not_connected": return "本场复盘不可取数";
             case "captured_locally": return "复盘五项已读取";
             case "partial": return "复盘部分数据缺失";
             default: return "复盘状态待核对";
