@@ -66,6 +66,7 @@ final class AppModel: ObservableObject {
     private var liveClient: LiveOperationsClient?
     private var livePollTask: URLSessionDataTask?
     private var livePollGeneration = 0
+    private var liveStartGeneration = 0
     private var liveCursor = ""
     private var liveDelivery = LivePromptDelivery()
     private var liveDisplayedUntilMS: Int64?
@@ -181,10 +182,14 @@ final class AppModel: ObservableObject {
             return
         }
         liveStarting = true
+        liveStartGeneration &+= 1
+        let generation = liveStartGeneration
         liveStatus = "正在创建场次…"
         client.create(description: liveDescription, douyinAccount: account) { [weak self] result in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, BackstageStatusPresentation.acceptsStartCallback(
+                    generation: generation, currentGeneration: self.liveStartGeneration,
+                    starting: self.liveStarting, stopping: self.liveStopping) else { return }
                 switch result {
                 case .success(let credentials):
                     var pendingCredentials = credentials
@@ -199,7 +204,10 @@ final class AppModel: ObservableObject {
                     }
                     client.start(pendingCredentials) { [weak self] startResult in
                         DispatchQueue.main.async {
-                            guard let self else { return }
+                            guard let self, BackstageStatusPresentation.acceptsStartCallback(
+                                    generation: generation, currentGeneration: self.liveStartGeneration,
+                                    starting: self.liveStarting, stopping: self.liveStopping),
+                                  Self.savedCredentials()?.sessionID == pendingCredentials.sessionID else { return }
                             self.liveStarting = false
                             switch startResult {
                             case .success(let activeCredentials):
@@ -218,26 +226,15 @@ final class AppModel: ObservableObject {
                                 self.activateLivePromptSession(
                                     activeCredentials,
                                     client: client,
-                                    status: "后台场次已就绪；请按下方步骤启动本机提示与屏幕广播"
+                                    status: BackstageStatusPresentation.active(status: activeCredentials.backstageStatus)
                                 )
                             case .failure(let error):
-                                if (error as? LiveOperationsHTTPError)?.isBackstageTaskBusy == true {
-                                    var recapBusy = pendingCredentials
-                                    recapBusy.backstageStartPending = false
-                                    recapBusy.liveConnectionPending = false
-                                    self.activateLivePromptSession(
-                                        recapBusy,
-                                        client: client,
-                                        status: "后台复盘任务繁忙；本场实时提示仍可继续，五项汇总可能缺失"
-                                    )
-                                } else {
-                                    self.activateLivePromptSession(
-                                        pendingCredentials,
-                                        client: client,
-                                        status: Self.startOutcomePendingMessage(error),
-                                        captureImmediately: false
-                                    )
-                                }
+                                self.activateLivePromptSession(
+                                    pendingCredentials,
+                                    client: client,
+                                    status: Self.startOutcomePendingMessage(error),
+                                    captureImmediately: false
+                                )
                             }
                         }
                     }
@@ -296,6 +293,8 @@ final class AppModel: ObservableObject {
             liveStatus = "没有可停止的场次"
             return
         }
+        liveStartGeneration &+= 1
+        liveStarting = false
         livePollGeneration &+= 1
         livePollTask?.cancel()
         livePollTask = nil
@@ -393,7 +392,7 @@ final class AppModel: ObservableObject {
                                 ? "同场实时收件已响应；后台复盘任务状态未知，未重复启动"
                                 : "同场实时收件已响应；已恢复本机采集"
                         } else if self.liveStatus == "运营收件暂不可用，正在重试" {
-                            self.liveStatus = "后台场次已就绪；运营收件已恢复"
+                            self.liveStatus = BackstageStatusPresentation.recovered(status: credentials.backstageStatus)
                         }
                         self.pollLivePrompts()
                     }
@@ -600,7 +599,7 @@ final class AppModel: ObservableObject {
                 self.liveStatus = "本场已结束；概览和记录暂不可读取"
             }
             if let recap = fetchedSummary?.backstageRecap {
-                self.liveStatus = self.backstageStatusText(recap.status)
+                self.liveStatus = BackstageStatusPresentation.summary(status: recap.status, claimedAtMS: recap.claimedAtMS)
             } else if fetchedSummary != nil {
                 self.liveStatus = "本场事件记录已读取；服务未返回后台五项任务记录，结果保持未知"
             }
@@ -629,7 +628,7 @@ final class AppModel: ObservableObject {
                 }
                 self.liveSummary = summary
                 if let recap = summary.backstageRecap {
-                    self.liveStatus = self.backstageStatusText(recap.status)
+                    self.liveStatus = BackstageStatusPresentation.summary(status: recap.status, claimedAtMS: recap.claimedAtMS)
                     self.finishCredentialRetentionIfTerminal(recap.status)
                 } else {
                     self.liveStatus = "服务未返回后台五项任务记录，结果保持未知"
@@ -643,19 +642,6 @@ final class AppModel: ObservableObject {
             return
         }
         LiveSessionState.clear()
-    }
-
-    private func backstageStatusText(_ status: String) -> String {
-        switch status {
-        case "waiting_for_stop": return "后台任务已绑定，等待结束信号"
-        case "capturing": return "已结束，后台汇总处理中"
-        case "not_connected": return "已结束；后台执行器未连接，结果待处理"
-        case "captured_locally": return "后台五项汇总已收到"
-        case "partial": return "后台汇总部分缺失，请核对缺项"
-        case "needs_input": return "后台任务需要处理后重试"
-        case "failed": return "后台汇总失败，请检查任务状态"
-        default: return "本场后台汇总状态：\(status)"
-        }
     }
 
     private static func savedCredentials() -> LiveSessionCredentials? {
