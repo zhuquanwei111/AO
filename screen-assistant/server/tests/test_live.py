@@ -271,8 +271,10 @@ def test_backstage_worker_unconfigured_and_result_validation(tmp_path):
         assert client.post("/v1/live/sessions/backstage/tasks/claim").status_code == 503
         session, headers = create(client, douyin_account="test-account")
         assert session["backstage_task_id"] is None
-        assert client.post(f"/v1/live/sessions/{session['session_id']}/start",
-                           headers=headers).status_code == 200
+        started = client.post(f"/v1/live/sessions/{session['session_id']}/start", headers=headers)
+        assert started.status_code == 200 and started.json()["task_status"] == "waiting_for_stop"
+        before_stop = client.get(f"/v1/live/sessions/{session['session_id']}/summary", headers=headers).json()["backstage_recap"]
+        assert before_stop["claimed_at_ms"] is None and before_stop["metrics"] is None
         client.post(f"/v1/live/sessions/{session['session_id']}/stop", headers=headers)
         summary = client.get(f"/v1/live/sessions/{session['session_id']}/summary",
                              headers=headers).json()
@@ -339,7 +341,15 @@ def test_busy_task_preserves_owner_and_allows_live_observations(tmp_path):
                   "capture_method": "fixture", "value_semantics": "no captured values"}
         assert client.post(first_url + "/backstage/result", headers=worker_headers, json=result).status_code == 200
         assert client.post("/v1/live/sessions/backstage/tasks/claim", headers=worker_headers).json()["status"] == "idle"
+        same = client.post(url + "/start", headers=second_headers).json()
+        assert same["status"] == "duplicate" and same["task_id"] == start.json()["task_id"]
+        assert same["task_status"] == "not_connected"
         assert client.post(url + "/stop", headers=second_headers).json()["backstage_status"] == "not_connected"
+        stopped_recap = client.get(url + "/summary", headers=second_headers).json()["backstage_recap"]
+        assert stopped_recap["status"] == "not_connected" and stopped_recap["stop_signal_received"] is True
+        assert stopped_recap["metrics"] is None and stopped_recap["claimed_at_ms"] is None
+        assert stopped_recap["received_at_ms"] is None and stopped_recap["stop_signal_source"] == "ios_app"
+        assert client.post("/v1/live/sessions/backstage/tasks/claim", headers=worker_headers).json()["status"] == "idle"
         assert client.post(url + "/comments", headers=second_headers, json=body).status_code == 409
 
 
