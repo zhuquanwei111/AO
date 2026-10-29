@@ -196,8 +196,10 @@ MISCONF（详见上方「重要」），写命令全拒、服务按契约 503；
 | `POST /v1/live/sessions` | 可无请求体，或 `{"description":"本场选填说明"}` | 201：`session_id, started_at_ms, session_token` |
 | `POST /v1/live/sessions/{id}/comments` | 下述观察对象 | 200：`status, counted, reason, prompt_id, received_at_ms, effective_at_ms, time_basis` |
 | `GET /v1/live/sessions/{id}/prompts` | `after` 默认空；`wait_ms` 默认0、范围0—15000 | `prompts, next_cursor, stopped, session_id` |
-| `POST /v1/live/sessions/{id}/stop` | 无请求体；重复调用幂等 | `session_id, stopped_at_ms` |
+| `POST /v1/live/sessions/{id}/stop` | 无请求体；顺序重复调用幂等 | `200`：`session_id, stopped_at_ms`；并发重复停止返回 `409` |
 | `GET /v1/live/sessions/{id}/events` | `after` 默认空；`limit` 默认50、范围1—100 | `events, next_cursor, has_more, session_id, started_at_ms, stopped_at_ms` |
+
+停止请求完成后顺序重复调用返回 `200`，`stopped_at_ms` 不变。若同一场次的停止正在处理中，并发重复请求返回 `409`（`detail` 为 `live session already stopping`）；客户端应视为停止尚未确认，稍后重试或核对场次状态，不应当作失败终态。其他原因的 `409` 应按对应错误处理。
 
 除创建外，均需 `X-Live-Session-Token: <创建返回的令牌>`；只存 SHA-256 摘要，
 令牌仅创建时返回，调用方应妥善保存且不得写日志。不存在/不匹配均403；同幂等ID内容
