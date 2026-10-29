@@ -181,12 +181,13 @@ def test_backstage_task_late_result_identity_idempotency_and_summary(tmp_path):
         claimed_again = client.post("/v1/live/sessions/backstage/tasks/claim", headers=worker_headers)
         assert claimed_again.json()["task"]["task_id"] == task_id
 
-        # 单活动任务：另一个主播的App场次不能覆盖当前本场任务。
+        # 另一场实时会话可开始，但不能覆盖当前任务或虚构后台结果。
         busy = client.post("/v1/live/sessions", json={"douyin_account": "主播号-002"})
         assert busy.status_code == 201
         busy_headers = {"X-Live-Session-Token": busy.json()["session_token"]}
-        assert client.post(f"/v1/live/sessions/{busy.json()['session_id']}/start",
-                           headers=busy_headers).status_code == 409
+        busy_start = client.post(f"/v1/live/sessions/{busy.json()['session_id']}/start", headers=busy_headers)
+        assert busy_start.status_code == 200 and busy_start.json()["task_status"] == "not_connected"
+        assert client.post("/v1/live/sessions/backstage/tasks/claim", headers=worker_headers).json()["task"]["task_id"] == task_id
 
         assert client.post(session_url + "/stop", headers=app_headers).json()["backstage_status"] == "capturing"
         processing = client.get(session_url + "/summary", headers=app_headers).json()["backstage_recap"]
@@ -261,14 +262,86 @@ def test_backstage_worker_unconfigured_and_result_validation(tmp_path):
         assert client.post("/v1/live/sessions/backstage/tasks/claim").status_code == 503
         session, headers = create(client, douyin_account="test-account")
         assert session["backstage_task_id"] is None
-        assert client.post(f"/v1/live/sessions/{session['session_id']}/start",
-                           headers=headers).status_code == 200
+        started = client.post(f"/v1/live/sessions/{session['session_id']}/start", headers=headers)
+        assert started.status_code == 200 and started.json()["task_status"] == "waiting_for_stop"
+        before_stop = client.get(f"/v1/live/sessions/{session['session_id']}/summary", headers=headers).json()["backstage_recap"]
+        assert before_stop["claimed_at_ms"] is None and before_stop["metrics"] is None
         client.post(f"/v1/live/sessions/{session['session_id']}/stop", headers=headers)
         summary = client.get(f"/v1/live/sessions/{session['session_id']}/summary",
                              headers=headers).json()
         assert summary["backstage_recap"]["status"] == "not_connected"
         assert summary["backstage_recap"]["metrics"] is None
         assert summary["backstage_recap"]["douyin_account"] == "test-account"
+
+
+def test_stopped_unclaimed_task_does_not_block_or_get_claimed_late(tmp_path):
+    config = settings(tmp_path / "unclaimed.sqlite3")
+    config = config.__class__(**{**config.__dict__, "backstage_worker_token": "worker-test"})
+    with TestClient(create_app(config)) as client:
+        old, old_headers = create(client, douyin_account="old-account")
+        old_url = f"/v1/live/sessions/{old['session_id']}"
+        old_task = client.post(old_url + "/start", headers=old_headers).json()["task_id"]
+        assert client.post(old_url + "/stop", headers=old_headers).json()["backstage_status"] == "not_connected"
+        worker_headers = {"X-Backstage-Worker-Token": "worker-test"}
+        assert client.post("/v1/live/sessions/backstage/tasks/claim", headers=worker_headers).json()["status"] == "idle"
+        new, new_headers = create(client, douyin_account="new-account")
+        new_url = f"/v1/live/sessions/{new['session_id']}"
+        start = client.post(new_url + "/start", headers=new_headers)
+        assert start.status_code == 200
+        assert start.json()["task_status"] == "waiting_for_stop"
+        claimed = client.post("/v1/live/sessions/backstage/tasks/claim", headers=worker_headers).json()["task"]
+        assert claimed["task_id"] == start.json()["task_id"] != old_task
+        recap = client.get(old_url + "/summary", headers=old_headers).json()["backstage_recap"]
+        assert recap["status"] == "not_connected" and recap["metrics"] is None
+
+
+def test_busy_task_preserves_owner_and_allows_live_observations(tmp_path):
+    clock = Clock()
+    config = settings(tmp_path / "busy.sqlite3")
+    config = config.__class__(**{**config.__dict__, "backstage_worker_token": "worker-test", "tianyi_api_key": "controlled-test"})
+    app = create_app(config, live_clock=clock)
+    with TestClient(app) as client:
+        app.state.model = ControlledOperationsModel()
+        first, first_headers = create(client, douyin_account="first-account")
+        first_url = f"/v1/live/sessions/{first['session_id']}"
+        first_id = client.post(first_url + "/start", headers=first_headers).json()["task_id"]
+        worker_headers = {"X-Backstage-Worker-Token": "worker-test"}
+        assert client.post("/v1/live/sessions/backstage/tasks/claim", headers=worker_headers).json()["task"]["task_id"] == first_id
+        second, second_headers = create(client, douyin_account="second-account")
+        url = f"/v1/live/sessions/{second['session_id']}"
+        start = client.post(url + "/start", headers=second_headers)
+        assert start.status_code == 200
+        assert start.json()["task_status"] == "not_connected"
+        assert start.json()["task_id"] != first_id
+        assert client.post(url + "/start", headers=second_headers).json()["task_id"] == start.json()["task_id"]
+        assert client.post(url + "/start", headers=second_headers, json={"source": "android_app"}).status_code == 409
+        assert client.post("/v1/live/sessions/backstage/tasks/claim", headers=worker_headers).json()["task"]["task_id"] == first_id
+        assert client.get(url + "/prompts", headers=second_headers, params={"wait_ms": 0}).json()["prompts"] == []
+        body = {"event_id": "busy-comment", "input_mode": "live_observation", "source": "ios_replaykit_ocr",
+                "coverage": "ocr_visible_sample", "reliability": "known", "text": "主播你是哪里人？",
+                "text_position": {"x": 0.1, "y": 0.3, "width": 0.2, "height": 0.04}, "observed_at_ms": clock.now}
+        assert client.post(url + "/comments", headers=second_headers, json=body).json()["reason"] == "generated"
+        assert len(client.get(url + "/prompts", headers=second_headers).json()["prompts"]) == 1
+        recap = client.get(url + "/summary", headers=second_headers).json()["backstage_recap"]
+        assert recap["status"] == "not_connected" and recap["metrics"] is None
+        assert client.post(first_url + "/stop", headers=first_headers).json()["backstage_status"] == "capturing"
+        assert client.post("/v1/live/sessions/backstage/tasks/claim", headers=worker_headers).json()["task"]["task_id"] == first_id
+        result = {"task_id": first_id, "douyin_account": "first-account", "status": "needs_input",
+                  "metrics": {key: None for key in ["累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪"]},
+                  "stop_signal_received": True, "start_signal_source": "ios_app", "stop_signal_source": "ios_app",
+                  "capture_method": "fixture", "value_semantics": "no captured values"}
+        assert client.post(first_url + "/backstage/result", headers=worker_headers, json=result).status_code == 200
+        assert client.post("/v1/live/sessions/backstage/tasks/claim", headers=worker_headers).json()["status"] == "idle"
+        same = client.post(url + "/start", headers=second_headers).json()
+        assert same["status"] == "duplicate" and same["task_id"] == start.json()["task_id"]
+        assert same["task_status"] == "not_connected"
+        assert client.post(url + "/stop", headers=second_headers).json()["backstage_status"] == "not_connected"
+        stopped_recap = client.get(url + "/summary", headers=second_headers).json()["backstage_recap"]
+        assert stopped_recap["status"] == "not_connected" and stopped_recap["stop_signal_received"] is True
+        assert stopped_recap["metrics"] is None and stopped_recap["claimed_at_ms"] is None
+        assert stopped_recap["received_at_ms"] is None and stopped_recap["stop_signal_source"] == "ios_app"
+        assert client.post("/v1/live/sessions/backstage/tasks/claim", headers=worker_headers).json()["status"] == "idle"
+        assert client.post(url + "/comments", headers=second_headers, json=body).status_code == 409
 
 
 def test_backstage_result_without_metrics_keeps_capture_time_unknown(tmp_path):
@@ -280,9 +353,9 @@ def test_backstage_result_without_metrics_keeps_capture_time_unknown(tmp_path):
         session, headers = create(client, douyin_account="主播号-003")
         started = client.post(f"/v1/live/sessions/{session['session_id']}/start",
                               headers=headers).json()
-        client.post(f"/v1/live/sessions/{session['session_id']}/stop", headers=headers)
         worker_headers = {"X-Backstage-Worker-Token": "fixture-worker-token"}
-        client.post("/v1/live/sessions/backstage/tasks/claim", headers=worker_headers)
+        assert client.post("/v1/live/sessions/backstage/tasks/claim", headers=worker_headers).json()["task"]["task_id"] == started["task_id"]
+        client.post(f"/v1/live/sessions/{session['session_id']}/stop", headers=headers)
         keys = ["累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪"]
         result = {
             "task_id": started["task_id"], "douyin_account": "主播号-003",
