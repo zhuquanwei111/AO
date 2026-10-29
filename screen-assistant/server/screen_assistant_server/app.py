@@ -76,7 +76,8 @@ def create_app(settings: Settings | None = None, *, live_clock=None) -> FastAPI:
                                      queue_limit=cfg.live_fusion_queue_limit)
         app.state.audio = AudioService(cfg, app.state.live)
         async def deliver_audio(sid, token, has_transcripts):
-            scheduled = app.state.live.schedule_fusion(sid, token, SimpleNamespace(app=app))
+            schedule = app.state.live.schedule_audio_fusion if has_transcripts else app.state.live.schedule_fusion
+            scheduled = schedule(sid, token, SimpleNamespace(app=app))
             if not scheduled and has_transcripts:
                 record = asyncio.create_task(app.state.live.run("record_audio_fusion_busy", sid, token))
                 try:

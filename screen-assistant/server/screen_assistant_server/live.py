@@ -190,6 +190,7 @@ class LiveService:
         self.fusion_queued = {}
         self.fusion_active = {}
         self.fusion_dirty = set()
+        self.fusion_audio_pending = {}
         self.fusion_stopping = set()
         self.fusion_closed = False
         self.waiters: dict[str, set[asyncio.Future]] = {}
@@ -217,6 +218,13 @@ class LiveService:
         self._pump_fusion()
         return True
 
+    def schedule_audio_fusion(self, sid, token, request):
+        scheduled = self.schedule_fusion(sid, token, request)
+        if scheduled:
+            # 每次有效音频触发使用新身份，旧执行不能清除随后到达的音频。
+            self.fusion_audio_pending[sid] = object()
+        return scheduled
+
     def _pump_fusion(self):
         while not self.fusion_closed and self.fusion_queue and len(self.fusion_active) < self.fusion_concurrency:
             sid = self.fusion_queue.popleft()
@@ -230,6 +238,7 @@ class LiveService:
             return
         self.fusion_active.pop(sid, None)
         self.fusion_dirty.discard(sid)
+        self.fusion_audio_pending.pop(sid, None)
         self._pump_fusion()
 
     async def _fusion_worker(self, sid, token, request):
@@ -238,10 +247,14 @@ class LiveService:
                 self.fusion_dirty.discard(sid)
                 if FUSION_SETTLE_MS:
                     await asyncio.sleep(FUSION_SETTLE_MS / 1000)
+                audio_generation = self.fusion_audio_pending.get(sid)
                 try:
                     await self.deliver_fusion(sid, token, request)
                 except Exception:
                     logger.warning("live_fusion outcome=failed")
+                finally:
+                    if audio_generation is not None and self.fusion_audio_pending.get(sid) is audio_generation:
+                        self.fusion_audio_pending.pop(sid, None)
                 if sid not in self.fusion_dirty or sid in self.fusion_stopping:
                     break
         except asyncio.CancelledError:
@@ -262,6 +275,7 @@ class LiveService:
         self.fusion_closed = True
         self.fusion_queue.clear()
         self.fusion_queued.clear()
+        self.fusion_audio_pending.clear()
         tasks = list(self.fusion_active.values())
         for task in tasks:
             task.cancel()
@@ -509,6 +523,7 @@ async def stop_session(session_id: str, request: Request,
     if session_id in service.fusion_stopping:
         raise HTTPException(409, "live session already stopping")
     service.fusion_stopping.add(session_id)
+    pending_audio = service.fusion_audio_pending.pop(session_id, None) is not None
     if not stopped:
         request.app.state.audio.begin_fusion_stop(session_id)
     try:
@@ -516,8 +531,13 @@ async def stop_session(session_id: str, request: Request,
         if not stopped:
             audio_result = await request.app.state.audio.finish_session(session_id, token)
         request.app.state.audio.closing.add(session_id)
-        if not stopped and request.app.state.audio.stop_transcripts.get(session_id):
-            await service.deliver_fusion(session_id, token, request, allow_stopping=True)
+        if not stopped and (pending_audio or request.app.state.audio.stop_transcripts.get(session_id)):
+            try:
+                await service.deliver_fusion(session_id, token, request, allow_stopping=True)
+            except HTTPException as error:
+                if error.status_code not in (429, 503):
+                    raise
+                logger.warning("live_fusion outcome=stop_candidate_failed status=%s", error.status_code)
         result = await service.run(
             "stop", session_id, token, payload.source if payload else None,
         )
