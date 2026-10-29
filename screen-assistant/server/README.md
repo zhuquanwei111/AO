@@ -266,6 +266,21 @@ loopback Redis，核对目录身份后为旧测试提供 `TEST_REDIS_URL`，结�
 
 ## M3：iOS 运营观察接线（本地实现）
 
+### 后台复盘与实时场次状态
+
+后台只处理一个未决任务。`POST /start` 返回 `status=started` 表示实时场次已启动，不能单凭它或 `task_id` 断言后台执行器已领取。重复 start 返回同一任务及其当前状态；实时观察和提示不依赖后台汇总完成。
+
+| 场景 | 现有字段及含义 |
+| --- | --- |
+| 后台已有未决任务，新场启动 | `task_status=not_connected`；本场后台取数不可用，不排队、不自动补领或重试。实时场次继续。 |
+| 正常场次开始，可能尚未有 worker | `task_status=waiting_for_stop`；不证明执行器在线或已领取。执行器未配置/离线时，停止前也可能保持此状态。 |
+| 任务已领取 | `summary.backstage_recap.claimed_at_ms` 非空；停止前状态仍为 `waiting_for_stop`。 |
+| 场次停止 | 已领取且结果未到时为 `capturing`；未领取为 `not_connected`，不会迟到领取。`stop_signal_received`、`stopped_at_ms` 和来源反映实际停止信号。 |
+| 结果回写 | `status` 为 `captured_locally`、`partial`、`needs_input` 或 `failed`，具体数据和采集时间按返回字段显示；未取得时 `metrics`、`received_at_ms` 为 null。 |
+| 没有配置账号 | start 为 `not_configured`、`task_id` 为 null；summary 的 `backstage_recap` 可为 null。 |
+
+`not_connected` 既可能来自后台忙，也可能来自场次停止时未领取；现有字段不区分原因，也不能反向推断执行器在线状态。旧客户端可能将它显示成待处理或已绑定，需要客户端按上述状态更新；服务端改动本身不改变已安装 App 的文案。
+
 M3 在 M2 fixture 契约上增加 `input_mode=live_observation`，不改变旧 `/v1/answer`。
 ReplayKit OCR 保留逐行文本框：iOS 将裁剪ROI内的 Vision 框映射为全屏左上原点归一化
 `text_position`，并提交 `source=ios_replaykit_ocr` 与 `observed_at_ms`。运营分支只挑
