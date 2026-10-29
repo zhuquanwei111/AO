@@ -329,7 +329,10 @@ def test_busy_task_preserves_owner_and_allows_live_observations(tmp_path):
         body = {"event_id": "busy-comment", "input_mode": "live_observation", "source": "ios_replaykit_ocr",
                 "coverage": "ocr_visible_sample", "reliability": "known", "text": "主播你是哪里人？",
                 "text_position": {"x": 0.1, "y": 0.3, "width": 0.2, "height": 0.04}, "observed_at_ms": clock.now}
-        assert client.post(url + "/comments", headers=second_headers, json=body).json()["reason"] == "generated"
+        observed = client.post(url + "/comments", headers=second_headers, json=body).json()
+        assert observed["status"] == "accepted"
+        assert observed["reason"] == "scheduled" and observed["prompt_id"] is None
+        wait_for_fusion(client)
         assert len(client.get(url + "/prompts", headers=second_headers).json()["prompts"]) == 1
         recap = client.get(url + "/summary", headers=second_headers).json()["backstage_recap"]
         assert recap["status"] == "not_connected" and recap["metrics"] is None
