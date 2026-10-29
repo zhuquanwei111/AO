@@ -549,7 +549,7 @@ private struct LiveSessionOverviewView: View {
             if recap.claimedAtMS != nil { return "取数任务已领取，等待本场结果" }
             return "任务已登记，取数状态待确认"
         case "capturing": return "取数任务已领取，等待本场结果"
-        case "not_connected": return "本场后台取数不可用，未取得本场复盘；不会自动补领。此状态不代表实时辅助已停用。"
+        case "not_connected": return "后台当前未连接，暂无本场复盘；后续状态以服务端回报为准。此状态不代表实时辅助已停用。"
         case "captured_locally": return "已取得五项"
         case "partial": return "部分缺失"
         case "needs_input": return "需要处理"
