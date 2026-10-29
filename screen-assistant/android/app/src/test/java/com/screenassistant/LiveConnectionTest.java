@@ -109,6 +109,7 @@ public class LiveConnectionTest {
         assertTrue(connection.connect()); assertTrue(connection.poll());
         assertEquals(1, display.bindings); assertEquals("实际运营建议", display.messages.get(0));
         assertTrue(display.overlay.textAt(1000).contains("本场复盘不可取数"));
+        assertTrue(display.overlay.textAt(1000).contains("不自动补领"));
         assertEquals(0, remote.stops); assertEquals(0, display.ended);
         clock.set(30001); assertTrue(connection.poll());
         assertEquals(1, remote.starts); assertEquals(0, remote.creates);

@@ -50,9 +50,9 @@ final class RecapText {
         switch (s) {
             case "not_configured": return "未配置抖音号";
             case "not_started": return "后台任务尚未启动";
-            case "waiting_for_stop": return "等待本场结束";
-            case "not_connected": return "本场后台复盘不可取数";
-            case "capturing": return "后台正在取数";
+            case "waiting_for_stop": return "任务已登记，取数状态待确认";
+            case "not_connected": return "本场后台复盘不可取数，不自动补领";
+            case "capturing": return "取数任务已领取，等待本场结果";
             case "captured_locally": return "已读取五项";
             case "partial": return "部分数据缺失";
             case "needs_input": return "需要核对账号/后台状态";

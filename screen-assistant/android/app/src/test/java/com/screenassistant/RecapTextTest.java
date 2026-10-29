@@ -27,6 +27,7 @@ public class RecapTextTest {
                 new JSONObject().put("status","not_connected").put("metrics",JSONObject.NULL));
         assertFalse(RecapText.pending(data)); assertTrue(RecapText.terminal(data));
         assertTrue(RecapText.backstage(data.getJSONObject("backstage_recap")).contains("本场后台复盘不可取数"));
+        assertTrue(RecapText.backstage(data.getJSONObject("backstage_recap")).contains("不自动补领"));
         assertTrue(RecapText.backstage(data.getJSONObject("backstage_recap")).contains("新增粉丝：未取得"));
         assertFalse(RecapText.backstage(data.getJSONObject("backstage_recap")).contains("新增粉丝：0"));
         data.put("stopped_at_ms",JSONObject.NULL);
@@ -46,5 +47,9 @@ public class RecapTextTest {
         }
         assertTrue(RecapText.backstage(new JSONObject().put("status","failed")).contains("取数失败"));
         assertTrue(RecapText.backstage(new JSONObject().put("status","captured_locally")).contains("已读取五项"));
+        assertTrue(RecapText.backstage(new JSONObject().put("status","waiting_for_stop"))
+                .contains("任务已登记，取数状态待确认"));
+        assertTrue(RecapText.backstage(new JSONObject().put("status","capturing"))
+                .contains("取数任务已领取，等待本场结果"));
     }
 }

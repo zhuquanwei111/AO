@@ -208,9 +208,9 @@ final class LiveConnection {
             case "failed": return "复盘取数失败";
             case "needs_input": return "复盘需核对账号或后台";
             case "not_configured": return "复盘未配置抖音号";
-            case "waiting_for_stop": return "复盘等待本场结束";
-            case "capturing": return "复盘取数中";
-            case "not_connected": return "本场复盘不可取数";
+            case "waiting_for_stop": return "复盘任务已登记，取数状态待确认";
+            case "capturing": return "复盘任务已领取，等待本场结果";
+            case "not_connected": return "本场复盘不可取数，不自动补领";
             case "captured_locally": return "复盘五项已读取";
             case "partial": return "复盘部分数据缺失";
             default: return "复盘状态待核对";
