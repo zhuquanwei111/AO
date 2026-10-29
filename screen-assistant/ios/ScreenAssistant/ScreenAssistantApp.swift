@@ -599,7 +599,7 @@ final class AppModel: ObservableObject {
                 self.liveStatus = "本场已结束；概览和记录暂不可读取"
             }
             if let recap = fetchedSummary?.backstageRecap {
-                self.liveStatus = BackstageStatusPresentation.summary(status: recap.status, claimedAtMS: recap.claimedAtMS)
+                self.liveStatus = Self.backstageStatusText(recap)
             } else if fetchedSummary != nil {
                 self.liveStatus = "本场事件记录已读取；服务未返回后台五项任务记录，结果保持未知"
             }
@@ -628,7 +628,7 @@ final class AppModel: ObservableObject {
                 }
                 self.liveSummary = summary
                 if let recap = summary.backstageRecap {
-                    self.liveStatus = BackstageStatusPresentation.summary(status: recap.status, claimedAtMS: recap.claimedAtMS)
+                    self.liveStatus = Self.backstageStatusText(recap)
                     self.finishCredentialRetentionIfTerminal(recap.status)
                 } else {
                     self.liveStatus = "服务未返回后台五项任务记录，结果保持未知"
@@ -642,6 +642,15 @@ final class AppModel: ObservableObject {
             return
         }
         LiveSessionState.clear()
+    }
+
+    private static func backstageStatusText(_ recap: LiveBackstageRecap) -> String {
+        let count = recap.metrics.map { metrics in
+            [metrics.cumulativeAudience, metrics.newFollowers, metrics.commentCount,
+             metrics.giftGivers, metrics.soundEnergy].compactMap { $0 }.count
+        }
+        return BackstageStatusPresentation.summary(status: recap.status, claimedAtMS: recap.claimedAtMS,
+                                                   receivedMetricCount: count)
     }
 
     private static func savedCredentials() -> LiveSessionCredentials? {

@@ -7,7 +7,7 @@ enum BackstageStatusPresentation {
         starting && !stopping && generation == currentGeneration
     }
 
-    static func summary(status: String?, claimedAtMS: Int64?) -> String {
+    static func summary(status: String?, claimedAtMS: Int64?, receivedMetricCount: Int? = nil) -> String {
         switch status {
         case "waiting_for_stop":
             return claimedAtMS == nil ? "后台任务已登记，取数状态待确认" : "取数任务已领取，等待本场结果"
@@ -16,9 +16,9 @@ enum BackstageStatusPresentation {
         case "not_connected":
             return "本场后台取数不可用，未取得本场复盘；不自动补领"
         case "captured_locally":
-            return "后台五项汇总已收到"
+            return receivedMetricCount == 5 ? "后台五项汇总已收到" : "后台结果状态已返回，五项读数待确认"
         case "partial":
-            return "后台汇总部分缺失，请核对缺项"
+            return receivedMetricCount == nil ? "后台结果状态为部分，读数尚未取得" : "后台汇总部分缺失，请核对缺项"
         case "needs_input":
             return "后台任务需要补充信息"
         case "failed":
