@@ -199,21 +199,20 @@ class LiveStore:
                     "task_id": existing["task_id"], "douyin_account": existing["douyin_account"],
                     "task_status": existing["status"], "signal_source": signal_source}
         active = self.db.execute(
-            "SELECT 1 FROM live_backstage_tasks WHERE status IN "
-            "('waiting_for_stop','capturing','not_connected') LIMIT 1"
+            "SELECT 1 FROM live_backstage_tasks WHERE result_hash IS NULL AND status IN "
+            "('waiting_for_stop','capturing') LIMIT 1"
         ).fetchone()
-        if active:
-            raise HTTPException(409, "a backstage recap task is already active")
+        task_status = "not_connected" if active else "waiting_for_stop"
         task_id = uuid.uuid4().hex
         with self.db:
             self.db.execute(
                 "INSERT INTO live_backstage_tasks "
                 "(task_id,session_id,douyin_account,status,created_at_ms,start_signal_source) "
-                "VALUES (?,?,?,'waiting_for_stop',?,?)",
-                (task_id, sid, account, self.clock(), signal_source),
+                "VALUES (?,?,?,?,?,?)",
+                (task_id, sid, account, task_status, self.clock(), signal_source),
             )
         return {"status": "started", "session_id": sid, "task_id": task_id,
-                "douyin_account": account, "task_status": "waiting_for_stop",
+                "douyin_account": account, "task_status": task_status,
                 "signal_source": signal_source}
 
     def description(self, sid: str, token: str | None) -> str:
@@ -551,7 +550,7 @@ class LiveStore:
         task = self.db.execute("""
             SELECT t.*,s.stopped_at_ms AS session_stopped_at_ms
             FROM live_backstage_tasks t JOIN live_sessions s USING(session_id)
-            WHERE t.result_hash IS NULL AND t.status IN ('waiting_for_stop','capturing','not_connected')
+            WHERE t.result_hash IS NULL AND t.status IN ('waiting_for_stop','capturing')
             ORDER BY t.created_at_ms LIMIT 1
         """).fetchone()
         if task is None:
