@@ -509,18 +509,21 @@ async def stop_session(session_id: str, request: Request,
     if session_id in service.fusion_stopping:
         raise HTTPException(409, "live session already stopping")
     service.fusion_stopping.add(session_id)
+    if not stopped:
+        request.app.state.audio.begin_fusion_stop(session_id)
     try:
         await service.stop_fusion(session_id)
         if not stopped:
             audio_result = await request.app.state.audio.finish_session(session_id, token)
         request.app.state.audio.closing.add(session_id)
-        if audio_result and audio_result["transcript_count"]:
+        if not stopped and request.app.state.audio.stop_transcripts.get(session_id):
             await service.deliver_fusion(session_id, token, request, allow_stopping=True)
         result = await service.run(
             "stop", session_id, token, payload.source if payload else None,
         )
     finally:
         request.app.state.audio.closing.discard(session_id)
+        request.app.state.audio.stop_transcripts.pop(session_id, None)
         service.fusion_stopping.discard(session_id)
     if audio_result is not None and (audio_result["transcript_count"] or audio_result["incomplete"]):
         result["audio"] = audio_result
