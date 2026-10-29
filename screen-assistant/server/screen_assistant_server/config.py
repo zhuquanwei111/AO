@@ -43,6 +43,14 @@ class Settings:
     silero_model_path: str = ""
     funasr_model_path: str = ""
     backstage_worker_token: str = ""
+    live_fusion_concurrency: int = 2
+    live_fusion_queue_limit: int = 16
+
+    def __post_init__(self):
+        if not 1 <= self.live_fusion_concurrency <= 16:
+            raise ValueError("live_fusion_concurrency must be between 1 and 16")
+        if not 1 <= self.live_fusion_queue_limit <= 256:
+            raise ValueError("live_fusion_queue_limit must be between 1 and 256")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -63,4 +71,6 @@ class Settings:
             silero_model_path=os.getenv("SILERO_ONNX_PATH", ""),
             funasr_model_path=os.getenv("FUNASR_MODEL_PATH", ""),
             backstage_worker_token=os.getenv("BACKSTAGE_WORKER_TOKEN", ""),
+            live_fusion_concurrency=_env_int("LIVE_FUSION_CONCURRENCY", 2),
+            live_fusion_queue_limit=_env_int("LIVE_FUSION_QUEUE_LIMIT", 16),
         )

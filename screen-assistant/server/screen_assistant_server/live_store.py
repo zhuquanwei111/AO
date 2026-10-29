@@ -54,6 +54,11 @@ class LiveStore:
                 PRIMARY KEY (session_id, event_hash),
                 UNIQUE (session_id, message_hash)
             );
+            CREATE TABLE IF NOT EXISTS live_audio_fusion_status (
+                session_id TEXT PRIMARY KEY,
+                background_analysis_busy_count INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(session_id) REFERENCES live_sessions(session_id)
+            );
             CREATE TABLE IF NOT EXISTS live_count_samples (
                 session_id TEXT NOT NULL, event_hash TEXT NOT NULL, source TEXT NOT NULL,
                 observed_at_ms INTEGER, effective_at_ms INTEGER NOT NULL, received_at_ms INTEGER NOT NULL,
@@ -393,6 +398,9 @@ class LiveStore:
 
     def session_summary(self, sid: str, token: str | None):
         session = self.authorize(sid, token)
+        audio_status = self.db.execute(
+            "SELECT background_analysis_busy_count FROM live_audio_fusion_status WHERE session_id=?", (sid,)
+        ).fetchone()
         rows = self.db.execute(
             "SELECT * FROM live_count_samples WHERE session_id=? ORDER BY source,effective_at_ms,received_at_ms",
             (sid,),
@@ -524,8 +532,20 @@ class LiveStore:
             "stopped_at_ms": session["stopped_at_ms"],
             "online_count": count_summary,
             "online_count_by_source": summaries,
+            "audio_fusion": {"background_analysis_busy_count":
+                             audio_status["background_analysis_busy_count"] if audio_status else 0},
             "backstage_recap": backstage,
         }
+
+    def record_audio_fusion_busy(self, sid: str, token: str | None):
+        self.authorize(sid, token)
+        with self.db:
+            self.db.execute("""
+                INSERT INTO live_audio_fusion_status (session_id, background_analysis_busy_count)
+                VALUES (?, 1)
+                ON CONFLICT(session_id) DO UPDATE SET background_analysis_busy_count =
+                    MIN(background_analysis_busy_count + 1, 9007199254740991)
+            """, (sid,))
 
     def claim_backstage_task(self):
         task = self.db.execute("""
