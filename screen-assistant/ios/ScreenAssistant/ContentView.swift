@@ -207,6 +207,8 @@ private struct AdvancedSettingsView: View {
 
                 Section(header: Text("直播数据识别区域"),
                         footer: Text("仅识别你在主播界面选定的裁剪区域。未保存区域时停用对应来源；请勿把热度或累计观看选作在线人数。")) {
+                    LiveROIOverview(comment: model.roi, onlineCount: model.onlineCountROI,
+                                    platformNotice: model.platformNoticeROI)
                     Button("应用参考直播区域预设…") {
                         confirmsLiveAreaPreset = true
                     }
@@ -236,6 +238,11 @@ private struct AdvancedSettingsView: View {
                         }
                     }
                     .disabled(model.liveActive)
+                    if let roi = model.onlineCountROI {
+                        Text("在线人数：\(roiSummary(for: roi))")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                    }
                     if model.onlineCountROI != nil {
                         Button("停用在线人数采集", role: .destructive) { model.onlineCountROI = nil }
                             .disabled(model.liveActive)
@@ -254,6 +261,11 @@ private struct AdvancedSettingsView: View {
                         }
                     }
                     .disabled(model.liveActive)
+                    if let roi = model.platformNoticeROI {
+                        Text("平台提醒：\(roiSummary(for: roi))")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                    }
                     if model.platformNoticeROI != nil {
                         Button("停用平台提醒采集", role: .destructive) { model.platformNoticeROI = nil }
                             .disabled(model.liveActive)

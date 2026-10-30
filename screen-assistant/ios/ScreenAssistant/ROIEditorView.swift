@@ -1,5 +1,46 @@
 import SwiftUI
 
+/// 按同一竖屏比例回显已保存区域；参照图不是当前屏幕截图。
+struct LiveROIOverview: View {
+    let comment: CGRect
+    let onlineCount: CGRect?
+    let platformNotice: CGRect?
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 16) {
+            GeometryReader { proxy in
+                ZStack(alignment: .topLeading) {
+                    Rectangle().fill(Color(.systemGray6))
+                    outline(comment, color: .blue, size: proxy.size)
+                    if let onlineCount { outline(onlineCount, color: .orange, size: proxy.size) }
+                    if let platformNotice { outline(platformNotice, color: .purple, size: proxy.size) }
+                }
+                .clipped()
+            }
+            .frame(width: 90, height: 90 * 844 / 390)
+            .accessibilityLabel("已保存识别区域示意图")
+            VStack(alignment: .leading, spacing: 8) {
+                Text("已保存区域示意").font(.subheadline)
+                Label("评论", systemImage: "square").foregroundColor(.blue)
+                Label(onlineCount == nil ? "在线人数：未配置" : "在线人数", systemImage: "square")
+                    .foregroundColor(.orange)
+                Label(platformNotice == nil ? "平台提醒：未配置" : "平台提醒", systemImage: "square")
+                    .foregroundColor(.purple)
+                Text("竖屏比例示意，非实时画面；请按主播界面核对。")
+                    .font(.footnote).foregroundColor(.secondary)
+            }
+            .font(.footnote)
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func outline(_ rect: CGRect, color: Color, size: CGSize) -> some View {
+        Rectangle().stroke(color, lineWidth: 2)
+            .frame(width: rect.width * size.width, height: rect.height * size.height)
+            .position(x: rect.midX * size.width, y: rect.midY * size.height)
+    }
+}
+
 /// 归一化 ROI 编辑器：在竖屏满屏参照上拖动/缩放矩形。
 /// 坐标为归一化值 (0..1)，**左上原点**——与 SharedConfig.roi() 一致，
 /// 扩展侧换算为像素（CIImage 左下原点）后裁剪。
