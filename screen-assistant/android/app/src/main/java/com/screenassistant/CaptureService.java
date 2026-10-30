@@ -412,6 +412,13 @@ public class CaptureService extends Service {
         return true;
     }
 
+    final void expandLocalOverlayForDebug() {
+        if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0
+                || phase != Phase.RUNNING || tornDown || operationMode) return;
+        overlayState.setStatus("本地测试：多行提示\n第一行\n第二行\n第三行\n第四行\n第五行", false);
+        renderOverlay(sessionEpoch);
+    }
+
     private void setup(int resultCode, Intent data) {
         setupStage = "setup_entered";
         logEvent("projection_setup_started", "phase=" + phase);

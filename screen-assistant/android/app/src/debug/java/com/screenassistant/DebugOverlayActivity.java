@@ -10,11 +10,14 @@ public final class DebugOverlayActivity extends Activity {
         super.onCreate(state);
         Intent service=new Intent(this,DebugOverlayService.class);
         boolean stop=getIntent().getBooleanExtra("stop",false);
+        boolean expand=getIntent().getBooleanExtra("expand",false);
         if (stop && !DebugOverlayService.running) { finish(); return; }
-        if (!stop && (CaptureService.phase != CaptureService.Phase.IDLE || CaptureService.uiVisible)) {
+        if (expand && !DebugOverlayService.running) { finish(); return; }
+        if (!stop && !expand && (CaptureService.phase != CaptureService.Phase.IDLE || CaptureService.uiVisible)) {
             finish(); return;
         }
         if (stop) service.setAction(CaptureService.ACTION_STOP);
+        else if (expand) service.setAction(DebugOverlayService.ACTION_EXPAND);
         startService(service);
         finish();
     }
