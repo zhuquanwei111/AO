@@ -6,7 +6,9 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
+import android.content.BroadcastReceiver;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.ServiceInfo;
 import android.graphics.Bitmap;
 import android.graphics.PixelFormat;
@@ -20,6 +22,7 @@ import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.os.PowerManager;
 import android.view.Gravity;
 import android.view.LayoutInflater;
 import android.view.MotionEvent;
@@ -122,6 +125,15 @@ public class CaptureService extends Service {
     private String drawnPromptId = "";
     private int localDebugMessages;
     private final Runnable replyHide = () -> renderOverlay(sessionEpoch);
+    private boolean screenReceiverRegistered;
+    private final BroadcastReceiver overlayScreenState = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            logEvent("overlay_screen_state", "action=" + intent.getAction()
+                    + " interactive=" + getSystemService(PowerManager.class).isInteractive()
+                    + " phase=" + phase + " ui=" + uiVisible + " torn_down=" + tornDown);
+            renderOverlay(sessionEpoch);
+        }
+    };
 
     private MediaProjection.Callback projectionCallback;
 
@@ -274,6 +286,11 @@ public class CaptureService extends Service {
         mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
         notifManager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         wm = getSystemService(WindowManager.class);
+        IntentFilter screenEvents = new IntentFilter(Intent.ACTION_SCREEN_ON);
+        screenEvents.addAction(Intent.ACTION_SCREEN_OFF);
+        androidx.core.content.ContextCompat.registerReceiver(this, overlayScreenState, screenEvents,
+                androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED);
+        screenReceiverRegistered = true;
         NotificationChannel ch = new NotificationChannel(CHANNEL_ID, "屏幕识别",
                 NotificationManager.IMPORTANCE_LOW);
         ch.setShowBadge(false);
@@ -374,6 +391,7 @@ public class CaptureService extends Service {
 
     @Override
     public void onDestroy() {
+        if (screenReceiverRegistered) { unregisterReceiver(overlayScreenState); screenReceiverRegistered = false; }
         logEvent("service_destroyed", "phase=" + phase + " teardown_reason=" + teardownReason);
         teardownInternal();
         LiveFrameAnalyzer closingAnalyzer = liveAnalyzer;
@@ -416,11 +434,17 @@ public class CaptureService extends Service {
     final void expandLocalOverlayForDebug() {
         if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0
                 || phase != Phase.RUNNING || tornDown || operationMode) return;
-        long now = System.currentTimeMillis();
+        long nowNs = SystemClock.elapsedRealtimeNanos();
         String label = (++localDebugMessages % 2 == 1) ? "A" : "B";
-        overlayState.update("debug-" + now, "本地固定测试文字" + label + "\n第一行\n第二行\n第三行\n第四行\n第五行", 0,
-                now + 15000, now, REPLY_AUTO_HIDE_MS);
-        renderOverlay(sessionEpoch);
+        try {
+            // 固定的过去/未来服务时钟，验证产品入队路径不依赖设备墙钟；不联网。
+            long serverNow = "A".equals(label) ? 1_700_000_000_000L : 1_900_000_000_000L;
+            org.json.JSONObject page = new org.json.JSONObject().put("server_time_ms", serverNow)
+                    .put("server_processing_ms", 0).put(PromptTiming.SENT_NS, nowNs).put(PromptTiming.RECEIVED_NS, nowNs);
+            long deadline = PromptTiming.from(page).deadline(new org.json.JSONObject().put("expires_at_ms", serverNow + 15000));
+            submitOverlayMessage("本地固定测试文字" + label + "\n第一行\n第二行\n第三行\n第四行\n第五行",
+                    sessionEpoch, deadline, "debug-" + nowNs, 0);
+        } catch (org.json.JSONException e) { throw new IllegalStateException(e); }
     }
 
     /** 由debug服务的系统DUMP入口核对同一个产品TextView；不读取采集帧或联网。 */
@@ -435,6 +459,7 @@ public class CaptureService extends Service {
         int ellipsized = 0;
         if (layout != null) for (int i=0; i<layout.getLineCount(); i++) ellipsized += layout.getEllipsisCount(i);
         writer.println("at=" + System.currentTimeMillis() + " id=" + safeId(overlayState.currentId())
+                + " elapsed=" + SystemClock.elapsedRealtime()
                 + " drawn=" + safeId(drawnPromptId) + " body_shown=" + body.isShown()
                 + " visible_rect=" + visible + " bounds=" + bounds.toShortString()
                 + " window=" + window.getWidth() + "x" + window.getHeight() + " ellipsized=" + ellipsized
@@ -665,10 +690,13 @@ public class CaptureService extends Service {
                         });
                     }
                     @Override public void prompt(org.json.JSONObject prompt) {
-                        long expires = prompt.optLong("expires_at_ms");
+                        long expires = prompt.optLong(PromptTiming.DEADLINE_MS);
                         String id = prompt.optString("prompt_id");
-                        logEvent("prompt_received", "id=" + safeId(id) + " expires=" + expires + " epoch=" + epoch);
-                        if (expires > System.currentTimeMillis() && !id.isEmpty())
+                        logEvent("prompt_received", "id=" + safeId(id) + " source_expires=" + prompt.optLong("expires_at_ms")
+                                + " deadline_elapsed=" + expires + " rtt=" + prompt.optLong("_client_rtt_ms")
+                                + " processing=" + prompt.optLong("_client_processing_ms")
+                                + " transport=" + prompt.optLong("_client_transport_ms") + " epoch=" + epoch);
+                        if (expires > SystemClock.elapsedRealtime() && !id.isEmpty())
                             showMessage("运营", prompt.optString("display_text"), epoch, expires, id, prompt.optInt("priority"));
                     }
                     @Override public void ended() {
@@ -707,13 +735,16 @@ public class CaptureService extends Service {
     }
 
     private void showMessage(String purpose, String reply, int epoch, long expiresAt, String id, int priority) {
+        submitOverlayMessage(DisplayText.labeled(purpose, reply), epoch, expiresAt, id, priority);
+    }
+
+    private void submitOverlayMessage(String fullText, int epoch, long expiresAt, String id, int priority) {
         if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch) return;
         int generation = messageGeneration;
-        String fullText = DisplayText.labeled(purpose, reply);
         if (fullText.isEmpty()) return;
         main.post(() -> {
             if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch || generation != messageGeneration) return;
-            long now = System.currentTimeMillis();
+            long now = SystemClock.elapsedRealtime();
             if (expiresAt > 0 && expiresAt <= now) return;
             boolean accepted = overlayState.update(id, fullText, priority, expiresAt, now, REPLY_AUTO_HIDE_MS);
             logEvent("prompt_processed", "id=" + safeId(id) + " accepted=" + accepted
@@ -733,6 +764,8 @@ public class CaptureService extends Service {
             removeReplyOverlay();
             return;
         }
+        // Handler使用uptime，休眠会推迟它；关屏移窗，亮屏先按连续时钟重算再附着。
+        if (!getSystemService(PowerManager.class).isInteractive()) { removeReplyOverlay(); return; }
         if (android.os.Build.VERSION.SDK_INT >= 23 && !android.provider.Settings.canDrawOverlays(this)) {
             removeReplyOverlay();
             setState("辅助正在运行，但悬浮窗权限不可用。回到应用打开悬浮窗权限后重新开始。");
@@ -812,7 +845,7 @@ public class CaptureService extends Service {
                 });
                 wm.addView(replyOverlayView, lp);
             }
-            long now = System.currentTimeMillis();
+            long now = SystemClock.elapsedRealtime();
             String text = overlayState.textAt(now);
             boolean expanded = !text.isEmpty();
             if (overlayConflictNotified && expanded) text = OVERLAY_CONFLICT + "\n" + text;
@@ -830,8 +863,9 @@ public class CaptureService extends Service {
             String id = overlayState.currentId();
             if (!id.equals(displayedPromptId)) {
                 logEvent("prompt_display", "id=" + safeId(id) + " previous=" + safeId(displayedPromptId)
-                        + " at=" + now + " source_expires=" + overlayState.sourceExpiryMs()
-                        + " visible_until=" + overlayState.expiresAtMs() + " protected_until=" + overlayState.protectedUntilMs()
+                        + " at=" + System.currentTimeMillis() + " elapsed=" + now
+                        + " source_expires_elapsed=" + overlayState.sourceExpiryMs()
+                        + " visible_until_elapsed=" + overlayState.expiresAtMs() + " protected_until_elapsed=" + overlayState.protectedUntilMs()
                         + " short_window=" + (expanded && overlayState.expiresAtMs() - now < OverlayMessageState.MIN_READ_MS)
                         + " epoch=" + epoch + " attached=" + replyOverlayView.isAttachedToWindow());
                 displayedPromptId = id;
@@ -866,7 +900,7 @@ public class CaptureService extends Service {
             setState("提示框遮挡识别区域，文字采样已暂停；请调整区域或提示框");
             if (!overlayConflictNotified) {
                 overlayConflictNotified = true;
-                replyTextView.setText(OVERLAY_CONFLICT + "\n" + overlayState.textAt(System.currentTimeMillis()));
+                replyTextView.setText(OVERLAY_CONFLICT + "\n" + overlayState.textAt(SystemClock.elapsedRealtime()));
                 android.widget.Toast.makeText(this, "提示框放不下，请调整识别区域", android.widget.Toast.LENGTH_LONG).show();
             }
             return;
@@ -894,11 +928,11 @@ public class CaptureService extends Service {
             setState("提示框遮挡识别区域，文字采样已暂停；请调整区域或提示框");
             if (!overlayConflictNotified) {
                 overlayConflictNotified=true;
-                replyTextView.setText(OVERLAY_CONFLICT + "\n" + overlayState.textAt(System.currentTimeMillis()));
+                replyTextView.setText(OVERLAY_CONFLICT + "\n" + overlayState.textAt(SystemClock.elapsedRealtime()));
             }
         } else if (overlayConflictNotified) {
             overlayConflictNotified=false;
-            replyTextView.setText(overlayState.textAt(System.currentTimeMillis()));
+            replyTextView.setText(overlayState.textAt(SystemClock.elapsedRealtime()));
         }
     }
 

@@ -4,7 +4,7 @@ import java.util.ArrayDeque;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 
-/** 主线程内管理本场提示；只保留有界内存，不持久化提示正文。 */
+/** 主线程内管理本场提示；时间参数均为elapsedRealtime毫秒，不持久化提示正文。 */
 final class OverlayMessageState {
     static final String WAITING_TEXT = "辅助中，等待内容";
     static final long MIN_READ_MS = 5000;
@@ -48,7 +48,7 @@ final class OverlayMessageState {
         if (sourceExpiryMs > 0 && sourceExpiryMs <= nowMs) { expiredCount++; return false; }
         // 实时提示以ID幂等；兼容无ID的本地问答仅对当前/待显示文字去重。
         String key = id == null ? "" : id;
-        seen.entrySet().removeIf(entry -> entry.getValue() <= nowMs);
+        // 保守截止点可能早于源TTL，不能据此遗忘ID并让重投续显；仍受128项容量限制。
         if (!key.isEmpty() && (seen.containsKey(key) || containsId(key))) return false;
         if (key.isEmpty() && ((current != null && value.equals(current.text))
                 || pending.stream().anyMatch(item -> value.equals(item.text)))) return false;

@@ -11,11 +11,26 @@ public final class DebugOverlayService extends CaptureService {
         if (intent!=null && ACTION_EXPAND.equals(intent.getAction()) && running) {
             expandLocalOverlayForDebug(); return START_NOT_STICKY;
         }
+        verifyClockJsonTypes();
         if (showLocalOverlayForDebug()) running=true; else stopSelf();
         return START_NOT_STICKY;
     }
     @Override public void onDestroy() { running=false; super.onDestroy(); }
     @Override protected void dump(java.io.FileDescriptor fd, java.io.PrintWriter writer, String[] args) {
         dumpLocalOverlayForDebug(writer);
+    }
+    private void verifyClockJsonTypes() {
+        String[] values={"1000","1000.0","true","\"1000\"","null","9223372036854775808"};
+        try {
+            long now=android.os.SystemClock.elapsedRealtimeNanos();
+            for (int i=0;i<values.length;i++) {
+                org.json.JSONObject page=new org.json.JSONObject("{\"server_time_ms\":"+values[i]+",\"server_processing_ms\":0}")
+                        .put(PromptTiming.SENT_NS,now).put(PromptTiming.RECEIVED_NS,now);
+                boolean valid=PromptTiming.from(page)!=null;
+                if (valid!=(i==0)) throw new IllegalStateException("本机JSON时效整数核验失败");
+                android.util.Log.i("CaptureService","event=debug_timing_json_type case="+i
+                        +" actual="+page.opt("server_time_ms").getClass().getSimpleName()+" accepted="+valid);
+            }
+        } catch (org.json.JSONException e) { throw new IllegalStateException(e); }
     }
 }

@@ -12,6 +12,7 @@ final class LiveConnection {
     static final String CONNECTING = "正在连接服务\n屏幕采集已启动，暂无运营提示";
     static final String OFFLINE = "服务未连接\n本地屏幕采集继续，暂无新运营提示";
     static final String CREATE_UNKNOWN = "场次创建未确认\n请回到应用核对，未重复创建";
+    static final String TIME_UNKNOWN = "提示时效未核实，本次提示未显示；屏幕采集继续";
 
     interface Store {
         LiveClient.Session get();
@@ -139,6 +140,19 @@ final class LiveConnection {
             String next = page.getString("next_cursor");
             // 先处理终止，不能先显示同页中的过期场次内容。
             if (page.optBoolean("stopped")) { serverStopped(); return false; }
+            PromptTiming timing = PromptTiming.from(page);
+            boolean timingProblem = timing == null;
+            JSONArray ready = new JSONArray();
+            if (timing != null) for (int i = 0; i < prompts.length(); i++) {
+                JSONObject prompt = prompts.getJSONObject(i);
+                long deadline = timing.deadline(prompt);
+                if (deadline < 0) { timingProblem = true; ready = new JSONArray(); break; }
+                if (deadline > 0) {
+                    prompt.put(PromptTiming.DEADLINE_MS, deadline).put("_client_rtt_ms", timing.rttMs)
+                            .put("_client_processing_ms", timing.processingMs).put("_client_transport_ms", timing.transportMs);
+                    ready.put(prompt);
+                }
+            }
             if (uptime.getAsLong() >= refreshRecapAt) {
                 refreshRecapAt = uptime.getAsLong() + 30000;
                 try {
@@ -156,8 +170,8 @@ final class LiveConnection {
             synchronized (this) {
                 if (closed) return false;
                 if (!announced) { announced = true; listener.session(session); }
-                status("实时已连接，等待运营提示\n" + recap, false);
-                for (int i = 0; i < prompts.length() && !closed; i++) listener.prompt(prompts.getJSONObject(i));
+                status("实时已连接，等待运营提示\n" + recap + (timingProblem ? "\n" + TIME_UNKNOWN : ""), false);
+                for (int i = 0; i < ready.length() && !closed; i++) listener.prompt(ready.getJSONObject(i));
                 cursor = next;
             }
             return true;
