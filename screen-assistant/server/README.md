@@ -48,6 +48,8 @@ agent/RAG/历史上下文/个性化；不持久化句子或回复日志。
 
 实时观察已保存并安排分析时返回 `status=accepted`、`reason=scheduled`、`prompt_id=null`；队列满而观察已保存时 `reason=analysis_busy`，本次不安排分析。结果仍通过 `/prompts` 获取，`scheduled` 不表示已生成提示。上述上限是进程内保护值，不是性能保证；进程退出后未完成的内存调度不会自动恢复。
 
+`/prompts` 的成功响应顶层含 `server_time_ms` 和 `server_processing_ms`：前者是与 `expires_at_ms` 同源的服务时钟毫秒；后者是从路由处理入口到长轮询结束后的单调耗时，整数毫秒向下取整。响应设置 `Cache-Control: no-store`。客户端使用本次请求完整往返的单调耗时（毫秒向上取整）减去服务处理时长，并从 `expires_at_ms - server_time_ms` 扣除该差值及 1 毫秒取整余量，再按单调时间扣除后续排队和显示时间。字段缺失、非法或处理时长大于往返时间时不得据此延长提示有效期；旧服务缺少这些字段。该计算依赖响应未被缓存和服务时钟未异常跳变，不是任意网络条件下的绝对保证。
+
 音频响应含 `transcripts` 时，`fusion_schedule` 标记本次融合触发为 `scheduled` 或 `analysis_busy`；该字段不表示提示已生成，也不概括后台音频作业的其他触发。没有返回转写时不提供该字段。
 
 后台音频转写保存后若融合触发因容量或关闭门禁未安排，场次 `/summary` 的 `audio_fusion.background_analysis_busy_count` 持久累计这类后台触发次数，初始为 0。计数不含转写正文、不自动重试，也不表示某条提示的最终状态。
