@@ -119,6 +119,7 @@ public class CaptureService extends Service {
     private boolean draggingOverlay;
     private boolean overlayConflictNotified;
     private String displayedPromptId = "";
+    private String drawnPromptId = "";
     private int localDebugMessages;
     private final Runnable replyHide = () -> renderOverlay(sessionEpoch);
 
@@ -420,6 +421,25 @@ public class CaptureService extends Service {
         overlayState.update("debug-" + now, "本地固定测试文字" + label + "\n第一行\n第二行\n第三行\n第四行\n第五行", 0,
                 now + 15000, now, REPLY_AUTO_HIDE_MS);
         renderOverlay(sessionEpoch);
+    }
+
+    /** 由debug服务的系统DUMP入口核对同一个产品TextView；不读取采集帧或联网。 */
+    final void dumpLocalOverlayForDebug(java.io.PrintWriter writer) {
+        if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0 || operationMode) return;
+        TextView body = replyTextView;
+        View window = replyOverlayView;
+        if (body == null || window == null) { writer.println("overlay=absent"); return; }
+        android.graphics.Rect bounds = new android.graphics.Rect();
+        boolean visible = body.getGlobalVisibleRect(bounds);
+        android.text.Layout layout = body.getLayout();
+        int ellipsized = 0;
+        if (layout != null) for (int i=0; i<layout.getLineCount(); i++) ellipsized += layout.getEllipsisCount(i);
+        writer.println("at=" + System.currentTimeMillis() + " id=" + safeId(overlayState.currentId())
+                + " drawn=" + safeId(drawnPromptId) + " body_shown=" + body.isShown()
+                + " visible_rect=" + visible + " bounds=" + bounds.toShortString()
+                + " window=" + window.getWidth() + "x" + window.getHeight() + " ellipsized=" + ellipsized
+                + " source_expires=" + overlayState.sourceExpiryMs() + " visible_until=" + overlayState.expiresAtMs());
+        writer.println("fixed_text=" + body.getText());
     }
 
     private void setup(int resultCode, Intent data) {
@@ -725,6 +745,16 @@ public class CaptureService extends Service {
             if (replyOverlayView == null) {
                 replyOverlayView = LayoutInflater.from(this).inflate(R.layout.overlay_reply, null);
                 replyTextView = replyOverlayView.findViewById(R.id.tv_reply);
+                replyOverlayView.getViewTreeObserver().addOnDrawListener(() -> {
+                    String id = overlayState.currentId();
+                    if (replyOverlayView != null && !id.equals(drawnPromptId)) {
+                        logEvent("prompt_drawn", "id=" + safeId(id) + " previous=" + safeId(drawnPromptId)
+                                + " at=" + System.currentTimeMillis() + " body_visible=" + replyTextView.isShown()
+                                + " width=" + replyOverlayView.getWidth() + " height=" + replyOverlayView.getHeight()
+                                + " epoch=" + sessionEpoch);
+                        drawnPromptId = id;
+                    }
+                });
                 overlayBlocksCapture = true;
                 replyOverlayView.addOnLayoutChangeListener((view,left,top,right,bottom,oldLeft,oldTop,oldRight,oldBottom) -> {
                     if (!draggingOverlay && (right-left != oldRight-oldLeft || bottom-top != oldBottom-oldTop)) {
@@ -898,6 +928,7 @@ public class CaptureService extends Service {
         overlayBlocksCapture = false;
         overlayConflictNotified = false;
         displayedPromptId = "";
+        drawnPromptId = "";
     }
 
     private void setState(String message) {

@@ -15,4 +15,7 @@ public final class DebugOverlayService extends CaptureService {
         return START_NOT_STICKY;
     }
     @Override public void onDestroy() { running=false; super.onDestroy(); }
+    @Override protected void dump(java.io.FileDescriptor fd, java.io.PrintWriter writer, String[] args) {
+        dumpLocalOverlayForDebug(writer);
+    }
 }
