@@ -3,18 +3,26 @@ import CoreFoundation
 
 /// 校验 JSON 数字原类型；JSONDecoder 对 1.0 可接受为 Int64。
 enum PromptTimingJSON {
-    private static func isInteger(_ value: Any?) -> Bool {
+    private static func integer(_ value: Any?) -> Int64? {
         guard let number = value as? NSNumber,
-              CFGetTypeID(number) != CFBooleanGetTypeID() else { return false }
+              CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
         let type = String(cString: number.objCType)
-        return type != "f" && type != "d"
+        guard type != "f" && type != "d" else { return nil }
+        return Int64(number.stringValue)
     }
 
-    static func hasValidIntegers(_ data: Data?) -> Bool {
+    struct Inspection {
+        let serverTimeMS: Int64?
+        let processingMS: Int64?
+        let expiries: [Int64?]
+    }
+
+    static func inspect(_ data: Data?) -> Inspection? {
         guard let data,
               let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              isInteger(root["server_time_ms"]), isInteger(root["server_processing_ms"]),
-              let prompts = root["prompts"] as? [[String: Any]] else { return false }
-        return prompts.allSatisfy { isInteger($0["expires_at_ms"]) }
+              let prompts = root["prompts"] as? [[String: Any]] else { return nil }
+        return Inspection(serverTimeMS: integer(root["server_time_ms"]),
+                          processingMS: integer(root["server_processing_ms"]),
+                          expiries: prompts.map { integer($0["expires_at_ms"]) })
     }
 }

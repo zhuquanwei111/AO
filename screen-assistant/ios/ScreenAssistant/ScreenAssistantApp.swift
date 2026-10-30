@@ -48,6 +48,8 @@ final class AppModel: ObservableObject {
     @Published var liveStatus = "未开始"
     @Published var liveEvents: [LivePrompt] = []
     @Published var liveTimingWarning = false
+    @Published private(set) var liveTimingAnchorFailures = 0
+    @Published private(set) var liveTimingInvalidItems = 0
     @Published var liveSummary: LiveSessionSummary?
     @Published var liveActive = false
     @Published var liveStopped = false
@@ -259,6 +261,8 @@ final class AppModel: ObservableObject {
         livePollTask = nil
         liveEvents = []
         liveTimingWarning = false
+        liveTimingAnchorFailures = 0
+        liveTimingInvalidItems = 0
         overviewLoading = false
         summaryRefreshInFlight = false
         overviewRequest.clear()
@@ -355,20 +359,24 @@ final class AppModel: ObservableObject {
                         LivePromptDelivery.displayExpiry(prompt.expiresAtMS, serverTimeMS: page.serverTimeMS,
                             processingMS: page.serverProcessingMS, startNS: page.requestStartNS, endNS: page.responseEndNS)
                     }
-                    let timingValid = deadlines.allSatisfy { $0 != nil }
-                    if !timingValid && !page.prompts.isEmpty && !self.liveTimingWarning {
-                        self.liveTimingWarning = true
-                    }
+                    let anchorValid = LivePromptDelivery.displayExpiry(page.serverTimeMS, serverTimeMS: page.serverTimeMS,
+                        processingMS: page.serverProcessingMS, startNS: page.requestStartNS, endNS: page.responseEndNS) != nil
                     let items = zip(page.prompts, deadlines).map { prompt, deadline in
                         let label = prompt.sources?.contains(where: { $0.kind == "comment" }) == true ? "问答" : "运营"
                         return LivePromptDelivery.Item(id: prompt.promptID,
                             text: "【\(label)】" + prompt.displayText,
-                            expiresAtMS: timingValid ? (deadline ?? 0) : 0,
-                            priority: prompt.priority ?? 0)
+                            expiresAtMS: deadline ?? 0,
+                            priority: prompt.priority ?? 0, timingInvalid: deadline == nil)
                     }
                     let beforeOverflow = self.liveDelivery.overflowCount
                     let beforeExpired = self.liveDelivery.expiredCount
-                    var acceptedIDs = Set(self.liveDelivery.receive(items, nowMS: now).map(\.id))
+                    let freshItems = self.liveDelivery.receive(items, nowMS: now)
+                    if !freshItems.isEmpty {
+                        if !anchorValid { self.liveTimingAnchorFailures += 1 }
+                        else { self.liveTimingInvalidItems += freshItems.filter(\.timingInvalid).count }
+                        if !anchorValid || freshItems.contains(where: \.timingInvalid) { self.liveTimingWarning = true }
+                    }
+                    var acceptedIDs = Set(freshItems.map(\.id))
                     let fresh = page.prompts.filter { acceptedIDs.remove($0.promptID) != nil }
                     self.liveEvents.insert(contentsOf: fresh, at: 0)
                     self.liveEvents = Array(self.liveEvents.prefix(100))
