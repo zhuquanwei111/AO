@@ -398,6 +398,20 @@ public class CaptureService extends Service {
         return null;
     }
 
+    /** 供 debug 子类复用真实窗口；不创建投影、不启动联网或采集线程任务。 */
+    final boolean showLocalOverlayForDebug() {
+        if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0
+                || phase != Phase.IDLE || !tornDown || uiVisible) return false;
+        screenSize = ScreenMetrics.realSizeDpi(this);
+        if (screenSize[0] <= 0 || screenSize[1] <= 0) return false;
+        tornDown = false;
+        operationMode = false;
+        phase = Phase.RUNNING;
+        overlayState.start("本地测试：拖动提示框");
+        renderOverlay(sessionEpoch);
+        return true;
+    }
+
     private void setup(int resultCode, Intent data) {
         setupStage = "setup_entered";
         logEvent("projection_setup_started", "phase=" + phase);
