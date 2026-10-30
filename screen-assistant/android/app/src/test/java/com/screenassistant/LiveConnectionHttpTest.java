@@ -35,6 +35,7 @@ public class LiveConnectionHttpTest {
         volatile boolean summaryStopped;
         volatile String clockFields = ",\"server_time_ms\":1000,\"server_processing_ms\":0";
         volatile String expiryJson = "16000";
+        volatile String promptsJson;
         volatile int pollBodyDelayMs;
         volatile Runnable beforePollResponse;
         Fixture() throws IOException {
@@ -93,8 +94,9 @@ public class LiveConnectionHttpTest {
                 }
                 if (offline) { respond(e, 503, "{}"); return; }
                 if (beforePollResponse != null) beforePollResponse.run();
-                respond(e, 200, "{\"session_id\":\"one\"" + clockFields + ","
-                        + "\"prompts\":[{\"prompt_id\":\"fixture\",\"expires_at_ms\":" + expiryJson + ",\"display_text\":\"真实接口夹具建议\"}],"
+                String prompts = promptsJson != null ? promptsJson
+                        : "[{\"prompt_id\":\"fixture\",\"expires_at_ms\":" + expiryJson + ",\"display_text\":\"真实接口夹具建议\"}]";
+                respond(e, 200, "{\"session_id\":\"one\"" + clockFields + ",\"prompts\":" + prompts + ","
                         + "\"next_cursor\":\"cursor-one\",\"stopped\":false}");
             } else if (path.endsWith("/stop")) {
                 stops.incrementAndGet();
@@ -196,6 +198,115 @@ public class LiveConnectionHttpTest {
             assertEquals(1, fixture.creates.get()); assertEquals(1, display.bindings);
             connection.close(true); connection.finishStop();
             assertEquals(1, fixture.stops.get()); assertTrue(store.session.stopped);
+        }
+    }
+
+    static class ReceivedDisplay extends LiveConnectionTest.Display {
+        final List<org.json.JSONObject> received = new ArrayList<>();
+        @Override public void prompt(org.json.JSONObject prompt) {
+            super.prompt(prompt);
+            received.add(prompt);
+        }
+        void clear() { received.clear(); messages.clear(); }
+    }
+
+    static String item(String id, String expiry) {
+        return "{\"prompt_id\":\"" + id + "\",\"display_text\":\"建议" + id + "\",\"priority\":"
+                + ("C".equals(id) ? 38 : 25) + (expiry == null ? "" : ",\"expires_at_ms\":" + expiry) + "}";
+    }
+
+    static void assertValidPair(ReceivedDisplay display) {
+        assertEquals(2, display.received.size());
+        assertEquals("A", display.received.get(0).optString("prompt_id"));
+        assertEquals("C", display.received.get(1).optString("prompt_id"));
+        assertEquals("建议A", display.messages.get(0));
+        assertEquals("建议C", display.messages.get(1));
+        assertEquals(25, display.received.get(0).optInt("priority"));
+        assertEquals(38, display.received.get(1).optInt("priority"));
+        for (org.json.JSONObject prompt : display.received) {
+            assertEquals(16000, prompt.optLong("expires_at_ms"));
+            assertEquals(24999, prompt.optLong(PromptTiming.DEADLINE_MS));
+        }
+    }
+
+    @Test public void realHttpInvalidExpiryPreservesOtherItemsAndCursorThroughFailure() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            ReceivedDisplay display = new ReceivedDisplay();
+            LiveConnectionTest.Memory store = new LiveConnectionTest.Memory();
+            LiveConnection connection = new LiveConnection(store,
+                    LiveClient.remote(fixture.base(), "", "", () -> 10_000_000_000L), display);
+            assertTrue(connection.connect());
+            fixture.promptsJson = "[" + item("A", "16000") + "," + item("B", null)
+                    + "," + item("bad", "true") + "," + item("C", "16000") + "]";
+            assertTrue(connection.poll());
+            assertValidPair(display);
+            assertTrue(display.diagnostic.contains(LiveConnection.TIME_UNKNOWN));
+            fixture.offline = true;
+            assertFalse(connection.poll());
+            assertEquals(2, display.received.size());
+            assertEquals(LiveConnection.OFFLINE, display.diagnostic);
+            fixture.offline = false;
+            fixture.promptsJson = "[" + item("D", "16000") + "]";
+            assertTrue(connection.poll());
+            assertEquals(3, display.received.size());
+            assertEquals("D", display.received.get(2).optString("prompt_id"));
+            assertFalse(display.diagnostic.contains(LiveConnection.TIME_UNKNOWN));
+            assertEquals(2, fixture.requests.stream().filter(r ->
+                    r.contains("/prompts?after=cursor-one&wait_ms=15000 private-token")).count());
+            assertEquals(1, fixture.creates.get());
+            assertEquals(1, display.bindings);
+            connection.close(true); connection.finishStop();
+            assertEquals(1, fixture.stops.get()); assertTrue(store.session.stopped);
+        }
+    }
+
+    @Test public void realHttpInvalidExpiryTypesAtEveryPositionKeepValidOrder() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            ReceivedDisplay display = new ReceivedDisplay();
+            LiveConnection connection = new LiveConnection(new LiveConnectionTest.Memory(),
+                    LiveClient.remote(fixture.base(), "", "", () -> 10_000_000_000L), display);
+            assertTrue(connection.connect());
+            String a = item("A", "16000"), c = item("C", "16000");
+            for (String expiry : new String[]{null, "null", "true", "false", "16000.0",
+                    "\"16000\"", "-1", "0", "9223372036854775808", "9223372036854775807"}) {
+                String bad = item("B", expiry);
+                for (String page : new String[]{bad + "," + a + "," + c,
+                        a + "," + bad + "," + c, a + "," + c + "," + bad}) {
+                    display.clear();
+                    fixture.promptsJson = "[" + page + "]";
+                    assertTrue(connection.poll());
+                    assertValidPair(display);
+                    assertTrue(display.diagnostic.contains(LiveConnection.TIME_UNKNOWN));
+                }
+            }
+        }
+    }
+
+    @Test public void realHttpBadPageAnchorStillRejectsAllButExpiredItemOnlySkipsItself() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            ReceivedDisplay display = new ReceivedDisplay();
+            LiveConnection connection = new LiveConnection(new LiveConnectionTest.Memory(),
+                    LiveClient.remote(fixture.base(), "", "", () -> 10_000_000_000L), display);
+            assertTrue(connection.connect());
+            fixture.promptsJson = "[" + item("A", "16000") + "," + item("expired", "1000")
+                    + "," + item("C", "16000") + "]";
+            for (String fields : new String[]{"", ",\"server_time_ms\":1000.0,\"server_processing_ms\":0",
+                    ",\"server_time_ms\":1000,\"server_processing_ms\":1"}) {
+                fixture.clockFields = fields;
+                assertTrue(connection.poll());
+                assertTrue(display.received.isEmpty());
+                assertTrue(display.diagnostic.contains(LiveConnection.TIME_UNKNOWN));
+            }
+            fixture.clockFields = ",\"server_time_ms\":1000,\"server_processing_ms\":0";
+            assertTrue(connection.poll());
+            assertValidPair(display);
+            assertFalse(display.diagnostic.contains(LiveConnection.TIME_UNKNOWN));
+            display.clear();
+            fixture.promptsJson = "[" + item("A", "16000") + "," + item("invalid", "-1")
+                    + "," + item("C", "16000") + "]";
+            assertTrue(connection.poll());
+            assertValidPair(display);
+            assertTrue(display.diagnostic.contains(LiveConnection.TIME_UNKNOWN));
         }
     }
 

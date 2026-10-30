@@ -146,7 +146,7 @@ final class LiveConnection {
             if (timing != null) for (int i = 0; i < prompts.length(); i++) {
                 JSONObject prompt = prompts.getJSONObject(i);
                 long deadline = timing.deadline(prompt);
-                if (deadline < 0) { timingProblem = true; ready = new JSONArray(); break; }
+                if (deadline < 0) { timingProblem = true; continue; }
                 if (deadline > 0) {
                     prompt.put(PromptTiming.DEADLINE_MS, deadline).put("_client_rtt_ms", timing.rttMs)
                             .put("_client_processing_ms", timing.processingMs).put("_client_transport_ms", timing.transportMs);
