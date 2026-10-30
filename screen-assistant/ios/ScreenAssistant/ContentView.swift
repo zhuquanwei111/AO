@@ -50,6 +50,11 @@ struct ContentView: View {
                     Text(model.liveStatus)
                         .font(.footnote)
                         .foregroundColor(.secondary)
+                    if model.liveTimingWarning {
+                        Text("部分提示缺少可靠时效信息，未在画中画显示；实时采集仍可继续。")
+                            .font(.footnote)
+                            .foregroundColor(.orange)
+                    }
                     Label(model.serviceStatusText, systemImage: "network")
                         .font(.footnote)
                         .foregroundColor(model.serviceStatusText.contains("未收到") ||

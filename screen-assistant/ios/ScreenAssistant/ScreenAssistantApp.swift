@@ -47,6 +47,7 @@ final class AppModel: ObservableObject {
     @Published var liveDescription = ""
     @Published var liveStatus = "未开始"
     @Published var liveEvents: [LivePrompt] = []
+    @Published var liveTimingWarning = false
     @Published var liveSummary: LiveSessionSummary?
     @Published var liveActive = false
     @Published var liveStopped = false
@@ -262,6 +263,7 @@ final class AppModel: ObservableObject {
         livePollTask?.cancel()
         livePollTask = nil
         liveEvents = []
+        liveTimingWarning = false
         overviewLoading = false
         summaryRefreshInFlight = false
         overviewRequest.clear()
@@ -356,12 +358,20 @@ final class AppModel: ObservableObject {
                 switch result {
                 case .success(let page):
                     self.liveCursor = page.nextCursor
-                    let now = Int64(Date().timeIntervalSince1970 * 1000)
-                    let items = page.prompts.map { prompt in
+                    let now = Int64(LiveOperationsClient.continuousNowNS() / 1_000_000)
+                    let deadlines = page.prompts.map { prompt in
+                        LivePromptDelivery.displayExpiry(prompt.expiresAtMS, serverTimeMS: page.serverTimeMS,
+                            processingMS: page.serverProcessingMS, startNS: page.requestStartNS, endNS: page.responseEndNS)
+                    }
+                    let timingValid = deadlines.allSatisfy { $0 != nil }
+                    if !timingValid && !page.prompts.isEmpty && !self.liveTimingWarning {
+                        self.liveTimingWarning = true
+                    }
+                    let items = zip(page.prompts, deadlines).map { prompt, deadline in
                         let label = prompt.sources?.contains(where: { $0.kind == "comment" }) == true ? "问答" : "运营"
                         return LivePromptDelivery.Item(id: prompt.promptID,
                             text: "【\(label)】" + prompt.displayText,
-                            expiresAtMS: LivePromptDelivery.displayExpiry(prompt.expiresAtMS, receivedAtMS: now),
+                            expiresAtMS: timingValid ? (deadline ?? 0) : 0,
                             priority: prompt.priority ?? 0)
                     }
                     let beforeOverflow = self.liveDelivery.overflowCount
@@ -420,7 +430,7 @@ final class AppModel: ObservableObject {
     }
 
     private func deliverLivePrompts() {
-        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        let now = Int64(LiveOperationsClient.continuousNowNS() / 1_000_000)
         if let expiry = liveDisplayedUntilMS, expiry <= now {
             liveDisplayedItems = LivePromptDelivery.unexpired(liveDisplayedItems, nowMS: now)
             liveDisplayedUntilMS = liveDisplayedItems.map(\.expiresAtMS).min()

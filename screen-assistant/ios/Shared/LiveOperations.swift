@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import Darwin
 
 enum LiveCommentFilter {
     static func isWorthwhileQuestion(_ text: String) -> Bool {
@@ -86,6 +87,20 @@ struct LivePrompt: Codable, Identifiable {
         case observationCount = "observation_count"
         case expiresAtMS = "expires_at_ms", priority, sources
     }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        promptID = try values.decode(String.self, forKey: .promptID)
+        inputMode = try values.decode(String.self, forKey: .inputMode)
+        startAtMS = try values.decode(Int64.self, forKey: .startAtMS)
+        endAtMS = try values.decode(Int64.self, forKey: .endAtMS)
+        phenomenon = try values.decode(String.self, forKey: .phenomenon)
+        suggestion = try values.decode(String.self, forKey: .suggestion)
+        displayText = try values.decode(String.self, forKey: .displayText)
+        observationCount = try values.decode(Int.self, forKey: .observationCount)
+        expiresAtMS = try? values.decode(Int64.self, forKey: .expiresAtMS)
+        priority = try values.decodeIfPresent(Int.self, forKey: .priority)
+        sources = try values.decodeIfPresent([LivePromptSource].self, forKey: .sources)
+    }
 }
 
 struct LivePromptSource: Codable {
@@ -97,8 +112,22 @@ struct LivePromptPage: Decodable {
     let prompts: [LivePrompt]
     let stopped: Bool
     let nextCursor: String
+    let serverTimeMS: Int64?
+    let serverProcessingMS: Int64?
+    var requestStartNS: UInt64?
+    var responseEndNS: UInt64?
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id", prompts, stopped, nextCursor = "next_cursor"
+        case serverTimeMS = "server_time_ms", serverProcessingMS = "server_processing_ms"
+    }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try values.decode(String.self, forKey: .sessionID)
+        prompts = try values.decode([LivePrompt].self, forKey: .prompts)
+        stopped = try values.decode(Bool.self, forKey: .stopped)
+        nextCursor = try values.decode(String.self, forKey: .nextCursor)
+        serverTimeMS = try? values.decode(Int64.self, forKey: .serverTimeMS)
+        serverProcessingMS = try? values.decode(Int64.self, forKey: .serverProcessingMS)
     }
 }
 
@@ -235,6 +264,8 @@ struct LiveOperationsClient {
     private let baseURL: URL
     private let session: URLSession
 
+    static func continuousNowNS() -> UInt64 { clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) }
+
     init?(baseURL: URL, session: URLSession? = nil) {
         guard baseURL.scheme == "http" || baseURL.scheme == "https" else { return nil }
         self.baseURL = baseURL
@@ -299,15 +330,19 @@ struct LiveOperationsClient {
         var components = URLComponents(url: endpoint("v1", "live", "sessions", credentials.sessionID, "prompts"), resolvingAgainstBaseURL: false)!
         components.queryItems = [URLQueryItem(name: "after", value: after), URLQueryItem(name: "wait_ms", value: "15000")]
         let request = authorized(components.url!, token: credentials.token)
+        let requestStartNS = Self.continuousNowNS()
         let task = session.dataTask(with: request) { data, response, error in
+            let responseEndNS = Self.continuousNowNS()
             switch Self.decode(LivePromptPage.self, data: data, response: response, error: error,
                                recordResponse: false) {
             case .failure(let failure): completion(.failure(failure), response, error)
-            case .success(let page):
+            case .success(var page):
                 guard page.sessionID == credentials.sessionID else {
                     completion(.failure(NSError(domain: "LiveOperations", code: -3)), response, error)
                     return
                 }
+                page.requestStartNS = requestStartNS
+                page.responseEndNS = responseEndNS
                 completion(.success(page), response, error)
             }
         }

@@ -2,9 +2,20 @@ import Foundation
 
 /// 仅管理本场待显示的提示；调用方在主线程持有并按实际排版选择帧。
 struct LivePromptDelivery {
-    /// 缺少服务端期限时仅设置本机显示上限，不代表服务端生成时间。
-    static func displayExpiry(_ serverExpiry: Int64?, receivedAtMS: Int64) -> Int64 {
-        serverExpiry ?? receivedAtMS + 15_000
+    /// 截止点使用本机连续单调毫秒；无法验证时间锚时返回 nil。
+    static func displayExpiry(_ serverExpiry: Int64?, serverTimeMS: Int64?, processingMS: Int64?,
+                              startNS: UInt64?, endNS: UInt64?) -> Int64? {
+        guard let expiry = serverExpiry, let server = serverTimeMS, let processing = processingMS,
+              let start = startNS, let end = endNS, expiry >= 0, server >= 0,
+              processing >= 0, end >= start else { return nil }
+        let elapsed = end - start
+        let rounded = elapsed / 1_000_000 + (elapsed % 1_000_000 == 0 ? 0 : 1)
+        guard rounded <= UInt64(Int64.max), end / 1_000_000 <= UInt64(Int64.max) else { return nil }
+        let rtt = Int64(rounded)
+        guard processing <= rtt else { return nil }
+        let remaining = max(0, expiry - min(expiry, server) - (rtt - processing) - 1)
+        let (deadline, overflow) = Int64(end / 1_000_000).addingReportingOverflow(remaining)
+        return overflow ? nil : deadline
     }
 
     struct Item {
