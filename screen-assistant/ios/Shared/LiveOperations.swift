@@ -112,8 +112,8 @@ struct LivePromptPage: Decodable {
     let prompts: [LivePrompt]
     let stopped: Bool
     let nextCursor: String
-    let serverTimeMS: Int64?
-    let serverProcessingMS: Int64?
+    var serverTimeMS: Int64?
+    var serverProcessingMS: Int64?
     var requestStartNS: UInt64?
     var responseEndNS: UInt64?
     enum CodingKeys: String, CodingKey {
@@ -340,6 +340,10 @@ struct LiveOperationsClient {
                 guard page.sessionID == credentials.sessionID else {
                     completion(.failure(NSError(domain: "LiveOperations", code: -3)), response, error)
                     return
+                }
+                if !PromptTimingJSON.hasValidIntegers(data) {
+                    page.serverTimeMS = nil
+                    page.serverProcessingMS = nil
                 }
                 page.requestStartNS = requestStartNS
                 page.responseEndNS = responseEndNS
