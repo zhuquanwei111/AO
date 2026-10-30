@@ -167,18 +167,18 @@ final class SampleHandler: RPBroadcastSampleHandler {
         var regionROIs: [String: CGRect] = ["comment": observationROI]
         var regions: [OCRService.RegionInput] = [
             OCRService.RegionInput(identifier: "comment",
-                                   image: autoreleasepool(invoking: { makeOCRImage(from: sampleBuffer, roi: observationROI) })
+                                   image: autoreleasepool(invoking: { makeOCRImage(from: sampleBuffer, roi: observationROI) }))
         ]
         if LiveSessionState.isEnabled() {
             if let roi = SharedConfig.onlineCountROI() {
                 regionROIs["online_count"] = roi
                 regions.append(OCRService.RegionInput(identifier: "online_count",
-                                                       image: autoreleasepool(invoking: { makeOCRImage(from: sampleBuffer, roi: roi) })
+                                                       image: autoreleasepool(invoking: { makeOCRImage(from: sampleBuffer, roi: roi) })))
             }
             if let roi = SharedConfig.platformNoticeROI() {
                 regionROIs["platform_notice"] = roi
                 regions.append(OCRService.RegionInput(identifier: "platform_notice",
-                                                       image: autoreleasepool(invoking: { makeOCRImage(from: sampleBuffer, roi: roi) })
+                                                       image: autoreleasepool(invoking: { makeOCRImage(from: sampleBuffer, roi: roi) })))
             }
         }
         guard regions.contains(where: { $0.image != nil }) else { endRound(generation: generation); return }
