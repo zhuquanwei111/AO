@@ -76,7 +76,7 @@ struct LivePrompt: Codable, Identifiable {
     let suggestion: String
     let displayText: String
     let observationCount: Int
-    let expiresAtMS: Int64?
+    var expiresAtMS: Int64?
     let priority: Int?
     let sources: [LivePromptSource]?
     var id: String { promptID }
@@ -109,7 +109,7 @@ struct LivePromptSource: Codable {
 
 struct LivePromptPage: Decodable {
     let sessionID: String
-    let prompts: [LivePrompt]
+    var prompts: [LivePrompt]
     let stopped: Bool
     let nextCursor: String
     var serverTimeMS: Int64?
@@ -341,7 +341,13 @@ struct LiveOperationsClient {
                     completion(.failure(NSError(domain: "LiveOperations", code: -3)), response, error)
                     return
                 }
-                if !PromptTimingJSON.hasValidIntegers(data) {
+                if let timing = PromptTimingJSON.inspect(data), timing.expiries.count == page.prompts.count {
+                    page.serverTimeMS = timing.serverTimeMS
+                    page.serverProcessingMS = timing.processingMS
+                    for index in page.prompts.indices {
+                        page.prompts[index].expiresAtMS = timing.expiries[index]
+                    }
+                } else {
                     page.serverTimeMS = nil
                     page.serverProcessingMS = nil
                 }

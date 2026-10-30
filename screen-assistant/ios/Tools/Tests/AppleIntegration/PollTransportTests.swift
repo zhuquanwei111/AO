@@ -36,8 +36,12 @@ private final class PollFixtureProtocol: URLProtocol {
         } else {
             timing = "\"server_time_ms\":1000,\"server_processing_ms\":0"
         }
+        let promptFields = "\"input_mode\":\"live_observation\",\"start_at_ms\":1,\"end_at_ms\":1,\"phenomenon\":\"x\",\"suggestion\":\"x\",\"display_text\":\"x\",\"observation_count\":1"
+        let prompts = path.hasPrefix("/mixed-timing/")
+            ? "[{\"prompt_id\":\"a\",\(promptFields),\"expires_at_ms\":5000},{\"prompt_id\":\"bad\",\(promptFields),\"expires_at_ms\":9.0},{\"prompt_id\":\"b\",\(promptFields),\"expires_at_ms\":6000}]"
+            : "[]"
         let json = status == 200
-            ? "{\"session_id\":\"fixture-session\",\"prompts\":[],\"stopped\":false,\"next_cursor\":\"next\",\(timing)}"
+            ? "{\"session_id\":\"fixture-session\",\"prompts\":\(prompts),\"stopped\":false,\"next_cursor\":\"next\",\(timing)}"
             : "{\"detail\":\"fixture\"}"
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Data(json.utf8))
@@ -79,8 +83,7 @@ final class PollTransportTests: XCTestCase {
                 XCTAssertEqual(page.nextCursor, "next")
                 if scenario == "invalid-timing" || scenario == "float-timing" { XCTAssertNil(page.serverTimeMS) }
                 else { XCTAssertEqual(page.serverTimeMS, 1000) }
-                if scenario == "invalid-timing" || scenario == "float-timing" { XCTAssertNil(page.serverProcessingMS) }
-                else { XCTAssertEqual(page.serverProcessingMS, 0) }
+                XCTAssertEqual(page.serverProcessingMS, 0)
                 XCTAssertNotNil(page.requestStartNS)
                 XCTAssertNotNil(page.responseEndNS)
                 XCTAssertNil(error)
@@ -111,6 +114,20 @@ final class PollTransportTests: XCTestCase {
         let prompt = try JSONDecoder().decode(LivePrompt.self, from: Data(json.utf8))
         XCTAssertEqual(prompt.promptID, "p")
         XCTAssertNil(prompt.expiresAtMS)
+    }
+    func testMixedPageRetainsSharedAnchorAndValidExpiry() {
+        let (client, session) = makeClient("mixed-timing")
+        defer { session.invalidateAndCancel() }
+        let finished = expectation(description: "mixed prompt timing")
+        _ = client.poll(credentials, after: "") { result, _, _ in
+            guard case .success(let page) = result else { XCTFail("expected mixed page"); finished.fulfill(); return }
+            XCTAssertEqual(page.serverTimeMS, 1000)
+            XCTAssertEqual(page.serverProcessingMS, 0)
+            XCTAssertEqual(page.prompts.map(\.promptID), ["a", "bad", "b"])
+            XCTAssertEqual(page.prompts.map(\.expiresAtMS), [5000, nil, 6000])
+            finished.fulfill()
+        }
+        wait(for: [finished], timeout: 5)
     }
     func testHTTPFailure() { check("http-error", expectedHTTP: 503) }
     func testTransportFailure() { check("disconnect", expectedError: .cannotConnectToHost) }
