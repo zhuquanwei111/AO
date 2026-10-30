@@ -144,18 +144,18 @@ struct ROIEditorView: View {
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            if showsPresets {
             ToolbarItem(placement: .navigationBarTrailing) {
-                Menu {
-                    Button("整屏") { roi = CGRect(x: 0.05, y: 0.05, width: 0.90, height: 0.90) }
-                    Button("上半屏") { roi = CGRect(x: 0.05, y: 0.05, width: 0.90, height: 0.42) }
-                    Button("下半屏") { roi = CGRect(x: 0.05, y: 0.53, width: 0.90, height: 0.42) }
-                    Button("中部横条（字幕区）") { roi = CGRect(x: 0.05, y: 0.72, width: 0.90, height: 0.20) }
-                    Button("左上四分之一") { roi = CGRect(x: 0.05, y: 0.05, width: 0.42, height: 0.42) }
-                } label: {
-                    Text("预设")
+                if showsPresets {
+                    Menu {
+                        Button("整屏") { roi = CGRect(x: 0.05, y: 0.05, width: 0.90, height: 0.90) }
+                        Button("上半屏") { roi = CGRect(x: 0.05, y: 0.05, width: 0.90, height: 0.42) }
+                        Button("下半屏") { roi = CGRect(x: 0.05, y: 0.53, width: 0.90, height: 0.42) }
+                        Button("中部横条（字幕区）") { roi = CGRect(x: 0.05, y: 0.72, width: 0.90, height: 0.20) }
+                        Button("左上四分之一") { roi = CGRect(x: 0.05, y: 0.05, width: 0.42, height: 0.42) }
+                    } label: {
+                        Text("预设")
+                    }
                 }
-            }
             }
         }
     }
