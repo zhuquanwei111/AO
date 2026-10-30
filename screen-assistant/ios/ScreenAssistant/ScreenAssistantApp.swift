@@ -73,6 +73,7 @@ final class AppModel: ObservableObject {
     private var liveDisplayedUntilMS: Int64?
     private var liveDisplayedItems: [LivePromptDelivery.Item] = []
     private var summaryRefreshInFlight = false
+    private var overviewRequest = OverviewRequestTracker()
     private var lastServiceConnection = ControlState.serviceConnection()
 
     init() {
@@ -263,6 +264,7 @@ final class AppModel: ObservableObject {
         liveEvents = []
         overviewLoading = false
         summaryRefreshInFlight = false
+        overviewRequest.clear()
         liveDelivery.clear()
         liveDisplayedUntilMS = nil
         liveDisplayedItems = []
@@ -613,6 +615,7 @@ final class AppModel: ObservableObject {
         let group = DispatchGroup()
         var fetchedEvents: LiveEventPage?
         var fetchedSummary: LiveSessionSummary?
+        let requestID = overviewRequest.begin()
         overviewLoading = true
         summaryRefreshInFlight = true
         group.enter()
@@ -630,10 +633,11 @@ final class AppModel: ObservableObject {
             }
         }
         group.notify(queue: .main) { [weak self] in
-            guard let self, !self.liveActive, !self.liveStarting, generation == self.liveStartGeneration,
-                  Self.savedCredentials()?.sessionID == credentials.sessionID else { return }
+            guard let self, self.overviewRequest.finish(requestID) else { return }
             self.overviewLoading = false
             self.summaryRefreshInFlight = false
+            guard !self.liveActive, !self.liveStarting, generation == self.liveStartGeneration,
+                  Self.savedCredentials()?.sessionID == credentials.sessionID else { return }
             if let events = fetchedEvents?.events { self.liveEvents = events }
             self.liveSummary = fetchedSummary
             self.finishCredentialRetentionIfTerminal(fetchedSummary?.backstageRecap?.status)
@@ -656,20 +660,22 @@ final class AppModel: ObservableObject {
     }
 
     func refreshStoppedOverview() {
-        guard !liveActive, !summaryRefreshInFlight,
+        guard !liveActive, !liveStarting, !summaryRefreshInFlight,
               let credentials = Self.savedCredentials(),
               let client = liveClient ?? SharedConfig.serverBaseURL().flatMap({ LiveOperationsClient(baseURL: $0) }) else {
             return
         }
         summaryRefreshInFlight = true
         overviewLoading = true
+        let requestID = overviewRequest.begin()
         let generation = liveStartGeneration
         client.summary(credentials, onResponse: overviewResponseHandler(credentials, generation: generation)) { [weak self] result in
             DispatchQueue.main.async {
-                guard let self, !self.liveActive, !self.liveStarting, generation == self.liveStartGeneration,
-                      Self.savedCredentials()?.sessionID == credentials.sessionID else { return }
+                guard let self, self.overviewRequest.finish(requestID) else { return }
                 self.summaryRefreshInFlight = false
                 self.overviewLoading = false
+                guard !self.liveActive, !self.liveStarting, generation == self.liveStartGeneration,
+                      Self.savedCredentials()?.sessionID == credentials.sessionID else { return }
                 guard case .success(let summary) = result else {
                     if self.liveSummary == nil {
                         self.liveStatus = "本场后台汇总暂不可读，可重试；事件记录独立保留"

@@ -70,7 +70,7 @@ struct LivePromptDelivery {
         }
         if !frame.isEmpty { lastOrdinaryFrameMS = nowMS }
         if let until = frame.filter({ $0.priority >= 100 }).map(\.expiresAtMS).min() {
-            urgentUntilMS = until
+            urgentUntilMS = min(until, nowMS + intervalMS)
         }
         return frame
     }
