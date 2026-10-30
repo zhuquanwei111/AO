@@ -25,9 +25,9 @@ public class RecapTextTest {
     @Test public void notConnectedIsUnavailableNotPendingAndDoesNotShowInventedZero() throws Exception {
         JSONObject data=new JSONObject().put("stopped_at_ms",123).put("backstage_recap",
                 new JSONObject().put("status","not_connected").put("metrics",JSONObject.NULL));
-        assertFalse(RecapText.pending(data)); assertTrue(RecapText.terminal(data));
-        assertTrue(RecapText.backstage(data.getJSONObject("backstage_recap")).contains("本场后台复盘不可取数"));
-        assertTrue(RecapText.backstage(data.getJSONObject("backstage_recap")).contains("不自动补领"));
+        assertFalse(RecapText.pending(data)); assertFalse(RecapText.terminal(data));
+        assertTrue(RecapText.backstage(data.getJSONObject("backstage_recap")).contains("本场复盘未取得"));
+        assertFalse(RecapText.backstage(data.getJSONObject("backstage_recap")).contains("不自动补领"));
         assertTrue(RecapText.backstage(data.getJSONObject("backstage_recap")).contains("新增粉丝：未取得"));
         assertFalse(RecapText.backstage(data.getJSONObject("backstage_recap")).contains("新增粉丝：0"));
         data.put("stopped_at_ms",JSONObject.NULL);
@@ -46,7 +46,7 @@ public class RecapTextTest {
             assertFalse(status,RecapText.pending(data)); assertTrue(status,RecapText.terminal(data));
         }
         assertTrue(RecapText.backstage(new JSONObject().put("status","failed")).contains("取数失败"));
-        assertTrue(RecapText.backstage(new JSONObject().put("status","captured_locally")).contains("已读取五项"));
+        assertTrue(RecapText.backstage(new JSONObject().put("status","captured_locally")).contains("后台报告已采集"));
         assertTrue(RecapText.backstage(new JSONObject().put("status","waiting_for_stop"))
                 .contains("任务已登记，取数状态待确认"));
         assertTrue(RecapText.backstage(new JSONObject().put("status","capturing"))

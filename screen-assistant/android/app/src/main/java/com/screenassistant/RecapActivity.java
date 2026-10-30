@@ -36,7 +36,8 @@ public class RecapActivity extends Activity {
         TextView title = text(column); title.setText("本场复盘"); title.setTextSize(22);
         Button reload = new Button(this); reload.setText("刷新本场"); column.addView(reload);
         reload.setOnClickListener(v -> {
-            if (session == null) session = Prefs.getSession(this);
+            LiveClient.Session current = Prefs.getSession(this);
+            if (!RecapRequest.sameSession(session,current)) { session=current; loadedEvents=null; }
             rounds = 0; load(true);
         });
         status = text(column); summary = text(column); events = text(column);
@@ -67,28 +68,34 @@ public class RecapActivity extends Activity {
         }
         busy = true; rounds++; main.removeCallbacks(refresh);
         status.setText("读取本场…");
+        LiveClient.Session requested = session;
         JSONArray previousEvents=loadedEvents;
         io.execute(() -> {
             JSONObject result = null; JSONArray rows = null; String error = "";
-            try { result = LiveClient.call(session, "summary", null); }
-            catch (Exception e) { error = "摘要读取失败：" + e.getMessage(); }
+            try { result = LiveClient.call(requested, "summary", null); }
+            catch (Exception e) { error = RecapRequest.failure(e); }
             if (includeEvents) {
-                try { rows = LiveClient.events(session); }
-                catch (Exception e) { error += " 事件读取失败：" + e.getMessage(); }
+                try { rows = LiveClient.events(requested); }
+                catch (Exception e) { error += " 事件读取未确认：" + e.getClass().getSimpleName(); }
             }
             JSONArray completeEvents=rows==null?previousEvents:rows;
             boolean cached=result!=null && completeEvents!=null && RecapText.terminal(result)
-                    && Prefs.cacheTerminalRecap(this,session,result,completeEvents);
+                    && Prefs.cacheTerminalRecap(this,requested,result,completeEvents);
             final JSONObject data = result; final JSONArray eventRows = rows; final String message = error;
             main.post(() -> {
                 busy = false;
                 if (!visible) return;
+                if (!RecapRequest.mayApply(requested,Prefs.getSession(this),cached)) {
+                    session=Prefs.getSession(this); loadedEvents=null;
+                    status.setText("场次已变化，请刷新当前场次。");
+                    summary.setText(""); events.setText(""); return;
+                }
                 status.setText(message.isEmpty() ? "已读取本场；在线统计是屏幕采样，后台五项另列。"
                         : "复盘读取不可用；本地辅助保持原状态。\n" + message);
                 if (data != null) summary.setText(renderSummary(data));
                 if (eventRows != null) { loadedEvents=eventRows; events.setText(renderEvents(eventRows)); }
                 if (cached) session=null;
-                if (rounds < 24 && (data == null || pending(data))) main.postDelayed(refresh, 5000);
+                if (rounds < 24 && data != null && pending(data)) main.postDelayed(refresh, 5000);
                 else if (data!=null && pending(data)) status.append("\n本轮自动刷新已暂停，点刷新或重开可继续。");
             });
         });

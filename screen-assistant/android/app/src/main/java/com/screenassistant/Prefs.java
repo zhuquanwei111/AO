@@ -137,7 +137,7 @@ public final class Prefs {
     public static synchronized boolean cacheTerminalRecap(Context c,LiveClient.Session session,
                                             org.json.JSONObject summary,org.json.JSONArray events) {
         LiveClient.Session current=getSession(c);
-        if (current==null || !current.id.equals(session.id) || !RecapText.terminal(summary)) return false;
+        if (!RecapRequest.sameSession(current,session) || !RecapText.terminal(summary)) return false;
         try {
             String raw=new org.json.JSONObject().put("summary",summary).put("events",events).toString();
             return sp(c).edit().putString("last_recap",raw).remove("live_session").commit();

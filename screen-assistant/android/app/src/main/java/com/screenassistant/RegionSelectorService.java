@@ -27,7 +27,6 @@ public class RegionSelectorService extends Service {
     private WindowManager wm;
     private View bubble;
     private View overlay;
-    private String regionKind = "legacy";
     private final Handler main = new Handler(Looper.getMainLooper());
 
     private final Runnable longPressExit = () -> {
@@ -44,8 +43,6 @@ public class RegionSelectorService extends Service {
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
-        String kind = intent == null ? null : intent.getStringExtra("region_kind");
-        regionKind = java.util.Arrays.asList(Regions.KEYS).contains(kind) ? kind : "legacy";
         return START_NOT_STICKY;
     }
 
@@ -74,7 +71,7 @@ public class RegionSelectorService extends Service {
 
     private void showBubble() {
         TextView tv = new TextView(this);
-        tv.setText("框选" + Regions.LABELS[java.util.Arrays.asList(Regions.KEYS).indexOf(regionKind)]);
+        tv.setText("编辑评论和人数区域");
         tv.setTextColor(0xFFFFFFFF);
         tv.setBackgroundResource(R.drawable.bg_bubble);
         int pad = (int) (12 * getResources().getDisplayMetrics().density);
@@ -138,6 +135,7 @@ public class RegionSelectorService extends Service {
         SelectionView sv = overlay.findViewById(R.id.selection_view);
         Button confirm = overlay.findViewById(R.id.btn_confirm);
         Button cancel = overlay.findViewById(R.id.btn_cancel);
+        confirm.setText("保存区域");
 
         WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.MATCH_PARENT,
@@ -153,34 +151,59 @@ public class RegionSelectorService extends Service {
             return;
         }
 
+        sv.post(() -> {
+            if (overlay == null) return;
+            int[] loc=new int[2]; sv.getLocationOnScreen(loc);
+            int[] size=ScreenMetrics.realSizeDpi(this);
+            android.graphics.RectF[] values=new android.graphics.RectF[2];
+            for (int i=0;i<values.length;i++) {
+                float[] r=Prefs.getRegion(this,Regions.ACTIVE_KEYS[i]);
+                if (r==null) r=i==0 ? Regions.commentDefault(.948f) : Regions.onlineDefault();
+                values[i]=new android.graphics.RectF(r[0]*size[0]-loc[0],r[1]*size[1]-loc[1],
+                        r[2]*size[0]-loc[0],r[3]*size[1]-loc[1]);
+            }
+            sv.setSelections(values);
+            Toast.makeText(this,"点击框选择，拖动或拉四角调整；未配置区域显示参考位置",Toast.LENGTH_LONG).show();
+        });
+
+        final boolean[] saved = {false};
         confirm.setOnClickListener(v -> {
-            android.graphics.RectF vr = sv.getSelectionRect();
+            android.graphics.RectF[] rectangles = sv.getSelections();
+            if (rectangles == null) {
+                Toast.makeText(this, "区域正在加载，请稍后再保存", Toast.LENGTH_SHORT).show();
+                return;
+            }
             int[] loc = new int[2];
             sv.getLocationOnScreen(loc);
             // 视图坐标 -> 整屏坐标（TYPE_APPLICATION_OVERLAY 不覆盖状态栏，需加偏移）
-            android.graphics.RectF screenRect = new android.graphics.RectF(
-                    vr.left + loc[0], vr.top + loc[1], vr.right + loc[0], vr.bottom + loc[1]);
             int[] size = ScreenMetrics.realSizeDpi(this);
             if (size[0] <= 0 || size[1] <= 0) {
                 Toast.makeText(this, "无法获取屏幕尺寸", Toast.LENGTH_SHORT).show();
                 stopSelf();
                 return;
             }
-            float l = clamp01(screenRect.left / size[0]);
-            float t = clamp01(screenRect.top / size[1]);
-            float r = clamp01(screenRect.right / size[0]);
-            float b = clamp01(screenRect.bottom / size[1]);
-            if (r - l < 0.03f || b - t < 0.02f) {
-                Toast.makeText(this, "区域太小，请拖动放大", Toast.LENGTH_SHORT).show();
-                return;
+            float[][] normalized=new float[rectangles.length][4];
+            for (int i=0;i<rectangles.length;i++) {
+                android.graphics.RectF vr=rectangles[i];
+                normalized[i]=new float[]{clamp01((vr.left+loc[0])/size[0]),clamp01((vr.top+loc[1])/size[1]),
+                        clamp01((vr.right+loc[0])/size[0]),clamp01((vr.bottom+loc[1])/size[1])};
+                if (normalized[i][2]-normalized[i][0]<.03f || normalized[i][3]-normalized[i][1]<.02f) {
+                    Toast.makeText(this,"区域太小，请拖动放大",Toast.LENGTH_SHORT).show(); return;
+                }
             }
-            Prefs.setRegion(this, regionKind, l, t, r, b);
-            Toast.makeText(this, "识别区域已保存", Toast.LENGTH_SHORT).show();
+            float[] oldOnline = Prefs.getRegion(this, "online_count");
+            boolean onlineChanged = !java.util.Arrays.equals(oldOnline, normalized[1]);
+            for (int i=0;i<normalized.length;i++) {
+                float[] r=normalized[i]; Prefs.setRegion(this,Regions.ACTIVE_KEYS[i],r[0],r[1],r[2],r[3]);
+            }
+            if (onlineChanged) Prefs.setOnlineConfirmed(this, false);
+            Toast.makeText(this, onlineChanged ? "区域已保存，请重新核对人数框用途" : "识别区域已保存", Toast.LENGTH_LONG).show();
             broadcastState();
-            stopSelf();
+            saved[0] = true;
+            cancel.setText("完成");
         });
         cancel.setOnClickListener(v -> {
-            Toast.makeText(this, "已取消框选", Toast.LENGTH_SHORT).show();
+            if (!saved[0]) Toast.makeText(this, "已取消框选", Toast.LENGTH_SHORT).show();
             stopSelf();
         });
     }

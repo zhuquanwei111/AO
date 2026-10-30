@@ -22,6 +22,7 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.view.Gravity;
 import android.view.LayoutInflater;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.TextView;
@@ -116,6 +117,8 @@ public class CaptureService extends Service {
 
     private View replyOverlayView;
     private TextView replyTextView;
+    private volatile boolean overlayBlocksCapture;
+    private boolean draggingOverlay;
     private final Runnable replyHide = () -> renderOverlay(sessionEpoch);
 
     private MediaProjection.Callback projectionCallback;
@@ -502,6 +505,7 @@ public class CaptureService extends Service {
 
     private void liveTick() {
         int epoch = sessionEpoch;
+        if (overlayBlocksCapture) { scheduleNext(epoch); return; }
         if (!busyEpoch.compareAndSet(-1, epoch)) { scheduleNext(epoch); return; }
         LiveFrameAnalyzer.Frame frame = null;
         try (Image image = imageReader.acquireLatestImage()) {
@@ -514,7 +518,7 @@ public class CaptureService extends Service {
                 }
                 lastFrameTimestamp = image.getTimestamp();
                 boolean ocr = now - lastLiveOcr >= intervalMs;
-                boolean person = now - lastLivePerson >= 3000;
+                boolean person = false;
                 frame = LiveFrameAnalyzer.snapshot(this, image, ocr, person);
                 if (ocr) lastLiveOcr = now;
                 if (person) lastLivePerson = now;
@@ -525,7 +529,7 @@ public class CaptureService extends Service {
         LiveFrameAnalyzer analyzer = liveAnalyzer;
         workExecutor.execute(() -> {
             try {
-                if (!tornDown && phase == Phase.RUNNING && epoch == sessionEpoch) analyzer.analyze(sample);
+                if (!tornDown && !overlayBlocksCapture && phase == Phase.RUNNING && epoch == sessionEpoch) analyzer.analyze(sample);
             } catch (Exception e) {
                 if (!tornDown && epoch == sessionEpoch) setState("本轮观察未取得：" + e.getClass().getSimpleName());
             } finally { sample.close(); busyEpoch.compareAndSet(epoch, -1); scheduleNext(epoch); }
@@ -610,7 +614,11 @@ public class CaptureService extends Service {
                             liveAnalyzer = new LiveFrameAnalyzer(CaptureService.this, recognizer, session,
                                     () -> !tornDown && !uiVisible && phase == Phase.RUNNING && sessionEpoch == epoch,
                                     message -> main.post(() -> {
-                                        if (!tornDown && epoch == sessionEpoch) setState(message);
+                                        if (!tornDown && epoch == sessionEpoch) {
+                                            setState(message);
+                                            overlayState.setStatus(connectionStatus + "\n" + message, false);
+                                            renderOverlay(epoch);
+                                        }
                                     }));
                             if (phase == Phase.RUNNING) startAudio();
                         });
@@ -686,6 +694,7 @@ public class CaptureService extends Service {
             if (replyOverlayView == null) {
                 replyOverlayView = LayoutInflater.from(this).inflate(R.layout.overlay_reply, null);
                 replyTextView = replyOverlayView.findViewById(R.id.tv_reply);
+                overlayBlocksCapture = true;
                 replyOverlayView.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
                     @Override
                     public void onViewAttachedToWindow(View view) {
@@ -703,22 +712,47 @@ public class CaptureService extends Service {
                         WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                         WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                                 | WindowManager.LayoutParams.FLAG_SECURE
-                                | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
                                 | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                         PixelFormat.TRANSLUCENT);
-                lp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+                lp.gravity = Gravity.TOP | Gravity.START;
                 // Android12+不可信覆盖层的触摸穿透必须满足系统最大遮挡透明度。
                 lp.alpha = android.os.Build.VERSION.SDK_INT >= 31
                         ? Math.min(.8f, getSystemService(android.hardware.input.InputManager.class).getMaximumObscuringOpacityForTouch()) : .8f;
                 lp.y = (int) (64 * getResources().getDisplayMetrics().density);
-                lp.width = Math.max(200, screenSize[0]
-                        - (int) (32 * getResources().getDisplayMetrics().density));
+                lp.x = (int) (16 * getResources().getDisplayMetrics().density);
+                lp.width = Math.max(200, (int) (screenSize[0] * .72f));
+                View handle = replyOverlayView.findViewById(R.id.drag_handle);
+                handle.setOnTouchListener(new View.OnTouchListener() {
+                    float downX, downY; int startX, startY;
+                    @Override public boolean onTouch(View view, MotionEvent event) {
+                        if (replyOverlayView == null) return false;
+                        switch (event.getActionMasked()) {
+                            case MotionEvent.ACTION_DOWN:
+                                draggingOverlay = true; overlayBlocksCapture = true;
+                                downX = event.getRawX(); downY = event.getRawY();
+                                startX = lp.x; startY = lp.y; return true;
+                            case MotionEvent.ACTION_MOVE:
+                                lp.x = startX + Math.round(event.getRawX() - downX);
+                                lp.y = startY + Math.round(event.getRawY() - downY);
+                                wm.updateViewLayout(replyOverlayView, lp); return true;
+                            case MotionEvent.ACTION_UP:
+                                view.performClick();
+                            case MotionEvent.ACTION_CANCEL:
+                                draggingOverlay = false; placeReplyOverlay(); return true;
+                            default: return false;
+                        }
+                    }
+                });
                 wm.addView(replyOverlayView, lp);
             }
             long now = System.currentTimeMillis();
             String text = overlayState.textAt(now);
             if (!text.contentEquals(replyTextView.getText())) replyTextView.setText(text);
             replyOverlayView.setVisibility(View.VISIBLE);
+            if (!draggingOverlay) {
+                overlayBlocksCapture = true;
+                replyOverlayView.post(this::placeReplyOverlay);
+            }
             logEvent("overlay_visible", "kind=" + (OverlayMessageState.WAITING_TEXT.equals(text) ? "waiting" : "message")
                     + " attached=" + replyOverlayView.isAttachedToWindow());
             if (overlayState.isMessageActive(now)) {
@@ -732,6 +766,45 @@ public class CaptureService extends Service {
                     + "）。请回到应用检查悬浮窗权限后重新开始。");
             notifManager.notify(NOTIF_ID, buildNotification("悬浮提示未显示，点此检查"));
         }
+    }
+
+    private void placeReplyOverlay() {
+        View view = replyOverlayView;
+        if (view == null || draggingOverlay || !view.isAttachedToWindow()) return;
+        int[] loc = new int[2]; view.getLocationOnScreen(loc);
+        java.util.List<int[]> areas = new java.util.ArrayList<>();
+        for (String key : Regions.ACTIVE_KEYS) {
+            float[] region = Prefs.getRegion(this, key);
+            if (Regions.valid(region)) areas.add(Regions.crop(region, screenSize[0], screenSize[1]));
+        }
+        int[] target = Regions.placeOverlay(screenSize[0], screenSize[1], view.getWidth(), view.getHeight(),
+                loc[0], loc[1], areas.toArray(new int[0][]));
+        if (target == null) {
+            overlayBlocksCapture = true;
+            setState("提示框遮挡识别区域，文字采样已暂停；请调整区域或提示框");
+            android.widget.Toast.makeText(this, "提示框放不下，请调整识别区域", android.widget.Toast.LENGTH_LONG).show();
+            return;
+        }
+        WindowManager.LayoutParams lp = (WindowManager.LayoutParams) view.getLayoutParams();
+        if (target[0] != loc[0] || target[1] != loc[1]) {
+            lp.x += target[0] - loc[0]; lp.y += target[1] - loc[1];
+            wm.updateViewLayout(view, lp);
+            view.post(this::verifyReplyPlacement);
+        } else verifyReplyPlacement();
+    }
+
+    private void verifyReplyPlacement() {
+        View view = replyOverlayView;
+        if (view == null || draggingOverlay) return;
+        int[] loc = new int[2]; view.getLocationOnScreen(loc);
+        boolean blocked = false;
+        for (String key : Regions.ACTIVE_KEYS) {
+            float[] r = Prefs.getRegion(this, key);
+            if (Regions.valid(r) && Regions.overlaps(loc[0], loc[1], view.getWidth(), view.getHeight(),
+                    Regions.crop(r, screenSize[0], screenSize[1]))) blocked = true;
+        }
+        overlayBlocksCapture = blocked;
+        if (blocked) setState("提示框遮挡识别区域，文字采样已暂停；请调整区域或提示框");
     }
 
     private static String safeId(String id) {
@@ -757,6 +830,7 @@ public class CaptureService extends Service {
             replyOverlayView = null;
             replyTextView = null;
         }
+        overlayBlocksCapture = false;
     }
 
     private void setState(String message) {

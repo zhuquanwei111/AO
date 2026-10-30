@@ -1,15 +1,31 @@
 <?xml version="1.0" encoding="utf-8"?>
-<TextView xmlns:android="http://schemas.android.com/apk/res/android"
-    android:id="@+id/tv_reply"
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:background="@drawable/bg_reply"
-    android:gravity="start|center_vertical"
-    android:maxLines="6"
-    android:ellipsize="end"
-    android:paddingStart="14dp"
-    android:paddingTop="10dp"
-    android:paddingEnd="14dp"
-    android:paddingBottom="10dp"
-    android:textColor="#FFFFFFFF"
-    android:textSize="14sp" />
+    android:orientation="horizontal">
+    <TextView
+        android:id="@+id/drag_handle"
+        android:layout_width="48dp"
+        android:layout_height="match_parent"
+        android:minHeight="48dp"
+        android:gravity="center"
+        android:contentDescription="@string/drag_reply_description"
+        android:text="@string/drag_reply_handle"
+        android:textColor="#FFFFFFFF"
+        android:textSize="24sp" />
+    <TextView
+        android:id="@+id/tv_reply"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:gravity="start|center_vertical"
+        android:maxLines="6"
+        android:ellipsize="end"
+        android:paddingTop="10dp"
+        android:paddingStart="0dp"
+        android:paddingEnd="14dp"
+        android:paddingBottom="10dp"
+        android:textColor="#FFFFFFFF"
+        android:textSize="14sp" />
+</LinearLayout>

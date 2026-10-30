@@ -21,10 +21,8 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -46,9 +44,8 @@ final class LiveFrameAnalyzer implements AutoCloseable {
     static Frame snapshot(Context context, Image image, boolean ocr, boolean person) {
         Frame f=new Frame(image.getWidth(),image.getHeight());
         try {
-            for (int i=1;i<Regions.KEYS.length;i++) {
-                String key=Regions.KEYS[i]; if (!ocr && !key.equals("person")) continue;
-                if (key.equals("person") && !person) continue;
+            for (String key:Regions.ACTIVE_KEYS) {
+                if (!ocr) continue;
                 float[] region=Prefs.getRegion(context,key); if (region==null) continue;
                 int[] r=Regions.crop(region,f.width,f.height); Rect rect=new Rect(r[0],r[1],r[2],r[3]);
                 Bitmap crop=CaptureService.cropImage(image,rect);
@@ -64,17 +61,14 @@ final class LiveFrameAnalyzer implements AutoCloseable {
     }
 
     private final TextRecognizer text;
-    private final PoseDetector poses=PoseDetection.getClient(new PoseDetectorOptions.Builder()
-            .setDetectorMode(PoseDetectorOptions.SINGLE_IMAGE_MODE).build());
-    private final FaceDetector faces=FaceDetection.getClient(new FaceDetectorOptions.Builder()
-            .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST).build());
+    private PoseDetector poses;
+    private FaceDetector faces;
     private final LiveClient.Session session;
     private final BooleanSupplier active;
     private final Consumer<String> status;
     private final Context context;
     private final ThreadPoolExecutor upload=new ThreadPoolExecutor(1,1,0,TimeUnit.SECONDS,
-            new ArrayBlockingQueue<>(1),new ThreadPoolExecutor.DiscardOldestPolicy());
-    private Set<String> previousComments=new HashSet<>();
+            new ArrayBlockingQueue<>(8),new ThreadPoolExecutor.AbortPolicy());
     private String previousNotice="";
     private String segment=UUID.randomUUID().toString();
     private HeadWindow head=new HeadWindow();
@@ -99,41 +93,49 @@ final class LiveFrameAnalyzer implements AutoCloseable {
                 .put("confidence",confidence<0?JSONObject.NULL:confidence).put("content",content==null?JSONObject.NULL:content);
     }
 
+    static boolean collectComment(CollectedRows<JSONObject> rows, String value, long wall,
+                                  JSONObject position, double confidence) throws Exception {
+        if (value.codePointCount(0,value.length())>500) return false;
+        rows.add(observation("comment",wall,new JSONObject().put("text",value)
+                .put("text_position",position),confidence));
+        return true;
+    }
+
     void analyze(Frame frame) throws Exception {
         if (frame.uptime<earliestUptime) return;
         if (reset) {
             reset=false; segment=UUID.randomUUID().toString(); sequence=0; head=new HeadWindow(); previousGray=null;
-            previousComments.clear(); previousNotice="";
+            previousNotice="";
         }
-        List<JSONObject> outgoing=new ArrayList<>();
+        CollectedRows<JSONObject> outgoing=new CollectedRows<>(128);
+        int invalidComments=0, skippedOnlineLines=0;
         for (Map.Entry<String,Bitmap> entry:frame.images.entrySet()) {
             if (!active.getAsBoolean()) return;
             String kind=entry.getKey(); if (kind.equals("person")) continue;
             Text result=Tasks.await(text.process(InputImage.fromBitmap(entry.getValue(),0)));
             JSONArray lines=new JSONArray(); double confidence=1; StringBuilder raw=new StringBuilder();
-            Set<String> comments=new HashSet<>();
             for (Text.TextBlock block:result.getTextBlocks()) for (Text.Line line:block.getLines()) {
-                if (lines.length()>=20) break;
-                Rect box=line.getBoundingBox(); if (box==null || box.isEmpty()) continue;
+                if (!kind.equals("comment") && lines.length()>=20) { skippedOnlineLines++; continue; }
+                Rect box=line.getBoundingBox(); if (box==null || box.isEmpty()) { if (kind.equals("comment")) invalidComments++; continue; }
                 Rect roi=frame.rects.get(kind);
                 int left=Math.max(roi.left,roi.left+box.left),top=Math.max(roi.top,roi.top+box.top);
                 int right=Math.min(roi.right,roi.left+box.right),bottom=Math.min(roi.bottom,roi.top+box.bottom);
-                if (left>=right || top>=bottom) continue;
-                String value=DisplayText.observed(line.getText()); if (value.isEmpty()) continue;
+                if (left>=right || top>=bottom) { if (kind.equals("comment")) invalidComments++; continue; }
+                String value=line.getText(); if (value==null || value.trim().isEmpty()) continue;
                 double score=line.getConfidence(); if (!Double.isFinite(score)||score<0||score>1) score=0;
                 JSONObject position=Regions.position(left,top,right,bottom,frame.width,frame.height);
                 confidence=Math.min(confidence,score);
-                lines.put(new JSONObject().put("text",limit(value,200)).put("bbox",position).put("confidence",score));
-                if (raw.length()>0) raw.append(' '); raw.append(value);
                 if (kind.equals("comment")) {
-                    comments.add(value);
-                    if (!previousComments.contains(value) && outgoing.size()<10)
-                        outgoing.add(observation("comment",frame.wall,new JSONObject().put("text",limit(value,500))
-                                .put("text_position",position),score));
+                    if (!collectComment(outgoing,value,frame.wall,position,score)) invalidComments++;
+                    continue;
                 }
+                if (value.codePointCount(0,value.length())>200) { skippedOnlineLines++; continue; }
+                lines.put(new JSONObject().put("text",value).put("bbox",position).put("confidence",score));
+                if (raw.length()>0) raw.append(' '); raw.append(value);
             }
             String value=raw.toString();
-            if (kind.equals("comment")) { previousComments=comments; continue; }
+            if (kind.equals("comment")) continue;
+            if (value.codePointCount(0,value.length())>120) { skippedOnlineLines += lines.length(); continue; }
             if (kind.equals("platform_notice") && value.equals(previousNotice)) continue;
             Rect roi=frame.rects.get(kind);
             JSONObject content=null;
@@ -147,26 +149,11 @@ final class LiveFrameAnalyzer implements AutoCloseable {
             outgoing.add(observation(kind,frame.wall,content,lines.length()==0?-1:confidence));
             if (kind.equals("platform_notice")) previousNotice=value;
         }
-        JSONObject person=null,signal=null;
-        Bitmap personImage=frame.images.get("person");
-        if (personImage!=null && active.getAsBoolean()) {
-            Rect r=frame.rects.get("person"); String region=r.toString();
-            if (!region.equals(personRegion)) { segment=UUID.randomUUID().toString(); sequence=0; head=new HeadWindow(); previousGray=null; personRegion=region; }
-            person=inspectPerson(personImage,frame);
-            HeadWindow.Candidate candidate=head.consume(frame.uptime,frame.wall,person.optDouble("head_ratio",Double.NaN),
-                    person.optDouble("head_confidence",0),"valid".equals(person.optString("quality")));
-            if (candidate!=null) signal=new JSONObject().put("event_id",UUID.randomUUID().toString()).put("source",PERSON_SOURCE)
-                    .put("signal","head_down").put("confidence",candidate.confidence).put("sample_count",candidate.samples)
-                    .put("started_at_ms",candidate.started).put("observed_at_ms",candidate.observed);
-        }
-        JSONObject personPayload=person,signalPayload=signal;
-        upload.execute(() -> {
-            try {
-                for (JSONObject o:outgoing) { if (!fresh(frame)) return; LiveClient.call(session,"observations",o); }
-                if (personPayload!=null && fresh(frame)) LiveClient.call(session,"person-observations",personPayload);
-                if (signalPayload!=null && fresh(frame)) LiveClient.call(session,"signals",signalPayload);
-            } catch (Exception e) { if (active.getAsBoolean()) status.accept("观察上传未确认："+e.getMessage()); }
-        });
+        boolean hadLoss=outgoing.dropped + invalidComments + skippedOnlineLines > 0;
+        if (hadLoss)
+            status.accept("本轮有 " + (outgoing.dropped + invalidComments + skippedOnlineLines) + " 行未上传，请检查识别区域");
+        BatchDispatch.submit(upload,outgoing,active,() -> fresh(frame),
+                row -> LiveClient.call(session,"observations",row),status,hadLoss);
     }
 
     private boolean fresh(Frame f) { return active.getAsBoolean() && f.uptime>=earliestUptime && SystemClock.elapsedRealtime()-f.uptime<6500; }
@@ -194,6 +181,10 @@ final class LiveFrameAnalyzer implements AutoCloseable {
         if (change/256<.0008) return p.put("quality","frozen_or_still");
         if (change/256>.25) return p.put("quality","scene_change");
         InputImage input=InputImage.fromBitmap(image,0);
+        if (poses==null) poses=PoseDetection.getClient(new PoseDetectorOptions.Builder()
+                .setDetectorMode(PoseDetectorOptions.SINGLE_IMAGE_MODE).build());
+        if (faces==null) faces=FaceDetection.getClient(new FaceDetectorOptions.Builder()
+                .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST).build());
         Pose pose=Tasks.await(poses.process(input));
         int faceCount=Tasks.await(faces.process(input)).size();
         if (faceCount>1) return p.put("quality","multiple_people").put("person_count",Math.min(10,faceCount));
@@ -213,5 +204,5 @@ final class LiveFrameAnalyzer implements AutoCloseable {
                 .put("body_vector",vector).put("head_ratio",vector.getDouble(1)).put("head_confidence",confidence);
     }
     private static String limit(String s,int n) { return s.substring(0,Math.min(n,s.length())); }
-    @Override public void close() { upload.shutdownNow(); poses.close(); faces.close(); }
+    @Override public void close() { upload.shutdownNow(); if (poses!=null) poses.close(); if (faces!=null) faces.close(); }
 }

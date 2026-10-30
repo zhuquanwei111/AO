@@ -29,7 +29,7 @@ public class MainActivity extends Activity {
     private MediaProjectionManager mpm;
     private EditText etUrl, etInterval;
     private TextView tvStatus, tvPermissions;
-    private Button btnMain, btnSettings, btnAdvanced, btnRecap, btnLegacy, btnPause;
+    private Button btnMain, btnSettings, btnAdvanced, btnRecap, btnPause;
     private View settingsPanel, advancedPanel;
     private LivePanel livePanel;
     private RegionPanel regionPanel;
@@ -54,7 +54,6 @@ public class MainActivity extends Activity {
         btnSettings = findViewById(R.id.btn_settings_toggle);
         btnAdvanced = findViewById(R.id.btn_advanced_toggle);
         btnRecap = findViewById(R.id.btn_recap);
-        btnLegacy = findViewById(R.id.btn_legacy_answer);
         btnPause = findViewById(R.id.btn_pause_resume);
         settingsPanel = findViewById(R.id.settings_panel);
         advancedPanel = findViewById(R.id.advanced_panel);
@@ -80,7 +79,6 @@ public class MainActivity extends Activity {
             btnAdvanced.setText(advancedExpanded ? "收起高级功能" : "高级功能");
         });
         btnRecap.setOnClickListener(v -> livePanel.openRecap());
-        btnLegacy.setOnClickListener(v -> startCapture(true));
         btnPause.setOnClickListener(v -> onPauseResumeClicked());
         findViewById(R.id.btn_region).setOnClickListener(v -> startRegionSelector());
         refreshUi();
@@ -151,7 +149,6 @@ public class MainActivity extends Activity {
         }
         btnPause.setEnabled(phase == CaptureService.Phase.RUNNING || phase == CaptureService.Phase.PAUSED);
         btnPause.setText(phase == CaptureService.Phase.PAUSED ? "继续屏幕辅助" : "暂停屏幕辅助");
-        btnLegacy.setEnabled(!capturing && !busy && !livePanel.hasActiveSession());
         btnRecap.setEnabled(true);
     }
 
@@ -221,7 +218,7 @@ public class MainActivity extends Activity {
             showStartError("区域选择阶段：请先结束屏幕辅助，再编辑识别区域。");
             return;
         }
-        RegionSelectorService.start(this, regionPanel.selected());
+        RegionSelectorService.start(this);
         moveTaskToBack(true);
     }
 

@@ -17,7 +17,7 @@ final class RecapText {
         if (recap==null || summary.isNull("stopped_at_ms")) return false;
         String status=recap.optString("status");
         return status.equals("captured_locally") || status.equals("partial") || status.equals("needs_input")
-                || status.equals("failed") || status.equals("not_configured") || status.equals("not_connected");
+                || status.equals("failed") || status.equals("not_configured");
     }
     static String backstage(JSONObject recap) {
         if (recap==null) return "后台五项：服务尚未提供，未取得数据";
@@ -51,9 +51,9 @@ final class RecapText {
             case "not_configured": return "未配置抖音号";
             case "not_started": return "后台任务尚未启动";
             case "waiting_for_stop": return "任务已登记，取数状态待确认";
-            case "not_connected": return "本场后台复盘不可取数，不自动补领";
+            case "not_connected": return "本场复盘未取得，取数状态待确认；可手动刷新";
             case "capturing": return "取数任务已领取，等待本场结果";
-            case "captured_locally": return "已读取五项";
+            case "captured_locally": return "后台报告已采集，数据见下方";
             case "partial": return "部分数据缺失";
             case "needs_input": return "需要核对账号/后台状态";
             case "failed": return "取数失败，未补零";
