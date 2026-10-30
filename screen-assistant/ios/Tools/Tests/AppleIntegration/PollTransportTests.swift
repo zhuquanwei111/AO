@@ -28,8 +28,11 @@ private final class PollFixtureProtocol: URLProtocol {
         let status = path.hasPrefix("/http-error/") ? 503 : 200
         let response = HTTPURLResponse(url: request.url!, statusCode: status,
                                        httpVersion: "HTTP/1.1", headerFields: nil)!
+        let timing = path.hasPrefix("/invalid-timing/")
+            ? "\"server_time_ms\":\"invalid\",\"server_processing_ms\":0"
+            : "\"server_time_ms\":1000,\"server_processing_ms\":0"
         let json = status == 200
-            ? "{\"session_id\":\"fixture-session\",\"prompts\":[],\"stopped\":false,\"next_cursor\":\"next\"}"
+            ? "{\"session_id\":\"fixture-session\",\"prompts\":[],\"stopped\":false,\"next_cursor\":\"next\",\(timing)}"
             : "{\"detail\":\"fixture\"}"
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Data(json.utf8))
@@ -69,6 +72,11 @@ final class PollTransportTests: XCTestCase {
                 guard case .success(let page) = result else { XCTFail("expected page"); finished.fulfill(); return }
                 XCTAssertEqual(page.sessionID, "fixture-session")
                 XCTAssertEqual(page.nextCursor, "next")
+                if scenario == "invalid-timing" { XCTAssertNil(page.serverTimeMS) }
+                else { XCTAssertEqual(page.serverTimeMS, 1000) }
+                XCTAssertEqual(page.serverProcessingMS, 0)
+                XCTAssertNotNil(page.requestStartNS)
+                XCTAssertNotNil(page.responseEndNS)
                 XCTAssertNil(error)
             } else if let expectedHTTP {
                 guard case .failure(let failure) = result else { XCTFail("expected HTTP failure"); finished.fulfill(); return }
@@ -90,6 +98,13 @@ final class PollTransportTests: XCTestCase {
     }
 
     func testSuccessfulPage() { check("success", expectedHTTP: 200) }
+    func testMalformedTimingDoesNotFailPoll() { check("invalid-timing", expectedHTTP: 200) }
+    func testMalformedPromptExpiryPreservesHistoryRecord() throws {
+        let json = "{\"prompt_id\":\"p\",\"input_mode\":\"live_observation\",\"start_at_ms\":1,\"end_at_ms\":1,\"phenomenon\":\"x\",\"suggestion\":\"x\",\"display_text\":\"x\",\"observation_count\":1,\"expires_at_ms\":\"invalid\"}"
+        let prompt = try JSONDecoder().decode(LivePrompt.self, from: Data(json.utf8))
+        XCTAssertEqual(prompt.promptID, "p")
+        XCTAssertNil(prompt.expiresAtMS)
+    }
     func testHTTPFailure() { check("http-error", expectedHTTP: 503) }
     func testTransportFailure() { check("disconnect", expectedError: .cannotConnectToHost) }
     func testTimeout() { check("timeout", expectedError: .timedOut) }
