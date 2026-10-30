@@ -133,6 +133,7 @@ final class AppModel: ObservableObject {
             }
 
         if liveActive, let credentials = Self.savedCredentials() {
+            PiPDisplayController.shared.setLiveSessionActive(true)
             liveCredentials = credentials
             liveClient = SharedConfig.serverBaseURL().flatMap { LiveOperationsClient(baseURL: $0) }
             if liveConnectionPending {
@@ -251,6 +252,7 @@ final class AppModel: ObservableObject {
                                            client: LiveOperationsClient,
                                            status: String,
                                            captureImmediately: Bool = true) {
+        PiPDisplayController.shared.setLiveSessionActive(true)
         var activeCredentials = credentials
         if !captureImmediately { activeCredentials.liveConnectionPending = true }
         livePollGeneration &+= 1
@@ -323,6 +325,7 @@ final class AppModel: ObservableObject {
                 self.audioSettings.appHostConfirmed = false
                 self.audioSettings.micHostConfirmed = false
                 self.liveActive = false
+                PiPDisplayController.shared.setLiveSessionActive(false)
                 self.liveStopped = true
                 self.liveCredentials = nil
                 LiveSessionState.disableCapturePreservingCredentials()
@@ -375,6 +378,7 @@ final class AppModel: ObservableObject {
                         PiPDisplayController.shared.endLiveContent()
                         self.liveStatus = "服务端场次已停止"
                         self.liveActive = false
+                        PiPDisplayController.shared.setLiveSessionActive(false)
                         self.liveStopped = true
                         self.liveConnectionPending = false
                         LiveSessionState.disableCapturePreservingCredentials()

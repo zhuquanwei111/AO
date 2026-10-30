@@ -55,6 +55,7 @@ final class PiPDisplayController: NSObject, ObservableObject {
     private var lastDisplayedText: String?
     private var lastDisplayedKind: DisplayKind?
     private var liveContentActive = false
+    private var liveSessionActive = false
     private var isPlaying = true
 
     private enum DisplayKind: Equatable {
@@ -273,6 +274,16 @@ final class PiPDisplayController: NSObject, ObservableObject {
 
     var canShowLiveFrame: Bool { pipController != nil }
 
+    /// 直播场次空闲时保留安静画面；连接诊断仍由主界面展示。
+    func setLiveSessionActive(_ active: Bool) {
+        liveSessionActive = active
+        guard active, !liveContentActive, lastDisplayedKind != nil else { return }
+        lastDisplayedText = nil
+        lastDisplayedKind = nil
+        lastRenderedCGImage = placeholderFrame()
+        if isPlaying, let image = lastRenderedCGImage { enqueue(image) }
+    }
+
     func endLiveContent() {
         guard liveContentActive else { return }
         liveContentActive = false
@@ -300,7 +311,7 @@ final class PiPDisplayController: NSObject, ObservableObject {
 
     /// 只在用户已启动 PiP 时显示最近真实请求的服务状态；不尝试启动系统 PiP。
     func showConnectionStatus(_ text: String) {
-        guard !liveContentActive, pipController != nil,
+        guard !liveSessionActive, !liveContentActive, pipController != nil,
               state == .starting || state == .running || state == .suspended else { return }
         showContent(text, kind: .connection)
     }
@@ -308,6 +319,7 @@ final class PiPDisplayController: NSObject, ObservableObject {
     private func showContent(_ rawText: String, kind: DisplayKind) {
         DispatchQueue.main.async { [weak self] in
             guard let self, self.pipController != nil else { return }
+            guard !self.liveSessionActive || kind == .operation else { return }
             guard !self.liveContentActive || kind == .operation else { return }
             let text = PiPTextFormatter.plainText(rawText)
             guard !text.isEmpty else { return }
@@ -381,7 +393,7 @@ final class PiPDisplayController: NSObject, ObservableObject {
                 .font: UIFont.systemFont(ofSize: 24),
                 .foregroundColor: UIColor.white
             ]
-            ("屏识AI助手 · 等待识别结果…" as NSString)
+            ((liveSessionActive ? "屏识" : "屏识AI助手 · 等待识别结果…") as NSString)
                 .draw(at: CGPoint(x: 24, y: 24), withAttributes: attrs)
         }
         return uiImage.cgImage!
