@@ -79,12 +79,17 @@ public class RecapActivity extends Activity {
                 catch (Exception e) { error += " 事件读取未确认：" + e.getClass().getSimpleName(); }
             }
             JSONArray completeEvents=rows==null?previousEvents:rows;
-            boolean cached=result!=null && completeEvents!=null && RecapText.terminal(result)
-                    && Prefs.cacheTerminalRecap(this,requested,result,completeEvents);
             final JSONObject data = result; final JSONArray eventRows = rows; final String message = error;
             main.post(() -> {
                 busy = false;
                 if (!visible) return;
+                if (!RecapRequest.sameSession(requested,Prefs.getSession(this))) {
+                    session=Prefs.getSession(this); loadedEvents=null;
+                    status.setText("场次已变化，请刷新当前场次。");
+                    summary.setText(""); events.setText(""); return;
+                }
+                boolean cached=data!=null && completeEvents!=null && RecapText.terminal(data)
+                        && Prefs.cacheTerminalRecap(this,requested,data,completeEvents);
                 if (!RecapRequest.mayApply(requested,Prefs.getSession(this),cached)) {
                     session=Prefs.getSession(this); loadedEvents=null;
                     status.setText("场次已变化，请刷新当前场次。");
