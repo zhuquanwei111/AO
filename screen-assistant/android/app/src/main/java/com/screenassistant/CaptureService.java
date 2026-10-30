@@ -76,6 +76,7 @@ public class CaptureService extends Service {
     private static final int CONNECT_TIMEOUT_MS = 5000;
     private static final int READ_TIMEOUT_MS = 10000;
     private static final long REPLY_AUTO_HIDE_MS = 6000L;
+    private static final String OVERLAY_CONFLICT = "提示框遮挡识别区，请调整区域或提示框";
 
     private MediaProjectionManager mpm;
     private NotificationManager notifManager;
@@ -775,6 +776,7 @@ public class CaptureService extends Service {
             }
             long now = System.currentTimeMillis();
             String text = overlayState.textAt(now);
+            if (overlayConflictNotified) text = OVERLAY_CONFLICT + "\n" + text;
             if (!text.contentEquals(replyTextView.getText())) replyTextView.setText(text);
             replyOverlayView.setVisibility(View.VISIBLE);
             if (!draggingOverlay) {
@@ -812,6 +814,7 @@ public class CaptureService extends Service {
             setState("提示框遮挡识别区域，文字采样已暂停；请调整区域或提示框");
             if (!overlayConflictNotified) {
                 overlayConflictNotified = true;
+                replyTextView.setText(OVERLAY_CONFLICT + "\n" + overlayState.textAt(System.currentTimeMillis()));
                 android.widget.Toast.makeText(this, "提示框放不下，请调整识别区域", android.widget.Toast.LENGTH_LONG).show();
             }
             return;
@@ -835,8 +838,16 @@ public class CaptureService extends Service {
                     Regions.crop(r, screenSize[0], screenSize[1]))) blocked = true;
         }
         overlayBlocksCapture = blocked;
-        if (blocked) setState("提示框遮挡识别区域，文字采样已暂停；请调整区域或提示框");
-        else overlayConflictNotified = false;
+        if (blocked) {
+            setState("提示框遮挡识别区域，文字采样已暂停；请调整区域或提示框");
+            if (!overlayConflictNotified) {
+                overlayConflictNotified=true;
+                replyTextView.setText(OVERLAY_CONFLICT + "\n" + overlayState.textAt(System.currentTimeMillis()));
+            }
+        } else if (overlayConflictNotified) {
+            overlayConflictNotified=false;
+            replyTextView.setText(overlayState.textAt(System.currentTimeMillis()));
+        }
     }
 
     private static String safeId(String id) {
