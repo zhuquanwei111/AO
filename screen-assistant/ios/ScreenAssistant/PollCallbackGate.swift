@@ -13,3 +13,22 @@ enum PollCallbackGate {
         return true
     }
 }
+
+/// 标记当前概览请求，旧回调不能结束后来发起的请求。
+struct OverviewRequestTracker {
+    private var current: UUID?
+
+    mutating func begin() -> UUID {
+        let id = UUID()
+        current = id
+        return id
+    }
+
+    mutating func finish(_ id: UUID) -> Bool {
+        guard current == id else { return false }
+        current = nil
+        return true
+    }
+
+    mutating func clear() { current = nil }
+}
