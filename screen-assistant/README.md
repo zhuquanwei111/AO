@@ -28,7 +28,7 @@ adb install -r .\app\build\outputs\apk\debug\app-debug.apk
 
 悬浮正文只显示有效建议，空闲或到期后收起为48dp手柄，新有效建议再展开。连接、采样上传和复盘诊断留在应用/通知中。普通提示最短阅读窗口本轮采用5秒；源TTL与既有6秒显示上限优先，剩余不足5秒时仅按剩余合法时效显示。等待队列最多16项，排队不重置源TTL，显示前清理过期项，按prompt ID幂等；沿后端既有`priority>=100`紧急契约插队，不从文案或消费等级推断紧急程度。
 
-提示时效要求`/prompts`提供同源整数`server_time_ms`与`server_processing_ms`（契约见[服务端说明](server/README.md)）。客户端在真实HTTP边界用包含休眠的`elapsedRealtimeNanos`测完整RTT并向上取整，扣除服务处理时长，再从源剩余时效扣传输预算和1ms余量；排队、5秒保护和6秒上限统一使用`elapsedRealtime`截止点。关屏移除窗口，亮屏先重算时效再附着。旧服务缺字段、非法元数据或不可信时效只拒显该响应提示，App/通知显示一次诊断，采集、轮询和停止继续；不把设备墙钟、HTTP Date或首次`returned_at_ms`作为替代锚。该计算依赖响应未缓存及服务时钟未异常跳变。
+提示时效要求`/prompts`提供同源整数`server_time_ms`与`server_processing_ms`（契约见[PR11冻结服务端说明](https://github.com/zhuquanwei111/AO/blob/90d0194c099ea5feb352c1ea55b891d89dce2e8f/screen-assistant/server/README.md)）。客户端在真实HTTP边界用包含休眠的`elapsedRealtimeNanos`测完整RTT并向上取整，扣除服务处理时长，再从源剩余时效扣传输预算和1ms余量；排队、5秒保护和6秒上限统一使用`elapsedRealtime`截止点。关屏移除窗口，亮屏先重算时效再附着。旧服务缺字段、非法元数据或不可信时效只拒显该响应提示，App/通知显示一次诊断，采集、轮询和停止继续；不把设备墙钟、HTTP Date或首次`returned_at_ms`作为替代锚。该计算依赖响应未缓存及服务时钟未异常跳变。
 
 使用步骤：
 
