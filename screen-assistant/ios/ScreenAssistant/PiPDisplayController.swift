@@ -306,7 +306,7 @@ final class PiPDisplayController: NSObject, ObservableObject {
         paragraph.lineBreakMode = .byWordWrapping
         paragraph.lineSpacing = 4
         let bounds = (text as NSString).boundingRect(
-            with: CGSize(width: 592, height: .greatestFiniteMagnitude),
+            with: CGSize(width: 592, height: CGFloat.greatestFiniteMagnitude),
             options: [.usesLineFragmentOrigin, .usesFontLeading],
             attributes: [.font: UIFont.systemFont(ofSize: 26), .paragraphStyle: paragraph],
             context: nil)
