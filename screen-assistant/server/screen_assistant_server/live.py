@@ -12,7 +12,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Literal
 
-from fastapi import APIRouter, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .live_rules import (
@@ -689,8 +689,15 @@ async def add_signal(session_id: str, payload: PersonSignal, request: Request,
 
 
 @router.get("/{session_id}/prompts")
-async def poll_prompts(session_id: str, request: Request,
+async def poll_prompts(session_id: str, request: Request, response: Response,
                        after: str = Query("", max_length=128),
                        wait_ms: int = Query(0, ge=0, le=MAX_WAIT_MS),
                        token: str | None = Header(None, alias="X-Live-Session-Token")):
-    return await request.app.state.live.poll(session_id, token, after, wait_ms)
+    started_ns = time.monotonic_ns()
+    service = request.app.state.live
+    result = await service.poll(session_id, token, after, wait_ms)
+    finished_ns = time.monotonic_ns()
+    result["server_time_ms"] = service.clock()
+    result["server_processing_ms"] = (finished_ns - started_ns) // 1_000_000
+    response.headers["Cache-Control"] = "no-store"
+    return result
