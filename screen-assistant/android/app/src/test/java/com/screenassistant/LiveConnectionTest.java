@@ -3,6 +3,7 @@ package com.screenassistant;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.Test;
+import java.io.IOException;
 import java.net.ConnectException;
 import java.net.SocketTimeoutException;
 import java.util.ArrayList;
@@ -14,8 +15,12 @@ public class LiveConnectionTest {
     static class Memory implements LiveConnection.Store {
         LiveClient.Session session;
         boolean creating, stopping;
+        int failSaves;
         public LiveClient.Session get() { return session; }
-        public void save(LiveClient.Session s) { session = s; creating = false; }
+        public void save(LiveClient.Session s) throws IOException {
+            if (failSaves > 0) { failSaves--; throw new IOException("disk full"); }
+            session = s; creating = false;
+        }
         public boolean creating() { return creating; }
         public void creating(boolean value) { creating = value; }
         public boolean stopping() { return stopping; }
@@ -148,6 +153,36 @@ public class LiveConnectionTest {
         assertEquals(0, display.bindings);
         connection.finishStop();
         assertTrue(store.session.stopped); assertFalse(store.stopping); assertEquals(1, remote.stops);
+    }
+
+    @Test public void failedCredentialSaveImmediatelyStopsCreatedSession() throws Exception {
+        Memory store = new Memory(); store.failSaves = 1;
+        Remote remote = new Remote(); Display display = new Display();
+        LiveConnection connection = new LiveConnection(store, remote, display);
+
+        assertFalse(connection.connect());
+        assertEquals(1, remote.creates); assertEquals(1, remote.starts); assertEquals(1, remote.stops);
+        assertEquals(SESSION.id, remote.stoppedId);
+        assertNull(store.session); assertFalse(store.creating); assertFalse(store.stopping);
+        assertTrue(display.overlay.textAt(1000).contains("凭证保存失败"));
+    }
+
+    @Test public void failedCredentialSaveRetainsStopTargetUntilRemoteStopSucceeds() throws Exception {
+        Memory store = new Memory(); store.failSaves = 1;
+        Remote remote = new Remote(); remote.stopError = new ConnectException("offline");
+        Display display = new Display();
+        LiveConnection connection = new LiveConnection(store, remote, display);
+
+        assertFalse(connection.connect());
+        assertEquals(1, remote.creates); assertEquals(1, remote.stops);
+        assertTrue(store.creating); assertTrue(store.stopping);
+        assertTrue(display.overlay.textAt(1000).contains("结束未确认"));
+
+        remote.stopError = null;
+        assertTrue(connection.connect());
+        assertEquals(2, remote.stops); assertEquals(2, remote.creates);
+        assertFalse(store.creating); assertFalse(store.stopping);
+        assertEquals(SESSION, store.session);
     }
 
     @Test public void stoppedPageAndLatePollNeverDeliverSuggestions() throws Exception {

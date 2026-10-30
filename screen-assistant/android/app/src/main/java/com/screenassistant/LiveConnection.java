@@ -58,6 +58,8 @@ final class LiveConnection {
     boolean connect() {
         if (closed || blocked) return false;
         try {
+            // 创建成功但凭证持久化失败时，先用内存中的目标重试结束，不能覆盖 session。
+            if (stopTarget != null) finishStop();
             if (store.stopping()) {
                 status("上场结束未确认\n正在核对，暂不创建新场次", true);
                 finishStop();
@@ -84,12 +86,30 @@ final class LiveConnection {
                     } else status(store.creating() ? CREATE_UNKNOWN : OFFLINE, true);
                     return false;
                 }
+                IOException saveFailure = null;
                 synchronized (this) {
                     session = created;
                     // 即使已停止也先保住刚返回的凭证；绝不丢弃后再创建。
-                    store.save(created);
-                    if (endRequested) { stopTarget = created; store.stopping(true); }
+                    try {
+                        store.save(created);
+                    } catch (IOException e) {
+                        stopTarget = created;
+                        saveFailure = e;
+                    }
+                    if (saveFailure == null && endRequested) { stopTarget = created; store.stopping(true); }
                     if (closed) return false;
+                }
+                if (saveFailure != null) {
+                    try { store.stopping(true); }
+                    catch (IOException e) { saveFailure.addSuppressed(e); }
+                    try {
+                        finishStop();
+                        status("新场次凭证保存失败，已结束该场次", true);
+                    } catch (Exception e) {
+                        saveFailure.addSuppressed(e);
+                        status("新场次凭证保存失败，结束未确认；正在保留该场次重试", true);
+                    }
+                    return false;
                 }
             }
             JSONObject summary = remote.summary(session);
@@ -191,8 +211,12 @@ final class LiveConnection {
             LiveClient.Session current = store.get();
             if (current != null && current.id.equals(target.id)) {
                 store.save(target.asStopped());
-                store.stopping(false);
             }
+            // save(created) 失败时本地没有凭证；远端确认结束后清除仅用于防重建的标记。
+            store.creating(false);
+            store.stopping(false);
+            if (stopTarget != null && stopTarget.id.equals(target.id)) stopTarget = null;
+            if (session != null && session.id.equals(target.id)) session = target.asStopped();
         }
     }
 
