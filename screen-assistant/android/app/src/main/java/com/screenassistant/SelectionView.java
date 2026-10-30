@@ -29,6 +29,7 @@ public class SelectionView extends View {
     private final Paint strokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint handlePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint sizePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint labelBackground = new Paint(Paint.ANTI_ALIAS_FLAG);
 
     private RectF rect = new RectF();
     private RectF[] selections;
@@ -56,6 +57,7 @@ public class SelectionView extends View {
         sizePaint.setColor(Color.WHITE);
         sizePaint.setTextSize(13f * density);
         sizePaint.setTextAlign(Paint.Align.CENTER);
+        labelBackground.setColor(0xCC111111);
     }
 
     @Override
@@ -86,8 +88,13 @@ public class SelectionView extends View {
             for (int i=0;i<selections.length;i++) {
                 strokePaint.setColor(i==selected ? Color.WHITE : Color.CYAN);
                 canvas.drawRect(selections[i],strokePaint);
-                canvas.drawText(Regions.ACTIVE_LABELS[i],selections[i].centerX(),
-                        Math.max(selections[i].top-8f,sizePaint.getTextSize()),sizePaint);
+                String label=Regions.ACTIVE_LABELS[i];
+                float half=Math.min(w/2f, sizePaint.measureText(label)/2f + 6f);
+                float labelX=Math.max(half,Math.min(w-half,selections[i].centerX()));
+                float labelY=Math.max(selections[i].top-8f,sizePaint.getTextSize()+4f);
+                canvas.drawRect(labelX-half,labelY-sizePaint.getTextSize()-3f,
+                        labelX+half,labelY+4f,labelBackground);
+                canvas.drawText(label,labelX,labelY,sizePaint);
             }
             strokePaint.setColor(Color.WHITE);
         }
