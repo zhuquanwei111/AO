@@ -24,7 +24,7 @@ cd screen-assistant\android
 adb install -r .\app\build\outputs\apk\debug\app-debug.apk
 ```
 
-启动应用后填写同一局域网中的服务地址（模拟器访问宿主机用`http://10.0.2.2:8000`）及轮询间隔。首次使用须允许“显示在其他应用上层”、通知（Android 13+）和每次会话的系统屏幕采集授权。选区只在主动编辑时临时出现；完成或取消后移除。正常采集时回复窗口标记`NOT_FOCUSABLE|NOT_TOUCHABLE`，当前模拟器确认采集运行期间没有残留选区层；特定厂商系统与真机触摸穿透仍需目标设备复验。
+启动应用后填写同一局域网中的服务地址（模拟器访问宿主机用`http://10.0.2.2:8000`）及轮询间隔。首次使用须允许“显示在其他应用上层”、通知（Android 13+）和每次会话的系统屏幕采集授权。选区只在主动编辑时临时出现；完成或取消后移除。正常采集时回复窗口可触摸，48dp宽的手柄用于拖动；窗口 flags 为`NOT_FOCUSABLE|FLAG_SECURE|NOT_TOUCH_MODAL`。回复窗口范围内的触摸由窗口接收，不会穿透到下层直播应用；窗口外触摸可按系统规则传递。目标设备触摸行为仍需复验。
 
 使用步骤：
 
@@ -77,12 +77,12 @@ Android 模拟器服务地址填`http://10.0.2.2:8000`；真机填电脑在同�
 | 项目 | 结果 |
 |---|---|
 | Debug构建、安装、启动 | 通过；私网IPv4地址校验已修复，`http://10.0.2.2:19180`通过启动流程并出现MediaProjection授权。新APK `screen-assistant-debug-urlfix.apk`。 |
-| MediaProjection、端侧OCR与选区交互 | 通过既有模拟器验收；区域选择只在编辑期间存在，确认/取消后退出。正常采集中回复窗 flags 为`NOT_FOCUSABLE|NOT_TOUCHABLE|NOT_TOUCH_MODAL`。 |
+| MediaProjection、端侧OCR与选区交互 | 通过既有模拟器验收；区域选择只在编辑期间存在，确认/取消后退出。正常采集中回复窗可触摸以支持拖动，flags 为`NOT_FOCUSABLE|FLAG_SECURE|NOT_TOUCH_MODAL`；窗口范围内触摸不穿透。目标设备触摸行为需复验。 |
 | Android旧客户端真实请求 | 2026-10-21 05:35:20.591Z收到HTTP 200；旧客户端未记录`X-Request-ID`。200表明服务端生成非空回复，但旧版没有客户端接收/悬浮展示证据；未重复该请求。 |
 | 新客户端固定响应→悬浮窗（不调用模型） | 本地stub的HTTP 200 JSON被解析为`SUCCESS`，回复非空；主线程分发后WindowManager attach回调确认`shown=true`。本地UI截图见artifact `screen-assistant-local-reply-ui.png`。 |
 | 新客户端真实服务端验证 | 2026-10-21 06:27:18Z HTTP 200，`X-Request-ID=61781edb75b049a4ab8a857f043ac46b`，端侧`SUCCESS`、非空reply长度73；WindowManager日志确认悬浮窗`shown=true`并完成attach。45核对服务端为`outcome=success`、`finish_reason=stop`，模型耗时2906ms/HTTP耗时2926ms，未记录正文。真实悬浮截图见artifact `android-real-reply-overlay.png`。 |
 | 重复204、断网恢复 | 同句后续请求收到204去重；一次未及时停止导致相同画面再次得到200（`X-Request-ID=7d8184d665924950a822b3bfae41a591`，服务端确认success/stop、模型耗时2899ms/HTTP耗时2901ms）及随后204。已force-stop采集。断网恢复未验证。 |
-| 回复窗底层点击穿透 | 日志确认窗口`focusable=false touchable=false`，并核对`NOT_FOCUSABLE|NOT_TOUCHABLE|NOT_TOUCH_MODAL`配置；本轮未在覆盖区域内实际点按，厂商系统与真机仍需验证。 |
+| 回复窗触摸与拖动 | 代码启用窗口触摸并给48dp宽拖动手柄处理拖动；窗口范围内触摸由回复窗接收，不穿透到底层应用，窗口外触摸由`NOT_TOUCH_MODAL`允许传递。本轮目标设备触摸行为未复验。 |
 | 系统外部撤销MediaProjection | 未验证；已覆盖应用内停止。 |
 | 不落盘、厂商策略、连续30分钟 | 代码设计为仅内存处理；未做文件系统取证、真机或长时间实测。 |
 
