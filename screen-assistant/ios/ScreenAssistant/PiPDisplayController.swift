@@ -277,7 +277,7 @@ final class PiPDisplayController: NSObject, ObservableObject {
     /// 直播场次空闲时保留安静画面；连接诊断仍由主界面展示。
     func setLiveSessionActive(_ active: Bool) {
         liveSessionActive = active
-        guard active, !liveContentActive, lastDisplayedKind != nil else { return }
+        guard active, !liveContentActive, pipController != nil else { return }
         lastDisplayedText = nil
         lastDisplayedKind = nil
         lastRenderedCGImage = placeholderFrame()
