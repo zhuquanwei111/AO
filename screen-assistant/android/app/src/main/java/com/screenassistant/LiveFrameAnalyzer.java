@@ -66,6 +66,7 @@ final class LiveFrameAnalyzer implements AutoCloseable {
     private final Consumer<String> status;
     private final Context context;
     private final ThreadPoolExecutor upload=BatchDispatch.executor();
+    private final CaptureLedger ledger=new CaptureLedger(10);
     private String previousNotice="";
     private String segment=UUID.randomUUID().toString();
     private HeadWindow head=new HeadWindow();
@@ -151,8 +152,10 @@ final class LiveFrameAnalyzer implements AutoCloseable {
         boolean hadLoss=outgoing.dropped + invalidComments + skippedOnlineLines > 0;
         if (hadLoss)
             status.accept("本轮有 " + (outgoing.dropped + invalidComments + skippedOnlineLines) + " 行未上传，请检查识别区域");
+        ledger.register(outgoing);
         BatchDispatch.submit(upload,outgoing,active,() -> fresh(frame),
-                row -> LiveClient.call(session,"observations",row),status,hadLoss);
+                row -> LiveClient.call(session,"observations",row),status,hadLoss,
+                (row,outcome) -> ledger.outcome(row.optString("event_id"),outcome));
     }
 
     private boolean fresh(Frame f) {
@@ -205,5 +208,5 @@ final class LiveFrameAnalyzer implements AutoCloseable {
                 .put("body_vector",vector).put("head_ratio",vector.getDouble(1)).put("head_confidence",confidence);
     }
     private static String limit(String s,int n) { return s.substring(0,Math.min(n,s.length())); }
-    @Override public void close() { upload.shutdownNow(); if (poses!=null) poses.close(); if (faces!=null) faces.close(); }
+    @Override public void close() { upload.shutdownNow(); ledger.clear(); if (poses!=null) poses.close(); if (faces!=null) faces.close(); }
 }

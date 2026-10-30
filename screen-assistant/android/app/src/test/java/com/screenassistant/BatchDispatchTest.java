@@ -61,4 +61,11 @@ public class BatchDispatchTest {
         assertTrue(states.get(0).contains("HTTP 403"));
         assertTrue(states.get(0).contains("未确认"));
     }
+    @Test public void recordsUnconfirmedRequestAndUnsentRemainder() {
+        List<String> outcomes=new ArrayList<>();
+        BatchDispatch.submit(Runnable::run,batch(3),()->true,()->true,
+                v->{if (v.equals("行1")) throw new IOException();},v->{},false,
+                (v,outcome)->outcomes.add(v+":"+outcome));
+        assertEquals(java.util.Arrays.asList("行0:http_success","行1:unconfirmed","行2:not_sent"),outcomes);
+    }
 }
