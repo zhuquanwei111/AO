@@ -4,6 +4,9 @@ func item(_ id: String, expires: Int64 = 20_000, priority: Int = 0) -> LivePromp
     .init(id: id, text: id, expiresAtMS: expires, priority: priority)
 }
 let fitsTwo: ([LivePromptDelivery.Item]) -> Bool = { $0.count <= 2 }
+let displayed = [item("early", expires: 3_000), item("later", expires: 9_000)]
+assert(LivePromptDelivery.unexpired(displayed, nowMS: 3_000).map(\.id) == ["later"])
+assert(LivePromptDelivery.unexpired(displayed, nowMS: 9_000).isEmpty)
 var delivery = LivePromptDelivery(capacity: 3, intervalMS: 3_000)
 assert(delivery.receive([item("a"), item("b"), item("a")], nowMS: 0).map(\.id) == ["a", "b"])
 assert(delivery.take(nowMS: 0, fits: fitsTwo).map(\.id) == ["a", "b"])

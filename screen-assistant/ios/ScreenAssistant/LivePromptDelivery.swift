@@ -23,6 +23,10 @@ struct LivePromptDelivery {
         self.intervalMS = intervalMS
     }
 
+    static func unexpired(_ items: [Item], nowMS: Int64) -> [Item] {
+        items.filter { $0.expiresAtMS > nowMS }
+    }
+
     mutating func receive(_ items: [Item], nowMS: Int64) -> [Item] {
         var fresh: [Item] = []
         expire(nowMS: nowMS)

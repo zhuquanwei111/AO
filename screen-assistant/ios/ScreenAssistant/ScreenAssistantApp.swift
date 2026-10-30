@@ -70,6 +70,7 @@ final class AppModel: ObservableObject {
     private var liveCursor = ""
     private var liveDelivery = LivePromptDelivery()
     private var liveDisplayedUntilMS: Int64?
+    private var liveDisplayedItems: [LivePromptDelivery.Item] = []
     private var summaryRefreshInFlight = false
     private var lastServiceConnection = ControlState.serviceConnection()
 
@@ -260,6 +261,7 @@ final class AppModel: ObservableObject {
         summaryRefreshInFlight = false
         liveDelivery.clear()
         liveDisplayedUntilMS = nil
+        liveDisplayedItems = []
         PiPDisplayController.shared.endLiveContent()
         liveSummary = nil
         liveCursor = ""
@@ -300,6 +302,7 @@ final class AppModel: ObservableObject {
         livePollTask = nil
         liveDelivery.clear()
         liveDisplayedUntilMS = nil
+        liveDisplayedItems = []
         PiPDisplayController.shared.endLiveContent()
         captureWanted = false
         liveConnectionPending = false
@@ -368,6 +371,7 @@ final class AppModel: ObservableObject {
                     if page.stopped {
                         self.liveDelivery.clear()
                         self.liveDisplayedUntilMS = nil
+                        self.liveDisplayedItems = []
                         PiPDisplayController.shared.endLiveContent()
                         self.liveStatus = "服务端场次已停止"
                         self.liveActive = false
@@ -410,8 +414,13 @@ final class AppModel: ObservableObject {
     private func deliverLivePrompts() {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         if let expiry = liveDisplayedUntilMS, expiry <= now {
-            PiPDisplayController.shared.endLiveContent()
-            liveDisplayedUntilMS = nil
+            liveDisplayedItems = LivePromptDelivery.unexpired(liveDisplayedItems, nowMS: now)
+            liveDisplayedUntilMS = liveDisplayedItems.map(\.expiresAtMS).min()
+            if liveDisplayedItems.isEmpty {
+                PiPDisplayController.shared.endLiveContent()
+            } else {
+                _ = PiPDisplayController.shared.showLiveFrame(liveDisplayedItems)
+            }
         }
         guard liveActive, !liveStopping, PiPDisplayController.shared.canShowLiveFrame else { return }
         let beforeExpired = liveDelivery.expiredCount
@@ -420,6 +429,7 @@ final class AppModel: ObservableObject {
             NSLog("Live prompt delivery: expired=%d", liveDelivery.expiredCount)
         }
         if !frame.isEmpty, PiPDisplayController.shared.showLiveFrame(frame) {
+            liveDisplayedItems = frame
             liveDisplayedUntilMS = frame.map(\.expiresAtMS).min()
             NSLog("Live prompt delivery: selected=%d", frame.count)
         }
