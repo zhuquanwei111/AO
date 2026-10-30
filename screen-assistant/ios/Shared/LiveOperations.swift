@@ -315,32 +315,41 @@ struct LiveOperationsClient {
         return task
     }
 
-    func events(_ credentials: LiveSessionCredentials, completion: @escaping (Result<LiveEventPage, Error>) -> Void) {
-        loadEvents(credentials, after: "", accumulated: [], completion: completion)
+    func events(_ credentials: LiveSessionCredentials,
+                onResponse: @escaping (URLResponse?, Error?) -> Void,
+                completion: @escaping (Result<LiveEventPage, Error>) -> Void) {
+        loadEvents(credentials, after: "", accumulated: [], onResponse: onResponse, completion: completion)
     }
 
     func summary(_ credentials: LiveSessionCredentials,
+                 onResponse: @escaping (URLResponse?, Error?) -> Void,
                  completion: @escaping (Result<LiveSessionSummary, Error>) -> Void) {
         let request = authorized(endpoint("v1", "live", "sessions", credentials.sessionID, "summary"),
                                  token: credentials.token)
         session.dataTask(with: request) { data, response, error in
-            completion(Self.decode(LiveSessionSummary.self, data: data, response: response, error: error))
+            onResponse(response, error)
+            completion(Self.decode(LiveSessionSummary.self, data: data, response: response, error: error,
+                                   recordResponse: false))
         }.resume()
     }
 
     private func loadEvents(_ credentials: LiveSessionCredentials, after: String,
                             accumulated: [LivePrompt],
+                            onResponse: @escaping (URLResponse?, Error?) -> Void,
                             completion: @escaping (Result<LiveEventPage, Error>) -> Void) {
         var components = URLComponents(url: endpoint("v1", "live", "sessions", credentials.sessionID, "events"), resolvingAgainstBaseURL: false)!
         components.queryItems = [URLQueryItem(name: "after", value: after), URLQueryItem(name: "limit", value: "100")]
         let request = authorized(components.url!, token: credentials.token)
         session.dataTask(with: request) { data, response, error in
-            switch Self.decode(LiveEventPage.self, data: data, response: response, error: error) {
+            onResponse(response, error)
+            switch Self.decode(LiveEventPage.self, data: data, response: response, error: error,
+                               recordResponse: false) {
             case .failure(let error): completion(.failure(error))
             case .success(let page):
                 let all = accumulated + page.events
                 if page.hasMore {
-                    self.loadEvents(credentials, after: page.nextCursor, accumulated: all, completion: completion)
+                    self.loadEvents(credentials, after: page.nextCursor, accumulated: all,
+                                    onResponse: onResponse, completion: completion)
                 } else {
                     var completePage = page
                     completePage.events = all

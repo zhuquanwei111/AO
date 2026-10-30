@@ -351,7 +351,7 @@ final class AppModel: ObservableObject {
                         let label = prompt.sources?.contains(where: { $0.kind == "comment" }) == true ? "问答" : "运营"
                         return LivePromptDelivery.Item(id: prompt.promptID,
                             text: "【\(label)】" + prompt.displayText,
-                            expiresAtMS: prompt.expiresAtMS ?? 0,
+                            expiresAtMS: LivePromptDelivery.displayExpiry(prompt.expiresAtMS, receivedAtMS: now),
                             priority: prompt.priority ?? 0)
                     }
                     let beforeOverflow = self.liveDelivery.overflowCount
@@ -561,28 +561,46 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func overviewResponseHandler(_ credentials: LiveSessionCredentials, generation: Int)
+        -> (URLResponse?, Error?) -> Void {
+        { [weak self] response, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                _ = PollCallbackGate.commitIfCurrent(
+                    sessionID: credentials.sessionID, generation: generation,
+                    currentSessionID: Self.savedCredentials()?.sessionID,
+                    currentGeneration: self.liveStartGeneration,
+                    active: !self.liveActive && !self.liveStarting, stopping: self.liveStopping,
+                    commit: { ControlState.recordServiceResponse(error: error, response: response) }
+                )
+            }
+        }
+    }
+
     private func loadStoppedOverview(_ credentials: LiveSessionCredentials, client: LiveOperationsClient) {
+        let generation = liveStartGeneration
+        let onResponse = overviewResponseHandler(credentials, generation: generation)
         let group = DispatchGroup()
         var fetchedEvents: LiveEventPage?
         var fetchedSummary: LiveSessionSummary?
         overviewLoading = true
         summaryRefreshInFlight = true
         group.enter()
-        client.events(credentials) { result in
+        client.events(credentials, onResponse: onResponse) { result in
             DispatchQueue.main.async {
                 if case .success(let page) = result { fetchedEvents = page }
                 group.leave()
             }
         }
         group.enter()
-        client.summary(credentials) { result in
+        client.summary(credentials, onResponse: onResponse) { result in
             DispatchQueue.main.async {
                 if case .success(let summary) = result { fetchedSummary = summary }
                 group.leave()
             }
         }
         group.notify(queue: .main) { [weak self] in
-            guard let self, !self.liveActive,
+            guard let self, !self.liveActive, !self.liveStarting, generation == self.liveStartGeneration,
                   Self.savedCredentials()?.sessionID == credentials.sessionID else { return }
             self.overviewLoading = false
             self.summaryRefreshInFlight = false
@@ -615,9 +633,10 @@ final class AppModel: ObservableObject {
         }
         summaryRefreshInFlight = true
         overviewLoading = true
-        client.summary(credentials) { [weak self] result in
+        let generation = liveStartGeneration
+        client.summary(credentials, onResponse: overviewResponseHandler(credentials, generation: generation)) { [weak self] result in
             DispatchQueue.main.async {
-                guard let self, !self.liveActive,
+                guard let self, !self.liveActive, !self.liveStarting, generation == self.liveStartGeneration,
                       Self.savedCredentials()?.sessionID == credentials.sessionID else { return }
                 self.summaryRefreshInFlight = false
                 self.overviewLoading = false

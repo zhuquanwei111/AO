@@ -2,6 +2,11 @@ import Foundation
 
 /// 仅管理本场待显示的提示；调用方在主线程持有并按实际排版选择帧。
 struct LivePromptDelivery {
+    /// 缺少服务端期限时仅设置本机显示上限，不代表服务端生成时间。
+    static func displayExpiry(_ serverExpiry: Int64?, receivedAtMS: Int64) -> Int64 {
+        serverExpiry ?? receivedAtMS + 15_000
+    }
+
     struct Item {
         let id: String
         let text: String

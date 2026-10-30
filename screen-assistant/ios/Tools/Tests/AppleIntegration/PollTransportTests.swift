@@ -94,4 +94,35 @@ final class PollTransportTests: XCTestCase {
     func testTransportFailure() { check("disconnect", expectedError: .cannotConnectToHost) }
     func testTimeout() { check("timeout", expectedError: .timedOut) }
     func testCancellation() { check("hold", expectedError: .cancelled, cancel: true) }
+
+    func testOverviewDecodingDoesNotCommitConnectionDiagnostics() {
+        for isSummary in [true, false] {
+            let (client, session) = makeClient("http-error")
+            let before = ControlState.serviceConnection()
+            let finished = expectation(description: isSummary ? "summary" : "events")
+            var observedStatus: Int?
+            let onResponse: (URLResponse?, Error?) -> Void = { response, error in
+                XCTAssertNil(error)
+                observedStatus = (response as? HTTPURLResponse)?.statusCode
+            }
+            if isSummary {
+                client.summary(credentials, onResponse: onResponse) { result in
+                    guard case .failure(let error) = result else { XCTFail("expected HTTP failure"); finished.fulfill(); return }
+                    XCTAssertEqual((error as? LiveOperationsHTTPError)?.statusCode, 503)
+                    XCTAssertEqual(ControlState.serviceConnection(), before)
+                    finished.fulfill()
+                }
+            } else {
+                client.events(credentials, onResponse: onResponse) { result in
+                    guard case .failure(let error) = result else { XCTFail("expected HTTP failure"); finished.fulfill(); return }
+                    XCTAssertEqual((error as? LiveOperationsHTTPError)?.statusCode, 503)
+                    XCTAssertEqual(ControlState.serviceConnection(), before)
+                    finished.fulfill()
+                }
+            }
+            wait(for: [finished], timeout: 5)
+            XCTAssertEqual(observedStatus, 503)
+            session.invalidateAndCancel()
+        }
+    }
 }
