@@ -2,11 +2,18 @@ package com.screenassistant;
 
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
 /** 逐条发送有界采样；停止、过期、队列满和请求失败分别处理。 */
 final class BatchDispatch {
+    static ThreadPoolExecutor executor() {
+        return new ThreadPoolExecutor(1,1,0,TimeUnit.SECONDS,
+                new ArrayBlockingQueue<>(8),new ThreadPoolExecutor.AbortPolicy());
+    }
     interface Send<T> { void send(T value) throws Exception; }
     static <T> void submit(Executor executor, CollectedRows<T> batch, BooleanSupplier active,
                            BooleanSupplier fresh, Send<T> send, Consumer<String> status, boolean hadLoss) {

@@ -6,6 +6,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ThreadPoolExecutor;
 import static org.junit.Assert.*;
 
 public class BatchDispatchTest {
@@ -37,5 +40,18 @@ public class BatchDispatchTest {
         AtomicBoolean active=new AtomicBoolean(true); sent.clear(); states.clear();
         BatchDispatch.submit(Runnable::run,batch(3),active::get,()->true,v->{ sent.add(v); active.set(false); },states::add,false);
         assertEquals(1,sent.size()); assertTrue(states.get(0).contains("2 条未上传"));
+    }
+    @Test public void actualQueueRejectsNinthWaitingBatchWithoutEvictingEarlierWork() throws Exception {
+        ThreadPoolExecutor executor=BatchDispatch.executor();
+        CountDownLatch started=new CountDownLatch(1), release=new CountDownLatch(1);
+        List<String> states=new ArrayList<>();
+        try {
+            executor.execute(()->{ started.countDown(); try { release.await(); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); } });
+            assertTrue(started.await(2,TimeUnit.SECONDS));
+            for (int i=0;i<8;i++) BatchDispatch.submit(executor,batch(1),()->true,()->true,v->{},states::add,false);
+            BatchDispatch.submit(executor,batch(2),()->true,()->true,v->{},states::add,false);
+            assertEquals(8,executor.getQueue().size());
+            assertEquals(1,states.size()); assertTrue(states.get(0).contains("2 条未上传"));
+        } finally { release.countDown(); executor.shutdownNow(); }
     }
 }

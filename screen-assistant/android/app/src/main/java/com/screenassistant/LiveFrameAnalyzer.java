@@ -24,9 +24,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
@@ -67,8 +65,7 @@ final class LiveFrameAnalyzer implements AutoCloseable {
     private final BooleanSupplier active;
     private final Consumer<String> status;
     private final Context context;
-    private final ThreadPoolExecutor upload=new ThreadPoolExecutor(1,1,0,TimeUnit.SECONDS,
-            new ArrayBlockingQueue<>(8),new ThreadPoolExecutor.AbortPolicy());
+    private final ThreadPoolExecutor upload=BatchDispatch.executor();
     private String previousNotice="";
     private String segment=UUID.randomUUID().toString();
     private HeadWindow head=new HeadWindow();
@@ -156,7 +153,9 @@ final class LiveFrameAnalyzer implements AutoCloseable {
                 row -> LiveClient.call(session,"observations",row),status,hadLoss);
     }
 
-    private boolean fresh(Frame f) { return active.getAsBoolean() && f.uptime>=earliestUptime && SystemClock.elapsedRealtime()-f.uptime<6500; }
+    private boolean fresh(Frame f) {
+        return FrameFreshness.valid(active.getAsBoolean(),f.uptime,earliestUptime,SystemClock.elapsedRealtime());
+    }
     private JSONObject inspectPerson(Bitmap image,Frame f) throws Exception {
         JSONObject p=new JSONObject().put("source",PERSON_SOURCE).put("coverage","sampled_person_roi")
                 .put("segment_id",segment).put("sequence",sequence++).put("observed_at_ms",f.wall)
