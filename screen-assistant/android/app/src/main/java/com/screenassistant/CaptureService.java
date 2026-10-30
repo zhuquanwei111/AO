@@ -119,6 +119,7 @@ public class CaptureService extends Service {
     private TextView replyTextView;
     private volatile boolean overlayBlocksCapture;
     private boolean draggingOverlay;
+    private boolean overlayConflictNotified;
     private final Runnable replyHide = () -> renderOverlay(sessionEpoch);
 
     private MediaProjection.Callback projectionCallback;
@@ -695,6 +696,12 @@ public class CaptureService extends Service {
                 replyOverlayView = LayoutInflater.from(this).inflate(R.layout.overlay_reply, null);
                 replyTextView = replyOverlayView.findViewById(R.id.tv_reply);
                 overlayBlocksCapture = true;
+                replyOverlayView.addOnLayoutChangeListener((view,left,top,right,bottom,oldLeft,oldTop,oldRight,oldBottom) -> {
+                    if (!draggingOverlay && (right-left != oldRight-oldLeft || bottom-top != oldBottom-oldTop)) {
+                        overlayBlocksCapture = true;
+                        view.post(this::placeReplyOverlay);
+                    }
+                });
                 replyOverlayView.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
                     @Override
                     public void onViewAttachedToWindow(View view) {
@@ -782,7 +789,10 @@ public class CaptureService extends Service {
         if (target == null) {
             overlayBlocksCapture = true;
             setState("提示框遮挡识别区域，文字采样已暂停；请调整区域或提示框");
-            android.widget.Toast.makeText(this, "提示框放不下，请调整识别区域", android.widget.Toast.LENGTH_LONG).show();
+            if (!overlayConflictNotified) {
+                overlayConflictNotified = true;
+                android.widget.Toast.makeText(this, "提示框放不下，请调整识别区域", android.widget.Toast.LENGTH_LONG).show();
+            }
             return;
         }
         WindowManager.LayoutParams lp = (WindowManager.LayoutParams) view.getLayoutParams();
@@ -805,6 +815,7 @@ public class CaptureService extends Service {
         }
         overlayBlocksCapture = blocked;
         if (blocked) setState("提示框遮挡识别区域，文字采样已暂停；请调整区域或提示框");
+        else overlayConflictNotified = false;
     }
 
     private static String safeId(String id) {
@@ -831,6 +842,7 @@ public class CaptureService extends Service {
             replyTextView = null;
         }
         overlayBlocksCapture = false;
+        overlayConflictNotified = false;
     }
 
     private void setState(String message) {
