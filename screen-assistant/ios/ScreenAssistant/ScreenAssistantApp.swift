@@ -359,6 +359,7 @@ final class AppModel: ObservableObject {
                     var acceptedIDs = Set(self.liveDelivery.receive(items, nowMS: now).map(\.id))
                     let fresh = page.prompts.filter { acceptedIDs.remove($0.promptID) != nil }
                     self.liveEvents.insert(contentsOf: fresh, at: 0)
+                    self.liveEvents = Array(self.liveEvents.prefix(100))
                     if !fresh.isEmpty { NSLog("Live prompt delivery: received=%d", fresh.count) }
                     if self.liveDelivery.overflowCount != beforeOverflow || self.liveDelivery.expiredCount != beforeExpired {
                         NSLog("Live prompt delivery: overflow=%d expired=%d", self.liveDelivery.overflowCount, self.liveDelivery.expiredCount)
