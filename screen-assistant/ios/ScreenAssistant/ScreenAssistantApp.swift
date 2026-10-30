@@ -427,6 +427,9 @@ final class AppModel: ObservableObject {
             }
         }
         guard liveActive, !liveStopping, PiPDisplayController.shared.canShowLiveFrame else { return }
+        if !liveDisplayedItems.isEmpty, !PiPDisplayController.shared.hasLiveContent {
+            _ = PiPDisplayController.shared.showLiveFrame(liveDisplayedItems)
+        }
         let beforeExpired = liveDelivery.expiredCount
         let frame = liveDelivery.take(nowMS: now) { PiPDisplayController.shared.liveFrameFits($0) }
         if liveDelivery.expiredCount != beforeExpired {

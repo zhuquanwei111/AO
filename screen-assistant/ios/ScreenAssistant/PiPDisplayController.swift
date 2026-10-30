@@ -188,6 +188,7 @@ final class PiPDisplayController: NSObject, ObservableObject {
         ControlState.setUserWantsCapture(false)
         hostView.removeFromSuperview()
         pipController = nil
+        liveContentActive = false
         lastRenderedCGImage = nil
         lastDisplayedText = nil
         lastDisplayedKind = nil
@@ -273,6 +274,7 @@ final class PiPDisplayController: NSObject, ObservableObject {
     }
 
     var canShowLiveFrame: Bool { pipController != nil }
+    var hasLiveContent: Bool { liveContentActive }
 
     /// 直播场次空闲时保留安静画面；连接诊断仍由主界面展示。
     func setLiveSessionActive(_ active: Bool) {
