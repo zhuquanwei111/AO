@@ -246,7 +246,7 @@ final class PiPDisplayController: NSObject, ObservableObject {
 
     /// 必须在主线程调用；仅表示选中并生成帧，不代表系统 PiP 已显示。
     func showLiveFrame(_ items: [LivePromptDelivery.Item]) -> Bool {
-        guard pipController != nil, !items.isEmpty else { return false }
+        guard canShowLiveFrame, !items.isEmpty else { return false }
         var text = liveFrameText(items)
         if !liveTextFits(text) {
             let characters = Array(text)
@@ -273,7 +273,9 @@ final class PiPDisplayController: NSObject, ObservableObject {
         liveTextFits(liveFrameText(items))
     }
 
-    var canShowLiveFrame: Bool { pipController != nil }
+    var canShowLiveFrame: Bool {
+        state == .running && isPlaying && pipController?.isPictureInPictureActive == true
+    }
     var hasLiveContent: Bool { liveContentActive }
 
     /// 直播场次空闲时保留安静画面；连接诊断仍由主界面展示。
