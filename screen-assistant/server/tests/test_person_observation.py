@@ -8,10 +8,13 @@ from screen_assistant_server.person_observation import PersonObservation, Person
 
 def sample(seq, *, segment="a", people=1, quality="valid", box=(0.3, 0.1, 0.4, 0.8),
            body=(0.0, 0.8, -0.5, 0.0, 0.5, 0.0), face=(0.2, 0.2, 0.1)):
-    return PersonObservation(segment, seq, 1_000 + seq * 3_000, seq * 3_000,
-                             quality, people, 0.8 if people else None,
-                             box if people else None, body if people else None,
-                             face if people else None)
+    return PersonObservation(segment_id=segment, sequence=seq,
+                             observed_at_ms=1_000 + seq * 3_000, uptime_ms=seq * 3_000,
+                             quality=quality, source="ios_replaykit_vision",
+                             person_count=people, confidence=0.8 if people else None,
+                             person_box=box if people else None,
+                             body_vector=body if people else None,
+                             face_vector=face if people else None)
 
 
 def exited():
