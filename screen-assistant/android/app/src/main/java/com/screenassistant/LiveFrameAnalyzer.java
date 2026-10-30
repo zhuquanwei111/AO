@@ -6,9 +6,10 @@ import android.graphics.Rect;
 import android.media.Image;
 import android.os.SystemClock;
 import com.google.android.gms.tasks.Tasks;
+import com.paddle.ocr.model.OCRBox;
+import com.paddle.ocr.model.OCRResult;
+import com.paddle.ocr.model.OCRRunResult;
 import com.google.mlkit.vision.common.InputImage;
-import com.google.mlkit.vision.text.Text;
-import com.google.mlkit.vision.text.TextRecognizer;
 import com.google.mlkit.vision.pose.Pose;
 import com.google.mlkit.vision.pose.PoseDetection;
 import com.google.mlkit.vision.pose.PoseDetector;
@@ -58,7 +59,7 @@ final class LiveFrameAnalyzer implements AutoCloseable {
         } catch (RuntimeException e) { f.close(); throw e; }
     }
 
-    private final TextRecognizer text;
+    private final PaddleOcrBridge text;
     private PoseDetector poses;
     private FaceDetector faces;
     private final LiveClient.Session session;
@@ -78,7 +79,7 @@ final class LiveFrameAnalyzer implements AutoCloseable {
 
     void invalidateBefore(long uptime) { earliestUptime=uptime; reset=true; }
 
-    LiveFrameAnalyzer(Context context, TextRecognizer text, LiveClient.Session session,
+    LiveFrameAnalyzer(Context context, PaddleOcrBridge text, LiveClient.Session session,
                       BooleanSupplier active, Consumer<String> status) {
         this.context=context; this.text=text; this.session=session; this.active=active; this.status=status;
     }
@@ -101,26 +102,34 @@ final class LiveFrameAnalyzer implements AutoCloseable {
 
     void analyze(Frame frame) throws Exception {
         if (frame.uptime<earliestUptime) return;
+        long frameStartMs=SystemClock.elapsedRealtime();
+        long coldLoadMs=text.initializeBlocking();
         if (reset) {
             reset=false; segment=UUID.randomUUID().toString(); sequence=0; head=new HeadWindow(); previousGray=null;
             previousNotice="";
         }
         CollectedRows<JSONObject> outgoing=new CollectedRows<>(128);
         int invalidComments=0, skippedOnlineLines=0;
+        long inferenceWallMs=0;
         for (Map.Entry<String,Bitmap> entry:frame.images.entrySet()) {
             if (!active.getAsBoolean()) return;
             String kind=entry.getKey(); if (kind.equals("person")) continue;
-            Text result=Tasks.await(text.process(InputImage.fromBitmap(entry.getValue(),0)));
+            OCRRunResult result=text.recognizeBlocking(entry.getValue());
+            inferenceWallMs+=result.getTotalTimeMs();
             JSONArray lines=new JSONArray(); double confidence=1; StringBuilder raw=new StringBuilder();
             int lineIndex=0;
-            for (Text.TextBlock block:result.getTextBlocks()) for (Text.Line line:block.getLines()) {
+            for (OCRResult line:result.getResults()) {
                 int sourceIndex=lineIndex++;
                 if (!kind.equals("comment") && lines.length()>=20) { skippedOnlineLines++; continue; }
-                Rect box=line.getBoundingBox(); if (box==null || box.isEmpty()) { if (kind.equals("comment")) invalidComments++; continue; }
                 Rect roi=frame.rects.get(kind);
-                int left=Math.max(roi.left,roi.left+box.left),top=Math.max(roi.top,roi.top+box.top);
-                int right=Math.min(roi.right,roi.left+box.right),bottom=Math.min(roi.bottom,roi.top+box.bottom);
-                if (left>=right || top>=bottom) { if (kind.equals("comment")) invalidComments++; continue; }
+                float[] quad=new float[8];
+                for (int point=0;point<4;point++) {
+                    quad[point*2]=line.getBox().getPoints().get(point).x;
+                    quad[point*2+1]=line.getBox().getPoints().get(point).y;
+                }
+                int[] bounds=PaddleOcrGeometry.absoluteBounds(quad,roi.left,roi.top,roi.right,roi.bottom);
+                if (bounds==null) { if (kind.equals("comment")) invalidComments++; continue; }
+                int left=bounds[0],top=bounds[1],right=bounds[2],bottom=bounds[3];
                 String value=line.getText(); if (value==null || value.trim().isEmpty()) continue;
                 double score=line.getConfidence(); if (!Double.isFinite(score)||score<0||score>1) score=0;
                 JSONObject position=Regions.position(left,top,right,bottom,frame.width,frame.height);
@@ -149,6 +158,9 @@ final class LiveFrameAnalyzer implements AutoCloseable {
             outgoing.add(observation(kind,frame.wall,content,lines.length()==0?-1:confidence));
             if (kind.equals("platform_notice")) previousNotice=value;
         }
+        android.util.Log.d("LiveFrameAnalyzer", "Paddle OCR coldLoadMs="+coldLoadMs+
+                " inferenceMs="+inferenceWallMs+" frameMs="+(SystemClock.elapsedRealtime()-frameStartMs)+
+                " uploadRows="+outgoing.rows.size()+" uploadQueue="+upload.getQueue().size());
         boolean hadLoss=outgoing.dropped + invalidComments + skippedOnlineLines > 0;
         if (hadLoss)
             status.accept("本轮有 " + (outgoing.dropped + invalidComments + skippedOnlineLines) + " 行未上传，请检查识别区域");

@@ -27,10 +27,7 @@ import android.view.View;
 import android.view.WindowManager;
 import android.widget.TextView;
 
-import com.google.mlkit.vision.common.InputImage;
-import com.google.mlkit.vision.text.TextRecognition;
-import com.google.mlkit.vision.text.TextRecognizer;
-import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions;
+import com.paddle.ocr.model.OCRRunResult;
 
 import java.nio.ByteBuffer;
 import java.lang.ref.WeakReference;
@@ -49,7 +46,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  *    路径过于复杂，V1 采取安全停止会话并提示重新开始；
  *  - createVirtualDisplay 前必须注册 onStop 回调，回调中回收全部资源。
  *
- * 隐私：全部画面仅在内存处理（Image->Bitmap->ML Kit），不落盘、不缓存句子与回复。
+ * 隐私：全部画面仅在内存处理（Image->Bitmap->Paddle OCR），不落盘、不缓存句子与回复。
  */
 public class CaptureService extends Service {
 
@@ -85,7 +82,7 @@ public class CaptureService extends Service {
     private MediaProjection projection;
     private android.hardware.display.VirtualDisplay virtualDisplay;
     private ImageReader imageReader;
-    private TextRecognizer recognizer;
+    private PaddleOcrBridge paddleOcr;
 
     private HandlerThread captureThread;
     private Handler captureHandler;
@@ -178,50 +175,48 @@ public class CaptureService extends Service {
             }
             final Bitmap b = crop;
             final String requestUrl = serverUrl;
-            recognizer.process(InputImage.fromBitmap(b, 0))
-                    .addOnSuccessListener(workExecutor, text -> {
-                        b.recycle();
-                        try {
-                            if (epoch != sessionEpoch) return;
-                            String sentence = normalize(text.getText());
-                            if (sentence.isEmpty()) {
-                                busyEpoch.compareAndSet(epoch, -1);
-                                scheduleNext(epoch);
-                                return;
-                            }
-                            if (operationMode) return; // 运营模式不以旧问答冒充运营提示
-                            AnswerClient.Result result =
-                                    AnswerClient.post(requestUrl, sentence, CONNECT_TIMEOUT_MS, READ_TIMEOUT_MS);
-                            android.util.Log.i("CaptureService", "answer response status=" + result.httpStatus
-                                    + " outcome=" + result.outcome + " request_id=" + safeId(result.requestId)
-                                    + " reply_chars=" + (result.reply == null ? 0 : result.reply.length())
-                                    + " epoch=" + epoch);
-                            if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch) {
-                                android.util.Log.i("CaptureService", "answer dropped by lifecycle request_id="
-                                        + safeId(result.requestId) + " phase=" + phase + " current_epoch=" + sessionEpoch);
-                                return; // 会话已停/换轮：不得回填
-                            }
-                            if (result.outcome == AnswerClient.Outcome.SUCCESS) {
-                                showReply(result.reply, epoch, result.requestId);
-                            } else if (result.outcome == AnswerClient.Outcome.DROP) {
-                                android.util.Log.w("CaptureService", "answer dropped request_id="
-                                        + safeId(result.requestId) + " status=" + result.httpStatus
-                                        + " error_type=" + errorType(result.error));
-                            }
-                            // DUPLICATE：保留当前展示；DROP：本轮静默丢弃
-                        } catch (Throwable t) {
-                            android.util.Log.w("CaptureService", "round failed", t);
-                        } finally {
-                            busyEpoch.compareAndSet(epoch, -1);
-                            scheduleNext(epoch);
-                        }
-                    })
-                    .addOnFailureListener(workExecutor, e -> {
-                        b.recycle();
-                        android.util.Log.w("CaptureService", "ocr failed", e);
-                        busyEpoch.compareAndSet(epoch, -1);
-                        scheduleNext(epoch);
-                    });
+            workExecutor.execute(() -> {
+                try {
+                    long coldLoadMs = paddleOcr.initializeBlocking();
+                    OCRRunResult ocr = paddleOcr.recognizeBlocking(b);
+                    android.util.Log.d("CaptureService", "Paddle OCR coldLoadMs=" + coldLoadMs
+                            + " totalMs=" + ocr.getTotalTimeMs() + " lines=" + ocr.getLineCount());
+                    if (epoch != sessionEpoch) return;
+                    StringBuilder rawText = new StringBuilder();
+                    for (com.paddle.ocr.model.OCRResult line : ocr.getResults()) {
+                        if (line.getText() == null || line.getText().trim().isEmpty()) continue;
+                        if (rawText.length() > 0) rawText.append(' ');
+                        rawText.append(line.getText());
+                    }
+                    String sentence = normalize(rawText.toString());
+                    if (sentence.isEmpty() || operationMode) return;
+                    AnswerClient.Result result =
+                            AnswerClient.post(requestUrl, sentence, CONNECT_TIMEOUT_MS, READ_TIMEOUT_MS);
+                    android.util.Log.i("CaptureService", "answer response status=" + result.httpStatus
+                            + " outcome=" + result.outcome + " request_id=" + safeId(result.requestId)
+                            + " reply_chars=" + (result.reply == null ? 0 : result.reply.length())
+                            + " epoch=" + epoch);
+                    if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch) {
+                        android.util.Log.i("CaptureService", "answer dropped by lifecycle request_id="
+                                + safeId(result.requestId) + " phase=" + phase + " current_epoch=" + sessionEpoch);
+                        return;
+                    }
+                    if (result.outcome == AnswerClient.Outcome.SUCCESS) {
+                        showReply(result.reply, epoch, result.requestId);
+                    } else if (result.outcome == AnswerClient.Outcome.DROP) {
+                        android.util.Log.w("CaptureService", "answer dropped request_id="
+                                + safeId(result.requestId) + " status=" + result.httpStatus
+                                + " error_type=" + errorType(result.error));
+                    }
+                } catch (Throwable t) {
+                    android.util.Log.e("CaptureService", "Paddle OCR failed; no alternate OCR is used", t);
+                    setState("Paddle OCR初始化或识别失败，本轮未识别");
+                } finally {
+                    b.recycle();
+                    busyEpoch.compareAndSet(epoch, -1);
+                    scheduleNext(epoch);
+                }
+            });
         }
     };
 
@@ -284,6 +279,7 @@ public class CaptureService extends Service {
         captureThread.start();
         captureHandler = new Handler(captureThread.getLooper());
         workExecutor = Executors.newSingleThreadExecutor();
+        paddleOcr = new PaddleOcrBridge(this);
         promptExecutor = Executors.newSingleThreadExecutor();
     }
 
@@ -378,11 +374,11 @@ public class CaptureService extends Service {
         logEvent("service_destroyed", "phase=" + phase + " teardown_reason=" + teardownReason);
         teardownInternal();
         LiveFrameAnalyzer closingAnalyzer = liveAnalyzer;
-        TextRecognizer closingRecognizer = recognizer;
+        PaddleOcrBridge closingPaddleOcr = paddleOcr;
         if (workExecutor != null) {
             workExecutor.execute(() -> {
                 if (closingAnalyzer != null) closingAnalyzer.close();
-                if (closingRecognizer != null) closingRecognizer.close();
+                if (closingPaddleOcr != null) closingPaddleOcr.close();
             });
             workExecutor.shutdown();
         }
@@ -464,11 +460,7 @@ public class CaptureService extends Service {
                     imageReader.getSurface(), null, captureHandler);
             logEvent("virtual_display_created", "result=" + (virtualDisplay == null ? "null" : "created"));
             if (virtualDisplay == null) throw new IllegalStateException("VirtualDisplay unavailable");
-            setupStage = "recognizer";
-            if (recognizer == null) {
-                recognizer = TextRecognition.getClient(
-                        new ChineseTextRecognizerOptions.Builder().build());
-            }
+            setupStage = "paddle_ocr";
             lastLiveOcr = 0;
             lastLivePerson = 0; lastFrameTimestamp = 0;
             connectionStatus = operationMode ? LiveConnection.CONNECTING : OverlayMessageState.WAITING_TEXT;
@@ -634,7 +626,7 @@ public class CaptureService extends Service {
                             try (Image ignored = imageReader.acquireLatestImage()) { }
                             catch (RuntimeException ignored) { }
                             liveSession = session;
-                            liveAnalyzer = new LiveFrameAnalyzer(CaptureService.this, recognizer, session,
+                            liveAnalyzer = new LiveFrameAnalyzer(CaptureService.this, paddleOcr, session,
                                     () -> !tornDown && !uiVisible && phase == Phase.RUNNING && sessionEpoch == epoch,
                                     message -> main.post(() -> {
                                         if (!tornDown && epoch == sessionEpoch) {

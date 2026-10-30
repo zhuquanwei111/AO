@@ -1,5 +1,6 @@
 plugins {
     id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
 }
 
 android {
@@ -11,8 +12,8 @@ android {
         applicationId "com.screenassistant"
         minSdk 29
         targetSdk 34
-        versionCode 5
-        versionName "0.2.3"
+        versionCode 6
+        versionName "0.2.4"
     }
 
     buildTypes {
@@ -30,10 +31,9 @@ android {
 dependencies {
     implementation platform('org.jetbrains.kotlin:kotlin-bom:1.8.22')
     implementation 'androidx.core:core:1.13.1'
-    // ML Kit 文字识别 v2（中文，bundled 模型，端上真实推理）
-    implementation 'com.google.mlkit:text-recognition-chinese:16.0.1'
     implementation 'com.google.mlkit:pose-detection:18.0.0-beta5'
     implementation 'com.google.mlkit:face-detection:16.1.7'
+    implementation project(':ppocr-sdk')
     testImplementation 'junit:junit:4.13.2'
     testImplementation 'org.json:json:20240303'
 }
