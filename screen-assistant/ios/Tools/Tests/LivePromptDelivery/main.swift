@@ -53,6 +53,8 @@ assert(LivePromptDelivery.displayExpiry(16_000, serverTimeMS: 1_000, processingM
 assert(LivePromptDelivery.displayExpiry(16_000, serverTimeMS: 1_000, processingMS: 0, startNS: 2, endNS: 1) == nil)
 let expiry = LivePromptDelivery.displayExpiry(16_000, serverTimeMS: 1_000, processingMS: 15_000, startNS: 0, endNS: 15_010_000_000)!
 assert(expiry == 29_999)
+assert(LivePromptDelivery.displayExpiry(16_000, serverTimeMS: 1_000, processingMS: 15_000, startNS: 0, endNS: 15_200_000_000) == 29_999)
+assert(LivePromptDelivery.displayExpiry(16_000, serverTimeMS: 1_000, processingMS: 15_000, startNS: 0, endNS: 31_000_000_000) == 31_000)
 for wallClock in [-86_400_000, 0, 86_400_000] {
     _ = wallClock // 截止点计算不读取设备墙钟。
     assert(LivePromptDelivery.displayExpiry(16_000, serverTimeMS: 1_000, processingMS: 15_000, startNS: 0, endNS: 15_010_000_000) == expiry)
