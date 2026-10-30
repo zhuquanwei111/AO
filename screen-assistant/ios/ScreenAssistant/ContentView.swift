@@ -86,6 +86,12 @@ struct ContentView: View {
                         Label(model.broadcastStatusText, systemImage: broadcastStatusIcon)
                             .font(.footnote)
                             .foregroundColor(broadcastStatusColor)
+                        Text(model.observationUploadStatus)
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                        Text("仅统计已识别的采样；忙碌时跳过的帧及画面漏识不在统计内。")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
                         HStack {
                             Text("已完成 OCR 轮次")
                             Spacer()
@@ -254,9 +260,9 @@ private struct AdvancedSettingsView: View {
                         }
                     } label: {
                         HStack {
-                            Text("平台提醒区域")
+                            Text("平台提醒区域（采集暂停）")
                             Spacer()
-                            Text(model.platformNoticeROI == nil ? "未配置" : "已配置")
+                            Text(model.platformNoticeROI == nil ? "未配置" : "已配置，采集暂停")
                                 .foregroundColor(model.platformNoticeROI == nil ? .secondary : .green)
                         }
                     }

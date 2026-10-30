@@ -24,7 +24,7 @@ struct LiveROIOverview: View {
                 Label("评论", systemImage: "square").foregroundColor(.blue)
                 Label(onlineCount == nil ? "在线人数：未配置" : "在线人数", systemImage: "square")
                     .foregroundColor(.orange)
-                Label(platformNotice == nil ? "平台提醒：未配置" : "平台提醒", systemImage: "square")
+                Label(platformNotice == nil ? "平台提醒：未配置" : "平台提醒：采集暂停", systemImage: "square")
                     .foregroundColor(.purple)
                 Text("竖屏比例示意，非实时画面；请按主播界面核对。")
                     .font(.footnote).foregroundColor(.secondary)
