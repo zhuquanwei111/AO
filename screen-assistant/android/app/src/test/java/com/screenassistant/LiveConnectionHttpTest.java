@@ -27,6 +27,9 @@ public class LiveConnectionHttpTest {
         final List<String> requests = Collections.synchronizedList(new ArrayList<>());
         final CountDownLatch polling = new CountDownLatch(1), releasePoll = new CountDownLatch(1);
         volatile boolean loseCreate, offline, delayPoll;
+        volatile String summaryStatus="failed";
+        volatile int summaryHttp=200;
+        volatile boolean summaryStopped;
         Fixture() throws IOException {
             executor.execute(() -> {
                 while (!server.isClosed()) {
@@ -69,7 +72,8 @@ public class LiveConnectionHttpTest {
                 if (loseCreate) return; // 模拟服务器已创建、响应却丢失。
                 respond(e, 201, "{\"session_id\":\"one\",\"session_token\":\"private-token\",\"started_at_ms\":10}");
             } else if (path.endsWith("/summary")) {
-                respond(e, 200, "{\"session_id\":\"one\",\"stopped_at_ms\":null,\"backstage_recap\":{\"status\":\"failed\"}}");
+                respond(e, summaryHttp, "{\"session_id\":\"one\",\"stopped_at_ms\":" + (summaryStopped ? "123" : "null")
+                        + ",\"backstage_recap\":{\"status\":\"" + summaryStatus + "\"}}");
             } else if (path.endsWith("/start")) {
                 if (!body.contains("android_app")) throw new IOException("source missing");
                 respond(e, 409, "{}");
@@ -107,6 +111,26 @@ public class LiveConnectionHttpTest {
         assertTrue(display.overlay.shouldDisplay(true, false));
         assertEquals(LiveConnection.OFFLINE, display.overlay.textAt(1000));
         assertTrue(display.messages.isEmpty());
+    }
+
+    @Test public void manualOldSessionRefreshReadsLateResultAndReportsForbidden() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.summaryStopped=true; fixture.summaryStatus="not_connected";
+            LiveClient.Session session=new LiveClient.Session(fixture.base(),"one","private-token",10,true);
+            org.json.JSONObject first=LiveClient.call(session,"summary",null);
+            assertFalse(RecapText.pending(first)); assertFalse(RecapText.terminal(first));
+            fixture.summaryStatus="captured_locally";
+            org.json.JSONObject refreshed=LiveClient.call(session,"summary",null);
+            assertTrue(RecapText.terminal(refreshed));
+            fixture.summaryHttp=403;
+            try { LiveClient.call(session,"summary",null); fail("应返回权限错误"); }
+            catch (LiveClient.HttpError error) {
+                assertEquals(403,error.status); assertTrue(RecapRequest.failure(error).contains("读取未确认"));
+            }
+            assertEquals(0,fixture.creates.get()); assertEquals(0,fixture.stops.get());
+            assertEquals(3,fixture.requests.size());
+            for (String request:fixture.requests) assertEquals("GET /v1/live/sessions/one/summary private-token",request);
+        }
     }
 
     @Test public void realHttpRecapConflictAndRecoveryUseOneSceneAndOriginalCursor() throws Exception {
