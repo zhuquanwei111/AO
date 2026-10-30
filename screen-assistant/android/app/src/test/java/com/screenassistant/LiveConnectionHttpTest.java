@@ -100,7 +100,7 @@ public class LiveConnectionHttpTest {
         public void close() throws IOException { releasePoll.countDown(); server.close(); executor.shutdownNow(); }
     }
 
-    @Test public void actualConnectionRefusedStillHasOverlayRequest() throws Exception {
+    @Test public void actualConnectionRefusedKeepsDiagnosticAndHandle() throws Exception {
         int port;
         try (ServerSocket reserved = new ServerSocket(0)) { port = reserved.getLocalPort(); }
         LiveConnectionTest.Memory store = new LiveConnectionTest.Memory();
@@ -109,7 +109,7 @@ public class LiveConnectionHttpTest {
         assertFalse(connection.connect());
         assertFalse(store.creating); assertNull(store.session);
         assertTrue(display.overlay.shouldDisplay(true, false));
-        assertEquals(LiveConnection.OFFLINE, display.overlay.textAt(1000));
+        assertEquals(LiveConnection.OFFLINE, display.diagnostic);
         assertTrue(display.messages.isEmpty());
     }
 
@@ -140,11 +140,11 @@ public class LiveConnectionHttpTest {
             LiveConnection connection = new LiveConnection(store, LiveClient.remote(fixture.base(), "", "account"), display);
             assertTrue(connection.connect()); assertTrue(connection.poll());
             assertEquals(1, display.bindings); assertEquals(1, display.messages.size());
-            assertTrue(display.overlay.textAt(1000).contains("复盘登记未确认"));
+            assertTrue(display.diagnostic.contains("复盘登记未确认"));
             assertTrue(fixture.requests.stream().anyMatch(r -> r.contains("wait_ms=0 private-token")));
             fixture.offline = true; assertFalse(connection.poll());
             assertEquals(1, display.messages.size());
-            assertEquals(LiveConnection.OFFLINE, display.overlay.textAt(1001));
+            assertEquals(LiveConnection.OFFLINE, display.diagnostic);
             fixture.offline = false; assertTrue(connection.poll());
             assertEquals(1, fixture.creates.get());
             assertTrue(fixture.requests.stream().anyMatch(r -> r.contains("after=cursor-one&wait_ms=15000 private-token")));
@@ -163,7 +163,7 @@ public class LiveConnectionHttpTest {
             fixture.loseCreate = false;
             assertFalse(new LiveConnection(store, LiveClient.remote(fixture.base(), "", ""), display).connect());
             assertEquals(1, fixture.creates.get());
-            assertTrue(display.overlay.textAt(1000).contains("创建未确认"));
+            assertTrue(display.diagnostic.contains("创建未确认"));
         }
     }
 

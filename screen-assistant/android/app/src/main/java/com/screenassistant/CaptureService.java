@@ -118,6 +118,7 @@ public class CaptureService extends Service {
     private volatile boolean overlayBlocksCapture;
     private boolean draggingOverlay;
     private boolean overlayConflictNotified;
+    private String displayedPromptId = "";
     private final Runnable replyHide = () -> renderOverlay(sessionEpoch);
 
     private MediaProjection.Callback projectionCallback;
@@ -404,7 +405,7 @@ public class CaptureService extends Service {
         tornDown = false;
         operationMode = false;
         phase = Phase.RUNNING;
-        overlayState.start("本地测试：拖动提示框");
+        overlayState.start();
         renderOverlay(sessionEpoch);
         return true;
     }
@@ -412,7 +413,9 @@ public class CaptureService extends Service {
     final void expandLocalOverlayForDebug() {
         if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0
                 || phase != Phase.RUNNING || tornDown || operationMode) return;
-        overlayState.setStatus("本地测试：多行提示\n第一行\n第二行\n第三行\n第四行\n第五行", false);
+        long now = System.currentTimeMillis();
+        overlayState.update("debug-" + now, "本地固定测试文字\n第一行\n第二行\n第三行\n第四行\n第五行", 0,
+                now + 15000, now, REPLY_AUTO_HIDE_MS);
         renderOverlay(sessionEpoch);
     }
 
@@ -640,8 +643,10 @@ public class CaptureService extends Service {
                     }
                     @Override public void prompt(org.json.JSONObject prompt) {
                         long expires = prompt.optLong("expires_at_ms");
-                        if (expires > System.currentTimeMillis())
-                            showMessage("运营", prompt.optString("display_text"), epoch, expires);
+                        String id = prompt.optString("prompt_id");
+                        logEvent("prompt_received", "id=" + safeId(id) + " expires=" + expires + " epoch=" + epoch);
+                        if (expires > System.currentTimeMillis() && !id.isEmpty())
+                            showMessage("运营", prompt.optString("display_text"), epoch, expires, id, prompt.optInt("priority"));
                     }
                     @Override public void ended() {
                         main.post(() -> {
@@ -675,6 +680,10 @@ public class CaptureService extends Service {
     }
 
     private void showMessage(String purpose, String reply, int epoch, long expiresAt) {
+        showMessage(purpose, reply, epoch, expiresAt, "", 0);
+    }
+
+    private void showMessage(String purpose, String reply, int epoch, long expiresAt, String id, int priority) {
         if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch) return;
         int generation = messageGeneration;
         String fullText = DisplayText.labeled(purpose, reply);
@@ -683,7 +692,11 @@ public class CaptureService extends Service {
             if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch || generation != messageGeneration) return;
             long now = System.currentTimeMillis();
             if (expiresAt > 0 && expiresAt <= now) return;
-            if (overlayState.update(fullText, expiresAt, now, REPLY_AUTO_HIDE_MS)) renderOverlay(epoch);
+            boolean accepted = overlayState.update(id, fullText, priority, expiresAt, now, REPLY_AUTO_HIDE_MS);
+            logEvent("prompt_processed", "id=" + safeId(id) + " accepted=" + accepted
+                    + " pending=" + overlayState.pendingCount() + " expired=" + overlayState.expiredCount()
+                    + " overflow=" + overlayState.overflowCount() + " epoch=" + epoch);
+            renderOverlay(epoch);
         });
     }
 
@@ -768,17 +781,31 @@ public class CaptureService extends Service {
             }
             long now = System.currentTimeMillis();
             String text = overlayState.textAt(now);
-            if (overlayConflictNotified) text = OVERLAY_CONFLICT + "\n" + text;
+            boolean expanded = !text.isEmpty();
+            if (overlayConflictNotified && expanded) text = OVERLAY_CONFLICT + "\n" + text;
+            replyTextView.setVisibility(expanded ? View.VISIBLE : View.GONE);
+            WindowManager.LayoutParams layout = (WindowManager.LayoutParams) replyOverlayView.getLayoutParams();
+            int width = expanded ? Math.max(200, (int) (screenSize[0] * .72f))
+                    : Math.round(48 * getResources().getDisplayMetrics().density);
+            if (layout.width != width) { layout.width = width; wm.updateViewLayout(replyOverlayView, layout); }
             if (!text.contentEquals(replyTextView.getText())) replyTextView.setText(text);
             replyOverlayView.setVisibility(View.VISIBLE);
             if (!draggingOverlay) {
                 overlayBlocksCapture = true;
                 replyOverlayView.post(this::placeReplyOverlay);
             }
-            logEvent("overlay_visible", "kind=" + (OverlayMessageState.WAITING_TEXT.equals(text) ? "waiting" : "message")
-                    + " attached=" + replyOverlayView.isAttachedToWindow());
-            if (overlayState.isMessageActive(now)) {
-                main.postDelayed(replyHide, Math.max(1, overlayState.expiresAtMs() - now));
+            String id = overlayState.currentId();
+            if (!id.equals(displayedPromptId)) {
+                logEvent("prompt_display", "id=" + safeId(id) + " previous=" + safeId(displayedPromptId)
+                        + " at=" + now + " source_expires=" + overlayState.sourceExpiryMs()
+                        + " visible_until=" + overlayState.expiresAtMs() + " protected_until=" + overlayState.protectedUntilMs()
+                        + " short_window=" + (expanded && overlayState.expiresAtMs() - now < OverlayMessageState.MIN_READ_MS)
+                        + " epoch=" + epoch + " attached=" + replyOverlayView.isAttachedToWindow());
+                displayedPromptId = id;
+            }
+            long nextChange = overlayState.nextChangeAtMs(now);
+            if (nextChange > 0) {
+                main.postDelayed(replyHide, Math.max(1, nextChange - now));
             }
         } catch (Exception e) {
             logEvent("overlay_attach_failed", "error=" + e.getClass().getSimpleName());
@@ -867,6 +894,7 @@ public class CaptureService extends Service {
         }
         overlayBlocksCapture = false;
         overlayConflictNotified = false;
+        displayedPromptId = "";
     }
 
     private void setState(String message) {

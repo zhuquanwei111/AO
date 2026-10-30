@@ -63,9 +63,14 @@ public class LiveConnectionTest {
     static class Display implements LiveConnection.Listener {
         final OverlayMessageState overlay = new OverlayMessageState();
         final List<String> messages = new ArrayList<>();
+        String diagnostic = LiveConnection.CONNECTING;
         int bindings, ended;
         Display() { overlay.start(LiveConnection.CONNECTING); }
-        public void status(String text, boolean discard) { overlay.setStatus(text, discard); }
+        public void status(String text, boolean discard) {
+            diagnostic = text;
+            overlay.setStatus(text, discard);
+            assertEquals("连接诊断不撑开空闲正文", "", overlay.textAt(1000));
+        }
         public void session(LiveClient.Session s) { bindings++; }
         public void prompt(JSONObject p) { messages.add(p.optString("display_text")); }
         public void ended() { ended++; }
@@ -82,14 +87,14 @@ public class LiveConnectionTest {
         LiveConnection connection = new LiveConnection(store, remote, display);
         assertFalse(connection.connect());
         assertTrue(display.overlay.shouldDisplay(true, false));
-        assertTrue(display.overlay.textAt(1000).contains("服务未连接"));
+        assertTrue(display.diagnostic.contains("服务未连接"));
         assertFalse(display.overlay.shouldDisplay(false, false));
         assertNull(store.session); assertFalse(store.creating);
         assertEquals(0, display.bindings); assertTrue(display.messages.isEmpty());
         remote.createError = null;
         assertTrue(connection.connect()); assertTrue(connection.poll());
         assertEquals(1, display.bindings);
-        assertTrue(display.overlay.textAt(1001).contains("实时已连接"));
+        assertTrue(display.diagnostic.contains("实时已连接"));
     }
 
     @Test public void recapFailureDoesNotStopKnownRealtimeSession() throws Exception {
@@ -101,7 +106,7 @@ public class LiveConnectionTest {
         assertTrue(connection.connect()); assertTrue(connection.poll());
         assertEquals(0, remote.creates); assertEquals(0, remote.stops);
         assertEquals(1, display.bindings); assertEquals("实际运营建议", display.messages.get(0));
-        assertTrue(display.overlay.textAt(1000).contains("复盘登记未确认"));
+        assertTrue(display.diagnostic.contains("复盘登记未确认"));
     }
 
     @Test public void busyRecapIsUnavailableButRealPromptStillArrivesWithoutRequeue() throws Exception {
@@ -113,8 +118,8 @@ public class LiveConnectionTest {
         LiveConnection connection = new LiveConnection(store, remote, display, clock::get);
         assertTrue(connection.connect()); assertTrue(connection.poll());
         assertEquals(1, display.bindings); assertEquals("实际运营建议", display.messages.get(0));
-        assertTrue(display.overlay.textAt(1000).contains("本场复盘未取得"));
-        assertFalse(display.overlay.textAt(1000).contains("不自动补领"));
+        assertTrue(display.diagnostic.contains("本场复盘未取得"));
+        assertFalse(display.diagnostic.contains("不自动补领"));
         assertEquals(0, remote.stops); assertEquals(0, display.ended);
         clock.set(30001); assertTrue(connection.poll());
         assertEquals(1, remote.starts); assertEquals(0, remote.creates);
@@ -127,7 +132,7 @@ public class LiveConnectionTest {
         LiveConnection connection = new LiveConnection(store, remote, display);
         assertTrue(connection.connect()); assertTrue(connection.poll());
         remote.pollError = new ConnectException(); assertFalse(connection.poll());
-        assertTrue(display.overlay.textAt(1000).contains("服务未连接"));
+        assertTrue(display.diagnostic.contains("服务未连接"));
         remote.pollError = null; assertTrue(connection.poll());
         assertEquals("c1", remote.lastCursor); assertEquals(0, remote.creates);
         assertEquals(1, display.bindings); assertEquals(SESSION, store.session);
@@ -141,7 +146,7 @@ public class LiveConnectionTest {
         remote.createError = null;
         assertFalse(new LiveConnection(store, remote, display).connect());
         assertEquals(1, remote.creates); assertEquals(0, display.bindings);
-        assertTrue(display.overlay.textAt(1000).contains("创建未确认"));
+        assertTrue(display.diagnostic.contains("创建未确认"));
     }
 
     @Test public void stopDuringCreatePreservesCredentialsAndClosesOnlyOldSession() throws Exception {
@@ -164,7 +169,7 @@ public class LiveConnectionTest {
         assertEquals(1, remote.creates); assertEquals(1, remote.starts); assertEquals(1, remote.stops);
         assertEquals(SESSION.id, remote.stoppedId);
         assertNull(store.session); assertFalse(store.creating); assertFalse(store.stopping);
-        assertTrue(display.overlay.textAt(1000).contains("凭证保存失败"));
+        assertTrue(display.diagnostic.contains("凭证保存失败"));
     }
 
     @Test public void failedCredentialSaveRetainsStopTargetUntilRemoteStopSucceeds() throws Exception {
@@ -176,7 +181,7 @@ public class LiveConnectionTest {
         assertFalse(connection.connect());
         assertEquals(1, remote.creates); assertEquals(1, remote.stops);
         assertTrue(store.creating); assertTrue(store.stopping);
-        assertTrue(display.overlay.textAt(1000).contains("结束未确认"));
+        assertTrue(display.diagnostic.contains("结束未确认"));
 
         remote.stopError = null;
         assertTrue(connection.connect());
@@ -238,11 +243,11 @@ public class LiveConnectionTest {
         assertEquals(1, remote.starts);
         clock.set(30001); remote.startError = null;
         assertTrue(connection.poll()); assertEquals(2, remote.starts);
-        assertTrue(display.overlay.textAt(1000).contains("复盘取数失败"));
+        assertTrue(display.diagnostic.contains("复盘取数失败"));
         clock.set(60002); remote.summaryError = new LiveClient.HttpError(503);
         assertTrue(connection.poll());
-        assertTrue(display.overlay.textAt(1001).contains("实时已连接"));
-        assertTrue(display.overlay.textAt(1001).contains("复盘状态未取得"));
+        assertTrue(display.diagnostic.contains("实时已连接"));
+        assertTrue(display.diagnostic.contains("复盘状态未取得"));
         assertEquals(0, remote.creates); assertEquals(0, remote.stops); assertEquals(1, display.bindings);
     }
 }
