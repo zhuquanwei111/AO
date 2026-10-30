@@ -648,6 +648,10 @@ async def add_typed_observation(session_id: str, payload: Observation, request: 
                                 token: str | None = Header(None, alias="X-Live-Session-Token")):
     service = request.app.state.live
     body = payload.model_dump()
+    # 新字段缺省时保留旧版本的指纹输入，避免跨版本重试冲突。
+    for key in ("capture_batch_id", "line_index"):
+        if key in body and body[key] is None:
+            del body[key]
     result = await service.run("add_observation", session_id, token, body, service.clock())
     return await process_fusion_observation(
         service, session_id, token, request, result, body,
