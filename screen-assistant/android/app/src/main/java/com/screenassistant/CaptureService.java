@@ -119,6 +119,7 @@ public class CaptureService extends Service {
     private boolean draggingOverlay;
     private boolean overlayConflictNotified;
     private String displayedPromptId = "";
+    private int localDebugMessages;
     private final Runnable replyHide = () -> renderOverlay(sessionEpoch);
 
     private MediaProjection.Callback projectionCallback;
@@ -405,6 +406,7 @@ public class CaptureService extends Service {
         tornDown = false;
         operationMode = false;
         phase = Phase.RUNNING;
+        localDebugMessages = 0;
         overlayState.start();
         renderOverlay(sessionEpoch);
         return true;
@@ -414,7 +416,8 @@ public class CaptureService extends Service {
         if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0
                 || phase != Phase.RUNNING || tornDown || operationMode) return;
         long now = System.currentTimeMillis();
-        overlayState.update("debug-" + now, "本地固定测试文字\n第一行\n第二行\n第三行\n第四行\n第五行", 0,
+        String label = (++localDebugMessages % 2 == 1) ? "A" : "B";
+        overlayState.update("debug-" + now, "本地固定测试文字" + label + "\n第一行\n第二行\n第三行\n第四行\n第五行", 0,
                 now + 15000, now, REPLY_AUTO_HIDE_MS);
         renderOverlay(sessionEpoch);
     }
