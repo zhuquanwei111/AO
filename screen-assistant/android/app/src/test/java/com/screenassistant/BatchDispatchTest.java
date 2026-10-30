@@ -54,4 +54,11 @@ public class BatchDispatchTest {
             assertEquals(1,states.size()); assertTrue(states.get(0).contains("2 条未上传"));
         } finally { release.countDown(); executor.shutdownNow(); }
     }
+    @Test public void forbiddenUploadShowsHttpStatus() {
+        List<String> states=new ArrayList<>();
+        BatchDispatch.submit(Runnable::run,batch(1),()->true,()->true,
+                v->{throw new LiveClient.HttpError(403);},states::add,false);
+        assertTrue(states.get(0).contains("HTTP 403"));
+        assertTrue(states.get(0).contains("未确认"));
+    }
 }

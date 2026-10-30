@@ -33,8 +33,10 @@ final class BatchDispatch {
                     }
                     if (!hadLoss && active.getAsBoolean()) status.accept("采集中，采样已上传；等待运营提示");
                 } catch (Exception e) {
+                    String cause=e instanceof LiveClient.HttpError ? "HTTP " + ((LiveClient.HttpError)e).status
+                            : e.getClass().getSimpleName();
                     if (active.getAsBoolean()) status.accept("采样上传未确认，剩余 " + (batch.rows.size()-sent)
-                            + " 条未确认：" + e.getClass().getSimpleName());
+                            + " 条未确认：" + cause);
                 }
             });
         } catch (RejectedExecutionException e) {
