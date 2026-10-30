@@ -88,13 +88,13 @@ final class AppModel: ObservableObject {
                                                        width: CGFloat(diagnosticRegion.width),
                                                        height: CGFloat(diagnosticRegion.height))
         captureWanted = ControlState.userWantsCapture()
+        audioSettings = AudioCaptureSettings.load()
         broadcastStatusText = Self.broadcastStatusDescription(
             activity: ControlState.broadcastActivity(),
             captureWanted: captureWanted,
             now: Date()
         )
         serviceStatusText = Self.serviceStatusDescription(ControlState.serviceConnection(), now: Date())
-        audioSettings = AudioCaptureSettings.load()
         if LiveSessionState.credentials() == nil {
             audioSettings.appHostConfirmed = false
             audioSettings.micHostConfirmed = false
