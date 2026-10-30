@@ -18,7 +18,10 @@ final class CollectedRows<T> {
     private int nextIndex;
     CollectedRows(int capacity) { this.capacity = capacity; }
     void add(T value) {
-        int index = nextIndex++;
+        addAt(nextIndex, value);
+    }
+    void addAt(int index, T value) {
+        nextIndex = Math.max(nextIndex, index + 1);
         if (rows.size() >= capacity) { dropped++; return; }
         rows.add(new Row<>(index, value));
     }

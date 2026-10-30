@@ -22,7 +22,7 @@ public class CollectedRowsTest {
     @Test public void commentPathKeepsEveryLineWithDistinctEventAndOriginalMetadata() throws Exception {
         CollectedRows<JSONObject> batch=new CollectedRows<>(128);
         JSONObject position=new JSONObject().put("x",.1).put("y",.2).put("width",.3).put("height",.04);
-        for (int i=0;i<25;i++) assertTrue(LiveFrameAnalyzer.collectComment(batch,"相同文字",1234,position,.8));
+        for (int i=0;i<25;i++) assertTrue(LiveFrameAnalyzer.collectComment(batch,i*2,"相同文字",1234,position,.8));
         HashSet<String> ids=new HashSet<>();
         for (CollectedRows.Row<JSONObject> row:batch.rows) {
             assertTrue(ids.add(row.value.getString("event_id")));
@@ -32,5 +32,6 @@ public class CollectedRowsTest {
             assertEquals(.1,row.value.getJSONObject("content").getJSONObject("text_position").getDouble("x"),.001);
         }
         assertEquals(25,batch.rows.size());
+        assertEquals(48,batch.rows.get(24).index);
     }
 }

@@ -90,10 +90,10 @@ final class LiveFrameAnalyzer implements AutoCloseable {
                 .put("confidence",confidence<0?JSONObject.NULL:confidence).put("content",content==null?JSONObject.NULL:content);
     }
 
-    static boolean collectComment(CollectedRows<JSONObject> rows, String value, long wall,
+    static boolean collectComment(CollectedRows<JSONObject> rows, int lineIndex, String value, long wall,
                                   JSONObject position, double confidence) throws Exception {
         if (value.codePointCount(0,value.length())>500) return false;
-        rows.add(observation("comment",wall,new JSONObject().put("text",value)
+        rows.addAt(lineIndex,observation("comment",wall,new JSONObject().put("text",value)
                 .put("text_position",position),confidence));
         return true;
     }
@@ -111,7 +111,9 @@ final class LiveFrameAnalyzer implements AutoCloseable {
             String kind=entry.getKey(); if (kind.equals("person")) continue;
             Text result=Tasks.await(text.process(InputImage.fromBitmap(entry.getValue(),0)));
             JSONArray lines=new JSONArray(); double confidence=1; StringBuilder raw=new StringBuilder();
+            int lineIndex=0;
             for (Text.TextBlock block:result.getTextBlocks()) for (Text.Line line:block.getLines()) {
+                int sourceIndex=lineIndex++;
                 if (!kind.equals("comment") && lines.length()>=20) { skippedOnlineLines++; continue; }
                 Rect box=line.getBoundingBox(); if (box==null || box.isEmpty()) { if (kind.equals("comment")) invalidComments++; continue; }
                 Rect roi=frame.rects.get(kind);
@@ -123,7 +125,7 @@ final class LiveFrameAnalyzer implements AutoCloseable {
                 JSONObject position=Regions.position(left,top,right,bottom,frame.width,frame.height);
                 confidence=Math.min(confidence,score);
                 if (kind.equals("comment")) {
-                    if (!collectComment(outgoing,value,frame.wall,position,score)) invalidComments++;
+                    if (!collectComment(outgoing,sourceIndex,value,frame.wall,position,score)) invalidComments++;
                     continue;
                 }
                 if (value.codePointCount(0,value.length())>200) { skippedOnlineLines++; continue; }
