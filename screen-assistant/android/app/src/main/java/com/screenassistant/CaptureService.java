@@ -706,7 +706,8 @@ public class CaptureService extends Service {
                     }
                 });
         liveConnection = connection;
-        promptExecutor.execute(() -> {
+        LiveConnection.beginWorker();
+        try { promptExecutor.execute(() -> {
             boolean prepared = false;
             try {
                 while (!tornDown && epoch == sessionEpoch && !connection.isClosed()) {
@@ -718,16 +719,18 @@ public class CaptureService extends Service {
                     }
                 }
             } finally {
-                if (connection.shouldEnd()) {
+                try { if (connection.shouldEnd()) {
                     try { audioCompletion.get(20, java.util.concurrent.TimeUnit.SECONDS); }
                     catch (Exception ignored) { /* 仍请求幂等结束 */ }
                     try { connection.finishStop(); }
                     catch (Exception e) { logEvent("session_stop_unconfirmed", "error=" + e.getClass().getSimpleName()); }
+                } } finally {
+                    LiveConnection.endWorker();
                     Intent changed = new Intent(Prefs.ACTION_STATE).setPackage(getPackageName());
                     sendBroadcast(changed);
                 }
             }
-        });
+        }); } catch (RuntimeException error) { LiveConnection.endWorker(); throw error; }
     }
 
     private void showMessage(String purpose, String reply, int epoch, long expiresAt) {

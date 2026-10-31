@@ -30,6 +30,7 @@ public class LiveConnectionHttpTest {
         final List<String> requests = Collections.synchronizedList(new ArrayList<>());
         final CountDownLatch polling = new CountDownLatch(1), releasePoll = new CountDownLatch(1);
         volatile boolean loseCreate, offline, delayPoll;
+        volatile int createHttp = 201, createDelayMs;
         volatile String summaryStatus="failed";
         volatile int summaryHttp=200;
         volatile boolean summaryStopped;
@@ -78,7 +79,12 @@ public class LiveConnectionHttpTest {
             if (path.equals("/v1/live/sessions")) {
                 creates.incrementAndGet();
                 if (loseCreate) return; // 模拟服务器已创建、响应却丢失。
-                respond(e, 201, "{\"session_id\":\"one\",\"session_token\":\"private-token\",\"started_at_ms\":10}");
+                if (createDelayMs > 0) {
+                    try { Thread.sleep(createDelayMs); }
+                    catch (InterruptedException error) { Thread.currentThread().interrupt(); return; }
+                }
+                respond(e, createHttp, createHttp == 201
+                        ? "{\"session_id\":\"one\",\"session_token\":\"private-token\",\"started_at_ms\":10}" : "{}");
             } else if (path.endsWith("/summary")) {
                 respond(e, summaryHttp, "{\"session_id\":\"one\",\"stopped_at_ms\":" + (summaryStopped ? "123" : "null")
                         + ",\"backstage_recap\":{\"status\":\"" + summaryStatus + "\"}}");
@@ -401,6 +407,28 @@ public class LiveConnectionHttpTest {
             assertFalse(new LiveConnection(store, remote(fixture.base(), "", ""), display).connect());
             assertEquals(1, fixture.creates.get());
             assertTrue(display.diagnostic.contains("创建未确认"));
+        }
+    }
+
+    @Test public void failedCreateRequiresExplicitLocalRecoveryBeforeNewHttpCreate() throws Exception {
+        for (boolean timeout : new boolean[]{false, true}) {
+            try (Fixture fixture = new Fixture()) {
+                fixture.createHttp = timeout ? 201 : 503;
+                fixture.createDelayMs = timeout ? 16000 : 0;
+                LiveConnectionTest.Memory store = new LiveConnectionTest.Memory();
+                LiveConnectionTest.Display display = new LiveConnectionTest.Display();
+                assertFalse(new LiveConnection(store, remote(fixture.base(), "", ""), display).connect());
+                assertTrue(store.creating); assertNull(store.session);
+                fixture.createHttp = 201; fixture.createDelayMs = 0;
+                assertFalse(new LiveConnection(store, remote(fixture.base(), "", ""), display).connect());
+                assertEquals(1, fixture.creates.get());
+                assertFalse(LiveConnection.releaseUnknownCreate(store, false, () -> true));
+                assertEquals(1, fixture.creates.get());
+                assertTrue(LiveConnection.releaseUnknownCreate(store, true, () -> true));
+                assertEquals(1, fixture.creates.get()); // 解除本机限制本身不发请求。
+                assertTrue(new LiveConnection(store, remote(fixture.base(), "", ""), display).connect());
+                assertEquals(2, fixture.creates.get());
+            }
         }
     }
 

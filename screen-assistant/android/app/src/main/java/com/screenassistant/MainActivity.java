@@ -65,7 +65,8 @@ public class MainActivity extends Activity {
         LinearLayout sessionContainer = findViewById(R.id.live_panel_container);
         regionPanel = new RegionPanel(this, regionContainer);
         audioPanel = new AudioPanel(this, audioContainer);
-        livePanel = new LivePanel(this, sessionContainer, this::refreshUi);
+        livePanel = new LivePanel(this, sessionContainer, this::refreshUi,
+                () -> !pendingStart && CaptureService.phase == CaptureService.Phase.IDLE);
 
         btnMain.setOnClickListener(v -> onMainAction());
         btnSettings.setOnClickListener(v -> {
