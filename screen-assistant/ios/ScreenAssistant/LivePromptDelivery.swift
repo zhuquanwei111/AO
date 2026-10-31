@@ -32,15 +32,17 @@ struct LivePromptDelivery {
         let priority: Int
         let timingInvalid: Bool
         let promptType: String?
+        let priorityInvalid: Bool
 
         init(id: String, text: String, expiresAtMS: Int64, priority: Int,
-             timingInvalid: Bool = false, promptType: String? = nil) {
+             timingInvalid: Bool = false, priorityInvalid: Bool = false, promptType: String? = nil) {
             self.id = id
             self.text = text
             self.expiresAtMS = expiresAtMS
             self.priority = priority
             self.timingInvalid = timingInvalid
             self.promptType = promptType
+            self.priorityInvalid = priorityInvalid
         }
     }
 
@@ -70,6 +72,7 @@ struct LivePromptDelivery {
             fresh.append(item)
             onDecision?(item, "received")
             if item.timingInvalid { onDecision?(item, "invalid_timing"); continue }
+            if item.priorityInvalid { onDecision?(item, "invalid_priority"); continue }
             if item.expiresAtMS <= nowMS {
                 expiredCount += 1
                 onDecision?(item, "expired_before_queue")
