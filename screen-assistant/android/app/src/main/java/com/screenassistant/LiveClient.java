@@ -67,7 +67,8 @@ public final class LiveClient {
 
     static Session sessionFromCreate(String baseUrl, JSONObject result) throws JSONException {
         JSONObject capabilities = result.optJSONObject("capabilities");
-        boolean batches = capabilities != null && Boolean.TRUE.equals(capabilities.opt("observation_batch_metadata"));
+        boolean batches = capabilities != null && Boolean.TRUE.equals(capabilities.opt("observation_batch_metadata"))
+                && Boolean.TRUE.equals(capabilities.opt("typed_prompts"));
         return new Session(baseUrl, result.getString("session_id"), result.getString("session_token"),
                 result.getLong("started_at_ms"), false, batches);
     }

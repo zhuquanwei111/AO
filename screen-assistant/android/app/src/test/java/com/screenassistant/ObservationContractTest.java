@@ -8,11 +8,18 @@ public class ObservationContractTest {
     @Test public void capabilityRequiresExplicitBooleanAndRestoredSessionFallsBack() throws Exception {
         JSONObject base = new JSONObject().put("session_id", "s").put("session_token", "t").put("started_at_ms", 1);
         assertFalse(LiveClient.sessionFromCreate("http://local", base).batchMetadata);
-        base.put("capabilities", new JSONObject().put("observation_batch_metadata", "true"));
+        JSONObject capabilities = new JSONObject().put("observation_batch_metadata", true);
+        base.put("capabilities", capabilities);
         assertFalse(LiveClient.sessionFromCreate("http://local", base).batchMetadata);
-        base.put("capabilities", new JSONObject().put("observation_batch_metadata", 1));
+        capabilities.remove("observation_batch_metadata"); capabilities.put("typed_prompts", true);
         assertFalse(LiveClient.sessionFromCreate("http://local", base).batchMetadata);
-        base.put("capabilities", new JSONObject().put("observation_batch_metadata", true));
+        for (Object invalid : new Object[]{JSONObject.NULL, "true", 1, false}) {
+            capabilities.put("observation_batch_metadata", invalid).put("typed_prompts", true);
+            assertFalse(LiveClient.sessionFromCreate("http://local", base).batchMetadata);
+            capabilities.put("observation_batch_metadata", true).put("typed_prompts", invalid);
+            assertFalse(LiveClient.sessionFromCreate("http://local", base).batchMetadata);
+        }
+        capabilities.put("observation_batch_metadata", true).put("typed_prompts", true);
         LiveClient.Session s = LiveClient.sessionFromCreate("http://local", base);
         assertTrue(s.batchMetadata);
         assertFalse(LiveClient.Session.from(s.json()).batchMetadata);

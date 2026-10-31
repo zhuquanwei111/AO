@@ -130,7 +130,7 @@ public class LiveConnectionHttpTest {
 
     @Test public void createCapabilityControlsRealObservationBodies() throws Exception {
         try (Fixture fixture = new Fixture()) {
-            fixture.createCapabilities = ",\"capabilities\":{\"observation_batch_metadata\":true}";
+            fixture.createCapabilities = ",\"capabilities\":{\"observation_batch_metadata\":true,\"typed_prompts\":true}";
             LiveClient.Session session = LiveClient.create(fixture.base(), "", "");
             assertTrue(session.batchMetadata);
             CollectedRows<org.json.JSONObject> rows = new CollectedRows<>(3);
@@ -150,7 +150,7 @@ public class LiveConnectionHttpTest {
             LiveClient.call(session, "observations", rows.rows.get(0).value);
             assertEquals(fixture.observationBodies.get(0), fixture.observationBodies.get(3));
 
-            fixture.createCapabilities = "";
+            fixture.createCapabilities = ",\"capabilities\":{\"observation_batch_metadata\":true}";
             LiveClient.Session old = LiveClient.create(fixture.base(), "", "");
             assertFalse(old.batchMetadata);
             CollectedRows<org.json.JSONObject> legacy = new CollectedRows<>(1);
