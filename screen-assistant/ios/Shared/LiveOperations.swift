@@ -27,7 +27,7 @@ struct LiveCapabilities: Codable {
     let observationBatchMetadata: Bool?
     let typedPrompts: Bool?
     var supportsObservationBatch: Bool {
-        observationBatchMetadata == true && typedPrompts == true
+        observationBatchMetadata == true
     }
     enum CodingKeys: String, CodingKey {
         case observationBatchMetadata = "observation_batch_metadata", typedPrompts = "typed_prompts"
@@ -121,11 +121,17 @@ struct LivePrompt: Codable, Identifiable {
     var expiresAtMS: Int64?
     var priority: Int?
     let sources: [LivePromptSource]?
-    let promptType: String?
-    let replyTo: LivePromptReplyTo?
+    var promptType: String?
+    var replyTo: LivePromptReplyTo?
     var priorityInvalid: Bool
     let sourcesInvalid: Bool
     var id: String { promptID }
+    mutating func applyCapabilities(_ capabilities: LiveCapabilities?) {
+        if capabilities?.typedPrompts != true {
+            promptType = nil
+            replyTo = nil
+        }
+    }
     enum CodingKeys: String, CodingKey {
         case promptID = "prompt_id", inputMode = "input_mode"
         case startAtMS = "start_at_ms", endAtMS = "end_at_ms"
@@ -460,6 +466,9 @@ struct LiveOperationsClient {
                     completion(.failure(NSError(domain: "LiveOperations", code: -3)), response, error)
                     return
                 }
+                for index in page.prompts.indices {
+                    page.prompts[index].applyCapabilities(credentials.capabilities)
+                }
                 if let timing = PromptTimingJSON.inspect(data),
                    page.rawPromptIndices.allSatisfy({ $0 < timing.expiries.count && $0 < timing.priorities.count }) {
                     page.serverTimeMS = timing.serverTimeMS
@@ -518,6 +527,9 @@ struct LiveOperationsClient {
                                recordResponse: false) {
             case .failure(let error): completion(.failure(error))
             case .success(var page):
+                for index in page.events.indices {
+                    page.events[index].applyCapabilities(credentials.capabilities)
+                }
                 let timing = PromptTimingJSON.inspect(data, collectionKey: "events")
                 Self.applyStrictPriorities(&page.events, rawIndices: page.rawEventIndices,
                                            priorities: timing?.priorities ?? [])

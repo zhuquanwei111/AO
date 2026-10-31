@@ -46,6 +46,8 @@ private final class PollFixtureProtocol: URLProtocol {
         let prompts: String
         if path.hasPrefix("/mixed-metadata/") {
             prompts = "[{\"prompt_id\":\"a\",\(promptFields),\"expires_at_ms\":5000,\"priority\":100},{\"prompt_id\":\"bad\",\(promptFields),\"expires_at_ms\":5000,\"priority\":\"invalid\",\"sources\":false},{\"prompt_id\":\"broken\"},{\"prompt_id\":\"b\",\(promptFields),\"expires_at_ms\":6000,\"priority\":25,\"sources\":[{\"kind\":\"comment\"},false]},{\"prompt_id\":\"float\",\(promptFields),\"expires_at_ms\":6000,\"priority\":100.0},{\"prompt_id\":\"missing\",\(promptFields),\"expires_at_ms\":6000},{\"prompt_id\":\"null\",\(promptFields),\"expires_at_ms\":6000,\"priority\":null},{\"prompt_id\":\"bool\",\(promptFields),\"expires_at_ms\":6000,\"priority\":true}]"
+        } else if path.hasPrefix("/typed-prompt/") {
+            prompts = "[{\"prompt_id\":\"typed\",\(promptFields),\"expires_at_ms\":5000,\"priority\":25,\"prompt_type\":\"comment_reply\",\"reply_to\":{\"comment_id\":\"local\",\"nickname\":null,\"text\":\"hello\"}}]"
         } else if path.hasPrefix("/mixed-timing/") {
             prompts = "[{\"prompt_id\":\"a\",\(promptFields),\"expires_at_ms\":5000},{\"prompt_id\":\"bad\",\(promptFields),\"expires_at_ms\":9.0},{\"prompt_id\":\"b\",\(promptFields),\"expires_at_ms\":6000}]"
         } else { prompts = "[]" }
@@ -94,10 +96,10 @@ final class PollTransportTests: XCTestCase {
         let prefix = "{\"session_id\":\"fixture-session\",\"session_token\":\"fixture-token\",\"started_at_ms\":1"
         for (suffix, supported) in [
             ("}", false),
-            (",\"capabilities\":{\"observation_batch_metadata\":true}}", false),
+            (",\"capabilities\":{\"observation_batch_metadata\":true}}", true),
             (",\"capabilities\":{\"observation_batch_metadata\":true,\"typed_prompts\":true}}", true),
-            (",\"capabilities\":{\"observation_batch_metadata\":true,\"typed_prompts\":false}}", false),
-            (",\"capabilities\":{\"observation_batch_metadata\":true,\"typed_prompts\":1}}", false),
+            (",\"capabilities\":{\"observation_batch_metadata\":true,\"typed_prompts\":false}}", true),
+            (",\"capabilities\":{\"observation_batch_metadata\":true,\"typed_prompts\":1}}", true),
             (",\"capabilities\":{\"observation_batch_metadata\":false,\"typed_prompts\":true}}", false),
             (",\"capabilities\":{\"observation_batch_metadata\":false}}", false),
             (",\"capabilities\":{\"observation_batch_metadata\":1}}", false),
@@ -105,6 +107,31 @@ final class PollTransportTests: XCTestCase {
         ] {
             let decoded = try JSONDecoder().decode(LiveSessionCredentials.self, from: Data((prefix + suffix).utf8))
             XCTAssertEqual(decoded.capabilities?.supportsObservationBatch == true, supported)
+        }
+    }
+
+    func testPollTypesFollowIndependentTypedCapability() throws {
+        let prefix = "{\"session_id\":\"fixture-session\",\"session_token\":\"fixture-token\",\"started_at_ms\":1"
+        for (suffix, supported) in [
+            ("}", false),
+            (",\"capabilities\":{\"observation_batch_metadata\":true,\"typed_prompts\":false}}", false),
+            (",\"capabilities\":{\"observation_batch_metadata\":false,\"typed_prompts\":true}}", true),
+            (",\"capabilities\":{\"typed_prompts\":1}}", false)
+        ] {
+            let credentials = try JSONDecoder().decode(LiveSessionCredentials.self, from: Data((prefix + suffix).utf8))
+            let (client, session) = makeClient("typed-prompt")
+            let finished = expectation(description: "typed capability")
+            _ = client.poll(credentials, after: "") { result, _, _ in
+                guard case .success(let page) = result, let prompt = page.prompts.first else {
+                    XCTFail("expected typed fixture"); finished.fulfill(); return
+                }
+                XCTAssertEqual(prompt.promptType, supported ? "comment_reply" : nil)
+                XCTAssertEqual(prompt.replyTo?.text, supported ? "hello" : nil)
+                XCTAssertEqual(prompt.displayText, "x")
+                finished.fulfill()
+            }
+            wait(for: [finished], timeout: 5)
+            session.invalidateAndCancel()
         }
     }
 
