@@ -248,3 +248,53 @@ def test_expired_batch_discards_transient_raw_payloads_on_poll(tmp_path):
         assert "records" not in batch and batch["rows"] == []
     finally:
         store.close()
+
+
+def test_legacy_phone_observation_samples_keep_http_time_and_source_classification(tmp_path):
+    # 取自脱敏录制的 Flow #7、16、27、37、153、269、3271、3306；无帧和批次真值。
+    clock = [1_793_361_760_000]
+    cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="",
+                   tianyi_base_url="http://model.invalid", tianyi_model="unused",
+                   dedup_ttl_seconds=60, max_sentence_chars=2000,
+                   model_timeout_seconds=1, model_connect_timeout_seconds=1,
+                   live_db_path=str(tmp_path / "phone-samples.sqlite3"))
+    source = "android_media_projection_ocr"
+    # 会话组、原 event ID、采集与接收毫秒、原文本、位置、原处理结果。
+    samples = [
+        (1, "cbd8b328-55ff-4b23-9d91-383b51a5e4c9", 1793361765436, 1793361769294, None, None, "source_missing"),
+        (1, "7e3022ac-8384-4595-84b9-740bd381934e", 1793361772303, 1793361776458, "胡言乱语：还在绷", (0.14047619047619048, 0.8114285714285714, 0.2746031746031746, 0.017142857142857144), "scheduled"),
+        (1, "395bdea6-ad54-49e7-822f-33f29b7a24d0", 1793361772303, 1793361776899, "0万+", (0.8, 0.055, 0.1, 0.045), "field_semantics_unconfirmed"),
+        (1, "80563833-b1f8-4f8b-b7a9-8c482791f85c", 1793361779222, 1793361780992, "八点领快递：坏孩子", (0.2, 0.7782142857142857, 0.3055555555555556, 0.016428571428571428), "scheduled"),
+        (1, "112a9c4e-d31e-4db2-bbb0-a649f91faabd", 1793361799323, 1793361801009, "10yalo:喊麦", (0.0880952380952381, 0.8946428571428572, 0.22698412698412698, 0.017857142857142856), "scheduled"),
+        (1, "0c18762c-0a4d-4d5b-a7fb-43a8666f14d7", 1793361822507, 1793361824210, "11：喊麦", (0.19523809523809524, 0.8482142857142857, 0.14365079365079364, 0.018571428571428572), "scheduled"),
+        (3, "e3331ab0-35c3-4173-a263-321b688fca16", 1793363769050, 1793363772822, "点点关注 一台苹果耳机", (0.2992063492063492, 0.7225, 0.3531746031746032, 0.016428571428571428), "scheduled"),
+        (3, "30f68222-1444-4f57-a6b5-d621fd8622da", 1793363775724, 1793363778040, "点点关注 一台苹果耳机", (0.4373015873015873, 0.8789285714285714, 0.3523809523809524, 0.016428571428571428), "scheduled"),
+    ]
+    with TestClient(create_app(cfg, live_clock=lambda: clock[0])) as client:
+        sessions = {}
+        for group, event_id, observed, received, raw, rect, expected in samples:
+            if group not in sessions:
+                clock[0] = observed - 1000
+                session = client.post("/v1/live/sessions", json={}).json()
+                headers = {"X-Live-Session-Token": session["session_token"]}
+                url = f"/v1/live/sessions/{session['session_id']}"
+                assert client.post(url + "/start", headers=headers, json={"source": "android_app"}).status_code == 200
+                sessions[group] = (url, headers)
+            url, headers = sessions[group]
+            clock[0] = received
+            is_count = expected in {"source_missing", "field_semantics_unconfirmed"}
+            position = dict(zip(("x", "y", "width", "height"), rect)) if rect else None
+            content = None if raw is None else ({"raw_text": raw, "field_semantics_confirmed": False,
+                                                 "text_position": position} if is_count else
+                                                {"text": raw, "text_position": position})
+            body = {"kind": "online_count" if is_count else "comment", "event_id": event_id,
+                    "source": source, "observed_at_ms": observed,
+                    "availability": "missing" if raw is None else "available",
+                    "coverage": "ocr_visible_sample", "reliability": "unknown" if raw is None else "known",
+                    "content": content}
+            response = client.post(url + "/observations", headers=headers, json=body)
+            assert response.status_code == 200
+            result = response.json()
+            assert (result["status"], result["reason"], result["effective_at_ms"], result["time_basis"]) == (
+                "accepted", expected, observed, "observed")
+            assert result["received_at_ms"] == received
