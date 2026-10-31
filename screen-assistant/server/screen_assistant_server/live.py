@@ -23,7 +23,7 @@ from .live_store import LiveStore, digest
 from .model_client import ModelTimeoutError, ModelUnavailableError
 from .live_fusion import (
     Observation, ObservationSource, TEST_COMMENT_FIXTURE_SOURCES,
-    observation_source_allowed,
+    observation_source_allowed, COMMENT_REPLY_MAX_AGE_MS,
 )
 from .person_observation import PersonObservation as PersonObservationValue, PersonPolicy
 
@@ -190,6 +190,7 @@ class LiveService:
         self.fusion_queued = {}
         self.fusion_active = {}
         self.fusion_dirty = set()
+        self.fusion_trigger_epoch = {}
         self.fusion_audio_pending = {}
         self.fusion_stopping = set()
         self.fusion_closed = False
@@ -204,16 +205,20 @@ class LiveService:
             self._fusion_done(sid, active)
             active = None
         if active is not None:
+            self.fusion_trigger_epoch[sid] = self.fusion_trigger_epoch.get(sid, 0) + 1
             self.fusion_dirty.add(sid)
             logger.info("live_fusion outcome=coalesced")
             return True
         if sid in self.fusion_queued:
+            self.fusion_trigger_epoch[sid] = self.fusion_trigger_epoch.get(sid, 0) + 1
             logger.info("live_fusion outcome=coalesced")
             return True
         if len(self.fusion_active) >= self.fusion_concurrency and len(self.fusion_queue) >= self.fusion_queue_limit:
             logger.info("live_fusion outcome=busy")
+            logger.info("live_data stage=scheduler session=%s outcome=scheduler_full", sid[:8])
             return False
         self.fusion_queued[sid] = (token, request)
+        self.fusion_trigger_epoch[sid] = self.fusion_trigger_epoch.get(sid, 0) + 1
         self.fusion_queue.append(sid)
         self._pump_fusion()
         return True
@@ -270,6 +275,7 @@ class LiveService:
         if task:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        self.fusion_trigger_epoch.pop(sid, None)
 
     async def close_fusion(self):
         self.fusion_closed = True
@@ -280,6 +286,7 @@ class LiveService:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        self.fusion_trigger_epoch.clear()
 
     def dispatch(self, method: str, *args):
         # 延迟初始化，使新存储不可写时不影响旧问答/健康检查的生命周期。
@@ -433,44 +440,91 @@ class LiveService:
     async def deliver_fusion(self, sid: str, token: str | None, request: Request,
                              *, urgent: bool = False, allow_stopping: bool = False):
         async def deliver():
-            candidate = await self.run("fusion_candidate", sid, token)
+            epoch = self.fusion_trigger_epoch.get(sid, 0)
+            candidate = await self.run("fusion_candidate", sid, token, epoch)
             if candidate is None:
                 return {"reason": "quiet", "prompt_id": None}
-            suggestion = candidate["suggestion"]
-            if candidate["model_text"]:
-                cfg = request.app.state.settings
-                if not cfg.tianyi_api_key:
-                    return {"reason": "model_unavailable", "prompt_id": None}
-                try:
-                    source = ",".join(dict.fromkeys(
-                        row["source"] for row in candidate["observations"]
-                    ))
-                    observed_at = max(row["effective_at_ms"] for row in candidate["observations"])
-                    suggestion = await asyncio.wait_for(
-                        request.app.state.model.suggest_live(
-                            candidate["model_text"], candidate["description"], source,
-                            observed_at, context=candidate["model_context"],
-                        ), timeout=cfg.model_timeout_seconds,
-                    )
-                except (asyncio.TimeoutError, ModelTimeoutError):
-                    logger.info("live_fusion outcome=timeout")
-                    return {"reason": "model_unavailable", "prompt_id": None}
-                except ModelUnavailableError:
-                    logger.info("live_fusion outcome=model_unavailable")
-                    return {"reason": "model_unavailable", "prompt_id": None}
-                if not valid_operation_suggestion(suggestion):
-                    return {"reason": "model_output_invalid", "prompt_id": None}
-            elif not suggestion or len(suggestion) > 100 or "\n" in suggestion or "\r" in suggestion:
-                return {"reason": "candidate_invalid", "prompt_id": None}
-            async with self.lock:
-                if self.fusion_closed or (sid in self.fusion_stopping and not allow_stopping):
-                    return {"reason": "cancelled", "prompt_id": None}
-                result = await self.call("save_fusion_candidate", sid, token, candidate, suggestion)
-                if result.get("prompt_id"):
-                    for future in self.waiters.get(sid, ()):
-                        if not future.done():
-                            future.set_result(None)
-                return result
+            is_comment = candidate.get("prompt_type") == "comment_reply"
+            comment_id = candidate["reply_to"]["comment_id"] if is_comment else None
+            terminal = False
+            model_called = False
+            try:
+                suggestion = candidate["suggestion"]
+                if candidate["model_text"]:
+                    cfg = request.app.state.settings
+                    if not cfg.tianyi_api_key:
+                        logger.info("live_data stage=model session=%s type=%s reason=config_unavailable",
+                                    sid[:8], candidate.get("prompt_type"))
+                        return {"reason": "model_unavailable", "prompt_id": None}
+                    try:
+                        if is_comment:
+                            remaining_ms = COMMENT_REPLY_MAX_AGE_MS - (self.clock() - candidate["first_observed_at_ms"])
+                            if remaining_ms <= 0:
+                                terminal = True
+                                logger.info("live_data stage=model session=%s type=comment_reply reason=expired", sid[:8])
+                                return {"reason": "candidate_expired", "prompt_id": None}
+                            model_called = True
+                            logger.info("live_data stage=model session=%s type=comment_reply reason=attempt", sid[:8])
+                            suggestion = await asyncio.wait_for(
+                                request.app.state.model.reply_to_comment(
+                                    candidate["model_text"], nickname=candidate["reply_to"]["nickname"],
+                                    priority_eligible=candidate.get("priority_eligible", False),
+                                ), timeout=min(cfg.model_timeout_seconds, remaining_ms / 1000),
+                            )
+                        else:
+                            source = ",".join(dict.fromkeys(
+                                row["source"] for row in candidate["observations"]
+                            ))
+                            observed_at = max(row["effective_at_ms"] for row in candidate["observations"])
+                            suggestion = await asyncio.wait_for(
+                                request.app.state.model.suggest_live(
+                                    candidate["model_text"], candidate["description"], source,
+                                    observed_at, context=candidate["model_context"],
+                                ), timeout=cfg.model_timeout_seconds,
+                            )
+                    except (asyncio.TimeoutError, ModelTimeoutError):
+                        logger.info("live_fusion outcome=timeout")
+                        logger.info("live_data stage=model session=%s type=%s reason=timeout",
+                                    sid[:8], candidate.get("prompt_type"))
+                        return {"reason": "model_unavailable", "prompt_id": None}
+                    except ModelUnavailableError as exc:
+                        if is_comment and exc.error_code == "model_output_invalid":
+                            terminal = True
+                            logger.info("live_data stage=model session=%s type=comment_reply reason=invalid", sid[:8])
+                            return {"reason": "model_output_invalid", "prompt_id": None}
+                        logger.info("live_fusion outcome=model_unavailable")
+                        logger.info("live_data stage=model session=%s type=%s reason=unavailable",
+                                    sid[:8], candidate.get("prompt_type"))
+                        return {"reason": "model_unavailable", "prompt_id": None}
+                    if is_comment and suggestion is None:
+                        terminal = True
+                        logger.info("live_data stage=model session=%s type=comment_reply reason=quiet", sid[:8])
+                        return {"reason": "quiet", "prompt_id": None}
+                    if not is_comment and not valid_operation_suggestion(suggestion):
+                        return {"reason": "model_output_invalid", "prompt_id": None}
+                elif not suggestion or len(suggestion) > 100 or "\n" in suggestion or "\r" in suggestion:
+                    return {"reason": "candidate_invalid", "prompt_id": None}
+                async with self.lock:
+                    if self.fusion_closed or (sid in self.fusion_stopping and not allow_stopping):
+                        return {"reason": "cancelled", "prompt_id": None}
+                    result = await self.call("save_fusion_candidate", sid, token, candidate, suggestion)
+                    if result.get("prompt_id"):
+                        for future in self.waiters.get(sid, ()):
+                            if not future.done():
+                                future.set_result(None)
+                    terminal = result.get("reason") in {
+                        "generated", "candidate_expired", "cooldown", "suppressed_by_priority"
+                    }
+                    logger.info("live_data stage=save session=%s type=%s reason=%s", sid[:8],
+                                candidate.get("prompt_type"), result.get("reason"))
+                    return result
+            finally:
+                if is_comment:
+                    await self.run("finish_comment_attempt", sid, comment_id, epoch, model_called, terminal)
+                    if terminal:
+                        if sid in self.fusion_active and sid not in self.fusion_stopping:
+                            # 同一有界执行槽继续处理已完成候选之后的其它评论。
+                            self.fusion_dirty.add(sid)
 
         if urgent:
             return await deliver()
@@ -625,11 +679,15 @@ async def add_comment(session_id: str, payload: CommentObservation, request: Req
 async def process_fusion_observation(service: LiveService, session_id: str,
                                      token: str | None, request: Request,
                                      result: dict, body: dict, *, urgent: bool):
-    if result.get("reason") != "windowed":
+    batch_ready = result.pop("_batch_ready", False)
+    if result.get("reason") != "windowed" and not batch_ready:
         return result
     if not urgent:
         scheduled = service.schedule_fusion(session_id, token, request)
-        result.update(reason="scheduled" if scheduled else "analysis_busy", prompt_id=None)
+        if result.get("reason") == "windowed":
+            result.update(reason="scheduled" if scheduled else "analysis_busy", prompt_id=None)
+        logger.info("live_data stage=dispatch session=%s kind=%s reason=%s", session_id[:8],
+                    body["kind"], result.get("reason"))
         return result
     delivered = await service.deliver_fusion(session_id, token, request, urgent=urgent)
     if delivered.get("reason") == "generated":
@@ -648,6 +706,10 @@ async def add_typed_observation(session_id: str, payload: Observation, request: 
                                 token: str | None = Header(None, alias="X-Live-Session-Token")):
     service = request.app.state.live
     body = payload.model_dump()
+    # 新字段缺省时保留旧版本的指纹输入，避免跨版本重试冲突。
+    for key in ("capture_batch_id", "line_index", "capture_comment_count"):
+        if key in body and body[key] is None:
+            del body[key]
     result = await service.run("add_observation", session_id, token, body, service.clock())
     return await process_fusion_observation(
         service, session_id, token, request, result, body,

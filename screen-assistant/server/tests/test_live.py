@@ -808,8 +808,8 @@ def test_typed_observations_fuse_by_time_and_platform_notice_preempts(tmp_path):
                 await asyncio.gather(*(post(ur, hr, row) for row in repeat_rows))
                 await wait_idle()
                 repeated = (await client.get(ur + "/events", headers=hr)).json()["events"]
-                assert len(repeated) == 1 and "重复出现同一问题主题" in repeated[0]["phenomenon"]
-                assert len(repeated[0]["sources"]) == 2
+                # 两条未确认昵称的 OCR 不能推断为不同评论；此场无模型配置，不造群体模板。
+                assert repeated == []
 
                 # 警告明确来自已核对提醒区，原文证据保留，且优先于普通评论模型任务。
                 third, h3 = await session()

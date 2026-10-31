@@ -6,8 +6,10 @@ import binascii
 import hashlib
 import hmac
 import json
+import logging
 import secrets
 import sqlite3
+import unicodedata
 import uuid
 from collections import Counter, deque
 from pathlib import Path
@@ -21,12 +23,28 @@ from .live_rules import (
 )
 from .live_fusion import (
     build_candidate, observation_source_allowed, online_count_details,
-    validate_observation_content,
+    validate_observation_content, comment_has_priority, comment_is_candidate, group_feedback,
+    COMMENT_REPLY_MAX_AGE_MS, COMMENT_REPLY_COOLDOWN_MS, GROUP_NOTICE_COOLDOWN_MS,
 )
+from .comment_reconstruction import reconstruct_comments
+
+logger = logging.getLogger("screen_assistant.app")
 
 
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def fusion_topic_cooldown(candidate: dict) -> int:
+    if candidate.get("prompt_type") == "comment_reply":
+        return COMMENT_REPLY_COOLDOWN_MS
+    topic = candidate["topic"]
+    if topic == "person:head_down":
+        return 90_000
+    if (candidate["priority"] >= 100 or topic.startswith(("person", "quality:"))
+            or any(row["source"].startswith("fixture:") for row in candidate["observations"])):
+        return COOLDOWN_MS
+    return GROUP_NOTICE_COOLDOWN_MS
 
 
 class LiveStore:
@@ -38,6 +56,11 @@ class LiveStore:
         self.clock = clock
         self.windows: dict[str, deque] = {}
         self.fusion_windows: dict[str, deque] = {}
+        self.comment_batches: dict[str, dict[tuple[str, str], dict]] = {}
+        self.comment_batch_sweeps: dict[str, int] = {}
+        self.comment_attempted: dict[str, set[str]] = {}
+        self.comment_attempt_counts: dict[str, dict[str, int]] = {}
+        self.comment_failed_epochs: dict[str, dict[str, int]] = {}
         self.db = sqlite3.connect(path, check_same_thread=False, timeout=0.5)
         self.db.row_factory = sqlite3.Row
         self.db.executescript("""
@@ -122,6 +145,22 @@ class LiveStore:
     def close(self):
         self.db.close()
 
+    def _expire_comment_payloads(self, sid: str, now: int) -> None:
+        previous = self.comment_batch_sweeps.get(sid)
+        if previous is not None and now >= previous and now - previous < 1000:
+            return
+        self.comment_batch_sweeps[sid] = now
+        for batch in self.comment_batches.get(sid, {}).values():
+            retention_deadline = batch.get("reply_deadline", batch["deadline"])
+            if now > retention_deadline:
+                batch["rows"].clear()
+                batch["quality_gaps"].clear()
+                batch.pop("records", None)
+                batch.pop("reply_rows", None)
+                if not batch.get("expired") and not batch["complete"]:
+                    logger.info("live_comment_batch outcome=expired")
+                batch["expired"] = True
+
     def authorize(self, sid: str, token: str | None):
         row = self.db.execute(
             "SELECT * FROM live_sessions WHERE session_id = ?", (sid,)
@@ -153,6 +192,7 @@ class LiveStore:
             "session_id": sid, "session_token": token, "started_at_ms": now,
             "douyin_account": douyin_account, "backstage_task_id": None,
             "backstage_status": "not_started" if douyin_account else "not_configured",
+            "capabilities": {"observation_batch_metadata": True, "typed_prompts": True},
         }
 
     def _stored_app_source(self, sid: str, session) -> str:
@@ -254,6 +294,13 @@ class LiveStore:
                     )
         self.windows.pop(sid, None)
         self.fusion_windows.pop(sid, None)
+        batches = self.comment_batches.pop(sid, {})
+        self.comment_batch_sweeps.pop(sid, None)
+        self.comment_attempted.pop(sid, None)
+        self.comment_attempt_counts.pop(sid, None)
+        self.comment_failed_epochs.pop(sid, None)
+        if any(not batch["complete"] for batch in batches.values()):
+            logger.info("live_comment_batch outcome=stopped_incomplete")
         task = self.db.execute(
             "SELECT task_id,status FROM live_backstage_tasks WHERE session_id=?", (sid,)
         ).fetchone()
@@ -266,6 +313,7 @@ class LiveStore:
 
     def add_observation(self, sid: str, token: str | None, body: dict, received_at_ms: int):
         session = self.authorize(sid, token)
+        self._expire_comment_payloads(sid, received_at_ms)
         if session["stopped_at_ms"] is not None:
             raise HTTPException(409, "live session stopped")
         if not observation_source_allowed(body["kind"], body["source"],
@@ -334,7 +382,7 @@ class LiveStore:
             stable_id = content.get("platform_message_id")
             if stable_id:
                 message_hash = digest(json.dumps([body["source"], stable_id]))
-            elif body["source"] == "ios_replaykit_ocr":
+            elif body["source"] == "ios_replaykit_ocr" and not body.get("capture_batch_id"):
                 normalized = "".join(content["text"].split())
                 identity = content.get("author_id")
                 position = content.get("text_position")
@@ -352,8 +400,33 @@ class LiveStore:
             (sid, message_hash),
         ).fetchone():
             usable, reason, message_hash = False, "duplicate_message", None
+
+        batch = None
+        batch_count = body.get("capture_comment_count")
+        if body["kind"] == "comment" and batch_count is not None:
+            key = (body["source"], body["capture_batch_id"])
+            batches = self.comment_batches.setdefault(sid, {})
+            batch = batches.get(key)
+            if batch is None:
+                batch = {"count": batch_count, "indices": {}, "rows": [], "quality_gaps": [],
+                         "deadline": min(effective, received_at_ms) + MAX_OBSERVATION_AGE_MS,
+                         "complete": False}
+                batches[key] = batch
+            if batch["count"] != batch_count:
+                raise HTTPException(409, "capture batch count mismatch")
+            if body["line_index"] in batch["indices"] or batch["complete"]:
+                raise HTTPException(409, "capture batch index already used")
+            batch["deadline"] = min(batch["deadline"], effective + MAX_OBSERVATION_AGE_MS)
+            if received_at_ms > batch["deadline"]:
+                batch["rows"].clear()
+                if not batch.get("expired"):
+                    logger.info("live_comment_batch outcome=expired")
+                    batch["expired"] = True
+                usable, reason = False, "batch_expired"
         if not usable:
             result["reason"] = reason or "unavailable"
+        elif batch is not None:
+            result["reason"] = "batch_incomplete"
         else:
             result["reason"] = "windowed"
 
@@ -381,6 +454,45 @@ class LiveStore:
                     json.dumps(content["text_position"], ensure_ascii=False) if content.get("text_position") else None,
                     json.dumps(content.get("ocr_lines", []), ensure_ascii=False), result["reason"],
                 ))
+        if batch is not None:
+            batch["indices"][body["line_index"]] = event_hash
+            if (not usable or observed is None) and received_at_ms <= batch["deadline"]:
+                box = (body.get("content") or {}).get("text_position")
+                batch["quality_gaps"].append({"event_id": body["event_id"],
+                                              "text_position": dict(box) if box else None})
+            if usable:
+                item = dict(body)
+                item.update(received_at_ms=received_at_ms, effective_at_ms=effective,
+                            normalized_count=None)
+                batch["rows"].append(item)
+            if len(batch["indices"]) == batch["count"]:
+                batch["complete"] = True
+                rows = batch["rows"]
+                batch["rows"] = []
+                if rows and received_at_ms <= batch["deadline"]:
+                    observed_rows = [row for row in rows if row.get("observed_at_ms") is not None]
+                    batch["records"] = reconstruct_comments(
+                        observed_rows, batch_complete=True, quality_gaps=batch["quality_gaps"]
+                    )
+                    batch["reply_deadline"] = max(
+                        (record["first_observed_at_ms"] + COMMENT_REPLY_MAX_AGE_MS
+                         for record in batch["records"] if type(record.get("first_observed_at_ms")) is int),
+                        default=batch["deadline"],
+                    )
+                    logger.info("live_data stage=batch session=%s reason=complete received=%d usable=%d",
+                                sid[:8], len(batch["indices"]), sum(
+                                    record.get("field_status", {}).get("text") == "usable"
+                                    and record.get("boundary_status") == "locally_complete"
+                                    for record in batch["records"]))
+                    batch["reply_rows"] = rows
+                    window = self.fusion_windows.setdefault(sid, deque(maxlen=MAX_WINDOW_OBSERVATIONS))
+                    window.extend(rows)
+                    result["_batch_ready"] = True
+                    if usable:
+                        result["reason"] = "windowed"
+            logger.info("live_data stage=observation session=%s kind=%s reason=%s",
+                        sid[:8], body["kind"], result["reason"])
+            return result
         if usable:
             item = dict(body)
             item["received_at_ms"] = received_at_ms
@@ -393,6 +505,8 @@ class LiveStore:
                 (row for row in window if row["effective_at_ms"] >= cutoff),
                 maxlen=MAX_WINDOW_OBSERVATIONS,
             )
+        logger.info("live_data stage=observation session=%s kind=%s reason=%s",
+                    sid[:8], body["kind"], result["reason"])
         return result
 
     def session_summary(self, sid: str, token: str | None):
@@ -622,34 +736,166 @@ class LiveStore:
         return {"status": "accepted", "task_id": task["task_id"],
                 "result_status": payload["status"], "received_at_ms": received_at}
 
-    def fusion_candidate(self, sid: str, token: str | None):
+    def fusion_candidate(self, sid: str, token: str | None, trigger_epoch: int = 0):
         session = self.authorize(sid, token)
         if session["stopped_at_ms"] is not None:
             return None
         now = self.clock()
         rows = [row for row in self.fusion_windows.get(sid, ())
                 if now - MAX_OBSERVATION_AGE_MS <= row["effective_at_ms"] <= now + FUSION_FUTURE_SKEW_MS]
-        candidate = build_candidate(rows)
+        # 带完整性门控的原始 OCR 项须先经评论重建，不能退回旧单句模型路径。
+        legacy_rows = [row for row in rows if not (
+            row["kind"] == "comment" and row.get("capture_comment_count") is not None
+        )]
+        candidate = build_candidate(legacy_rows)
+        by_event = {row["event_id"]: row for row in rows}
+        reply_by_event = {row["event_id"]: row for batch in self.comment_batches.get(sid, {}).values()
+                          if batch["complete"] and now <= batch.get("reply_deadline", batch["deadline"])
+                          for row in batch.get("reply_rows", [])}
+        attempted = self.comment_attempted.setdefault(sid, set())
+        counts = self.comment_attempt_counts.get(sid, {})
+        failed_epochs = self.comment_failed_epochs.get(sid, {})
+        comment_candidate = None
+        records = [record for batch in self.comment_batches.get(sid, {}).values()
+                   if batch["complete"] and now <= batch.get("reply_deadline", batch["deadline"])
+                   for record in batch.get("records", [])]
+        for record in sorted(records, key=lambda item: counts.get(item.get("comment_id"), 0)):
+            status = record.get("field_status", {})
+            text = record.get("text")
+            comment_id = record.get("comment_id")
+            first = record.get("first_observed_at_ms")
+            if (status.get("text") != "usable" or record.get("boundary_status") != "locally_complete"
+                    or not isinstance(text, str) or not isinstance(comment_id, str)
+                    or comment_id in attempted or counts.get(comment_id, 0) >= 2
+                    or failed_epochs.get(comment_id, -1) >= trigger_epoch or type(first) is not int
+                    or not now - COMMENT_REPLY_MAX_AGE_MS <= first <= now + FUSION_FUTURE_SKEW_MS):
+                continue
+            ids = record.get("source_event_ids") or []
+            field_sources = record.get("field_sources") or {}
+            text_sources = field_sources.get("text") or []
+            if (not ids or not text_sources or any(event_id not in ids for event_id in text_sources)
+                    or any(event_id not in reply_by_event for event_id in ids)):
+                continue
+            selected = [reply_by_event[event_id] for event_id in ids]
+            if any(row["source"] != record.get("source") for row in selected):
+                continue
+            def usable_field(name):
+                sources = field_sources.get(name) or []
+                return status.get(name) == "usable" and bool(sources) and all(source in ids for source in sources)
+            consumption = record.get("consumption_level") if usable_field("consumption_level") else None
+            fan = record.get("fan_level") if usable_field("fan_level") else None
+            if not comment_is_candidate(text, consumption_level=consumption, fan_level=fan):
+                logger.info("live_data stage=filter session=%s type=comment_reply reason=noise_or_level", sid[:8])
+                continue
+            nickname = record.get("nickname") if usable_field("nickname") else None
+            if not isinstance(nickname, str) or not nickname.strip():
+                nickname = None
+            clean_text = "".join(unicodedata.normalize("NFKC", text).split()).casefold()
+            clean_name = ("".join(unicodedata.normalize("NFKC", nickname).split()).casefold()
+                          if nickname is not None else None)
+            topic = "comment_reply:" + digest(json.dumps(
+                [record["source"], "comment_reply", clean_name, clean_text], ensure_ascii=True
+            ))
+            last_reply = self.db.execute(
+                "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash=?",
+                (sid, digest(topic)),
+            ).fetchone()[0]
+            if last_reply is not None and now - last_reply < COMMENT_REPLY_COOLDOWN_MS:
+                logger.info("live_data stage=filter session=%s type=comment_reply reason=cooldown", sid[:8])
+                continue
+            comment_candidate = {
+                "topic": topic, "priority": 25, "phenomenon": "公屏评论",
+                "observations": selected, "suggestion": None, "model_text": text,
+                "prompt_type": "comment_reply", "priority_eligible": comment_has_priority(consumption, fan),
+                "first_observed_at_ms": first,
+                "reply_to": {"comment_id": comment_id, "nickname": nickname, "text": text},
+            }
+            break
+        if comment_candidate is not None and (candidate is None or candidate["priority"] <= 25):
+            candidate = comment_candidate
+        elif comment_candidate is None and (candidate is None or candidate["priority"] < 25):
+            grouped: dict[str, list[dict]] = {}
+            for batch in self.comment_batches.get(sid, {}).values():
+                if not batch["complete"] or now > batch["deadline"]:
+                    continue
+                for record in batch.get("records", []):
+                    status, fields = record.get("field_status", {}), record.get("field_sources", {})
+                    ids = record.get("source_event_ids") or []
+                    if (status.get("text") != "usable" or status.get("nickname") != "usable"
+                            or record.get("boundary_status") != "locally_complete" or not ids
+                            or any(event_id not in by_event for event_id in ids)
+                            or not fields.get("text") or not fields.get("nickname")
+                            or any(event_id not in ids for event_id in fields["text"] + fields["nickname"])
+                            or any(by_event[event_id]["source"] != record.get("source") for event_id in ids)):
+                        continue
+                    grouped.setdefault(record["source"], []).append(record)
+            for records in grouped.values():
+                group = group_feedback(records, now)
+                if not group:
+                    continue
+                normalized = "".join(unicodedata.normalize("NFKC", group[0]["text"]).split()).casefold()
+                topic = "group_feedback:" + digest(normalized)
+                last_group = self.db.execute(
+                    "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash=?",
+                    (sid, digest(topic)),
+                ).fetchone()[0]
+                group_cooldown = COOLDOWN_MS if group[0]["source"].startswith("fixture:") else GROUP_NOTICE_COOLDOWN_MS
+                if last_group is not None and now - last_group < group_cooldown:
+                    continue
+                event_ids = list(dict.fromkeys(event_id for item in group for event_id in item["source_event_ids"]))
+                candidate = {
+                    "topic": topic, "priority": 25, "phenomenon": "评论区集中反馈相同内容",
+                    "suggestion": "评论区集中反馈了相同内容，可以结合已知信息回应。",
+                    "model_text": None, "model_context": "", "observations": [by_event[event_id] for event_id in event_ids],
+                    "prompt_type": "operation_notice",
+                }
+                break
         if candidate is None:
+            logger.info("live_data stage=candidate session=%s reason=quiet", sid[:8])
             return None
         topic_hash = digest(candidate["topic"])
         last_same_topic = self.db.execute(
             "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash=?",
             (sid, topic_hash),
         ).fetchone()[0]
-        topic_cooldown = 90_000 if candidate["topic"] == "person:head_down" else COOLDOWN_MS
+        topic_cooldown = fusion_topic_cooldown(candidate)
         if last_same_topic is not None and now - last_same_topic < topic_cooldown:
+            logger.info("live_data stage=filter session=%s type=%s reason=cooldown", sid[:8],
+                        candidate.get("prompt_type", "operation_notice"))
             return None
-        if candidate["priority"] < 100:
+        if candidate["priority"] < 100 and candidate.get("prompt_type") != "comment_reply":
             recent = self.db.execute(
                 "SELECT payload FROM live_events WHERE session_id=? AND generated_at_ms>?",
                 (sid, now - COOLDOWN_MS),
             ).fetchall()
             if any(json.loads(row["payload"]).get("priority", 0) > candidate["priority"]
                    for row in recent):
+                logger.info("live_data stage=filter session=%s type=%s reason=priority", sid[:8],
+                            candidate.get("prompt_type", "operation_notice"))
                 return None
         candidate["description"] = session["description"]
+        candidate.setdefault("prompt_type", "operation_notice")
+        if candidate.get("prompt_type") == "comment_reply":
+            attempted.add(candidate["reply_to"]["comment_id"])
+        logger.info("live_data stage=candidate session=%s type=%s reason=selected", sid[:8], candidate["prompt_type"])
         return candidate
+
+    def finish_comment_attempt(self, sid: str, comment_id: str, trigger_epoch: int,
+                               model_called: bool, terminal: bool) -> None:
+        """记录实际调用及其终态；瞬时失败只允许后续新触发重试。"""
+        if sid not in self.comment_attempted:
+            return
+        counts = self.comment_attempt_counts.setdefault(sid, {})
+        if model_called:
+            counts[comment_id] = counts.get(comment_id, 0) + 1
+        if terminal:
+            return
+        if counts.get(comment_id, 0) >= 2:
+            logger.info("live_comment outcome=attempts_exhausted")
+            return
+        self.comment_attempted[sid].discard(comment_id)
+        if model_called:
+            self.comment_failed_epochs.setdefault(sid, {})[comment_id] = trigger_epoch
 
     def save_fusion_candidate(self, sid: str, token: str | None,
                               candidate: dict, suggestion: str):
@@ -659,17 +905,21 @@ class LiveStore:
         now = self.clock()
         rows = candidate["observations"]
         latest = max(row["effective_at_ms"] for row in rows)
-        if now - latest > MAX_OBSERVATION_AGE_MS:
+        age_limit = COMMENT_REPLY_MAX_AGE_MS if candidate.get("prompt_type") == "comment_reply" else MAX_OBSERVATION_AGE_MS
+        if now - latest > age_limit:
+            return {"reason": "candidate_expired", "prompt_id": None}
+        if (candidate.get("prompt_type") == "comment_reply"
+                and now - candidate["first_observed_at_ms"] > COMMENT_REPLY_MAX_AGE_MS):
             return {"reason": "candidate_expired", "prompt_id": None}
         topic_hash = digest(candidate["topic"])
         last = self.db.execute(
             "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash=?",
             (sid, topic_hash),
         ).fetchone()[0]
-        topic_cooldown = 90_000 if candidate["topic"] == "person:head_down" else COOLDOWN_MS
+        topic_cooldown = fusion_topic_cooldown(candidate)
         if last is not None and now-last < topic_cooldown:
             return {"reason": "cooldown", "prompt_id": None}
-        if candidate["priority"] < 100:
+        if candidate["priority"] < 100 and candidate.get("prompt_type") != "comment_reply":
             higher = self.db.execute(
                 "SELECT payload FROM live_events WHERE session_id=? AND generated_at_ms>?",
                 (sid, now-COOLDOWN_MS),
@@ -762,6 +1012,11 @@ class LiveStore:
             ),
             "sources": sources, "priority": candidate["priority"],
         }
+        if candidate.get("prompt_type") == "comment_reply":
+            event["prompt_type"] = "comment_reply"
+            event["reply_to"] = candidate["reply_to"]
+        elif candidate.get("prompt_type") == "operation_notice":
+            event["prompt_type"] = "operation_notice"
         with self.db:
             self.db.execute(
                 "INSERT INTO live_events (session_id,topic_hash,generated_at_ms,expires_at_ms,payload) VALUES (?,?,?,?,?)",
@@ -816,6 +1071,7 @@ class LiveStore:
     def prompts(self, sid: str, token: str | None, after: str):
         session = self.authorize(sid, token)
         seq, now = self.sequence(sid, after), self.clock()
+        self._expire_comment_payloads(sid, now)
         stopped = session["stopped_at_ms"] is not None
         rows = [] if stopped else self.db.execute(
             "SELECT * FROM live_events WHERE session_id=? AND seq>? AND expires_at_ms>? ORDER BY seq LIMIT 50",
@@ -833,6 +1089,10 @@ class LiveStore:
             if event["returned_at_ms"] is None:
                 event.update(returned_at_ms=now, delivery_state="returned_to_client")
             prompts.append(event)
+        if prompts:
+            logger.info("live_data stage=poll session=%s reason=returned reply=%d notice=%d", sid[:8],
+                        sum(event.get("prompt_type") == "comment_reply" for event in prompts),
+                        sum(event.get("prompt_type") == "operation_notice" for event in prompts))
         maximum = self.db.execute(
             "SELECT COALESCE(MAX(seq),0) FROM live_events WHERE session_id=?", (sid,)
         ).fetchone()[0]

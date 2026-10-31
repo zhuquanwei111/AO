@@ -9,6 +9,51 @@ from screen_assistant_server.live_fusion import (
 )
 
 
+def test_comment_eligibility_level_boundaries_and_unknown():
+    from screen_assistant_server.live_fusion import comment_is_candidate
+    assert comment_is_candidate("👍", consumption_level=30, fan_level=None)
+    assert comment_is_candidate("哈哈", consumption_level=None, fan_level=8)
+    assert not comment_is_candidate("👍", consumption_level=29, fan_level=7)
+    assert not comment_is_candidate("哈哈", consumption_level=None, fan_level=None)
+    assert not comment_is_candidate("1", consumption_level=None, fan_level=None)
+    assert comment_is_candidate("这个颜色很漂亮", consumption_level=None, fan_level=None)
+    assert comment_is_candidate("这款还有吗？", consumption_level=0, fan_level=0)
+    assert not comment_is_candidate("", consumption_level=30, fan_level=8)
+    assert not comment_is_candidate("👍", consumption_level=True, fan_level=False)
+
+
+def test_group_feedback_requires_distinct_named_messages_within_window():
+    from screen_assistant_server.live_fusion import group_feedback
+    now = 100_000
+    def row(comment_id, nickname, text, seen):
+        return {"comment_id": comment_id, "nickname": nickname, "text": text,
+                "last_seen_at_ms": seen}
+    one = row("c1", "小明", "有点卡", now)
+    assert group_feedback([one, one], now) is None
+    assert group_feedback([one, row("c2", None, "有点卡", now)], now) is None
+    assert group_feedback([one, row("c2", "小明", "有点卡", now)], now) is None
+    assert group_feedback([one, row(None, "小红", "有点卡", now)], now) is None
+    assert group_feedback([one, row("c1", "小红", "有点卡", now)], now) is None
+    assert group_feedback([one, row("c2", "小红", "有点卡", now - 10_001)], now) is None
+    result = group_feedback([one, row("c2", "小红", "有点卡", now - 10_000)], now)
+    assert result is not None
+    assert {item["comment_id"] for item in result} == {"c1", "c2"}
+    assert group_feedback([one, row("c2", "小红", "很流畅", now)], now) is None
+
+
+def test_legacy_repeated_ocr_without_distinct_names_is_not_group_feedback():
+    def row(event_id):
+        return {"kind": "comment", "event_id": event_id, "source": "ios_replaykit_ocr",
+                "effective_at_ms": 1000, "received_at_ms": 1000, "observed_at_ms": 1000,
+                "availability": "available", "coverage": "ocr_visible_sample", "reliability": "known",
+                "confidence": None, "content": {"text": "主播你是哪里人？", "text_position": None}}
+    candidate = build_candidate([row("e1"), row("e2")])
+    assert candidate is not None
+    assert candidate["topic"].startswith("question:")
+    assert candidate["model_text"] == "主播你是哪里人？"
+    assert len(candidate["observations"]) == 1
+
+
 def test_confirmed_online_count_units_and_proxy_rejection():
     assert parse_online_count("在线人数 1.2万人", field_semantics_confirmed=True) == 12_000
     assert parse_online_count("当前在线：3.4万", field_semantics_confirmed=True) == 34_000

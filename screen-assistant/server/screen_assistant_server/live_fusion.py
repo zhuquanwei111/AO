@@ -10,6 +10,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .live_rules import COUNT_TREND_SAMPLES, INTERACTION_SPARSE_MAX, question
 from .audio import AudioSpan, OriginalFormat
 
+COMMENT_REPLY_MAX_AGE_MS = 20_000
+COMMENT_REPLY_COOLDOWN_MS = 20_000
+GROUP_NOTICE_COOLDOWN_MS = 30_000
+
 
 ObservationSource = Literal[
     "ios_replaykit_ocr", "ios_replaykit_online_count_roi",
@@ -205,11 +209,23 @@ class ObservationBase(BaseModel):
 class CommentObservation(ObservationBase):
     kind: Literal["comment"]
     content: CommentContent | None = None
+    capture_batch_id: str | None = Field(default=None, min_length=1, max_length=128)
+    line_index: int | None = Field(default=None, ge=0, le=65535, strict=True)
+    capture_comment_count: int | None = Field(default=None, ge=1, le=128, strict=True)
+
+    @model_validator(mode="after")
+    def valid_capture_line(self):
+        if self.line_index is not None and self.capture_batch_id is None:
+            raise ValueError("line_index requires capture_batch_id")
+        if self.capture_comment_count is not None and (self.capture_batch_id is None or self.line_index is None):
+            raise ValueError("capture_comment_count requires capture_batch_id and line_index")
+        return self
 
 
 class OnlineCountObservation(ObservationBase):
     kind: Literal["online_count"]
     content: OnlineCountContent | None = None
+    capture_batch_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class InteractionObservation(ObservationBase):
@@ -295,6 +311,48 @@ def online_count_details(raw_text: str, *, field_semantics_confirmed: bool) -> d
 def parse_online_count(raw_text: str, *, field_semantics_confirmed: bool) -> int | None:
     details = online_count_details(raw_text, field_semantics_confirmed=field_semantics_confirmed)
     return details["nominal_value"] if details else None
+
+
+def comment_has_priority(consumption_level: int | None, fan_level: int | None) -> bool:
+    return ((type(consumption_level) is int and consumption_level >= 30)
+            or (type(fan_level) is int and fan_level >= 8))
+
+
+def comment_is_candidate(text: str, *, consumption_level: int | None,
+                         fan_level: int | None) -> bool:
+    """先按明确等级放宽，再过滤无上下文的低信息普通评论。"""
+    text = text.strip()
+    if not text:
+        return False
+    if comment_has_priority(consumption_level, fan_level):
+        return True
+    compact = "".join(char for char in text if not char.isspace())
+    if compact in {"嗯", "哦", "啊", "哈哈", "呵呵", "嘿嘿"}:
+        return False
+    meaningful = [char for char in compact if unicodedata.category(char)[0] in {"L", "N"}]
+    return len(meaningful) >= 2
+
+
+def group_feedback(comments: list[dict], now_ms: int) -> list[dict] | None:
+    """从调用方确认的正文和昵称中找同文反馈；昵称可区分不等于账号数。"""
+    groups: dict[str, dict[str, dict]] = {}
+    for item in comments:
+        name, text, seen = item.get("nickname"), item.get("text"), item.get("last_seen_at_ms")
+        comment_id = item.get("comment_id")
+        if (not isinstance(comment_id, str) or not comment_id.strip()
+                or not isinstance(name, str) or not name.strip() or not isinstance(text, str)
+                or not text.strip() or type(seen) is not int
+                or not now_ms - 10_000 <= seen <= now_ms):
+            continue
+        name_key = unicodedata.normalize("NFKC", name).strip().casefold()
+        text_key = "".join(unicodedata.normalize("NFKC", text).split()).casefold()
+        names = groups.setdefault(text_key, {})
+        names.setdefault(name_key, item)
+        if len(names) >= 2:
+            selected = list(names.values())
+            if len({row.get("comment_id") for row in selected}) >= 2:
+                return selected
+    return None
 
 
 def _candidate(topic: str, priority: int, phenomenon: str, suggestion: str | None,
@@ -458,12 +516,6 @@ def build_candidate(observations: list[dict]) -> dict | None:
                               "持续低头候选与近期可见问题同时出现",
                               "你刚才持续低头了一会儿，抬头看一下镜头，再接住这个问题。",
                               [person, topic_rows[-1]])
-        if len(topic_rows) >= 2:
-            label = question(topic_rows[-1]["content"]["text"])[1]
-            return _candidate("repeated_question:" + topic, 38,
-                              "近期可见公屏重复出现同一问题主题",
-                              f"近期重复出现“{label}”的问题，可以集中回应一次，再邀请大家接着聊。",
-                              topic_rows[-2:])
 
     if person and person["content"]["signal"] == "person_not_visible_candidate":
         return _candidate("person:head_down", 20,
