@@ -395,7 +395,7 @@ final class AppModel: ObservableObject {
                     let anchorValid = LivePromptDelivery.displayExpiry(page.serverTimeMS, serverTimeMS: page.serverTimeMS,
                         processingMS: page.serverProcessingMS, startNS: page.requestStartNS, endNS: page.responseEndNS) != nil
                     let items = zip(page.prompts, deadlines).map { prompt, deadline in
-                        let label = prompt.sources?.contains(where: { $0.kind == "comment" }) == true ? "问答" : "运营"
+                        let label = LivePromptDelivery.promptLabel(prompt.promptType)
                         return LivePromptDelivery.Item(id: prompt.promptID,
                             text: "【\(label)】" + prompt.displayText,
                             expiresAtMS: deadline ?? 0,

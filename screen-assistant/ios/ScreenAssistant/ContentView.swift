@@ -509,8 +509,13 @@ private struct LiveSessionOverviewView: View {
                             }
                             .font(.caption)
                             .foregroundColor(.secondary)
+                            Text(LivePromptDelivery.promptLabel(event.promptType)).font(.caption)
                             Text(event.phenomenon).font(.subheadline)
-                            Text(event.suggestion).font(.body)
+                            Text(event.displayText).font(.body)
+                            if event.promptType == "comment_reply", let reply = event.replyTo {
+                                Text("原评论：\(reply.nickname.flatMap { $0.isEmpty ? nil : "\($0)：" } ?? "")\(reply.text)")
+                                    .font(.footnote).foregroundColor(.secondary)
+                            }
                         }
                         .padding(.vertical, 4)
                     }
@@ -653,8 +658,13 @@ private struct LiveEventListView: View {
                 }
                 .font(.caption)
                 .foregroundColor(.secondary)
+                Text(LivePromptDelivery.promptLabel(event.promptType)).font(.caption)
                 Text(event.phenomenon).font(.subheadline)
-                Text(event.suggestion).font(.body)
+                Text(event.displayText).font(.body)
+                if event.promptType == "comment_reply", let reply = event.replyTo {
+                    Text("原评论：\(reply.nickname.flatMap { $0.isEmpty ? nil : "\($0)：" } ?? "")\(reply.text)")
+                        .font(.footnote).foregroundColor(.secondary)
+                }
             }
             .padding(.vertical, 4)
         }

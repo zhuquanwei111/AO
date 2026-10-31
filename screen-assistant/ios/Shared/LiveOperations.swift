@@ -118,6 +118,8 @@ struct LivePrompt: Codable, Identifiable {
     var expiresAtMS: Int64?
     let priority: Int?
     let sources: [LivePromptSource]?
+    let promptType: String?
+    let replyTo: LivePromptReplyTo?
     var id: String { promptID }
     enum CodingKeys: String, CodingKey {
         case promptID = "prompt_id", inputMode = "input_mode"
@@ -125,6 +127,7 @@ struct LivePrompt: Codable, Identifiable {
         case phenomenon, suggestion, displayText = "display_text"
         case observationCount = "observation_count"
         case expiresAtMS = "expires_at_ms", priority, sources
+        case promptType = "prompt_type", replyTo = "reply_to"
     }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -139,6 +142,17 @@ struct LivePrompt: Codable, Identifiable {
         expiresAtMS = try? values.decode(Int64.self, forKey: .expiresAtMS)
         priority = try values.decodeIfPresent(Int.self, forKey: .priority)
         sources = try values.decodeIfPresent([LivePromptSource].self, forKey: .sources)
+        promptType = try? values.decode(String.self, forKey: .promptType)
+        replyTo = try? values.decode(LivePromptReplyTo.self, forKey: .replyTo)
+    }
+}
+
+struct LivePromptReplyTo: Codable {
+    let commentID: String
+    let nickname: String?
+    let text: String
+    enum CodingKeys: String, CodingKey {
+        case commentID = "comment_id", nickname, text
     }
 }
 

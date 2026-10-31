@@ -1,5 +1,10 @@
 import Foundation
 
+assert(LivePromptDelivery.promptLabel("comment_reply") == "评论回复")
+assert(LivePromptDelivery.promptLabel("operation_notice") == "运营提醒")
+assert(LivePromptDelivery.promptLabel(nil) == "提示")
+assert(LivePromptDelivery.promptLabel("future") == "提示")
+
 func item(_ id: String, expires: Int64 = 20_000, priority: Int = 0) -> LivePromptDelivery.Item {
     .init(id: id, text: id, expiresAtMS: expires, priority: priority)
 }

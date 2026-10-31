@@ -58,6 +58,19 @@ private final class PollFixtureProtocol: URLProtocol {
 }
 
 final class PollTransportTests: XCTestCase {
+    func testPromptTypesAndReliableReplyDecodeWithLegacyFallback() throws {
+        let prefix = "{\"prompt_id\":\"p\",\"input_mode\":\"live_observation\",\"start_at_ms\":1,\"end_at_ms\":1,\"phenomenon\":\"comment\",\"suggestion\":\"suggestion\",\"display_text\":\"speak\",\"observation_count\":1"
+        let typed = prefix + ",\"prompt_type\":\"comment_reply\",\"reply_to\":{\"comment_id\":\"local\",\"nickname\":null,\"text\":\"hello\"}}"
+        let reply = try JSONDecoder().decode(LivePrompt.self, from: Data(typed.utf8))
+        XCTAssertEqual(reply.promptType, "comment_reply")
+        XCTAssertEqual(reply.replyTo?.text, "hello")
+        XCTAssertNil(reply.replyTo?.nickname)
+        XCTAssertEqual(reply.displayText, "speak")
+        let legacy = try JSONDecoder().decode(LivePrompt.self, from: Data((prefix + "}").utf8))
+        XCTAssertNil(legacy.promptType)
+        XCTAssertEqual(LivePromptDelivery.promptLabel(legacy.promptType), "提示")
+    }
+
     func testCreateCapabilitiesRequireExplicitBooleanTrue() throws {
         let prefix = "{\"session_id\":\"fixture-session\",\"session_token\":\"fixture-token\",\"started_at_ms\":1"
         for (suffix, supported) in [

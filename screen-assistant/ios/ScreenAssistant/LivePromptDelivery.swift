@@ -2,6 +2,13 @@ import Foundation
 
 /// 仅管理本场待显示的提示；调用方在主线程持有并按实际排版选择帧。
 struct LivePromptDelivery {
+    static func promptLabel(_ type: String?) -> String {
+        switch type {
+        case "comment_reply": return "评论回复"
+        case "operation_notice": return "运营提醒"
+        default: return "提示"
+        }
+    }
     /// 截止点使用本机连续单调毫秒；无法验证时间锚时返回 nil。
     static func displayExpiry(_ serverExpiry: Int64?, serverTimeMS: Int64?, processingMS: Int64?,
                               startNS: UInt64?, endNS: UInt64?) -> Int64? {
