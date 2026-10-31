@@ -192,6 +192,22 @@ def test_comment_reply_uses_one_model_call_and_untrusted_structured_input():
     asyncio.run(run())
 
 
+def test_comment_reply_can_pass_confirmed_priority_without_guessing_badges():
+    payloads = []
+    async def run():
+        def handler(request):
+            payloads.append(json.loads(request.content))
+            return httpx.Response(200, json={"choices": [{"message": {"content":
+                '{"respond":true,"reply":"谢谢支持！"}'}, "finish_reason": "stop"}]})
+        client = make_client(handler)
+        try:
+            assert await client.reply_to_comment("👍", nickname=None, priority_eligible=True) == "谢谢支持！"
+        finally:
+            await client.aclose()
+    asyncio.run(run())
+    assert json.loads(payloads[0]["messages"][1]["content"])["priority_eligible"] is True
+
+
 @pytest.mark.parametrize("content,finish", [
     ('{"respond":false,"reply":null}', "stop"),
     ('{"respond":true,"reply":"你好"}', "stop"),

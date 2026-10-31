@@ -306,6 +306,26 @@ def parse_online_count(raw_text: str, *, field_semantics_confirmed: bool) -> int
     return details["nominal_value"] if details else None
 
 
+def comment_has_priority(consumption_level: int | None, fan_level: int | None) -> bool:
+    return ((type(consumption_level) is int and consumption_level >= 30)
+            or (type(fan_level) is int and fan_level >= 8))
+
+
+def comment_is_candidate(text: str, *, consumption_level: int | None,
+                         fan_level: int | None) -> bool:
+    """先按明确等级放宽，再过滤无上下文的低信息普通评论。"""
+    text = text.strip()
+    if not text:
+        return False
+    if comment_has_priority(consumption_level, fan_level):
+        return True
+    compact = "".join(char for char in text if not char.isspace())
+    if compact in {"嗯", "哦", "啊", "哈哈", "呵呵", "嘿嘿"}:
+        return False
+    meaningful = [char for char in compact if unicodedata.category(char)[0] in {"L", "N"}]
+    return len(meaningful) >= 2
+
+
 def _candidate(topic: str, priority: int, phenomenon: str, suggestion: str | None,
                selected: list[dict], *, model_text: str | None = None,
                model_context: str = "") -> dict:

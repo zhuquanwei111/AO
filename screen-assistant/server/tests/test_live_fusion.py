@@ -9,6 +9,19 @@ from screen_assistant_server.live_fusion import (
 )
 
 
+def test_comment_eligibility_level_boundaries_and_unknown():
+    from screen_assistant_server.live_fusion import comment_is_candidate
+    assert comment_is_candidate("👍", consumption_level=30, fan_level=None)
+    assert comment_is_candidate("哈哈", consumption_level=None, fan_level=8)
+    assert not comment_is_candidate("👍", consumption_level=29, fan_level=7)
+    assert not comment_is_candidate("哈哈", consumption_level=None, fan_level=None)
+    assert not comment_is_candidate("1", consumption_level=None, fan_level=None)
+    assert comment_is_candidate("这个颜色很漂亮", consumption_level=None, fan_level=None)
+    assert comment_is_candidate("这款还有吗？", consumption_level=0, fan_level=0)
+    assert not comment_is_candidate("", consumption_level=30, fan_level=8)
+    assert not comment_is_candidate("👍", consumption_level=True, fan_level=False)
+
+
 def test_confirmed_online_count_units_and_proxy_rejection():
     assert parse_online_count("在线人数 1.2万人", field_semantics_confirmed=True) == 12_000
     assert parse_online_count("当前在线：3.4万", field_semantics_confirmed=True) == 34_000
