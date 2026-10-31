@@ -700,12 +700,14 @@ public class CaptureService extends Service {
                     @Override public void prompt(org.json.JSONObject prompt) {
                         long expires = prompt.optLong(PromptTiming.DEADLINE_MS);
                         String id = prompt.optString("prompt_id");
+                        Integer priority = LiveConnection.strictPriority(prompt);
+                        if (priority == null) return;
                         logEvent("prompt_received", "id=" + safeId(id) + " type=" + DisplayText.promptType(prompt) + " source_expires=" + prompt.optLong("expires_at_ms")
                                 + " deadline_elapsed=" + expires + " rtt=" + prompt.optLong("_client_rtt_ms")
                                 + " processing=" + prompt.optLong("_client_processing_ms")
                                 + " transport=" + prompt.optLong("_client_transport_ms") + " epoch=" + epoch);
                         if (expires > SystemClock.elapsedRealtime() && !id.isEmpty())
-                            showMessage(DisplayText.promptLabel(prompt), prompt.optString("display_text"), epoch, expires, id, prompt.optInt("priority"));
+                            showMessage(DisplayText.promptLabel(prompt), prompt.optString("display_text"), epoch, expires, id, priority);
                         else if (!id.isEmpty())
                             logEvent("prompt_outcome", "id=" + safeId(id) + " reason=source_expired_before_queue");
                     }

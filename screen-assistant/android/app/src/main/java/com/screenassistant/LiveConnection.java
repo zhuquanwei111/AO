@@ -38,6 +38,14 @@ final class LiveConnection {
     static final String OFFLINE = "服务未连接\n本地屏幕采集继续，暂无新运营提示";
     static final String CREATE_UNKNOWN = "场次创建未确认\n请回到应用核对，未重复创建";
     static final String TIME_UNKNOWN = "提示时效未核实，本次提示未显示；屏幕采集继续";
+    static final String PRIORITY_UNKNOWN = "个别提示优先级无效，已跳过；屏幕采集继续";
+
+    static Integer strictPriority(JSONObject prompt) {
+        Object value = prompt.opt("priority");
+        if (!(value instanceof Integer) && !(value instanceof Long)) return null;
+        long number = ((Number)value).longValue();
+        return number < Integer.MIN_VALUE || number > Integer.MAX_VALUE ? null : (int)number;
+    }
 
     interface Store {
         LiveClient.Session get();
@@ -169,12 +177,18 @@ final class LiveConnection {
             if (page.optBoolean("stopped")) { serverStopped(); return false; }
             PromptTiming timing = PromptTiming.from(page);
             boolean timingProblem = timing == null;
+            boolean priorityProblem = false;
             JSONArray ready = new JSONArray();
             if (timing != null) for (int i = 0; i < prompts.length(); i++) {
                 JSONObject prompt = prompts.getJSONObject(i);
                 long deadline = timing.deadline(prompt);
                 if (deadline < 0) { timingProblem = true; listener.promptDropped(prompt.optString("prompt_id"), "invalid_expiry"); continue; }
-                if (deadline == 0) listener.promptDropped(prompt.optString("prompt_id"), "conservative_deadline_exhausted");
+                if (deadline == 0) { listener.promptDropped(prompt.optString("prompt_id"), "conservative_deadline_exhausted"); continue; }
+                if (strictPriority(prompt) == null) {
+                    priorityProblem = true;
+                    listener.promptDropped(prompt.optString("prompt_id"), "invalid_priority");
+                    continue;
+                }
                 if (deadline > 0) {
                     prompt.put(PromptTiming.DEADLINE_MS, deadline).put("_client_rtt_ms", timing.rttMs)
                             .put("_client_processing_ms", timing.processingMs).put("_client_transport_ms", timing.transportMs);
@@ -198,7 +212,8 @@ final class LiveConnection {
             synchronized (this) {
                 if (closed) return false;
                 if (!announced) { announced = true; listener.session(session); }
-                status("实时已连接，等待运营提示\n" + recap + (timingProblem ? "\n" + TIME_UNKNOWN : ""), false);
+                status("实时已连接，等待运营提示\n" + recap + (timingProblem ? "\n" + TIME_UNKNOWN : "")
+                        + (priorityProblem ? "\n" + PRIORITY_UNKNOWN : ""), false);
                 for (int i = 0; i < ready.length() && !closed; i++) listener.prompt(ready.getJSONObject(i));
                 cursor = next;
             }

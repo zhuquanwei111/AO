@@ -103,7 +103,7 @@ public class LiveConnectionHttpTest {
                 if (offline) { respond(e, 503, "{}"); return; }
                 if (beforePollResponse != null) beforePollResponse.run();
                 String prompts = promptsJson != null ? promptsJson
-                        : "[{\"prompt_id\":\"fixture\",\"expires_at_ms\":" + expiryJson + ",\"display_text\":\"真实接口夹具建议\"}]";
+                        : "[{\"prompt_id\":\"fixture\",\"priority\":25,\"expires_at_ms\":" + expiryJson + ",\"display_text\":\"真实接口夹具建议\"}]";
                 respond(e, 200, "{\"session_id\":\"one\"" + clockFields + ",\"prompts\":" + prompts + ","
                         + "\"next_cursor\":\"cursor-one\",\"stopped\":false}");
             } else if (path.endsWith("/observations")) {
@@ -286,9 +286,9 @@ public class LiveConnectionHttpTest {
 
     @Test public void typedPromptReachesDisplayWithServerAssociationAndLegacyNeutral() throws Exception {
         try (Fixture fixture = new Fixture()) {
-            fixture.promptsJson = "[{\"prompt_id\":\"a\",\"expires_at_ms\":16000,\"prompt_type\":\"comment_reply\","
+            fixture.promptsJson = "[{\"prompt_id\":\"a\",\"priority\":25,\"expires_at_ms\":16000,\"prompt_type\":\"comment_reply\","
                     + "\"display_text\":\"欢迎回来\",\"reply_to\":{\"comment_id\":\"c1\",\"nickname\":\"小明\",\"text\":\"来了\"}},"
-                    + "{\"prompt_id\":\"b\",\"expires_at_ms\":16000,\"source\":\"comment\",\"display_text\":\"谢谢\"}]";
+                    + "{\"prompt_id\":\"b\",\"priority\":25,\"expires_at_ms\":16000,\"source\":\"comment\",\"display_text\":\"谢谢\"}]";
             ReceivedDisplay display = new ReceivedDisplay();
             LiveConnection connection = new LiveConnection(new LiveConnectionTest.Memory(),
                     remote(fixture.base(), "", ""), display);
@@ -298,6 +298,50 @@ public class LiveConnectionHttpTest {
             assertEquals("欢迎回来", display.received.get(0).getString("display_text"));
             assertEquals("c1", display.received.get(0).getJSONObject("reply_to").getString("comment_id"));
             assertEquals("提示", DisplayText.promptLabel(display.received.get(1)));
+        }
+    }
+
+    @Test public void malformedPriorityIsIsolatedAndSourcesDoNotDropValidPrompts() throws Exception {
+        for (String bad : new String[]{"true", "100.0", "\"100\"", "null", "2147483648", "MISSING"}) {
+            try (Fixture fixture = new Fixture()) {
+                String priority = "MISSING".equals(bad) ? "" : ",\"priority\":" + bad;
+                fixture.promptsJson = "[{\"prompt_id\":\"A\",\"priority\":25,\"expires_at_ms\":16000,\"display_text\":\"甲\",\"sources\":42},"
+                        + "{\"prompt_id\":\"B\"" + priority + ",\"expires_at_ms\":16000,\"display_text\":\"坏项\"},"
+                        + "{\"prompt_id\":\"C\",\"priority\":100,\"expires_at_ms\":16000,\"display_text\":\"紧急\",\"sources\":[null,{}]}]";
+                ReceivedDisplay display = new ReceivedDisplay();
+                LiveConnection connection = new LiveConnection(new LiveConnectionTest.Memory(), remote(fixture.base(), "", ""), display);
+                assertTrue(connection.connect()); assertTrue(connection.poll());
+                assertEquals(2, display.received.size());
+                assertEquals("A", display.received.get(0).getString("prompt_id"));
+                assertEquals("C", display.received.get(1).getString("prompt_id"));
+                assertEquals(25, display.received.get(0).getInt("priority"));
+                assertEquals(100, display.received.get(1).getInt("priority"));
+                assertTrue(display.received.get(0).getLong(PromptTiming.DEADLINE_MS) > 0);
+                assertTrue(display.received.get(1).getLong(PromptTiming.DEADLINE_MS) > 0);
+                assertTrue(display.diagnostic.contains("优先级"));
+                fixture.promptsJson = "[]"; assertTrue(connection.poll());
+                assertTrue(fixture.requests.stream().anyMatch(r -> r.contains("after=cursor-one")));
+            }
+        }
+    }
+
+    @Test public void validUrgentPriorityStillPreemptsAfterRealHttpDecode() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.promptsJson = "[{\"prompt_id\":\"A\",\"priority\":0,\"expires_at_ms\":16000,\"display_text\":\"普通\"},"
+                    + "{\"prompt_id\":\"C\",\"priority\":100,\"expires_at_ms\":16000,\"display_text\":\"紧急\"}]";
+            java.util.concurrent.atomic.AtomicLong nanos = new java.util.concurrent.atomic.AtomicLong(1_000_000_000L);
+            OverlayMessageState windowState = new OverlayMessageState(); windowState.start();
+            LiveConnectionTest.Display display = new LiveConnectionTest.Display() {
+                @Override public void prompt(org.json.JSONObject prompt) {
+                    super.prompt(prompt);
+                    windowState.update(prompt.optString("prompt_id"), prompt.optString("display_text"),
+                            LiveConnection.strictPriority(prompt), prompt.optLong(PromptTiming.DEADLINE_MS), 1000, 12000);
+                }
+            };
+            LiveConnection connection = new LiveConnection(new LiveConnectionTest.Memory(),
+                    LiveClient.remote(fixture.base(), "", "", nanos::get), display);
+            assertTrue(connection.connect()); assertTrue(connection.poll());
+            assertEquals("C", windowState.currentId()); assertEquals("紧急", windowState.textAt(1000));
         }
     }
 

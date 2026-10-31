@@ -174,7 +174,7 @@ public class LiveConnectionTest {
         Memory store = new Memory(); store.session = SESSION;
         Remote remote = new Remote(); Display display = new Display();
         remote.startError = new LiveClient.HttpError(409);
-        remote.page.getJSONArray("prompts").put(new JSONObject().put("display_text", "实际运营建议").put("expires_at_ms", 16000));
+        remote.page.getJSONArray("prompts").put(new JSONObject().put("display_text", "实际运营建议").put("expires_at_ms", 16000).put("priority", 25));
         LiveConnection connection = new LiveConnection(store, remote, display);
         assertTrue(connection.connect()); assertTrue(connection.poll());
         assertEquals(0, remote.creates); assertEquals(0, remote.stops);
@@ -187,7 +187,7 @@ public class LiveConnectionTest {
         Remote remote = new Remote(); Display display = new Display();
         java.util.concurrent.atomic.AtomicLong clock = new java.util.concurrent.atomic.AtomicLong();
         remote.startStatus = "not_connected"; remote.summaryStatus = "not_connected";
-        remote.page.getJSONArray("prompts").put(new JSONObject().put("display_text", "实际运营建议").put("expires_at_ms", 16000));
+        remote.page.getJSONArray("prompts").put(new JSONObject().put("display_text", "实际运营建议").put("expires_at_ms", 16000).put("priority", 25));
         LiveConnection connection = new LiveConnection(store, remote, display, clock::get);
         assertTrue(connection.connect()); assertTrue(connection.poll());
         assertEquals(1, display.bindings); assertEquals("实际运营建议", display.messages.get(0));
