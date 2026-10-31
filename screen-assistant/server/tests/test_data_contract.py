@@ -139,7 +139,7 @@ def test_batch_expiry_and_session_isolation(tmp_path):
     clock = [now]
     store = LiveStore(str(tmp_path / "batch-expiry.sqlite3"), lambda: clock[0])
     try:
-        a, b = store.create(""), store.create("")
+        a, b, c = store.create(""), store.create(""), store.create("")
         first = {"kind": "comment", "event_id": "e1", "source": "ios_replaykit_ocr",
                  "observed_at_ms": now, "availability": "available", "coverage": "ocr_visible_sample",
                  "reliability": "known", "content": {"text": "你好"},
@@ -151,6 +151,10 @@ def test_batch_expiry_and_session_isolation(tmp_path):
         assert store.add_observation(a["session_id"], a["session_token"], fixture, now)["reason"] == "batch_incomplete"
         separate = {**first, "event_id": "other-e1", "capture_batch_id": "other"}
         assert store.add_observation(a["session_id"], a["session_token"], separate, now)["reason"] == "batch_incomplete"
+        assert store.add_observation(c["session_id"], c["session_token"], first, now)["reason"] == "batch_incomplete"
+        store.stop(c["session_id"], c["session_token"])
+        assert c["session_id"] not in store.comment_batches
+        assert store.events(c["session_id"], c["session_token"])["events"] == []
         second = {**first, "event_id": "e2", "line_index": 9}
         ready = store.add_observation(b["session_id"], b["session_token"], second, now + 1000)
         assert ready["_batch_ready"] is True
