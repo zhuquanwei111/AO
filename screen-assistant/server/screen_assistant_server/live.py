@@ -215,6 +215,7 @@ class LiveService:
             return True
         if len(self.fusion_active) >= self.fusion_concurrency and len(self.fusion_queue) >= self.fusion_queue_limit:
             logger.info("live_fusion outcome=busy")
+            logger.info("live_data stage=scheduler session=%s outcome=scheduler_full", sid[:8])
             return False
         self.fusion_queued[sid] = (token, request)
         self.fusion_trigger_epoch[sid] = self.fusion_trigger_epoch.get(sid, 0) + 1
