@@ -175,18 +175,14 @@ final class SampleHandler: RPBroadcastSampleHandler {
                 regions.append(OCRService.RegionInput(identifier: "online_count",
                                                        image: autoreleasepool(invoking: { makeOCRImage(from: sampleBuffer, roi: roi) })))
             }
-            if let roi = SharedConfig.platformNoticeROI() {
-                regionROIs["platform_notice"] = roi
-                regions.append(OCRService.RegionInput(identifier: "platform_notice",
-                                                       image: autoreleasepool(invoking: { makeOCRImage(from: sampleBuffer, roi: roi) })))
-            }
         }
         guard regions.contains(where: { $0.image != nil }) else { endRound(generation: generation); return }
         logMemory(stage: "roi-rendered")
         let sampleObservedAtMS = Int64(Date().timeIntervalSince1970 * 1000)
+        let countSemanticsConfirmed = SharedConfig.onlineCountSemanticsConfirmed()
         let sampledCredentials = LiveSessionState.isEnabled() ? LiveSessionState.credentials() : nil
 
-        // 同一个有界OCR任务串行识别评论、可选人数和提醒裁剪图。
+        // 同一个有界OCR任务串行识别评论和可选人数裁剪图。
         guard let ocr = OCRService.recognize(regions: regions, completion: { [weak self] results in
             guard let self else { return }
             self.logMemory(stage: "ocr-finished")
@@ -204,34 +200,17 @@ final class SampleHandler: RPBroadcastSampleHandler {
                     return
                 }
                 let commentLines = results.first(where: { $0.identifier == "comment" })?.lines ?? []
-                let questionPayload = commentLines.first(where: { LiveCommentFilter.isWorthwhileQuestion($0.text) })
-                    .flatMap { line -> (String, [String: Double])? in
-                        guard let question = SentenceFormatter.sentence(fromOCRText: line.text),
-                              question.count <= SharedConfig.maxSentenceLength else { return nil }
-                        return (question, LiveCommentFilter.screenPosition(line.boundingBox, within: observationROI))
-                    }
-                var typedPayloads: [[String: Any]] = []
-                if let noticeROI = regionROIs["platform_notice"] {
-                    let lines = results.first(where: { $0.identifier == "platform_notice" })?.lines ?? []
-                    typedPayloads.append(Self.platformNoticePayload(lines: lines, roi: noticeROI,
-                                                                    observedAtMS: sampleObservedAtMS))
-                }
+                var countPayload: [String: Any]?
                 if let countROI = regionROIs["online_count"] {
                     let lines = results.first(where: { $0.identifier == "online_count" })?.lines ?? []
-                    typedPayloads.append(Self.onlineCountPayload(lines: lines, roi: countROI,
-                                                                 observedAtMS: sampleObservedAtMS))
+                    countPayload = Self.onlineCountPayload(lines: lines, roi: countROI,
+                                                           observedAtMS: sampleObservedAtMS,
+                                                           semanticsConfirmed: countSemanticsConfirmed)
                 }
-                var payloads = typedPayloads.map { ($0, false) }
-                if let (question, position) = questionPayload {
-                    payloads.append(([
-                        "event_id": UUID().uuidString.lowercased(), "input_mode": "live_observation",
-                        "source": "ios_replaykit_ocr", "coverage": "ocr_visible_sample",
-                        "reliability": "known", "text": String(question.prefix(500)),
-                        "text_position": position, "observed_at_ms": sampleObservedAtMS
-                    ], true))
-                }
-                self.enqueueObservations(payloads, credentials: credentials, baseURL: baseURL,
-                                         generation: generation, captureGeneration: captureGeneration)
+                self.enqueueSample(commentLines: commentLines, commentROI: observationROI,
+                                   countPayload: countPayload, observedAtMS: sampleObservedAtMS,
+                                   credentials: credentials, baseURL: baseURL,
+                                   generation: generation, captureGeneration: captureGeneration)
                 self.endRound(generation: generation)
                 return
             }
@@ -349,13 +328,13 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     private static func onlineCountPayload(lines: [OCRService.TextLine], roi: CGRect,
-                                           observedAtMS: Int64) -> [String: Any] {
+                                           observedAtMS: Int64, semanticsConfirmed: Bool) -> [String: Any] {
         let rawText = String(lines.map(\.text).joined(separator: " ").prefix(120))
         let available = !rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let content: Any
         if available {
             content = [
-                "raw_text": rawText, "field_semantics_confirmed": true,
+                "raw_text": rawText, "field_semantics_confirmed": semanticsConfirmed,
                 "text_position": mergedPosition(lines: lines, roi: roi),
                 "ocr_lines": Array(lines.prefix(20)).map { ocrLinePayload($0, roi: roi) }
             ] as [String: Any]
@@ -407,37 +386,75 @@ final class SampleHandler: RPBroadcastSampleHandler {
         return LiveCommentFilter.screenPosition(bounds, within: roi)
     }
 
-    /// 仅在 stateQueue 操作缓冲；请求正文和凭据不写入诊断。
-    private func enqueueObservations(_ payloads: [([String: Any], Bool)],
-                                     credentials: LiveSessionCredentials, baseURL: URL,
-                                     generation: Int, captureGeneration: Int) {
-        for (payload, isComment) in payloads {
-            guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
-                stateQueue.sync {
-                    if observationContextValid(generation: generation, captureGeneration: captureGeneration,
-                                               sessionID: credentials.sessionID, token: credentials.token) {
-                        recordObservationIssue("encoding")
-                    }
-                }
+    /// 采样轮内保持人数后评论的原有顺序；只保留可发送的有界前缀。
+    private func enqueueSample(commentLines: [OCRService.TextLine], commentROI: CGRect,
+                               countPayload: [String: Any]?, observedAtMS: Int64,
+                               credentials: LiveSessionCredentials, baseURL: URL,
+                               generation: Int, captureGeneration: Int) {
+        var builder = ObservationUploadBuffer.BatchBuilder()
+        var rejected: [String: Int] = [:]
+        func note(_ reason: String) { rejected[reason, default: 0] += 1 }
+        func append(_ event: ObservationUploadBuffer.Event) {
+            let isComment = event.isComment
+            switch builder.append(event) {
+            case .accepted: break
+            case .commentLimit: note(isComment ? "limit_comment" : "limit_count")
+            case .countLimit: note("invalid_count")
+            case .byteLimit: note(isComment ? "bytes_comment" : "bytes_count")
+            case .itemOversize: note(isComment ? "oversize_comment" : "oversize_count")
+            }
+        }
+        if let countPayload {
+            if let data = try? JSONSerialization.data(withJSONObject: countPayload) {
+                append(.init(id: UUID(), body: data, isComment: false, observedAtMS: observedAtMS))
+            } else { note("invalid_count") }
+        }
+        for (index, line) in commentLines.enumerated() {
+            guard index < ObservationUploadBuffer.BatchBuilder.maxComments else {
+                note("limit_comment")
                 continue
             }
-            stateQueue.sync {
-                guard observationContextValid(generation: generation, captureGeneration: captureGeneration,
-                                              sessionID: credentials.sessionID, token: credentials.token) else { return }
-                if let active = observationBuffer.active,
-                   (active.sessionID != credentials.sessionID || active.token != credentials.token ||
-                    active.generation != captureGeneration) {
-                    cancelObservationTransport()
-                }
-                let item = ObservationUploadBuffer.Item(id: UUID(), body: data, generation: captureGeneration,
-                    sessionID: credentials.sessionID, token: credentials.token, baseURL: baseURL,
-                    isComment: isComment)
-                switch observationBuffer.append(item) {
-                case .accepted: startNextObservation()
-                case .overflow: recordObservationIssue("overflow")
-                case .oversize: recordObservationIssue("oversize")
-                }
+            let position = LiveCommentFilter.screenPosition(line.boundingBox, within: commentROI)
+            var validPosition: [String: Double]?
+            if let x = position["x"], let y = position["y"], let w = position["width"],
+               let h = position["height"], x.isFinite, y.isFinite, w.isFinite, h.isFinite,
+               x >= 0, y >= 0, x <= 1, y <= 1, w > 0, h > 0, w <= 1, h <= 1 {
+                validPosition = position
             }
+            let confidence = line.confidence.isFinite && (0...1).contains(line.confidence)
+                ? Double(line.confidence) : nil
+            guard let event = ObservationUploadBuffer.comment(text: line.text, position: validPosition,
+                    confidence: confidence, observedAtMS: observedAtMS) else {
+                note("invalid_comment")
+                continue
+            }
+            append(event)
+        }
+        stateQueue.sync {
+            guard observationContextValid(generation: generation, captureGeneration: captureGeneration,
+                                          sessionID: credentials.sessionID, token: credentials.token) else { return }
+            for (reason, count) in rejected { recordObservationIssue(reason, count: count) }
+            let nowMS = Int64(Date().timeIntervalSince1970 * 1000)
+            let fresh = builder.events.filter { !ObservationUploadBuffer.isExpired($0, nowMS: nowMS) }
+            recordObservationIssue("expired", count: builder.events.count - fresh.count)
+            let batch = ObservationUploadBuffer.Batch(id: UUID(), events: fresh,
+                observedAtMS: observedAtMS, generation: captureGeneration,
+                sessionID: credentials.sessionID, token: credentials.token, baseURL: baseURL)
+            guard !batch.events.isEmpty else { return }
+            if let active = observationBuffer.active,
+               (active.sessionID != credentials.sessionID || active.token != credentials.token ||
+                active.generation != captureGeneration) { cancelObservationTransport() }
+            switch observationBuffer.append(batch) {
+            case .accepted: startNextObservation()
+            case .overflow:
+                recordObservationIssue("overflow_batch")
+                recordObservationIssue("overflow_comment", count: batch.events.filter(\.isComment).count)
+                recordObservationIssue("overflow_count", count: batch.events.filter { !$0.isComment }.count)
+            case .invalid:
+                recordObservationIssue("invalid_comment", count: batch.events.filter(\.isComment).count)
+                recordObservationIssue("invalid_count", count: batch.events.filter { !$0.isComment }.count)
+            }
+            updateObservationQueueStatus()
         }
     }
 
@@ -449,72 +466,107 @@ final class SampleHandler: RPBroadcastSampleHandler {
         return current.sessionID == sessionID && current.token == token
     }
 
-    /// 必须在 stateQueue；仅一项在途。失败不重试，不把 200 当作生成提示。
+    /// 必须在 stateQueue；仅一批在途，批内逐条发送，不自动重试。
     private func startNextObservation() {
-        guard observationTask == nil, let item = observationBuffer.begin() else { return }
+        guard observationTask == nil else { return }
         let generation = roundGeneration
-        guard observationContextValid(generation: generation, captureGeneration: item.generation,
-                                      sessionID: item.sessionID, token: item.token) else {
-            observationBuffer.clear()
-            recordObservationIssue("stale")
+        while let candidate = observationBuffer.begin(), let event = candidate.current {
+            guard observationContextValid(generation: generation, captureGeneration: candidate.generation,
+                                          sessionID: candidate.sessionID, token: candidate.token) else {
+                cancelObservationTransport()
+                return
+            }
+            guard ObservationUploadBuffer.isExpired(event, nowMS: Int64(Date().timeIntervalSince1970 * 1000)) else { break }
+            _ = observationBuffer.complete(batchID: candidate.id, eventID: event.id)
+            recordObservationIssue("expired")
+        }
+        guard let batch = observationBuffer.begin(), let item = batch.current else {
+            updateObservationQueueStatus()
             return
         }
-        let endpoint = ["v1", "live", "sessions", item.sessionID,
-                        item.isComment ? "comments" : "observations"].reduce(item.baseURL) {
+        if Int64(Date().timeIntervalSince1970 * 1000) < item.observedAtMS {
+            recordObservationIssue("clock_backward")
+        }
+        guard observationContextValid(generation: generation, captureGeneration: batch.generation,
+                                      sessionID: batch.sessionID, token: batch.token) else {
+            cancelObservationTransport()
+            return
+        }
+        let endpoint = ["v1", "live", "sessions", batch.sessionID,
+                        item.isComment ? "comments" : "observations"].reduce(batch.baseURL) {
             $0.appendingPathComponent($1, isDirectory: false)
         }
         var request = URLRequest(url: endpoint, timeoutInterval: 20)
         request.httpMethod = "POST"
-        request.setValue(item.token, forHTTPHeaderField: "X-Live-Session-Token")
+        request.setValue(batch.token, forHTTPHeaderField: "X-Live-Session-Token")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = item.body
         let task = observationSession.dataTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
             self.stateQueue.async {
-                guard self.observationBuffer.active?.id == item.id else { return }
-                guard self.observationContextValid(generation: generation, captureGeneration: item.generation,
-                                                   sessionID: item.sessionID, token: item.token) else {
+                guard self.observationBuffer.active?.id == batch.id,
+                      self.observationBuffer.active?.current?.id == item.id else { return }
+                guard self.observationContextValid(generation: generation, captureGeneration: batch.generation,
+                                                   sessionID: batch.sessionID, token: batch.token) else {
                     self.cancelObservationTransport()
                     return
                 }
-                _ = self.observationBuffer.complete(item.id)
+                _ = self.observationBuffer.complete(batchID: batch.id, eventID: item.id)
                 self.observationTask = nil
                 ControlState.recordServiceResponse(error: error, response: response)
                 switch ObservationUploadBuffer.classify(data: data,
                     statusCode: (response as? HTTPURLResponse)?.statusCode, hasError: error != nil) {
                 case .received:
                     self.recordObservationIssue("received")
+                case .duplicate:
+                    self.recordObservationIssue("duplicate")
+                case .merged:
+                    self.recordObservationIssue("merged")
                 case .analysisBusy:
                     self.recordObservationIssue("received")
                     self.recordObservationIssue("analysis_busy")
-                case .failed:
-                    self.recordObservationIssue("http_failed")
-                case .other:
-                    self.recordObservationIssue("unconfirmed")
+                case .rejected:
+                    self.recordObservationIssue("rejected")
+                case .unknown:
+                    self.recordObservationIssue("unknown")
+                    if error != nil || ((response as? HTTPURLResponse)?.statusCode ?? 0) >= 500 {
+                        self.cancelObservationTransport()
+                        return
+                    }
                 }
                 self.startNextObservation()
             }
         }
         observationTask = task
+        updateObservationQueueStatus()
         task.resume()
     }
 
-    private func recordObservationIssue(_ reason: String) {
+    private func recordObservationIssue(_ reason: String, count: Int = 1) {
+        guard count > 0 else { return }
         guard let defaults = AppGroup.defaults else { return }
         let key = "observation.upload.\(reason)"
-        let count = defaults.integer(forKey: key) + 1
-        defaults.set(count, forKey: key)
+        let total = defaults.integer(forKey: key) + count
+        defaults.set(total, forKey: key)
         defaults.set(reason, forKey: "observation.upload.lastReason")
-        if ["encoding", "overflow", "oversize", "stale", "http_failed", "unconfirmed"].contains(reason) {
-            NSLog("采样上传异常：原因=%@，累计=%d", reason, count)
+        if !["received", "duplicate", "merged", "analysis_busy"].contains(reason) {
+            NSLog("采样上传异常：原因=%@，累计=%d", reason, total)
         }
     }
 
+    private func updateObservationQueueStatus() {
+        guard let defaults = AppGroup.defaults else { return }
+        defaults.set(observationBuffer.pending.count, forKey: "observation.upload.waiting_batches")
+        defaults.set(observationTask != nil, forKey: "observation.upload.sending")
+    }
+
     private func cancelObservationTransport() {
-        if observationTask != nil || !observationBuffer.pending.isEmpty { recordObservationIssue("stale") }
+        let discarded = observationBuffer.discard(inFlight: observationTask != nil)
+        recordObservationIssue("unknown", count: discarded.unknown)
+        recordObservationIssue("cancel_unsent", count: discarded.unsent)
         observationTask?.cancel()
         observationTask = nil
-        observationBuffer.clear()
+        updateObservationQueueStatus()
     }
 
     /// 结束一轮：清 roundActive 并按配置间隔排定下一轮可开始时刻。

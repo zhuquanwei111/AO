@@ -22,6 +22,7 @@ struct SharedConfig {
         static let onlineCountROIY = "config.onlineCountROI.y"
         static let onlineCountROIWidth = "config.onlineCountROI.width"
         static let onlineCountROIHeight = "config.onlineCountROI.height"
+        static let onlineCountSemanticsConfirmed = "config.onlineCountROI.semanticsConfirmed"
         static let platformNoticeROIEnabled = "config.platformNoticeROI.enabled"
         static let platformNoticeROIX = "config.platformNoticeROI.x"
         static let platformNoticeROIY = "config.platformNoticeROI.y"
@@ -137,6 +138,14 @@ struct SharedConfig {
         setConfiguredROI(roi, enabledKey: Keys.onlineCountROIEnabled, xKey: Keys.onlineCountROIX,
                          yKey: Keys.onlineCountROIY, widthKey: Keys.onlineCountROIWidth,
                          heightKey: Keys.onlineCountROIHeight)
+    }
+
+    static func onlineCountSemanticsConfirmed() -> Bool {
+        AppGroup.defaults?.bool(forKey: Keys.onlineCountSemanticsConfirmed) ?? false
+    }
+
+    static func setOnlineCountSemanticsConfirmed(_ confirmed: Bool) {
+        AppGroup.defaults?.set(confirmed, forKey: Keys.onlineCountSemanticsConfirmed)
     }
 
     static func platformNoticeROI() -> CGRect? {

@@ -46,9 +46,13 @@ struct LivePromptDelivery {
     let capacity: Int
     let intervalMS: Int64
 
-    init(capacity: Int = 16, intervalMS: Int64 = 3_000) {
+    init(capacity: Int = 16, intervalMS: Int64 = 8_000) {
         self.capacity = capacity
         self.intervalMS = intervalMS
+    }
+
+    static func unexpired(_ items: [Item], nowMS: Int64) -> [Item] {
+        items.filter { $0.expiresAtMS > nowMS }
     }
 
     mutating func receive(_ items: [Item], nowMS: Int64) -> [Item] {

@@ -16,6 +16,12 @@ private final class PollFixtureProtocol: URLProtocol {
 
     override func startLoading() {
         let path = request.url!.path
+        if path.hasSuffix("/stop"),
+           (!path.contains("/sessions/fixture-session/stop") ||
+            request.value(forHTTPHeaderField: "X-Live-Session-Token") != "fixture-token") {
+            client?.urlProtocol(self, didFailWithError: URLError(.userAuthenticationRequired))
+            return
+        }
         if path.hasPrefix("/immediate-") {
             let query = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems
             guard query?.first(where: { $0.name == "wait_ms" })?.value == "0",
@@ -69,6 +75,100 @@ private final class PollFixtureProtocol: URLProtocol {
 }
 
 final class PollTransportTests: XCTestCase {
+    func testStopPendingCredentialsRoundTripAndLegacyDecode() throws {
+        var pending = credentials
+        pending.stopPending = true
+        let restored = try JSONDecoder().decode(LiveSessionCredentials.self, from: JSONEncoder().encode(pending))
+        XCTAssertEqual(restored.sessionID, pending.sessionID)
+        XCTAssertEqual(restored.stopPending, true)
+        let legacy = Data("{\"session_id\":\"old\",\"session_token\":\"token\",\"started_at_ms\":1}".utf8)
+        XCTAssertNil(try JSONDecoder().decode(LiveSessionCredentials.self, from: legacy).stopPending)
+    }
+
+    func testStopPendingUsesIsolatedRealCredentialStorage() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let suite = "stop-fixture-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+            defaults.removePersistentDomain(forName: suite)
+        }
+        let url = directory.appendingPathComponent("session.json")
+        var pending = credentials
+        pending.stopPending = true
+        XCTAssertTrue(LiveSessionState.save(pending, fileURL: url, defaults: defaults))
+        let restored = try XCTUnwrap(LiveSessionState.credentials(fileURL: url))
+        XCTAssertEqual(restored.sessionID, pending.sessionID)
+        XCTAssertEqual(restored.token, pending.token)
+        XCTAssertEqual(restored.stopPending, true)
+        XCTAssertTrue(LiveSessionState.recoverActive(restored, captureEnabled: true))
+        XCTAssertTrue(LiveSessionState.recoverActive(restored, captureEnabled: false))
+        XCTAssertTrue(LiveSessionState.holdCaptureOnRecovery(restored))
+        let invalidURL = directory.appendingPathComponent("missing/session.json")
+        XCTAssertFalse(LiveSessionState.save(pending, fileURL: invalidURL, defaults: defaults))
+        XCTAssertEqual(LiveSessionState.credentials(fileURL: url)?.stopPending, true)
+        XCTAssertTrue(LiveSessionState.confirmStopped(pending, fileURL: url, defaults: defaults))
+        XCTAssertEqual(LiveSessionState.credentials(fileURL: url)?.stopPending, false)
+        XCTAssertFalse(LiveSessionState.recoverActive(LiveSessionState.credentials(fileURL: url), captureEnabled: false))
+    }
+
+    func testStopTransportSuccessAndTimeoutDoNotWriteDiagnosticsBeforeGate() {
+        for scenario in ["success", "timeout"] {
+            let (client, session) = makeClient(scenario)
+            let before = ControlState.serviceConnection()
+            let finished = expectation(description: scenario)
+            client.stop(credentials, recordResponse: false) { ok, response, error in
+                XCTAssertEqual(ok, scenario == "success")
+                if scenario == "success" { XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200) }
+                else { XCTAssertEqual((error as? URLError)?.code, .timedOut) }
+                XCTAssertEqual(ControlState.serviceConnection(), before)
+                finished.fulfill()
+            }
+            wait(for: [finished], timeout: 5)
+            session.invalidateAndCancel()
+        }
+    }
+
+    func testPendingStorageSurvivesTimeoutAndOriginalSessionRetry() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let suite = "stop-retry-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+            defaults.removePersistentDomain(forName: suite)
+        }
+        let url = directory.appendingPathComponent("session.json")
+        var pending = credentials
+        pending.stopPending = true
+        XCTAssertTrue(LiveSessionState.save(pending, fileURL: url, defaults: defaults))
+        let (timeoutClient, timeoutSession) = makeClient("timeout")
+        let timedOut = expectation(description: "原场结束请求超时")
+        timeoutClient.stop(pending, recordResponse: false) { ok, _, _ in
+            XCTAssertFalse(ok)
+            timedOut.fulfill()
+        }
+        wait(for: [timedOut], timeout: 5)
+        timeoutSession.invalidateAndCancel()
+        let restored = try XCTUnwrap(LiveSessionState.credentials(fileURL: url))
+        XCTAssertEqual(restored.sessionID, pending.sessionID)
+        XCTAssertEqual(restored.token, pending.token)
+        XCTAssertEqual(restored.stopPending, true)
+        XCTAssertTrue(LiveSessionState.recoverActive(restored, captureEnabled: false))
+        XCTAssertTrue(LiveSessionState.holdCaptureOnRecovery(restored))
+        let (retryClient, retrySession) = makeClient("success")
+        let confirmed = expectation(description: "原场结束重试成功")
+        retryClient.stop(restored, recordResponse: false) { ok, _, _ in
+            XCTAssertTrue(ok)
+            if ok { XCTAssertTrue(LiveSessionState.confirmStopped(restored, fileURL: url, defaults: defaults)) }
+            confirmed.fulfill()
+        }
+        wait(for: [confirmed], timeout: 5)
+        retrySession.invalidateAndCancel()
+        XCTAssertEqual(LiveSessionState.credentials(fileURL: url)?.stopPending, false)
+    }
+
     private func makeClient(_ scenario: String) -> (LiveOperationsClient, URLSession) {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [PollFixtureProtocol.self]
