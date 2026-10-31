@@ -5,6 +5,14 @@ import org.json.JSONObject;
 
 /** 冻结v1共享summary的纯Java展示适配。缺值不补零，后台与OCR统计分开。 */
 final class RecapText {
+    static String stopStatus(boolean hasSession, boolean stopped, boolean pending, boolean inFlight) {
+        if (inFlight) return "本机采集已停止，正在确认场次结束。";
+        if (pending) return hasSession
+                ? "本机采集已停止，场次结束尚未确认。请返回设置重试结束本场。"
+                : "场次结束尚未确认，本机未保存场次凭证，请核对服务端状态。";
+        if (hasSession && stopped) return "本场已结束。";
+        return "";
+    }
     private static final String[] METRICS={"累计观众","新增粉丝","评论人数","送礼人数","获得音浪"};
     static boolean pending(JSONObject summary) {
         JSONObject recap=summary.optJSONObject("backstage_recap");

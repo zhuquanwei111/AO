@@ -95,6 +95,8 @@ public class CaptureService extends Service {
     private volatile LiveClient.Session liveSession;
     private boolean operationMode;
     private volatile LiveConnection liveConnection;
+    static volatile boolean stopInProgress;
+    private boolean connectionWorkerActive;
     private volatile String connectionStatus = "";
     private volatile LiveFrameAnalyzer liveAnalyzer;
     private long lastLiveOcr;
@@ -382,7 +384,12 @@ public class CaptureService extends Service {
             }
             case ACTION_STOP:
             default:
-                if (liveConnection != null) liveConnection.close(true);
+                if (liveConnection != null) {
+                    synchronized (liveConnection) {
+                        stopInProgress = connectionWorkerActive;
+                        liveConnection.close(true);
+                    }
+                }
                 teardown("已结束辅助", "app_stop_action");
                 break;
         }
@@ -706,6 +713,7 @@ public class CaptureService extends Service {
                     }
                 });
         liveConnection = connection;
+        synchronized (connection) { connectionWorkerActive = true; }
         promptExecutor.execute(() -> {
             boolean prepared = false;
             try {
@@ -718,11 +726,19 @@ public class CaptureService extends Service {
                     }
                 }
             } finally {
-                if (connection.shouldEnd()) {
+                boolean shouldEnd;
+                synchronized (connection) {
+                    shouldEnd = connection.shouldEnd();
+                    if (!shouldEnd) connectionWorkerActive = false;
+                }
+                if (shouldEnd) {
                     try { audioCompletion.get(20, java.util.concurrent.TimeUnit.SECONDS); }
                     catch (Exception ignored) { /* 仍请求幂等结束 */ }
                     try { connection.finishStop(); }
                     catch (Exception e) { logEvent("session_stop_unconfirmed", "error=" + e.getClass().getSimpleName()); }
+                    finally {
+                        synchronized (connection) { connectionWorkerActive = false; stopInProgress = false; }
+                    }
                     Intent changed = new Intent(Prefs.ACTION_STATE).setPackage(getPackageName());
                     sendBroadcast(changed);
                 }

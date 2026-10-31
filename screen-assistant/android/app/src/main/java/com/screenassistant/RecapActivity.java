@@ -1,6 +1,10 @@
 package com.screenassistant;
 
 import android.app.Activity;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -20,12 +24,15 @@ import java.util.concurrent.Executors;
 public class RecapActivity extends Activity {
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService io = Executors.newSingleThreadExecutor();
-    private TextView summary, events, status;
+    private TextView summary, events, status, stopStatus;
     private LiveClient.Session session;
     private boolean visible, busy;
     private int rounds;
     private JSONArray loadedEvents;
     private final Runnable refresh = () -> load(false);
+    private final BroadcastReceiver stateReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) { refreshStopStatus(); }
+    };
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -40,16 +47,32 @@ public class RecapActivity extends Activity {
             if (!RecapRequest.sameSession(session,current)) { session=current; loadedEvents=null; }
             rounds = 0; load(true);
         });
-        status = text(column); summary = text(column); events = text(column);
+        stopStatus = text(column); status = text(column); summary = text(column); events = text(column);
     }
 
     private TextView text(LinearLayout parent) {
         TextView t = new TextView(this); t.setTextSize(16); t.setPadding(0, 12, 0, 12);
         t.setTextIsSelectable(true); parent.addView(t); return t;
     }
-    @Override protected void onStart() { super.onStart(); CaptureService.setAssistantUiVisible(true); visible = true; rounds = 0; load(true); }
-    @Override protected void onStop() { CaptureService.setAssistantUiVisible(false); visible = false; main.removeCallbacks(refresh); super.onStop(); }
+    @Override protected void onStart() {
+        super.onStart();
+        androidx.core.content.ContextCompat.registerReceiver(this, stateReceiver,
+                new IntentFilter(Prefs.ACTION_STATE), androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED);
+        CaptureService.setAssistantUiVisible(true); visible = true; rounds = 0; refreshStopStatus(); load(true);
+    }
+    @Override protected void onStop() {
+        CaptureService.setAssistantUiVisible(false); visible = false; main.removeCallbacks(refresh);
+        unregisterReceiver(stateReceiver); super.onStop();
+    }
     @Override protected void onDestroy() { io.shutdown(); super.onDestroy(); }
+
+    private void refreshStopStatus() {
+        LiveClient.Session current = Prefs.getSession(this);
+        boolean cached = current == null && Prefs.hasCachedRecap(this);
+        stopStatus.setText(RecapText.stopStatus(current != null || cached,
+                cached || current != null && current.stopped,
+                Prefs.stopPending(this), CaptureService.stopInProgress));
+    }
 
     private void load(boolean includeEvents) {
         if (!visible || busy) return;
@@ -100,6 +123,7 @@ public class RecapActivity extends Activity {
                 if (data != null) summary.setText(renderSummary(data));
                 if (eventRows != null) { loadedEvents=eventRows; events.setText(renderEvents(eventRows)); }
                 if (cached) session=null;
+                refreshStopStatus();
                 if (rounds < 24 && data != null && pending(data)) main.postDelayed(refresh, 5000);
                 else if (data!=null && pending(data)) status.append("\n本轮自动刷新已暂停，点刷新或重开可继续。");
             });
