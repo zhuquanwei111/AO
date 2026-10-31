@@ -450,10 +450,10 @@ struct LiveOperationsClient {
         }.resume()
     }
 
-    func poll(_ credentials: LiveSessionCredentials, after: String,
+    func poll(_ credentials: LiveSessionCredentials, after: String, waitMS: Int = 15_000,
               completion: @escaping (Result<LivePromptPage, Error>, URLResponse?, Error?) -> Void) -> URLSessionDataTask {
         var components = URLComponents(url: endpoint("v1", "live", "sessions", credentials.sessionID, "prompts"), resolvingAgainstBaseURL: false)!
-        components.queryItems = [URLQueryItem(name: "after", value: after), URLQueryItem(name: "wait_ms", value: "15000")]
+        components.queryItems = [URLQueryItem(name: "after", value: after), URLQueryItem(name: "wait_ms", value: String(waitMS))]
         let request = authorized(components.url!, token: credentials.token)
         let requestStartNS = Self.continuousNowNS()
         let task = session.dataTask(with: request) { data, response, error in
