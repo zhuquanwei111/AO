@@ -208,6 +208,17 @@ def test_comment_reply_can_pass_confirmed_priority_without_guessing_badges():
     assert json.loads(payloads[0]["messages"][1]["content"])["priority_eligible"] is True
 
 
+def test_comment_reply_keeps_direct_utterance_starting_with_keyi():
+    async def run():
+        client = make_client(lambda _: httpx.Response(200, json={"choices": [{
+            "message": {"content": '{"respond":true,"reply":"可以呀！"}'}, "finish_reason": "stop"}]}))
+        try:
+            assert await client.reply_to_comment("可以吗", nickname=None) == "可以呀！"
+        finally:
+            await client.aclose()
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("content,finish", [
     ('{"respond":false,"reply":null}', "stop"),
     ('{"respond":true,"reply":"你好"}', "stop"),
@@ -231,6 +242,8 @@ def test_comment_reply_valid_results(content, finish):
     ('{"respond":true,"reply":"你好","extra":1}', "stop"),
     ('{"respond":true,"respond":false,"reply":null}', "stop"),
     ('{"respond":true,"reply":"' + "一" * 81 + '"}', "stop"),
+    ('{"respond":true,"reply":"建议主播先确认今晚的安排。"}', "stop"),
+    ('{"respond":true,"reply":"可以回一句：今晚玩鹅鸭杀。"}', "stop"),
     ('{"respond":true,"reply":"你好"}', "length"),
 ])
 def test_comment_reply_rejects_invalid_model_result(content, finish):

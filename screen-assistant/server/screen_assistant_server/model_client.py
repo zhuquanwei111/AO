@@ -309,7 +309,9 @@ class TianyiChatClient:
             if not isinstance(reply, str):
                 raise ValueError("invalid reply")
             reply = reply.strip()
-            if not reply or len(reply) > 80 or any(ord(char) < 32 for char in reply):
+            advice_prefixes = ("建议主播", "主播可以", "可以让主播", "可以回一句", "可以笑着接一句")
+            if (not reply or len(reply) > 80 or any(ord(char) < 32 for char in reply)
+                    or reply.startswith(advice_prefixes)):
                 raise ValueError("invalid reply")
             return reply
         except (ValueError, KeyError, IndexError, TypeError):
