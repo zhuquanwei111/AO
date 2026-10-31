@@ -105,8 +105,10 @@ def test_comment_reply_without_valid_model_result_writes_no_prompt(tmp_path, mon
                        model_timeout_seconds=0.1, model_connect_timeout_seconds=0.1,
                        live_db_path=str(tmp_path / f"reply-{outcome}.sqlite3"))
         app = create_app(cfg, live_clock=lambda: now)
+        calls = []
         class Model:
             async def reply_to_comment(self, *args, **kwargs):
+                calls.append((args, kwargs))
                 if outcome == "timeout":
                     await asyncio.Event().wait()
                 if outcome == "invalid":
@@ -120,6 +122,7 @@ def test_comment_reply_without_valid_model_result_writes_no_prompt(tmp_path, mon
                 session = (await client.post("/v1/live/sessions", json={})).json()
                 sid, token = session["session_id"], session["session_token"]
                 candidate = {"model_text": "你好", "suggestion": None, "prompt_type": "comment_reply",
+                             "first_observed_at_ms": now,
                              "reply_to": {"comment_id": "c1", "nickname": None, "text": "你好"}}
                 candidates = iter([candidate, None])
                 app.state.live.store.fusion_candidate = lambda *_: next(candidates, None)
@@ -127,6 +130,7 @@ def test_comment_reply_without_valid_model_result_writes_no_prompt(tmp_path, mon
                 await asyncio.wait_for(app.state.live.fusion_active[sid], 2)
                 response = await client.get(f"/v1/live/sessions/{sid}/prompts",
                                             headers={"X-Live-Session-Token": token})
+                assert len(calls) == 1
                 assert response.json()["prompts"] == []
     asyncio.run(run())
 
