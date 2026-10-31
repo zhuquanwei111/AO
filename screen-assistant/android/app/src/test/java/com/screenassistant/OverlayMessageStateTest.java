@@ -8,16 +8,41 @@ public class OverlayMessageStateTest {
         OverlayMessageState state = new OverlayMessageState(); state.start(); return state;
     }
     private boolean offer(OverlayMessageState state, String id, int priority, long expiry, long now) {
-        return state.update(id, "运营：" + id, priority, expiry, now, 6000);
+        return state.update(id, "运营：" + id, priority, expiry, now, 12000);
     }
 
-    @Test public void ordinaryArrivalAt887msMustKeepCurrentForFiveSeconds() {
+    @Test public void ordinaryArrivalAt887msMustKeepCurrentForEightSeconds() {
         OverlayMessageState state = started();
-        state.update("运营：当前建议", 16000, 1000, 6000);
-        state.update("运营：普通后到", 16887, 1887, 6000);
+        state.update("运营：当前建议", 16000, 1000, 12000);
+        state.update("运营：普通后到", 16887, 1887, 12000);
         assertEquals("运营：当前建议", state.textAt(1887));
-        assertEquals("运营：当前建议", state.textAt(5999));
-        assertEquals("运营：普通后到", state.textAt(6000));
+        assertEquals("运营：当前建议", state.textAt(8999));
+        assertEquals("运营：普通后到", state.textAt(9000));
+    }
+
+    @Test public void ordinaryWaitsEightSecondsAndIdleCollapsesAtTwelve() {
+        OverlayMessageState state = started();
+        assertTrue(state.update("A", "普通A", 25, 31000, 1000, 12000));
+        assertTrue(state.update("B", "普通B", 38, 31000, 1887, 12000));
+        assertEquals("普通A", state.textAt(5999));
+        assertEquals("普通A", state.textAt(8999));
+        assertEquals("普通B", state.textAt(9000));
+
+        OverlayMessageState idle = started();
+        assertTrue(idle.update("A", "普通A", 25, 31000, 1000, 12000));
+        assertEquals("普通A", idle.textAt(12999));
+        assertEquals("", idle.textAt(13000));
+    }
+
+    @Test public void longerProtectionCanExpireWaitingPromptWithoutRenewingIt() {
+        OverlayMessageState state = started();
+        assertTrue(state.update("A", "普通A", 25, 31000, 1000, 12000));
+        assertTrue(state.update("B", "普通B", 38, 8000, 1887, 12000));
+        assertEquals("普通A", state.textAt(6000));
+        assertEquals("普通A", state.textAt(8000));
+        assertEquals(1, state.expiredCount());
+        assertEquals(0, state.pendingCount());
+        assertEquals("", state.textAt(13000));
     }
 
     @Test public void idleAndExpiredMessagesMustNotShowConnectionOrUploadStatus() {
@@ -32,12 +57,12 @@ public class OverlayMessageStateTest {
         assertTrue(state.shouldDisplay(true, false));
     }
 
-    @Test public void sixSecondLocalLimitStillAppliesWithoutPending() {
+    @Test public void twelveSecondLocalLimitStillAppliesWithoutPending() {
         OverlayMessageState state = started();
         offer(state, "A", 25, 16000, 1000);
-        assertEquals("运营：A", state.textAt(6999));
-        assertEquals("", state.textAt(7000));
-        assertFalse(state.isMessageActive(7000));
+        assertEquals("运营：A", state.textAt(12999));
+        assertEquals("", state.textAt(13000));
+        assertFalse(state.isMessageActive(13000));
     }
 
     @Test public void sourceExpiryWinsEvenDuringProtectionAndDuplicateDoesNotExtend() {
@@ -47,7 +72,7 @@ public class OverlayMessageStateTest {
         offer(state, "B", 38, 16000, 1887);
         assertEquals("运营：A", state.textAt(2199));
         assertEquals("运营：B", state.textAt(2200));
-        assertEquals(8200, state.expiresAtMs());
+        assertEquals(14200, state.expiresAtMs());
     }
 
     @Test public void expiredQueuedItemNeverAppearsAndDoesNotExtendCurrent() {
@@ -58,31 +83,31 @@ public class OverlayMessageStateTest {
         assertEquals("运营：A", state.textAt(4000));
         assertEquals(1, state.expiredCount());
         assertEquals(0, state.pendingCount());
-        assertEquals(7000, state.nextChangeAtMs(4000));
-        assertEquals("", state.textAt(7000));
+        assertEquals(13000, state.nextChangeAtMs(4000));
+        assertEquals("", state.textAt(13000));
     }
 
-    @Test public void queuedShortLifeUsesRemainingSourceTimeWithoutFiveSecondExtension() {
+    @Test public void queuedShortLifeUsesRemainingSourceTimeWithoutEightSecondExtension() {
         OverlayMessageState state = started();
         offer(state, "A", 25, 16000, 1000);
-        offer(state, "B", 38, 6500, 1887);
-        assertEquals("运营：B", state.textAt(6000));
-        assertEquals(6500, state.sourceExpiryMs());
-        assertEquals(6500, state.expiresAtMs());
-        assertEquals(6500, state.protectedUntilMs());
-        assertEquals("", state.textAt(6500));
+        offer(state, "B", 38, 9500, 1887);
+        assertEquals("运营：B", state.textAt(9000));
+        assertEquals(9500, state.sourceExpiryMs());
+        assertEquals(9500, state.expiresAtMs());
+        assertEquals(9500, state.protectedUntilMs());
+        assertEquals("", state.textAt(9500));
     }
 
     @Test public void realUrgentPreemptsButPriority38AndTextDoNot() {
         OverlayMessageState state = started();
         offer(state, "A", 25, 16000, 1000);
-        state.update("B", "紧急！规则模板消费等级100", 38, 16000, 1887, 6000);
+        state.update("B", "紧急！规则模板消费等级100", 38, 16000, 1887, 12000);
         assertEquals("运营：A", state.textAt(1887));
         assertTrue(offer(state, "U", 100, 18000, 1900));
         assertEquals("运营：U", state.textAt(1900));
         offer(state, "C", 80, 18000, 2000);
         assertEquals("运营：U", state.textAt(7000));
-        assertEquals("紧急！规则模板消费等级100", state.textAt(7900));
+        assertEquals("紧急！规则模板消费等级100", state.textAt(13900));
     }
 
     @Test public void idempotencyIncludesQueuedShownAndDiscardedIds() {
@@ -91,12 +116,12 @@ public class OverlayMessageStateTest {
         offer(state, "B", 38, 30000, 1887);
         assertFalse(offer(state, "B", 100, 40000, 2000));
         assertEquals(1, state.pendingCount());
-        assertEquals(6000, state.nextChangeAtMs(2000));
-        state.textAt(6000);
-        assertFalse(offer(state, "A", 25, 30000, 6100));
+        assertEquals(9000, state.nextChangeAtMs(2000));
+        state.textAt(9000);
+        assertFalse(offer(state, "A", 25, 30000, 9100));
         state.setStatus("断线", true);
-        assertEquals("", state.textAt(6200));
-        assertFalse(offer(state, "B", 38, 30000, 6200));
+        assertEquals("", state.textAt(9200));
+        assertFalse(offer(state, "B", 38, 30000, 9200));
     }
 
     @Test public void boundedQueueReportsOverflowAndPreservesUrgentAdmission() {
@@ -147,9 +172,9 @@ public class OverlayMessageStateTest {
 
     @Test public void normalizedLocalDuplicateDoesNotRefreshOrBypassProtection() {
         OverlayMessageState state = started();
-        state.update(DisplayText.labeled("运营", "**新建议**"), 0, 1000, 6000);
-        assertFalse(state.update(DisplayText.labeled("运营", "# 新建议"), 0, 1200, 6000));
-        assertEquals(7000, state.expiresAtMs());
-        assertEquals("", state.textAt(7000));
+        state.update(DisplayText.labeled("运营", "**新建议**"), 0, 1000, 12000);
+        assertFalse(state.update(DisplayText.labeled("运营", "# 新建议"), 0, 1200, 12000));
+        assertEquals(13000, state.expiresAtMs());
+        assertEquals("", state.textAt(13000));
     }
 }

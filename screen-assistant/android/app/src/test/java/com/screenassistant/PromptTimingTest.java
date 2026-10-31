@@ -77,15 +77,15 @@ public class PromptTimingTest {
         long deadline = timing.deadline(expiry(4000));
         assertEquals(3999, deadline);
         OverlayMessageState state = new OverlayMessageState(); state.start();
-        assertFalse(state.update("late", "迟到", 25, deadline, 4000, 6000));
+        assertFalse(state.update("late", "迟到", 25, deadline, 4000, 12000));
         assertEquals("", state.textAt(4000));
     }
 
-    @Test public void shortSourceLifeCannotBeExtendedToThreeOrFiveSeconds() throws Exception {
+    @Test public void shortSourceLifeCannotBeExtendedToEightSeconds() throws Exception {
         PromptTiming timing = PromptTiming.from(page(1000, 0, 1_000_000_000L, 1_000_000_000L));
         OverlayMessageState state = new OverlayMessageState(); state.start();
         long deadline = timing.deadline(expiry(3000));
-        assertTrue(state.update("short", "短源寿命", 25, deadline, 1000, 6000));
+        assertTrue(state.update("short", "短源寿命", 25, deadline, 1000, 12000));
         assertEquals(2999, state.expiresAtMs());
         assertEquals(2999, state.protectedUntilMs());
         assertEquals("", state.textAt(2999));
@@ -94,10 +94,10 @@ public class PromptTimingTest {
     @Test public void continuousTimeIncludingSleepExpiresCurrentAndQueuedItems() throws Exception {
         PromptTiming timing = PromptTiming.from(page(1000, 0, 1_000_000_000L, 1_000_000_000L));
         OverlayMessageState state = new OverlayMessageState(); state.start();
-        state.update("A", "当前", 25, timing.deadline(expiry(16000)), 1000, 6000);
-        state.update("B", "排队", 38, timing.deadline(expiry(7000)), 1887, 6000);
+        state.update("A", "当前", 25, timing.deadline(expiry(16000)), 1000, 12000);
+        state.update("B", "排队", 38, timing.deadline(expiry(7000)), 1887, 12000);
         // 代表休眠后连续时钟推进，而Handler的uptime尚未补足延时。
-        assertEquals("", state.textAt(10000));
+        assertEquals("", state.textAt(14000));
         assertEquals(1, state.expiredCount());
         assertEquals(0, state.pendingCount());
     }
@@ -106,11 +106,11 @@ public class PromptTimingTest {
         OverlayMessageState state = new OverlayMessageState(); state.start();
         PromptTiming first = PromptTiming.from(page(1000, 0, 0, 10_000_000_000L));
         long early = first.deadline(expiry(16000));
-        assertTrue(state.update("A", "同一条", 25, early, first.receivedMs, 6000));
+        assertTrue(state.update("A", "同一条", 25, early, first.receivedMs, 12000));
         assertEquals("", state.textAt(early));
         PromptTiming reread = PromptTiming.from(page(6000, 0, 15_000_000_000L, 15_000_000_000L));
-        assertFalse(state.update("A", "同一条", 25, reread.deadline(expiry(16000)), 15000, 6000));
-        assertTrue(state.update("B", "新的ID", 25, reread.deadline(expiry(16000)), 15000, 6000));
+        assertFalse(state.update("A", "同一条", 25, reread.deadline(expiry(16000)), 15000, 12000));
+        assertTrue(state.update("B", "新的ID", 25, reread.deadline(expiry(16000)), 15000, 12000));
     }
 
     @Test public void localDeadlineOverflowIsRejected() throws Exception {

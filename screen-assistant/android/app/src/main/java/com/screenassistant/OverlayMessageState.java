@@ -7,7 +7,7 @@ import java.util.LinkedHashMap;
 /** 主线程内管理本场提示；时间参数均为elapsedRealtime毫秒，不持久化提示正文。 */
 final class OverlayMessageState {
     static final String WAITING_TEXT = "辅助中，等待内容";
-    static final long MIN_READ_MS = 5000;
+    static final long MIN_READ_MS = 8000;
     static final int CAPACITY = 16;
     private static final int SEEN_CAPACITY = 128;
 
@@ -95,7 +95,7 @@ final class OverlayMessageState {
         }
         if (next != null) {
             current = next;
-            // 排队不改源TTL；开始显示时仍受既有6秒显示上限约束。
+            // 排队不改源TTL；开始显示时仍受传入的本机显示上限约束。
             expiresAtMs = Math.min(next.sourceExpiry, nowMs + next.maxVisible);
             protectedUntilMs = Math.min(expiresAtMs, nowMs + MIN_READ_MS);
         } else if (current == null) { expiresAtMs = 0; protectedUntilMs = 0; }

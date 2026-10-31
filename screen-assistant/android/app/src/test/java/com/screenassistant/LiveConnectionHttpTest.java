@@ -139,13 +139,40 @@ public class LiveConnectionHttpTest {
                     long now = System.nanoTime() / 1_000_000L;
                     long deadline = prompt.optLong("_client_expires_elapsed_ms");
                     if (deadline > now) state.update(prompt.optString("prompt_id"), prompt.optString("display_text"),
-                            25, deadline, now, 6000);
+                            25, deadline, now, 12000);
                 }
             };
             LiveConnection connection = new LiveConnection(store, remote(fixture.base(), "", ""), display);
             assertTrue(connection.connect()); assertTrue(connection.poll());
             assertTrue("服务端1970年时钟不能令当前本机提示失效", state.isMessageActive(System.nanoTime()/1_000_000L));
             assertEquals("真实接口夹具建议", state.textAt(System.nanoTime()/1_000_000L));
+        }
+    }
+
+    @Test public void realHttpPromptsUseEightSecondProtectionWithoutRenewingSourceDeadline() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            java.util.concurrent.atomic.AtomicLong nanos = new java.util.concurrent.atomic.AtomicLong(1_000_000_000L);
+            OverlayMessageState state = new OverlayMessageState(); state.start();
+            LiveConnectionTest.Display display = new LiveConnectionTest.Display() {
+                @Override public void prompt(org.json.JSONObject prompt) {
+                    super.prompt(prompt);
+                    long now = nanos.get() / 1_000_000L;
+                    state.update(prompt.optString("prompt_id"), prompt.optString("display_text"),
+                            prompt.optInt("priority"), prompt.optLong(PromptTiming.DEADLINE_MS), now, 12000);
+                }
+            };
+            LiveConnection connection = new LiveConnection(new LiveConnectionTest.Memory(),
+                    LiveClient.remote(fixture.base(), "", "", nanos::get), display);
+            assertTrue(connection.connect());
+            fixture.promptsJson = "[" + item("A", "31000") + "]";
+            assertTrue(connection.poll());
+            nanos.set(1_887_000_000L);
+            fixture.promptsJson = "[" + item("C", "31000") + "]";
+            assertTrue(connection.poll());
+            assertEquals("建议A", state.textAt(5999));
+            assertEquals("建议A", state.textAt(8999));
+            assertEquals("建议C", state.textAt(9000));
+            assertEquals(2, display.messages.size());
         }
     }
 

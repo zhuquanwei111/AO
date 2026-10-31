@@ -75,7 +75,7 @@ public class CaptureService extends Service {
 
     private static final int CONNECT_TIMEOUT_MS = 5000;
     private static final int READ_TIMEOUT_MS = 10000;
-    private static final long REPLY_AUTO_HIDE_MS = 6000L;
+    private static final long REPLY_AUTO_HIDE_MS = 12000L;
     private static final String OVERLAY_CONFLICT = "提示框遮挡识别区，请调整区域或提示框";
 
     private MediaProjectionManager mpm;
