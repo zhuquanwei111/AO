@@ -33,6 +33,7 @@ final class LiveConnection {
         void status(String text, boolean discardMessage);
         void session(LiveClient.Session session);
         void prompt(JSONObject prompt);
+        default void promptDropped(String id, String reason) { }
         void ended();
     }
 
@@ -146,7 +147,8 @@ final class LiveConnection {
             if (timing != null) for (int i = 0; i < prompts.length(); i++) {
                 JSONObject prompt = prompts.getJSONObject(i);
                 long deadline = timing.deadline(prompt);
-                if (deadline < 0) { timingProblem = true; continue; }
+                if (deadline < 0) { timingProblem = true; listener.promptDropped(prompt.optString("prompt_id"), "invalid_expiry"); continue; }
+                if (deadline == 0) listener.promptDropped(prompt.optString("prompt_id"), "conservative_deadline_exhausted");
                 if (deadline > 0) {
                     prompt.put(PromptTiming.DEADLINE_MS, deadline).put("_client_rtt_ms", timing.rttMs)
                             .put("_client_processing_ms", timing.processingMs).put("_client_transport_ms", timing.transportMs);

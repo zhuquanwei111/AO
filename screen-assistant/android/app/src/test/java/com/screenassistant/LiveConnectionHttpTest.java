@@ -295,6 +295,21 @@ public class LiveConnectionHttpTest {
         }
     }
 
+    @Test public void expiredHttpPromptReportsIdWithoutDisplay() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.expiryJson = "999";
+            java.util.List<String> drops = new java.util.ArrayList<>();
+            LiveConnectionTest.Display display = new LiveConnectionTest.Display() {
+                @Override public void promptDropped(String id, String reason) { drops.add(id + ":" + reason); }
+            };
+            LiveConnection connection = new LiveConnection(new LiveConnectionTest.Memory(),
+                    remote(fixture.base(), "", ""), display);
+            assertTrue(connection.connect()); assertTrue(connection.poll());
+            assertTrue(display.messages.isEmpty());
+            assertEquals(java.util.Collections.singletonList("fixture:conservative_deadline_exhausted"), drops);
+        }
+    }
+
     static String item(String id, String expiry) {
         return "{\"prompt_id\":\"" + id + "\",\"display_text\":\"建议" + id + "\",\"priority\":"
                 + ("C".equals(id) ? 38 : 25) + (expiry == null ? "" : ",\"expires_at_ms\":" + expiry) + "}";

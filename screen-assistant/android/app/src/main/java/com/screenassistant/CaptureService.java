@@ -116,7 +116,8 @@ public class CaptureService extends Service {
     private int[] screenSize = new int[2];
     private String setupStage = "idle";
     private volatile String teardownReason = "none";
-    private final OverlayMessageState overlayState = new OverlayMessageState();
+    private final OverlayMessageState overlayState = new OverlayMessageState((id, reason) ->
+            logEvent("prompt_outcome", "id=" + safeId(id) + " reason=" + reason));
 
     private View replyOverlayView;
     private TextView replyTextView;
@@ -699,12 +700,17 @@ public class CaptureService extends Service {
                     @Override public void prompt(org.json.JSONObject prompt) {
                         long expires = prompt.optLong(PromptTiming.DEADLINE_MS);
                         String id = prompt.optString("prompt_id");
-                        logEvent("prompt_received", "id=" + safeId(id) + " source_expires=" + prompt.optLong("expires_at_ms")
+                        logEvent("prompt_received", "id=" + safeId(id) + " type=" + DisplayText.promptType(prompt) + " source_expires=" + prompt.optLong("expires_at_ms")
                                 + " deadline_elapsed=" + expires + " rtt=" + prompt.optLong("_client_rtt_ms")
                                 + " processing=" + prompt.optLong("_client_processing_ms")
                                 + " transport=" + prompt.optLong("_client_transport_ms") + " epoch=" + epoch);
                         if (expires > SystemClock.elapsedRealtime() && !id.isEmpty())
                             showMessage(DisplayText.promptLabel(prompt), prompt.optString("display_text"), epoch, expires, id, prompt.optInt("priority"));
+                        else if (!id.isEmpty())
+                            logEvent("prompt_outcome", "id=" + safeId(id) + " reason=source_expired_before_queue");
+                    }
+                    @Override public void promptDropped(String id, String reason) {
+                        logEvent("prompt_outcome", "id=" + safeId(id) + " reason=" + reason);
                     }
                     @Override public void ended() {
                         main.post(() -> {
@@ -761,7 +767,9 @@ public class CaptureService extends Service {
         main.post(() -> {
             if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch || generation != messageGeneration) return;
             long now = SystemClock.elapsedRealtime();
-            if (expiresAt > 0 && expiresAt <= now) return;
+            if (expiresAt > 0 && expiresAt <= now) {
+                logEvent("prompt_outcome", "id=" + safeId(id) + " reason=source_expired_before_queue"); return;
+            }
             boolean accepted = overlayState.update(id, fullText, priority, expiresAt, now, REPLY_AUTO_HIDE_MS);
             logEvent("prompt_processed", "id=" + safeId(id) + " accepted=" + accepted
                     + " pending=" + overlayState.pendingCount() + " expired=" + overlayState.expiredCount()

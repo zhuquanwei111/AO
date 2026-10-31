@@ -3,6 +3,7 @@ package com.screenassistant;
 import java.util.ArrayDeque;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.function.BiConsumer;
 
 /** 主线程内管理本场提示；时间参数均为elapsedRealtime毫秒，不持久化提示正文。 */
 final class OverlayMessageState {
@@ -27,6 +28,10 @@ final class OverlayMessageState {
     private Message current;
     private long expiresAtMs, protectedUntilMs;
     private int expiredCount, overflowCount;
+    private final BiConsumer<String,String> trace;
+
+    OverlayMessageState() { this((id, reason) -> {}); }
+    OverlayMessageState(BiConsumer<String,String> trace) { this.trace = trace; }
 
     void start() { start(WAITING_TEXT); }
     void start(String initialStatus) { clear(); running = true; }
@@ -45,7 +50,7 @@ final class OverlayMessageState {
     boolean update(String id, String value, int priority, long sourceExpiryMs, long nowMs, long maxVisibleMs) {
         if (!running || value == null || value.isEmpty() || maxVisibleMs <= 0) return false;
         advance(nowMs);
-        if (sourceExpiryMs > 0 && sourceExpiryMs <= nowMs) { expiredCount++; return false; }
+        if (sourceExpiryMs > 0 && sourceExpiryMs <= nowMs) { expiredCount++; trace.accept(id, "source_expired_arrival"); return false; }
         // 实时提示以ID幂等；兼容无ID的本地问答仅对当前/待显示文字去重。
         String key = id == null ? "" : id;
         // 保守截止点可能早于源TTL，不能据此遗忘ID并让重投续显；仍受128项容量限制。
@@ -60,17 +65,19 @@ final class OverlayMessageState {
         Message next = new Message(key, value, priority, sourceExpiry, maxVisibleMs);
         if (pending.size() >= CAPACITY) {
             overflowCount++;
-            if (priority < 100) return false;
+            if (priority < 100) { trace.accept(key, "queue_full"); return false; }
             // 与现有iOS有界容器一致：紧急项满载时可淘汰最后一个普通等待项。
             Iterator<Message> reverse = pending.descendingIterator();
             boolean removed = false;
             while (reverse.hasNext()) {
-                if (reverse.next().priority < 100) { reverse.remove(); removed = true; break; }
+                Message candidate = reverse.next();
+                if (candidate.priority < 100) { reverse.remove(); trace.accept(candidate.id, "queue_evicted"); removed = true; break; }
             }
-            if (!removed) return false;
+            if (!removed) { trace.accept(key, "queue_full"); return false; }
         }
         pending.addLast(next);
         advance(nowMs);
+        if (pending.contains(next)) trace.accept(key, "queued");
         return true;
     }
 
@@ -82,9 +89,13 @@ final class OverlayMessageState {
         if (!running) return;
         Iterator<Message> iterator = pending.iterator();
         while (iterator.hasNext()) {
-            if (iterator.next().sourceExpiry <= nowMs) { iterator.remove(); expiredCount++; }
+            Message item = iterator.next();
+            if (item.sourceExpiry <= nowMs) { iterator.remove(); expiredCount++; trace.accept(item.id, "source_expired_queued"); }
         }
-        if (current != null && nowMs >= expiresAtMs) current = null;
+        if (current != null && nowMs >= expiresAtMs) {
+            trace.accept(current.id, nowMs >= current.sourceExpiry ? "source_expired_visible" : "local_limit");
+            current = null;
+        }
         Message urgent = null;
         for (Message item : pending) if (item.priority >= 100) { urgent = item; break; }
         Message next = null;
@@ -105,7 +116,11 @@ final class OverlayMessageState {
 
     void setStatus(String value, boolean discardMessage) {
         // 诊断由App/通知保存；连接、上传、复盘状态不能作为悬浮正文。
-        if (discardMessage) { current = null; pending.clear(); expiresAtMs = 0; protectedUntilMs = 0; }
+        if (discardMessage) {
+            if (current != null) trace.accept(current.id, "connection_discard");
+            for (Message item : pending) trace.accept(item.id, "connection_discard");
+            current = null; pending.clear(); expiresAtMs = 0; protectedUntilMs = 0;
+        }
     }
 
     boolean shouldDisplay(boolean overlayAllowed, boolean assistantVisible) {

@@ -165,6 +165,10 @@ public class MainActivity extends Activity {
     }
 
     private void startCapture(boolean legacyAnswer) {
+        startCapture(legacyAnswer, false);
+    }
+
+    private void startCapture(boolean legacyAnswer, boolean onlineNoticeSeen) {
         transientStatus = "";
         logFlow("assist_start_clicked", "entry=" + (legacyAnswer ? "advanced_legacy" : "primary"));
         if (pendingStart || CaptureService.phase != CaptureService.Phase.IDLE || livePanel.isWorking()) return;
@@ -176,6 +180,17 @@ public class MainActivity extends Activity {
         if (interval < 1 || interval > 3600) { showStartError("连接设置阶段：识别间隔须为 1 至 3600 秒。"); return; }
         if (legacyAnswer && livePanel.hasActiveSession()) {
             showStartError("旧问答兼容入口不可用于正在进行的辅助场次。请先结束该场次。"); return;
+        }
+        if (!legacyAnswer && !onlineNoticeSeen && !Prefs.onlineConfirmed(this)) {
+            new android.app.AlertDialog.Builder(this)
+                    .setMessage("人数框尚未确认。请在连接与识别设置中核对它是否为当前在线人数；未确认时不会把框内数字当作已确认在线人数。")
+                    .setPositiveButton("继续辅助", (dialog, which) -> startCapture(false, true))
+                    .setNegativeButton("去设置核对", (dialog, which) -> {
+                        settingsExpanded = true;
+                        settingsPanel.setVisibility(View.VISIBLE);
+                        btnSettings.setText("收起设置");
+                    }).show();
+            return;
         }
         Prefs.setServerUrl(this, url);
         Prefs.setIntervalSec(this, interval);
