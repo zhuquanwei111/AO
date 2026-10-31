@@ -147,10 +147,15 @@ def test_batch_expiry_and_session_isolation(tmp_path):
         for session in (a, b):
             result = store.add_observation(session["session_id"], session["session_token"], first, now)
             assert result["reason"] == "batch_incomplete"
+        fixture = {**first, "event_id": "fixture-e1", "source": "fixture:ocr_comment"}
+        assert store.add_observation(a["session_id"], a["session_token"], fixture, now)["reason"] == "batch_incomplete"
+        separate = {**first, "event_id": "other-e1", "capture_batch_id": "other"}
+        assert store.add_observation(a["session_id"], a["session_token"], separate, now)["reason"] == "batch_incomplete"
         second = {**first, "event_id": "e2", "line_index": 9}
         ready = store.add_observation(b["session_id"], b["session_token"], second, now + 1000)
         assert ready["_batch_ready"] is True
         assert not store.fusion_windows.get(a["session_id"])
+        assert len(store.comment_batches[a["session_id"]]) == 3
         clock[0] += 10_001
         late = store.add_observation(a["session_id"], a["session_token"], second, clock[0])
         assert late["reason"] == "batch_expired"
