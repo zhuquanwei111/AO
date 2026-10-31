@@ -502,8 +502,12 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private func recordObservationIssue(_ reason: String) {
         guard let defaults = AppGroup.defaults else { return }
         let key = "observation.upload.\(reason)"
-        defaults.set(defaults.integer(forKey: key) + 1, forKey: key)
+        let count = defaults.integer(forKey: key) + 1
+        defaults.set(count, forKey: key)
         defaults.set(reason, forKey: "observation.upload.lastReason")
+        if ["encoding", "overflow", "oversize", "stale", "http_failed", "unconfirmed"].contains(reason) {
+            NSLog("采样上传异常：原因=%@，累计=%d", reason, count)
+        }
     }
 
     private func cancelObservationTransport() {
