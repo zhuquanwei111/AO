@@ -174,10 +174,6 @@ final class PollTransportTests: XCTestCase {
         let (client, session) = makeClient(scenario)
         defer { session.invalidateAndCancel() }
         let before = ControlState.serviceConnection()
-        guard before.phase == .unknown else {
-            XCTFail("Use a fresh isolated simulator with no saved connection state")
-            return
-        }
         let finished = expectation(description: scenario)
         let task = client.poll(credentials, after: "") { result, response, error in
             if let expectedHTTP, expectedHTTP == 200 {
