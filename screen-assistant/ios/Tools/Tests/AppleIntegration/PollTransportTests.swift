@@ -43,9 +43,12 @@ private final class PollFixtureProtocol: URLProtocol {
             timing = "\"server_time_ms\":1000,\"server_processing_ms\":0"
         }
         let promptFields = "\"input_mode\":\"live_observation\",\"start_at_ms\":1,\"end_at_ms\":1,\"phenomenon\":\"x\",\"suggestion\":\"x\",\"display_text\":\"x\",\"observation_count\":1"
-        let prompts = path.hasPrefix("/mixed-timing/")
-            ? "[{\"prompt_id\":\"a\",\(promptFields),\"expires_at_ms\":5000},{\"prompt_id\":\"bad\",\(promptFields),\"expires_at_ms\":9.0},{\"prompt_id\":\"b\",\(promptFields),\"expires_at_ms\":6000}]"
-            : "[]"
+        let prompts: String
+        if path.hasPrefix("/mixed-metadata/") {
+            prompts = "[{\"prompt_id\":\"a\",\(promptFields),\"expires_at_ms\":5000,\"priority\":100},{\"prompt_id\":\"bad\",\(promptFields),\"expires_at_ms\":5000,\"priority\":\"invalid\",\"sources\":false},{\"prompt_id\":\"b\",\(promptFields),\"expires_at_ms\":6000,\"priority\":25}]"
+        } else if path.hasPrefix("/mixed-timing/") {
+            prompts = "[{\"prompt_id\":\"a\",\(promptFields),\"expires_at_ms\":5000},{\"prompt_id\":\"bad\",\(promptFields),\"expires_at_ms\":9.0},{\"prompt_id\":\"b\",\(promptFields),\"expires_at_ms\":6000}]"
+        } else { prompts = "[]" }
         let json = status == 200
             ? "{\"session_id\":\"fixture-session\",\"prompts\":\(prompts),\"stopped\":false,\"next_cursor\":\"next\",\(timing)}"
             : "{\"detail\":\"fixture\"}"
@@ -225,6 +228,22 @@ final class PollTransportTests: XCTestCase {
             XCTAssertEqual(page.serverProcessingMS, 0)
             XCTAssertEqual(page.prompts.map(\.promptID), ["a", "bad", "b"])
             XCTAssertEqual(page.prompts.map(\.expiresAtMS), [5000, nil, 6000])
+            finished.fulfill()
+        }
+        wait(for: [finished], timeout: 5)
+    }
+    func testMixedMetadataDoesNotBlockValidPageOrCursor() {
+        let (client, session) = makeClient("mixed-metadata")
+        defer { session.invalidateAndCancel() }
+        let finished = expectation(description: "mixed prompt metadata")
+        _ = client.poll(credentials, after: "") { result, _, _ in
+            guard case .success(let page) = result else { XCTFail("expected mixed page"); finished.fulfill(); return }
+            XCTAssertEqual(page.nextCursor, "next")
+            XCTAssertEqual(page.prompts.map(\.promptID), ["a", "bad", "b"])
+            XCTAssertEqual(page.prompts.map(\.priority), [100, nil, 25])
+            XCTAssertTrue(page.prompts[1].priorityInvalid)
+            XCTAssertTrue(page.prompts[1].sourcesInvalid)
+            XCTAssertFalse(page.prompts[0].priorityInvalid)
             finished.fulfill()
         }
         wait(for: [finished], timeout: 5)

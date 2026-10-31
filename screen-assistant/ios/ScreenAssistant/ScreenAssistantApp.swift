@@ -56,6 +56,8 @@ final class AppModel: ObservableObject {
     @Published var liveTimingWarning = false
     @Published private(set) var liveTimingAnchorFailures = 0
     @Published private(set) var liveTimingInvalidItems = 0
+    @Published private(set) var livePriorityInvalidItems = 0
+    @Published private(set) var liveSourcesInvalidItems = 0
     @Published var liveSummary: LiveSessionSummary?
     @Published var liveActive = false
     @Published var liveStopped = false
@@ -279,6 +281,8 @@ final class AppModel: ObservableObject {
         liveTimingWarning = false
         liveTimingAnchorFailures = 0
         liveTimingInvalidItems = 0
+        livePriorityInvalidItems = 0
+        liveSourcesInvalidItems = 0
         overviewLoading = false
         summaryRefreshInFlight = false
         overviewRequest.clear()
@@ -399,7 +403,8 @@ final class AppModel: ObservableObject {
                         return LivePromptDelivery.Item(id: prompt.promptID,
                             text: "【\(label)】" + prompt.displayText,
                             expiresAtMS: deadline ?? 0,
-                            priority: prompt.priority ?? 0, timingInvalid: deadline == nil)
+                            priority: prompt.priority ?? 0, timingInvalid: deadline == nil,
+                            priorityInvalid: prompt.priorityInvalid)
                     }
                     let beforeOverflow = self.liveDelivery.overflowCount
                     let beforeExpired = self.liveDelivery.expiredCount
@@ -411,6 +416,8 @@ final class AppModel: ObservableObject {
                     }
                     var acceptedIDs = Set(freshItems.map(\.id))
                     let fresh = page.prompts.filter { acceptedIDs.remove($0.promptID) != nil }
+                    self.livePriorityInvalidItems += fresh.filter(\.priorityInvalid).count
+                    self.liveSourcesInvalidItems += fresh.filter(\.sourcesInvalid).count
                     self.liveEvents.insert(contentsOf: fresh, at: 0)
                     self.liveEvents = Array(self.liveEvents.prefix(100))
                     if !fresh.isEmpty { NSLog("Live prompt delivery: received=%d", fresh.count) }
