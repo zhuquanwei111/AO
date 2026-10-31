@@ -145,9 +145,6 @@ def reconstruct_comments(observations: list[dict[str, Any]], previous: list[dict
                         parts.append(item)
                         used.add(item["event_id"])
                         edge = b
-                    elif b["x"] < start_box["x"] and _gap(b, start_box) <= min(b["width"], start_box["width"]) * 0.5:
-                        parts.insert(0, item)
-                        used.add(item["event_id"])
                 # One nearby left-shifted continuation is only a candidate;
                 # a new header terminates it and an intervening row is ambiguous.
                 below = [i for i in ordered if i["event_id"] not in used and _box(i)
@@ -210,8 +207,9 @@ def reconstruct_comments(observations: list[dict[str, Any]], previous: list[dict
                     break
                 # 另一明确下一行标题是边界；其它邻近片段可能是续行或弹窗。
                 is_next_header = _split(other["content"]["text"]) and other_box["y"] >= box["y"] + box["height"] * 0.7
-                is_left_prefix = _overlap(box, other_box) and other_box["x"] + other_box["width"] <= box["x"]
-                if _near(box, other_box) and not is_next_header and not is_left_prefix:
+                distant_left = (_overlap(box, other_box) and other_box["x"] + other_box["width"] <= box["x"]
+                                and _gap(other_box, box) > min(other_box["width"], box["width"]) * 0.5)
+                if _near(box, other_box) and not is_next_header and not distant_left:
                     reasons.append("nearby_unassigned")
                     break
         comment["usability_reasons"] = reasons

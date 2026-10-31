@@ -35,6 +35,19 @@ def test_complete_batch_can_use_real_badge_body_without_guessing_levels():
     assert comment["fan_level"] is None and comment["consumption_level"] is None
 
 
+def test_unclassified_left_adjacent_fragment_is_not_swallowed_or_usable():
+    rows = [row("a", "续文", (.10, .30, .10, .04)),
+            row("b", "阿青：你好", (.21, .30, .30, .04), index=1)]
+    comments = reconstruct_comments(rows, batch_complete=True, quality_gaps=[])
+    comment = next(c for c in comments if c["text"] == "你好")
+    fragment = next(c for c in comments if c["source_event_ids"] == ["a"])
+    assert fragment["boundary_status"] == "ambiguous"
+    assert "a" not in comment["source_event_ids"]
+    assert comment["field_sources"]["text"] == ["b"]
+    assert comment["field_status"]["text"] != "usable"
+    assert "nearby_unassigned" in comment["usability_reasons"]
+
+
 def test_clear_question_requires_explicit_complete_batch_and_quality_review():
     rows = [row("a", "阿青：今天几点开播？", (.1, .3, .45, .04))]
     eligible = reconstruct_comments(rows, batch_complete=True, quality_gaps=[])[0]
