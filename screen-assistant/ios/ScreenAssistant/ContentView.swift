@@ -50,6 +50,16 @@ struct ContentView: View {
                     Text(model.liveStatus)
                         .font(.footnote)
                         .foregroundColor(.secondary)
+                    if model.liveTimingWarning {
+                        Text("部分提示缺少可靠时效信息，未在画中画显示；实时采集仍可继续。时间锚异常 \(model.liveTimingAnchorFailures) 次，单条时效异常 \(model.liveTimingInvalidItems) 条。")
+                            .font(.footnote)
+                            .foregroundColor(.orange)
+                    }
+                    if model.livePriorityInvalidItems > 0 || model.liveSourcesInvalidItems > 0 || model.liveEntryInvalidItems > 0 {
+                        Text("部分提示字段异常：必需字段异常 \(model.liveEntryInvalidItems) 次；优先级异常 \(model.livePriorityInvalidItems) 条，仅保留记录；来源异常 \(model.liveSourcesInvalidItems) 条，无法解读的来源保持未知。")
+                            .font(.footnote)
+                            .foregroundColor(.orange)
+                    }
                     Label(model.serviceStatusText, systemImage: "network")
                         .font(.footnote)
                         .foregroundColor(model.serviceStatusText.contains("未收到") ||
@@ -483,6 +493,10 @@ private struct LiveSessionOverviewView: View {
                             .foregroundColor(.secondary)
                             Text(event.phenomenon).font(.subheadline)
                             Text(event.suggestion).font(.body)
+                            if event.priorityInvalid {
+                                Text("优先级异常，无法用于画中画调度")
+                                    .font(.footnote).foregroundColor(.orange)
+                            }
                         }
                         .padding(.vertical, 4)
                     }
@@ -509,7 +523,7 @@ private struct LiveSessionOverviewView: View {
     private func backstageSection(_ recap: LiveBackstageRecap) -> some View {
         Section(header: Text("后台五项汇总"),
                 footer: Text("按App结束信号读取的主播后台页面快照，不代表平台最终结算；近似原文按原精度展示。")) {
-            row("任务状态", statusText(recap.status))
+            row("任务状态", statusText(recap))
             row("抖音号快照", recap.douyinAccount)
             if let roomID = recap.roomID, !roomID.isEmpty { row("场次线索", roomID) }
             if let metrics = recap.metrics {
@@ -543,16 +557,27 @@ private struct LiveSessionOverviewView: View {
         }
     }
 
-    private func statusText(_ status: String) -> String {
-        switch status {
-        case "waiting_for_stop": return "等待结束信号"
-        case "capturing": return "处理中"
-        case "not_connected": return "执行器未连接／待处理"
-        case "captured_locally": return "已取得五项"
+    private func statusText(_ recap: LiveBackstageRecap) -> String {
+        switch recap.status {
+        case "waiting_for_stop":
+            if recap.claimedAtMS != nil { return "取数任务已领取，等待本场结果" }
+            return "任务已登记，取数状态待确认"
+        case "capturing": return "取数任务已领取，等待本场结果"
+        case "not_connected": return "后台当前未连接，暂无本场复盘；后续状态以服务端回报为准。此状态不代表实时辅助已停用。"
+        case "captured_locally":
+            guard let metrics = recap.metrics,
+                  metrics.cumulativeAudience != nil,
+                  metrics.newFollowers != nil,
+                  metrics.commentCount != nil,
+                  metrics.giftGivers != nil,
+                  metrics.soundEnergy != nil else {
+                return "复盘读数待确认"
+            }
+            return "已取得五项"
         case "partial": return "部分缺失"
         case "needs_input": return "需要处理"
         case "failed": return "失败"
-        default: return status
+        default: return "任务状态待确认"
         }
     }
 
@@ -616,6 +641,10 @@ private struct LiveEventListView: View {
                 .foregroundColor(.secondary)
                 Text(event.phenomenon).font(.subheadline)
                 Text(event.suggestion).font(.body)
+                if event.priorityInvalid {
+                    Text("优先级异常，无法用于画中画调度")
+                        .font(.footnote).foregroundColor(.orange)
+                }
             }
             .padding(.vertical, 4)
         }

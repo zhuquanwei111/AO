@@ -13,10 +13,10 @@ import os
 /// 隐私与生命周期约束：
 ///   - 原始 sample/pixel buffer 不出采集回调；OCR仅保留自有ROI图像。
 ///     输入测试可保留一张自有小图做单在途检测；所有图像仅内存处理，不落盘。
-///   - 不持久化句子/回复；每轮的句子与回复只活到本轮结束。
-///   - 一轮 = 帧→OCR→请求→响应，全程 roundActive；期间到达的帧直接跳过
+///   - 不持久化句子/回复；运营观察只在有限的内存发送缓冲中暂留。
+///   - 运营一轮 = 帧→OCR→入队；旧问答仍等待响应。忙时到达的帧直接跳过
 ///     （PRD：“下一轮忙则跳过以免堆积”）。
-///   - 空识别 / 网络失败 / 422 / 503 / 504：本轮静默丢弃，下一轮继续。
+///   - 运营上传拒入及失败只记录计数与原因；下一轮继续。
 ///   - 204：不刷新当前 PiP 展示。
 final class SampleHandler: RPBroadcastSampleHandler {
 
@@ -27,7 +27,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     /// 下一轮可开始的最早时刻（CFAbsoluteTime）。仅在 stateQueue 内读写。
     /// 忙时跳过新帧，不保留 sampleBuffer 队列；扩展峰值内存尚未真机测量。
     private var nextRoundEligibleTime: CFAbsoluteTime = 0
-    /// 一轮是否正在进行（帧→OCR→请求→响应 全链路）。
+    /// 一轮是否正在进行（运营到入队为止；旧问答到响应为止）。
     private var roundActive = false
     /// 暂停、继续、结束广播时使旧 OCR 与 HTTP 回调失效。
     private var roundGeneration = 0
@@ -35,6 +35,14 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var activeCaptureGeneration = 0
     private var activeRequest: URLSessionDataTask?
     private var activeOCR: OCRService.CancellationToken?
+    private var observationBuffer = ObservationUploadBuffer()
+    private var observationTask: URLSessionDataTask?
+    private let observationSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.waitsForConnectivity = false
+        config.timeoutIntervalForRequest = 35
+        return URLSession(configuration: config)
+    }()
     private let personObservationQueue = DispatchQueue(label: "com.screenassistant.person-observation-http")
     private let personObservationSession: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
@@ -133,7 +141,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
         stateQueue.sync {
             let wantsCapture = ControlState.userWantsCapture()
             let configuredGeneration = ControlState.captureGeneration()
-            if roundActive && (!wantsCapture || activeCaptureGeneration != configuredGeneration) {
+            if (roundActive || observationTask != nil || !observationBuffer.pending.isEmpty) &&
+                (!wantsCapture || activeCaptureGeneration != configuredGeneration) {
                 roundGeneration &+= 1
                 roundActive = false
                 cancelActiveWork()
@@ -158,23 +167,24 @@ final class SampleHandler: RPBroadcastSampleHandler {
         var regionROIs: [String: CGRect] = ["comment": observationROI]
         var regions: [OCRService.RegionInput] = [
             OCRService.RegionInput(identifier: "comment",
-                                   image: autoreleasepool(invoking: { makeOCRImage(from: sampleBuffer, roi: observationROI) })
+                                   image: autoreleasepool(invoking: { makeOCRImage(from: sampleBuffer, roi: observationROI) }))
         ]
         if LiveSessionState.isEnabled() {
             if let roi = SharedConfig.onlineCountROI() {
                 regionROIs["online_count"] = roi
                 regions.append(OCRService.RegionInput(identifier: "online_count",
-                                                       image: autoreleasepool(invoking: { makeOCRImage(from: sampleBuffer, roi: roi) })
+                                                       image: autoreleasepool(invoking: { makeOCRImage(from: sampleBuffer, roi: roi) })))
             }
             if let roi = SharedConfig.platformNoticeROI() {
                 regionROIs["platform_notice"] = roi
                 regions.append(OCRService.RegionInput(identifier: "platform_notice",
-                                                       image: autoreleasepool(invoking: { makeOCRImage(from: sampleBuffer, roi: roi) })
+                                                       image: autoreleasepool(invoking: { makeOCRImage(from: sampleBuffer, roi: roi) })))
             }
         }
         guard regions.contains(where: { $0.image != nil }) else { endRound(generation: generation); return }
         logMemory(stage: "roi-rendered")
         let sampleObservedAtMS = Int64(Date().timeIntervalSince1970 * 1000)
+        let sampledCredentials = LiveSessionState.isEnabled() ? LiveSessionState.credentials() : nil
 
         // 同一个有界OCR任务串行识别评论、可选人数和提醒裁剪图。
         guard let ocr = OCRService.recognize(regions: regions, completion: { [weak self] results in
@@ -187,7 +197,9 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
             // 运营会话使用独立收件契约；旧 OCR 问答不得抢先进入 PiP。
             if LiveSessionState.isEnabled() {
-                guard let liveClient = SharedConfig.serverBaseURL().flatMap({ LiveOperationsClient(baseURL: $0) }) else {
+                guard let credentials = sampledCredentials,
+                      let baseURL = SharedConfig.serverBaseURL(),
+                      baseURL.scheme == "http" || baseURL.scheme == "https" else {
                     self.endRound(generation: generation)
                     return
                 }
@@ -209,27 +221,18 @@ final class SampleHandler: RPBroadcastSampleHandler {
                     typedPayloads.append(Self.onlineCountPayload(lines: lines, roi: countROI,
                                                                  observedAtMS: sampleObservedAtMS))
                 }
-                let finish = { [weak self] in self?.endRound(generation: generation) }
-                let sendQuestion = { [weak self] in
-                    guard let self, self.isCurrentRound(generation, captureGeneration: captureGeneration),
-                          let (question, position) = questionPayload else { finish(); return }
-                    let task = liveClient.submitObservation(question, textPosition: position,
-                                                            observedAtMS: sampleObservedAtMS) { finish() }
-                    self.installActiveRequest(task, generation: generation,
-                                              captureGeneration: captureGeneration)
-                    if task == nil { finish() }
+                var payloads = typedPayloads.map { ($0, false) }
+                if let (question, position) = questionPayload {
+                    payloads.append(([
+                        "event_id": UUID().uuidString.lowercased(), "input_mode": "live_observation",
+                        "source": "ios_replaykit_ocr", "coverage": "ocr_visible_sample",
+                        "reliability": "known", "text": String(question.prefix(500)),
+                        "text_position": position, "observed_at_ms": sampleObservedAtMS
+                    ], true))
                 }
-                guard !typedPayloads.isEmpty else { sendQuestion(); return }
-                liveClient.submitObservations(typedPayloads,
-                    shouldContinue: { [weak self] in
-                        guard let self else { return false }
-                        return self.isCurrentRound(generation, captureGeneration: captureGeneration)
-                    },
-                    onTask: { [weak self] task in
-                        self?.installActiveRequest(task, generation: generation,
-                                                   captureGeneration: captureGeneration)
-                    },
-                    completion: sendQuestion)
+                self.enqueueObservations(payloads, credentials: credentials, baseURL: baseURL,
+                                         generation: generation, captureGeneration: captureGeneration)
+                self.endRound(generation: generation)
                 return
             }
 
@@ -404,14 +407,114 @@ final class SampleHandler: RPBroadcastSampleHandler {
         return LiveCommentFilter.screenPosition(bounds, within: roi)
     }
 
-    private func installActiveRequest(_ request: URLSessionDataTask?, generation: Int,
-                                      captureGeneration: Int) {
-        stateQueue.sync {
-            if roundActive && !isBroadcastPaused && roundGeneration == generation &&
-                activeCaptureGeneration == captureGeneration {
-                activeRequest = request
-            } else { request?.cancel() }
+    /// 仅在 stateQueue 操作缓冲；请求正文和凭据不写入诊断。
+    private func enqueueObservations(_ payloads: [([String: Any], Bool)],
+                                     credentials: LiveSessionCredentials, baseURL: URL,
+                                     generation: Int, captureGeneration: Int) {
+        for (payload, isComment) in payloads {
+            guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
+                stateQueue.sync {
+                    if observationContextValid(generation: generation, captureGeneration: captureGeneration,
+                                               sessionID: credentials.sessionID, token: credentials.token) {
+                        recordObservationIssue("encoding")
+                    }
+                }
+                continue
+            }
+            stateQueue.sync {
+                guard observationContextValid(generation: generation, captureGeneration: captureGeneration,
+                                              sessionID: credentials.sessionID, token: credentials.token) else { return }
+                if let active = observationBuffer.active,
+                   (active.sessionID != credentials.sessionID || active.token != credentials.token ||
+                    active.generation != captureGeneration) {
+                    cancelObservationTransport()
+                }
+                let item = ObservationUploadBuffer.Item(id: UUID(), body: data, generation: captureGeneration,
+                    sessionID: credentials.sessionID, token: credentials.token, baseURL: baseURL,
+                    isComment: isComment)
+                switch observationBuffer.append(item) {
+                case .accepted: startNextObservation()
+                case .overflow: recordObservationIssue("overflow")
+                case .oversize: recordObservationIssue("oversize")
+                }
+            }
         }
+    }
+
+    private func observationContextValid(generation: Int, captureGeneration: Int,
+                                         sessionID: String, token: String) -> Bool {
+        guard !isBroadcastPaused, roundGeneration == generation,
+              ControlState.userWantsCapture(), ControlState.captureGeneration() == captureGeneration,
+              LiveSessionState.isEnabled(), let current = LiveSessionState.credentials() else { return false }
+        return current.sessionID == sessionID && current.token == token
+    }
+
+    /// 必须在 stateQueue；仅一项在途。失败不重试，不把 200 当作生成提示。
+    private func startNextObservation() {
+        guard observationTask == nil, let item = observationBuffer.begin() else { return }
+        let generation = roundGeneration
+        guard observationContextValid(generation: generation, captureGeneration: item.generation,
+                                      sessionID: item.sessionID, token: item.token) else {
+            observationBuffer.clear()
+            recordObservationIssue("stale")
+            return
+        }
+        let endpoint = ["v1", "live", "sessions", item.sessionID,
+                        item.isComment ? "comments" : "observations"].reduce(item.baseURL) {
+            $0.appendingPathComponent($1, isDirectory: false)
+        }
+        var request = URLRequest(url: endpoint, timeoutInterval: 20)
+        request.httpMethod = "POST"
+        request.setValue(item.token, forHTTPHeaderField: "X-Live-Session-Token")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = item.body
+        let task = observationSession.dataTask(with: request) { [weak self] data, response, error in
+            guard let self else { return }
+            self.stateQueue.async {
+                guard self.observationBuffer.active?.id == item.id else { return }
+                guard self.observationContextValid(generation: generation, captureGeneration: item.generation,
+                                                   sessionID: item.sessionID, token: item.token) else {
+                    self.cancelObservationTransport()
+                    return
+                }
+                _ = self.observationBuffer.complete(item.id)
+                self.observationTask = nil
+                ControlState.recordServiceResponse(error: error, response: response)
+                switch ObservationUploadBuffer.classify(data: data,
+                    statusCode: (response as? HTTPURLResponse)?.statusCode, hasError: error != nil) {
+                case .received:
+                    self.recordObservationIssue("received")
+                case .analysisBusy:
+                    self.recordObservationIssue("received")
+                    self.recordObservationIssue("analysis_busy")
+                case .failed:
+                    self.recordObservationIssue("http_failed")
+                case .other:
+                    self.recordObservationIssue("unconfirmed")
+                }
+                self.startNextObservation()
+            }
+        }
+        observationTask = task
+        task.resume()
+    }
+
+    private func recordObservationIssue(_ reason: String) {
+        guard let defaults = AppGroup.defaults else { return }
+        let key = "observation.upload.\(reason)"
+        let count = defaults.integer(forKey: key) + 1
+        defaults.set(count, forKey: key)
+        defaults.set(reason, forKey: "observation.upload.lastReason")
+        if ["encoding", "overflow", "oversize", "stale", "http_failed", "unconfirmed"].contains(reason) {
+            NSLog("采样上传异常：原因=%@，累计=%d", reason, count)
+        }
+    }
+
+    private func cancelObservationTransport() {
+        if observationTask != nil || !observationBuffer.pending.isEmpty { recordObservationIssue("stale") }
+        observationTask?.cancel()
+        observationTask = nil
+        observationBuffer.clear()
     }
 
     /// 结束一轮：清 roundActive 并按配置间隔排定下一轮可开始时刻。
@@ -477,6 +580,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         activeOCR = nil
         activeRequest?.cancel()
         activeRequest = nil
+        cancelObservationTransport()
         logMemory(stage: "work-cancelled")
     }
 
