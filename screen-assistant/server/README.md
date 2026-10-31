@@ -52,6 +52,8 @@ agent/RAG/历史上下文/个性化；不持久化句子或回复日志。
 
 `/observations` 的 `comment` 与 `online_count` 可在顶层提供 `capture_batch_id`（1–128 字符）；`comment` 还可提供 `line_index`（0–65535 的整数，必须同时提供批次）。批次对应实际采集轮，行号是 OCR 输出顺序，不代表已拆分的语义评论。两项缺省兼容旧客户端；重试沿用相同 `event_id` 及完整请求。只有服务端实际部署支持此契约后，客户端才能发送新字段；旧服务会拒绝这些字段。
 
+创建场次的 `capabilities` 指示已支持的可选能力：`observation_batch_metadata` 为真时可以在新采集轮使用批次字段；`typed_prompts` 为假时不要依赖提示类型。服务端缺少能力对象或相应字段时视为不支持。带采集批次的评论仍按事件 ID 和完整请求做幂等校验，不套用旧 iOS 文本与位置的消息去重；无批次的旧请求继续原规则。
+
 音频响应含 `transcripts` 时，`fusion_schedule` 标记本次融合触发为 `scheduled` 或 `analysis_busy`；该字段不表示提示已生成，也不概括后台音频作业的其他触发。没有返回转写时不提供该字段。
 
 后台音频转写保存后若融合触发因容量或关闭门禁未安排，场次 `/summary` 的 `audio_fusion.background_analysis_busy_count` 持久累计这类后台触发次数，初始为 0。计数不含转写正文、不自动重试，也不表示某条提示的最终状态。

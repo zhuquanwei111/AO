@@ -153,6 +153,7 @@ class LiveStore:
             "session_id": sid, "session_token": token, "started_at_ms": now,
             "douyin_account": douyin_account, "backstage_task_id": None,
             "backstage_status": "not_started" if douyin_account else "not_configured",
+            "capabilities": {"observation_batch_metadata": True, "typed_prompts": False},
         }
 
     def _stored_app_source(self, sid: str, session) -> str:
@@ -329,7 +330,7 @@ class LiveStore:
             else:
                 parsed = count_details["nominal_value"]
         message_hash = None
-        if usable and body["kind"] == "comment":
+        if usable and body["kind"] == "comment" and not body.get("capture_batch_id"):
             content = body["content"]
             stable_id = content.get("platform_message_id")
             if stable_id:
