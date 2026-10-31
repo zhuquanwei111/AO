@@ -90,6 +90,44 @@ def test_comment_reply_candidate_uses_bounded_scheduler_and_prompt_dto(tmp_path,
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("outcome", ["quiet", "timeout", "invalid"])
+def test_comment_reply_without_valid_model_result_writes_no_prompt(tmp_path, monkeypatch, outcome):
+    import screen_assistant_server.live as live
+    from screen_assistant_server.model_client import ModelUnavailableError
+    monkeypatch.setattr(live, "FUSION_SETTLE_MS", 0)
+    now = 1_790_000_000_000
+    async def run():
+        cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="fake",
+                       tianyi_base_url="http://model.invalid", tianyi_model="fake",
+                       dedup_ttl_seconds=60, max_sentence_chars=2000,
+                       model_timeout_seconds=0.1, model_connect_timeout_seconds=0.1,
+                       live_db_path=str(tmp_path / f"reply-{outcome}.sqlite3"))
+        app = create_app(cfg, live_clock=lambda: now)
+        class Model:
+            async def reply_to_comment(self, *args, **kwargs):
+                if outcome == "timeout":
+                    await asyncio.Event().wait()
+                if outcome == "invalid":
+                    raise ModelUnavailableError("model_output_invalid")
+                return None
+            async def aclose(self):
+                pass
+        async with app.router.lifespan_context(app):
+            app.state.model = Model()
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                session = (await client.post("/v1/live/sessions", json={})).json()
+                sid, token = session["session_id"], session["session_token"]
+                candidate = {"model_text": "你好", "suggestion": None, "prompt_type": "comment_reply",
+                             "reply_to": {"comment_id": "c1", "nickname": None, "text": "你好"}}
+                app.state.live.store.fusion_candidate = lambda *_: candidate
+                assert app.state.live.schedule_fusion(sid, token, type("Request", (), {"app": app})())
+                await asyncio.wait_for(app.state.live.fusion_active[sid], 2)
+                response = await client.get(f"/v1/live/sessions/{sid}/prompts",
+                                            headers={"X-Live-Session-Token": token})
+                assert response.json()["prompts"] == []
+    asyncio.run(run())
+
+
 def test_observation_returns_while_model_is_blocked(tmp_path):
     async def run():
         cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="fake",
