@@ -171,7 +171,8 @@ public class MainActivity extends Activity {
     private void startCapture(boolean legacyAnswer, boolean onlineNoticeSeen) {
         transientStatus = "";
         logFlow("assist_start_clicked", "entry=" + (legacyAnswer ? "advanced_legacy" : "primary"));
-        if (pendingStart || CaptureService.phase != CaptureService.Phase.IDLE || livePanel.isWorking()) return;
+        if (pendingStart || CaptureService.phase != CaptureService.Phase.IDLE
+                || CaptureService.stopInProgress || livePanel.isWorking()) return;
         String url = etUrl.getText().toString().trim();
         int interval;
         try { interval = Integer.parseInt(etInterval.getText().toString().trim()); }
@@ -327,7 +328,7 @@ public class MainActivity extends Activity {
         CaptureService.Phase phase = CaptureService.phase;
         if (phase == CaptureService.Phase.IDLE) {
             btnMain.setText(livePanel != null && livePanel.hasActiveSession() ? "继续辅助" : "开始辅助");
-            btnMain.setEnabled(!pendingStart && (livePanel == null || !livePanel.isWorking()));
+            btnMain.setEnabled(!pendingStart && !CaptureService.stopInProgress && (livePanel == null || !livePanel.isWorking()));
         }
     }
 
