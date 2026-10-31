@@ -117,7 +117,7 @@ public class MainActivity extends Activity {
                 status = "辅助已暂停。屏幕授权仍保留，可从高级功能继续或结束。";
                 break;
             case STOPPING:
-                status = "正在结束屏幕辅助…";
+                status = CaptureService.stopInProgress ? "本机采集已停止，正在确认场次结束。" : "正在结束屏幕辅助…";
                 break;
             case STARTING:
                 status = "正在启动本地屏幕采集…";
