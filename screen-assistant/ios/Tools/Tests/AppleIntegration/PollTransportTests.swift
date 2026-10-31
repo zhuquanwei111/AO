@@ -155,6 +155,17 @@ final class PollTransportTests: XCTestCase {
             session.invalidateAndCancel()
         }
     }
+    func testPollCredentialsRejectReplacedToken() {
+        XCTAssertTrue(PollCallbackGate.matchesCredentials(sessionID: "fixture-session", token: "old",
+            currentSessionID: "fixture-session", currentToken: "old",
+            savedSessionID: "fixture-session", savedToken: "old"))
+        XCTAssertFalse(PollCallbackGate.matchesCredentials(sessionID: "fixture-session", token: "old",
+            currentSessionID: "fixture-session", currentToken: "new",
+            savedSessionID: "fixture-session", savedToken: "old"))
+        XCTAssertFalse(PollCallbackGate.matchesCredentials(sessionID: "fixture-session", token: "old",
+            currentSessionID: "fixture-session", currentToken: "old",
+            savedSessionID: "fixture-session", savedToken: "new"))
+    }
     func testMalformedTimingDoesNotFailPoll() { check("invalid-timing", expectedHTTP: 200) }
     func testFloatingTimingDoesNotFailPoll() { check("float-timing", expectedHTTP: 200) }
     func testMalformedPromptExpiryPreservesHistoryRecord() throws {
