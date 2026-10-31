@@ -185,6 +185,7 @@ def test_comment_reply_uses_one_model_call_and_untrusted_structured_input():
             await client.aclose()
         assert reply == "谢谢你的祝福，也祝你今天开心。"
         assert len(requests) == 1 and "response_format" not in requests[0]
+        assert requests[0]["max_tokens"] == 512
         assert "不可信" in requests[0]["messages"][0]["content"]
         assert json.loads(requests[0]["messages"][1]["content"]) == {
             "text": "bless you", "nickname": None,
@@ -267,7 +268,6 @@ def test_comment_reply_valid_results(content, finish):
     ('{"respond":true,"reply":"' + "一" * 81 + '"}', "stop"),
     ('{"respond":true,"reply":"建议主播先确认今晚的安排。"}', "stop"),
     ('{"respond":true,"reply":"可以回一句：今晚玩鹅鸭杀。"}', "stop"),
-    ('{"respond":true,"reply":"你好"}', "length"),
 ])
 def test_comment_reply_rejects_invalid_model_result(content, finish):
     async def run():
@@ -277,6 +277,19 @@ def test_comment_reply_rejects_invalid_model_result(content, finish):
             with pytest.raises(ModelUnavailableError) as error:
                 await client.reply_to_comment("hello", nickname=None)
             assert error.value.error_code == "model_output_invalid"
+        finally:
+            await client.aclose()
+    asyncio.run(run())
+
+
+def test_comment_reply_truncated_result_is_recoverable_without_returning_text():
+    async def run():
+        client = make_client(lambda _: httpx.Response(200, json={"choices": [
+            {"message": {"content": '{"respond":true,"reply":"残缺'}, "finish_reason": "length"}]}))
+        try:
+            with pytest.raises(ModelUnavailableError) as error:
+                await client.reply_to_comment("hello", nickname=None)
+            assert error.value.error_code == "model_output_truncated"
         finally:
             await client.aclose()
     asyncio.run(run())

@@ -279,7 +279,7 @@ class TianyiChatClient:
                 )},
             ],
             "temperature": 0.2,
-            "max_tokens": 128,
+            "max_tokens": MAX_OUTPUT_TOKENS,
             "reasoning_effort": REASONING_EFFORT,
             "stream": False,
         }
@@ -293,6 +293,8 @@ class TianyiChatClient:
             raise ModelUnavailableError(_provider_error_code(resp), upstream_status=resp.status_code)
         try:
             choice = resp.json()["choices"][0]
+            if choice.get("finish_reason") == "length":
+                raise ModelUnavailableError("model_output_truncated", finish_reason="length")
             content = choice["message"]["content"]
             if choice.get("finish_reason") != "stop" or not isinstance(content, str) or len(content) > 512:
                 raise ValueError("invalid response")

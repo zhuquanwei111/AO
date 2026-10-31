@@ -750,7 +750,7 @@ def test_reply_cooldown_is_scoped_and_failure_does_not_create_cooldown(tmp_path)
         assert sum(text == "你想聊什么？" and name == "阿青" for text, name in calls) == 2
 
 
-@pytest.mark.parametrize("mode", ["unavailable", "timeout", "missing_key"])
+@pytest.mark.parametrize("mode", ["unavailable", "timeout", "missing_key", "truncated"])
 def test_transient_model_failure_keeps_batch_candidates_for_next_observation(tmp_path, mode):
     from dataclasses import replace
     from screen_assistant_server.model_client import ModelUnavailableError
@@ -767,7 +767,7 @@ def test_transient_model_failure_keeps_batch_candidates_for_next_observation(tmp
             if not self.available:
                 if mode == "timeout":
                     await asyncio.Event().wait()
-                raise ModelUnavailableError("controlled")
+                raise ModelUnavailableError("model_output_truncated" if mode == "truncated" else "controlled")
             return "我们可以聊聊这个话题。"
         async def aclose(self):
             pass
@@ -811,7 +811,8 @@ def test_transient_model_failure_keeps_batch_candidates_for_next_observation(tmp
         assert len([event for event in events if event.get("prompt_type") == "comment_reply"]) == 3
 
 
-@pytest.mark.parametrize("mode", ["exhausted", "quiet", "invalid", "expired", "stopped"])
+@pytest.mark.parametrize("mode", ["exhausted", "quiet", "invalid", "expired", "stopped",
+                                  "truncated_exhausted", "truncated_expired", "truncated_stopped"])
 def test_comment_attempt_terminal_and_lifetime_boundaries(tmp_path, mode):
     from screen_assistant_server.model_client import ModelUnavailableError
     clock = [1_790_000_000_000]
@@ -825,7 +826,8 @@ def test_comment_attempt_terminal_and_lifetime_boundaries(tmp_path, mode):
             calls.append(text)
             if mode == "quiet":
                 return None
-            raise ModelUnavailableError("model_output_invalid" if mode == "invalid" else "controlled")
+            raise ModelUnavailableError("model_output_invalid" if mode == "invalid" else
+                                        "model_output_truncated" if mode.startswith("truncated_") else "controlled")
         async def aclose(self):
             pass
     app = create_app(cfg, live_clock=lambda: clock[0])
@@ -849,9 +851,9 @@ def test_comment_attempt_terminal_and_lifetime_boundaries(tmp_path, mode):
         assert send("first", "阿青：你想聊什么？").status_code == 200
         client.portal.call(wait_idle)
         assert calls == ["你想聊什么？"]
-        if mode == "expired":
+        if mode in {"expired", "truncated_expired"}:
             clock[0] += 20_001
-        if mode == "stopped":
+        if mode in {"stopped", "truncated_stopped"}:
             assert client.post(url + "/stop", headers=headers).status_code == 200
             assert send("after-stop", "小乙：嗯").status_code == 409
         else:
@@ -859,6 +861,6 @@ def test_comment_attempt_terminal_and_lifetime_boundaries(tmp_path, mode):
             client.portal.call(wait_idle)
             assert send("third", "小丙：嗯").status_code == 200
             client.portal.call(wait_idle)
-        assert len(calls) == (2 if mode == "exhausted" else 1)
+        assert len(calls) == (2 if mode in {"exhausted", "truncated_exhausted"} else 1)
         events = client.get(url + "/events", headers=headers).json()["events"]
         assert not any(event.get("prompt_type") == "comment_reply" for event in events)
