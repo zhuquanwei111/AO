@@ -100,6 +100,9 @@ def reconstruct_comments(observations: list[dict[str, Any]], previous: list[dict
     Callers isolate sessions, enforce capture completeness and decide expiry.
     No platform identifiers, credentials, or persistent state are inferred.
     """
+    batch_keys = {(item.get("source", ""), item.get("capture_batch_id")) for item in observations}
+    gap_ids = {gap["event_id"] for gap in quality_gaps or ()}
+    observations = [item for item in observations if item["event_id"] not in gap_ids]
     batches: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for item in observations:
         batch = item.get("capture_batch_id")
@@ -173,9 +176,12 @@ def reconstruct_comments(observations: list[dict[str, Any]], previous: list[dict
 
     # 可消费只表示本轮已观察到的局部结构满足窄规则，不代表平台真值。
     lookup = {item["event_id"]: item for item in observations}
-    batch_keys = {(item.get("source", ""), item.get("capture_batch_id")) for item in observations}
     for comment in result:
         reasons = []
+        assigned_elsewhere = {event_id for other_comment in result
+                              if other_comment is not comment and other_comment["header_evidence"]
+                              and other_comment["text"] and other_comment["source"] == comment["source"]
+                              for event_id in other_comment["source_event_ids"]}
         sources = comment["field_sources"]["text"]
         item = lookup.get(sources[0]) if len(sources) == 1 else None
         box = _box(item) if item else None
@@ -205,11 +211,13 @@ def reconstruct_comments(observations: list[dict[str, Any]], previous: list[dict
                 if not other_box:
                     reasons.append("unlocated_observation")
                     break
-                # 另一明确下一行标题是边界；其它邻近片段可能是续行或弹窗。
-                is_next_header = _split(other["content"]["text"]) and other_box["y"] >= box["y"] + box["height"] * 0.7
+                # 上下另一条有评论头的已归属片段是边界；独立未知片段不豁免。
+                is_other_comment = (other["event_id"] in assigned_elsewhere and
+                                    (other_box["y"] >= box["y"] + box["height"] * 0.7 or
+                                     box["y"] >= other_box["y"] + other_box["height"] * 0.7))
                 distant_left = (_overlap(box, other_box) and other_box["x"] + other_box["width"] <= box["x"]
                                 and _gap(other_box, box) > min(other_box["width"], box["width"]) * 0.5)
-                if _near(box, other_box) and not is_next_header and not distant_left:
+                if _near(box, other_box) and not is_other_comment and not distant_left:
                     reasons.append("nearby_unassigned")
                     break
         comment["usability_reasons"] = reasons

@@ -4,7 +4,7 @@
 
 2026-10-31 补充：拟由集成调用方提供的 `capture_comment_count` 用于传输完整性门控，并非语义评论数量。**PR12 的基线和本模块没有实现该传输字段、能力协商或服务端门控**；相关实现由独立集成 PR 负责，其合并和部署状态需另行确认。模块不自行判定批次是否收齐；生产调用方应先按协议确认收到全部合法项，再调用本模块。`partial` 和 `ambiguous` 只描述语义边界，不能证明传输完成；旧 DTO 缺批次时仍仅作单条处理。
 
-本模块不以 OCR confidence 推断语义角色。调用方须先把已收到的不可靠项计入传输收齐，然后显式提供 `batch_complete=True` 和 `quality_gaps`：每个不能供重建的项传 `{event_id, text_position}`，位置未知为 null；经检查无缺口传空列表。缺口文字不能用于重建；位置未知阻止整批升级，邻近缺口阻止相应评论升级。默认 `batch_complete=False, quality_gaps=None` 不升级；缺 batch、多个 batch 或来源混合也不升级。调用方仍负责会话隔离、质量检查和真实时效，本参数只是调用方断言，模块不能验证传输收齐。旧 DTO 不可伪称新批次完整。
+本模块不以 OCR confidence 推断语义角色。调用方须先把已收到的不可靠项计入传输收齐，然后显式提供 `batch_complete=True` 和 `quality_gaps`：每个不能供重建的项传 `{event_id, text_position}`，位置未知为 null；经检查无缺口传空列表。`observations` 应只包含可用于重建的项；若质量缺口事件误同时传入，模块按事件 ID 剔除，不使用其文字，仍按缺口位置阻止升级。位置未知阻止整批升级，邻近缺口阻止相应评论升级。默认 `batch_complete=False, quality_gaps=None` 不升级；缺 batch、多个 batch 或来源混合也不升级。调用方仍负责会话隔离、质量检查和真实时效，本参数只是调用方断言，模块不能验证传输收齐。旧 DTO 不可伪称新批次完整。
 
 输出字典包括临时 `comment_id`、`source`、`nickname`、`text`、`consumption_level`、`fan_level`、`fan_group`、每字段 `field_status`/`field_sources`、`source_event_ids`、真实 `first_observed_at_ms`/`last_seen_at_ms`、`boundary_status`、`tracking_status`、归一化 `position`、`usability_reasons` 和未经分类的 `header_evidence`。临时 ID 由首项来源、事件 ID 和观察时间确定，同输入重复调用结果一致；调用方仍须按会话隔离，不得当跨会话全局身份。`field_status` 对五个业务字段使用 `usable/candidate/unknown`：`usable` 仅可按下述局部规则使用，`candidate` 是未确认候选，`unknown` 对应 null。`field_sources` 同五键，值为真实输入 event_id 数组。`boundary_status` 为 `locally_complete/partial/ambiguous`；只有正文同时为 `usable` 和 `locally_complete` 才可按调用方业务规则消费，昵称仅在自身为 `usable` 时使用。`header_evidence` 不得用作身份；它可能含昵称等原始文字，不应写入常规日志或默认发给模型。两个等级和团名保持未知，不由前导数字或人工真值补猜。
 
@@ -14,7 +14,7 @@
 
 `fragments` 保存本轮用于序列比较的 OCR 文本及框，可能包含个人信息，应与 `header_evidence` 一样按原始观察处理，不写入普通日志或默认发给模型。
 
-同排依据垂直重叠和水平方向的局部距离；左侧未分类片段不并入评论，保留独立观察，紧邻正文框时阻止正文升级；不能仅凭位置断定片段为徽章。短续行仅形成部分候选，不覆盖任意跨行。Paddle [BoxSorter 固定源码](https://github.com/PaddlePaddle/PaddleOCR/blob/77ddbafccdee5020368c16c6960e6ff51e40b971/deploy/ppocr-android/ppocr-sdk/src/main/java/com/paddle/ocr/postprocess/BoxSorter.kt)提供阅读顺序启发，Python [difflib](https://docs.python.org/3/library/difflib.html)提供序列相似比较；这两者不提供角色解析或确定的屏幕消息身份。本模块不重新实现 OCR，不使用图标颜色、字符级框或未提供的平台 ID。
+同排依据垂直重叠和水平方向的局部距离；左侧未分类片段不并入评论，保留独立观察，紧邻正文框时阻止正文升级；不能仅凭位置断定片段为徽章。上下有独立评论头且正文非空的其他评论及其已归属片段视为边界，不因行间距小而单独阻止升级；未归属片段不因被单独输出而自动获得此豁免。短续行仅形成部分候选，不覆盖任意跨行。Paddle [BoxSorter 固定源码](https://github.com/PaddlePaddle/PaddleOCR/blob/77ddbafccdee5020368c16c6960e6ff51e40b971/deploy/ppocr-android/ppocr-sdk/src/main/java/com/paddle/ocr/postprocess/BoxSorter.kt)提供阅读顺序启发，Python [difflib](https://docs.python.org/3/library/difflib.html)提供序列相似比较；这两者不提供角色解析或确定的屏幕消息身份。本模块不重新实现 OCR，不使用图标颜色、字符级框或未提供的平台 ID。
 
 当前几何参数是仅经所列样例校准的工程值，不是用户业务阈值：同排至少覆盖较短框高的 45%，相邻横向间隔不超过两框较窄宽度的一半；续行最多四字符、纵向间隔不超过起始框高的一半且不能与另一个明确起始同排。跨帧仅比较10秒内相似度至少0.95的唯一候选，要求横向偏移≤0.05及共同上移偏差≤0.03（均为归一化屏幕坐标）。这些条件既可能漏掉真实续行/连续消息，也不能排除误并；应继续用实场样例验证而非视为通用真值。
 
