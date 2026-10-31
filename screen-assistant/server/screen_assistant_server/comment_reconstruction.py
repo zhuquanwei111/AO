@@ -159,7 +159,7 @@ def reconstruct_comments(observations: list[dict[str, Any]], previous: list[dict
                     shares_next_start = any(other is not start and _box(other) and _overlap(b, _box(other))
                                             for other in starts)
                     continuation = item["content"]["text"].strip()
-                    if (_split(continuation) is None and not shares_next_start
+                    if (continuation and _split(continuation) is None and not shares_next_start
                             and len(continuation) <= 4 and not continuation[0].isdigit()
                             and 0 <= gap <= start_box["height"] * 0.5
                             and b["x"] <= start_box["x"] + start_box["width"] * 0.2):
