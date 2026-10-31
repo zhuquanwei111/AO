@@ -160,6 +160,9 @@ public final class LiveClient {
             }
             long sentNs = continuousNanos == null ? 0 : continuousNanos.getAsLong();
             int status = c.getResponseCode();
+            // 停止仅以200确认；已受理或无内容响应仍保留原场待确认状态。
+            if ("POST".equals(method) && path.endsWith("/stop") && status != HttpURLConnection.HTTP_OK)
+                throw new HttpError(status);
             if (status < 200 || status >= 300) throw new HttpError(status);
             if (status == 204) return new JSONObject();
             try (InputStream in = c.getInputStream(); ByteArrayOutputStream out = new ByteArrayOutputStream()) {

@@ -34,6 +34,7 @@ public class LiveConnectionHttpTest {
         volatile int createHttp = 201, createDelayMs;
         volatile String summaryStatus="failed";
         volatile int summaryHttp=200;
+        volatile int stopHttp=200;
         volatile boolean summaryStopped;
         volatile String clockFields = ",\"server_time_ms\":1000,\"server_processing_ms\":0";
         volatile String expiryJson = "16000";
@@ -111,7 +112,7 @@ public class LiveConnectionHttpTest {
                 respond(e, 200, "{}");
             } else if (path.endsWith("/stop")) {
                 stops.incrementAndGet();
-                respond(e, 200, "{\"session_id\":\"one\",\"stopped_at_ms\":20}");
+                respond(e, stopHttp, "{\"session_id\":\"one\",\"stopped_at_ms\":20}");
             } else respond(e, 404, "{}");
         }
         void respond(Socket e, int status, String value) throws IOException {
@@ -510,6 +511,32 @@ public class LiveConnectionHttpTest {
             assertTrue(fixture.requests.stream().anyMatch(r -> r.contains("after=cursor-one&wait_ms=15000 private-token")));
             connection.close(true); connection.finishStop();
             assertEquals(1, fixture.stops.get()); assertTrue(store.session.stopped); assertFalse(store.stopping);
+        }
+    }
+
+    @Test public void stopRequiresHttp200AndRetriesOnlyOriginalSession() throws Exception {
+        for (int status : new int[]{202, 204}) {
+            try (Fixture fixture = new Fixture()) {
+                LiveConnectionTest.Memory store = new LiveConnectionTest.Memory();
+                LiveConnection connection = new LiveConnection(store, remote(fixture.base(), "", ""),
+                        new LiveConnectionTest.Display());
+                assertTrue(connection.connect());
+                LiveClient.Session original = store.session;
+                connection.close(true);
+                fixture.stopHttp = status;
+                try { connection.finishStop(); fail("非200不能确认结束"); }
+                catch (LiveClient.HttpError expected) { assertEquals(status, expected.status); }
+                assertSame(original, store.session);
+                assertFalse(store.session.stopped); assertTrue(store.stopping);
+                fixture.stopHttp = 200;
+                connection.finishStop();
+                assertTrue(store.session.stopped); assertFalse(store.stopping);
+                assertEquals(original.id, store.session.id);
+                assertEquals(original.token, store.session.token);
+                assertEquals(1, fixture.creates.get()); assertEquals(2, fixture.stops.get());
+                assertEquals(2, fixture.requests.stream().filter(
+                        r -> r.equals("POST /v1/live/sessions/one/stop private-token")).count());
+            }
         }
     }
 
