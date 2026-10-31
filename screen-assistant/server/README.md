@@ -50,6 +50,8 @@ agent/RAG/历史上下文/个性化；不持久化句子或回复日志。
 
 `/prompts` 的成功响应顶层含 `server_time_ms` 和 `server_processing_ms`：前者是与 `expires_at_ms` 同源的服务时钟毫秒；后者是从路由处理入口到长轮询结束后的单调耗时，整数毫秒向下取整。响应设置 `Cache-Control: no-store`。客户端使用本次请求完整往返的单调耗时（毫秒向上取整）减去服务处理时长，并从 `expires_at_ms - server_time_ms` 扣除该差值及 1 毫秒取整余量，再按单调时间扣除后续排队和显示时间。字段缺失、非法或处理时长大于往返时间时不得据此延长提示有效期；旧服务缺少这些字段。该计算依赖响应未被缓存和服务时钟未异常跳变，不是任意网络条件下的绝对保证。
 
+`/observations` 的 `comment` 与 `online_count` 可在顶层提供 `capture_batch_id`（1–128 字符）；`comment` 还可提供 `line_index`（0–65535 的整数，必须同时提供批次）。批次对应实际采集轮，行号是 OCR 输出顺序，不代表已拆分的语义评论。两项缺省兼容旧客户端；重试沿用相同 `event_id` 及完整请求。只有服务端实际部署支持此契约后，客户端才能发送新字段；旧服务会拒绝这些字段。
+
 音频响应含 `transcripts` 时，`fusion_schedule` 标记本次融合触发为 `scheduled` 或 `analysis_busy`；该字段不表示提示已生成，也不概括后台音频作业的其他触发。没有返回转写时不提供该字段。
 
 后台音频转写保存后若融合触发因容量或关闭门禁未安排，场次 `/summary` 的 `audio_fusion.background_analysis_busy_count` 持久累计这类后台触发次数，初始为 0。计数不含转写正文、不自动重试，也不表示某条提示的最终状态。
