@@ -167,3 +167,64 @@ def test_live_suggestion_discards_long_or_truncated_output():
                 await client.aclose()
 
     asyncio.run(run())
+
+
+def test_comment_reply_uses_one_model_call_and_untrusted_structured_input():
+    requests = []
+
+    async def run():
+        def handler(request):
+            requests.append(json.loads(request.content))
+            return httpx.Response(200, json={"choices": [{"message": {"content":
+                '{"respond":true,"reply":"谢谢你的祝福，也祝你今天开心。"}'},
+                "finish_reason": "stop"}]})
+        client = make_client(handler)
+        try:
+            reply = await client.reply_to_comment("bless you", nickname=None)
+        finally:
+            await client.aclose()
+        assert reply == "谢谢你的祝福，也祝你今天开心。"
+        assert len(requests) == 1 and "response_format" not in requests[0]
+        assert "不可信" in requests[0]["messages"][0]["content"]
+        assert json.loads(requests[0]["messages"][1]["content"]) == {
+            "text": "bless you", "nickname": None,
+        }
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("content,finish", [
+    ('{"respond":false,"reply":null}', "stop"),
+    ('{"respond":true,"reply":"你好"}', "stop"),
+])
+def test_comment_reply_valid_results(content, finish):
+    async def run():
+        client = make_client(lambda _: httpx.Response(200, json={"choices": [
+            {"message": {"content": content}, "finish_reason": finish}]}))
+        try:
+            return await client.reply_to_comment("hello", nickname="小明")
+        finally:
+            await client.aclose()
+    result = asyncio.run(run())
+    assert result == (None if 'false' in content else "你好")
+
+
+@pytest.mark.parametrize("content,finish", [
+    ("not-json", "stop"), ('{"respond":1,"reply":"你好"}', "stop"),
+    ('{"respond":true,"reply":null}', "stop"),
+    ('{"respond":false,"reply":"你好"}', "stop"),
+    ('{"respond":true,"reply":"你好","extra":1}', "stop"),
+    ('{"respond":true,"respond":false,"reply":null}', "stop"),
+    ('{"respond":true,"reply":"' + "一" * 81 + '"}', "stop"),
+    ('{"respond":true,"reply":"你好"}', "length"),
+])
+def test_comment_reply_rejects_invalid_model_result(content, finish):
+    async def run():
+        client = make_client(lambda _: httpx.Response(200, json={"choices": [
+            {"message": {"content": content}, "finish_reason": finish}]}))
+        try:
+            with pytest.raises(ModelUnavailableError) as error:
+                await client.reply_to_comment("hello", nickname=None)
+            assert error.value.error_code == "model_output_invalid"
+        finally:
+            await client.aclose()
+    asyncio.run(run())
