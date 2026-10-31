@@ -33,7 +33,10 @@ private final class PollFixtureProtocol: URLProtocol {
             client?.urlProtocol(self, didFailWithError: URLError(.cannotConnectToHost))
             return
         }
-        let status = path.hasPrefix("/http-error/") ? 503 : (path.hasPrefix("/immediate-unauthorized/") ? 401 : 200)
+        let status = path.hasPrefix("/http-error/") ? 503
+            : (path.hasPrefix("/immediate-unauthorized/") ? 401
+                : (path.hasPrefix("/immediate-forbidden/") ? 403
+                    : (path.hasPrefix("/immediate-missing/") ? 404 : 200)))
         let response = HTTPURLResponse(url: request.url!, statusCode: status,
                                        httpVersion: "HTTP/1.1", headerFields: nil)!
         let timing: String
@@ -136,19 +139,21 @@ final class PollTransportTests: XCTestCase {
         }
     }
     func testImmediatePollRejectsUnauthorizedResponse() {
-        let (client, session) = makeClient("immediate-unauthorized")
-        defer { session.invalidateAndCancel() }
-        let before = ControlState.serviceConnection()
-        let finished = expectation(description: "immediate unauthorized")
-        _ = client.poll(credentials, after: "", waitMS: 0) { result, _, _ in
-            guard case .failure(let error) = result else {
-                XCTFail("expected unauthorized failure"); finished.fulfill(); return
+        for (scenario, expectedStatus) in [("immediate-unauthorized", 401), ("immediate-forbidden", 403), ("immediate-missing", 404)] {
+            let (client, session) = makeClient(scenario)
+            let before = ControlState.serviceConnection()
+            let finished = expectation(description: scenario)
+            _ = client.poll(credentials, after: "", waitMS: 0) { result, _, _ in
+                guard case .failure(let error) = result else {
+                    XCTFail("expected HTTP failure"); finished.fulfill(); return
+                }
+                XCTAssertEqual((error as? LiveOperationsHTTPError)?.statusCode, expectedStatus)
+                XCTAssertEqual(ControlState.serviceConnection(), before)
+                finished.fulfill()
             }
-            XCTAssertEqual((error as? LiveOperationsHTTPError)?.statusCode, 401)
-            XCTAssertEqual(ControlState.serviceConnection(), before)
-            finished.fulfill()
+            wait(for: [finished], timeout: 5)
+            session.invalidateAndCancel()
         }
-        wait(for: [finished], timeout: 5)
     }
     func testMalformedTimingDoesNotFailPoll() { check("invalid-timing", expectedHTTP: 200) }
     func testFloatingTimingDoesNotFailPoll() { check("float-timing", expectedHTTP: 200) }
