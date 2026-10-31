@@ -23,6 +23,19 @@ enum LiveCommentFilter {
     }
 }
 
+struct LiveCapabilities: Codable {
+    let observationBatchMetadata: Bool?
+    let typedPrompts: Bool?
+    enum CodingKeys: String, CodingKey {
+        case observationBatchMetadata = "observation_batch_metadata", typedPrompts = "typed_prompts"
+    }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        observationBatchMetadata = try? values.decode(Bool.self, forKey: .observationBatchMetadata)
+        typedPrompts = try? values.decode(Bool.self, forKey: .typedPrompts)
+    }
+}
+
 struct LiveSessionCredentials: Codable {
     let sessionID: String
     let token: String
@@ -34,6 +47,7 @@ struct LiveSessionCredentials: Codable {
     var backstageStartPending: Bool?
     var liveConnectionPending: Bool?
     var stopPending: Bool? = nil
+    var capabilities: LiveCapabilities? = nil
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id", token = "session_token", startedAtMS = "started_at_ms"
         case douyinAccount = "douyin_account"
@@ -41,6 +55,29 @@ struct LiveSessionCredentials: Codable {
         case backstageStartPending = "backstage_start_pending"
         case liveConnectionPending = "live_connection_pending"
         case stopPending = "stop_pending"
+        case capabilities
+    }
+    init(sessionID: String, token: String, startedAtMS: Int64, douyinAccount: String?,
+         backstageTaskID: String?, backstageStatus: String?, backstageStartPending: Bool?,
+         liveConnectionPending: Bool?, stopPending: Bool? = nil, capabilities: LiveCapabilities? = nil) {
+        self.sessionID = sessionID; self.token = token; self.startedAtMS = startedAtMS
+        self.douyinAccount = douyinAccount; self.backstageTaskID = backstageTaskID
+        self.backstageStatus = backstageStatus; self.backstageStartPending = backstageStartPending
+        self.liveConnectionPending = liveConnectionPending; self.stopPending = stopPending
+        self.capabilities = capabilities
+    }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try values.decode(String.self, forKey: .sessionID)
+        token = try values.decode(String.self, forKey: .token)
+        startedAtMS = try values.decode(Int64.self, forKey: .startedAtMS)
+        douyinAccount = try values.decodeIfPresent(String.self, forKey: .douyinAccount)
+        backstageTaskID = try values.decodeIfPresent(String.self, forKey: .backstageTaskID)
+        backstageStatus = try values.decodeIfPresent(String.self, forKey: .backstageStatus)
+        backstageStartPending = try values.decodeIfPresent(Bool.self, forKey: .backstageStartPending)
+        liveConnectionPending = try values.decodeIfPresent(Bool.self, forKey: .liveConnectionPending)
+        stopPending = try values.decodeIfPresent(Bool.self, forKey: .stopPending)
+        capabilities = try? values.decode(LiveCapabilities.self, forKey: .capabilities)
     }
 }
 
