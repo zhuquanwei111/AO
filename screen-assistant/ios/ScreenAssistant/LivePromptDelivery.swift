@@ -22,11 +22,11 @@ struct LivePromptDelivery {
         let id: String
         let text: String
         let expiresAtMS: Int64
-        let priority: Int
+        let priority: Int?
         let timingInvalid: Bool
         let priorityInvalid: Bool
 
-        init(id: String, text: String, expiresAtMS: Int64, priority: Int,
+        init(id: String, text: String, expiresAtMS: Int64, priority: Int?,
              timingInvalid: Bool = false, priorityInvalid: Bool = false) {
             self.id = id
             self.text = text
@@ -60,13 +60,13 @@ struct LivePromptDelivery {
         expire(nowMS: nowMS)
         for item in items where seen.insert(item.id).inserted {
             fresh.append(item)
-            if item.timingInvalid || item.priorityInvalid { continue }
+            if item.timingInvalid || item.priorityInvalid || item.priority == nil { continue }
             if item.expiresAtMS <= nowMS {
                 expiredCount += 1
             } else if pending.count >= capacity {
                 overflowCount += 1
-                if item.priority >= 100,
-                   let index = pending.lastIndex(where: { $0.priority < 100 }) {
+                if let priority = item.priority, priority >= 100,
+                   let index = pending.lastIndex(where: { ($0.priority ?? Int.min) < 100 }) {
                     pending.remove(at: index)
                     pending.append(item)
                 }
@@ -80,20 +80,20 @@ struct LivePromptDelivery {
     mutating func take(nowMS: Int64, fits: ([Item]) -> Bool) -> [Item] {
         expire(nowMS: nowMS)
         guard !pending.isEmpty else { return [] }
-        let urgent = pending.firstIndex(where: { $0.priority >= 100 })
+        let urgent = pending.firstIndex(where: { ($0.priority ?? Int.min) >= 100 })
         if urgent == nil, let until = urgentUntilMS, nowMS < until { return [] }
         if urgent == nil, let last = lastOrdinaryFrameMS, nowMS - last < intervalMS { return [] }
         if let index = urgent, index != 0 { pending.insert(pending.remove(at: index), at: 0) }
         var frame: [Item] = []
         while let first = pending.first {
-            if let initial = frame.first, initial.priority >= 100 && first.priority < 100 { break }
+            if let initial = frame.first, (initial.priority ?? Int.min) >= 100 && (first.priority ?? Int.min) < 100 { break }
             let candidate = frame + [first]
             if !frame.isEmpty && !fits(candidate) { break }
             frame.append(pending.removeFirst())
             if !fits(frame) { break } // 单条超长由 renderer 明确省略
         }
         if !frame.isEmpty { lastOrdinaryFrameMS = nowMS }
-        if let until = frame.filter({ $0.priority >= 100 }).map(\.expiresAtMS).min() {
+        if let until = frame.filter({ ($0.priority ?? Int.min) >= 100 }).map(\.expiresAtMS).min() {
             urgentUntilMS = min(until, nowMS + intervalMS)
         }
         return frame

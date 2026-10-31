@@ -79,9 +79,9 @@ struct LivePrompt: Codable, Identifiable {
     let displayText: String
     let observationCount: Int
     var expiresAtMS: Int64?
-    let priority: Int?
+    var priority: Int?
     let sources: [LivePromptSource]?
-    let priorityInvalid: Bool
+    var priorityInvalid: Bool
     let sourcesInvalid: Bool
     var id: String { promptID }
     enum CodingKeys: String, CodingKey {
@@ -103,9 +103,24 @@ struct LivePrompt: Codable, Identifiable {
         observationCount = try values.decode(Int.self, forKey: .observationCount)
         expiresAtMS = try? values.decode(Int64.self, forKey: .expiresAtMS)
         priority = try? values.decode(Int.self, forKey: .priority)
-        sources = try? values.decode([LivePromptSource].self, forKey: .sources)
-        priorityInvalid = values.contains(.priority) && ((try? values.decodeNil(forKey: .priority)) == false) && priority == nil
-        sourcesInvalid = values.contains(.sources) && ((try? values.decodeNil(forKey: .sources)) == false) && sources == nil
+        priorityInvalid = priority == nil
+        if !values.contains(.sources) || (try? values.decodeNil(forKey: .sources)) == true {
+            sources = nil
+            sourcesInvalid = false
+        } else if var entries = try? values.nestedUnkeyedContainer(forKey: .sources) {
+            var valid: [LivePromptSource] = []
+            var invalid = false
+            while !entries.isAtEnd {
+                let decoder = try entries.superDecoder()
+                if let source = try? LivePromptSource(from: decoder) { valid.append(source) }
+                else { invalid = true }
+            }
+            sources = valid
+            sourcesInvalid = invalid
+        } else {
+            sources = nil
+            sourcesInvalid = true
+        }
     }
 }
 
@@ -113,9 +128,35 @@ struct LivePromptSource: Codable {
     let kind: String?
 }
 
+/// 只隔离无法解码的单条提示，保留有效项在原始页面中的位置。
+private struct LivePromptItems: Decodable {
+    let items: [LivePrompt]
+    let indices: [Int]
+    let invalidCount: Int
+    init(from decoder: Decoder) throws {
+        var entries = try decoder.unkeyedContainer()
+        var valid: [LivePrompt] = []
+        var positions: [Int] = []
+        var invalid = 0
+        while !entries.isAtEnd {
+            let index = entries.currentIndex
+            let itemDecoder = try entries.superDecoder()
+            if let item = try? LivePrompt(from: itemDecoder) {
+                valid.append(item)
+                positions.append(index)
+            } else { invalid += 1 }
+        }
+        items = valid
+        indices = positions
+        invalidCount = invalid
+    }
+}
+
 struct LivePromptPage: Decodable {
     let sessionID: String
     var prompts: [LivePrompt]
+    let rawPromptIndices: [Int]
+    let invalidEntryCount: Int
     let stopped: Bool
     let nextCursor: String
     var serverTimeMS: Int64?
@@ -129,7 +170,10 @@ struct LivePromptPage: Decodable {
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         sessionID = try values.decode(String.self, forKey: .sessionID)
-        prompts = try values.decode([LivePrompt].self, forKey: .prompts)
+        let decoded = try values.decode(LivePromptItems.self, forKey: .prompts)
+        prompts = decoded.items
+        rawPromptIndices = decoded.indices
+        invalidEntryCount = decoded.invalidCount
         stopped = try values.decode(Bool.self, forKey: .stopped)
         nextCursor = try values.decode(String.self, forKey: .nextCursor)
         serverTimeMS = try? values.decode(Int64.self, forKey: .serverTimeMS)
@@ -144,9 +188,23 @@ struct LiveEventPage: Decodable {
     var events: [LivePrompt]
     let nextCursor: String
     let hasMore: Bool
+    let rawEventIndices: [Int]
+    var invalidEntryCount: Int
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id", startedAtMS = "started_at_ms"
         case stoppedAtMS = "stopped_at_ms", events, nextCursor = "next_cursor", hasMore = "has_more"
+    }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try values.decode(String.self, forKey: .sessionID)
+        startedAtMS = try values.decode(Int64.self, forKey: .startedAtMS)
+        stoppedAtMS = try values.decodeIfPresent(Int64.self, forKey: .stoppedAtMS)
+        let decoded = try values.decode(LivePromptItems.self, forKey: .events)
+        events = decoded.items
+        rawEventIndices = decoded.indices
+        invalidEntryCount = decoded.invalidCount
+        nextCursor = try values.decode(String.self, forKey: .nextCursor)
+        hasMore = try values.decode(Bool.self, forKey: .hasMore)
     }
 }
 
@@ -348,15 +406,22 @@ struct LiveOperationsClient {
                     completion(.failure(NSError(domain: "LiveOperations", code: -3)), response, error)
                     return
                 }
-                if let timing = PromptTimingJSON.inspect(data), timing.expiries.count == page.prompts.count {
+                if let timing = PromptTimingJSON.inspect(data),
+                   page.rawPromptIndices.allSatisfy({ $0 < timing.expiries.count && $0 < timing.priorities.count }) {
                     page.serverTimeMS = timing.serverTimeMS
                     page.serverProcessingMS = timing.processingMS
                     for index in page.prompts.indices {
-                        page.prompts[index].expiresAtMS = timing.expiries[index]
+                        page.prompts[index].expiresAtMS = timing.expiries[page.rawPromptIndices[index]]
                     }
+                    Self.applyStrictPriorities(&page.prompts, rawIndices: page.rawPromptIndices,
+                                               priorities: timing.priorities)
                 } else {
                     page.serverTimeMS = nil
                     page.serverProcessingMS = nil
+                    for index in page.prompts.indices {
+                        page.prompts[index].priority = nil
+                        page.prompts[index].priorityInvalid = true
+                    }
                 }
                 page.requestStartNS = requestStartNS
                 page.responseEndNS = responseEndNS
@@ -370,7 +435,8 @@ struct LiveOperationsClient {
     func events(_ credentials: LiveSessionCredentials,
                 onResponse: @escaping (URLResponse?, Error?) -> Void,
                 completion: @escaping (Result<LiveEventPage, Error>) -> Void) {
-        loadEvents(credentials, after: "", accumulated: [], onResponse: onResponse, completion: completion)
+        loadEvents(credentials, after: "", accumulated: [], invalidCount: 0,
+                   onResponse: onResponse, completion: completion)
     }
 
     func summary(_ credentials: LiveSessionCredentials,
@@ -386,7 +452,7 @@ struct LiveOperationsClient {
     }
 
     private func loadEvents(_ credentials: LiveSessionCredentials, after: String,
-                            accumulated: [LivePrompt],
+                            accumulated: [LivePrompt], invalidCount: Int,
                             onResponse: @escaping (URLResponse?, Error?) -> Void,
                             completion: @escaping (Result<LiveEventPage, Error>) -> Void) {
         var components = URLComponents(url: endpoint("v1", "live", "sessions", credentials.sessionID, "events"), resolvingAgainstBaseURL: false)!
@@ -397,18 +463,37 @@ struct LiveOperationsClient {
             switch Self.decode(LiveEventPage.self, data: data, response: response, error: error,
                                recordResponse: false) {
             case .failure(let error): completion(.failure(error))
-            case .success(let page):
+            case .success(var page):
+                let timing = PromptTimingJSON.inspect(data, collectionKey: "events")
+                Self.applyStrictPriorities(&page.events, rawIndices: page.rawEventIndices,
+                                           priorities: timing?.priorities ?? [])
                 let all = accumulated + page.events
                 if page.hasMore {
                     self.loadEvents(credentials, after: page.nextCursor, accumulated: all,
+                                    invalidCount: invalidCount + page.invalidEntryCount,
                                     onResponse: onResponse, completion: completion)
                 } else {
                     var completePage = page
                     completePage.events = all
+                    completePage.invalidEntryCount += invalidCount
                     completion(.success(completePage))
                 }
             }
         }.resume()
+    }
+
+    private static func applyStrictPriorities(_ prompts: inout [LivePrompt], rawIndices: [Int],
+                                              priorities: [Int64?]) {
+        for index in prompts.indices {
+            guard index < rawIndices.count, rawIndices[index] < priorities.count,
+                  let raw = priorities[rawIndices[index]], let priority = Int(exactly: raw) else {
+                prompts[index].priority = nil
+                prompts[index].priorityInvalid = true
+                continue
+            }
+            prompts[index].priority = priority
+            prompts[index].priorityInvalid = false
+        }
     }
 
     func submitObservation(_ text: String, textPosition: [String: Double], observedAtMS: Int64,

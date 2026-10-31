@@ -15,14 +15,16 @@ enum PromptTimingJSON {
         let serverTimeMS: Int64?
         let processingMS: Int64?
         let expiries: [Int64?]
+        let priorities: [Int64?]
     }
 
-    static func inspect(_ data: Data?) -> Inspection? {
+    static func inspect(_ data: Data?, collectionKey: String = "prompts") -> Inspection? {
         guard let data,
               let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let prompts = root["prompts"] as? [[String: Any]] else { return nil }
+              let prompts = root[collectionKey] as? [Any] else { return nil }
         return Inspection(serverTimeMS: integer(root["server_time_ms"]),
                           processingMS: integer(root["server_processing_ms"]),
-                          expiries: prompts.map { integer($0["expires_at_ms"]) })
+                          expiries: prompts.map { integer(($0 as? [String: Any])?["expires_at_ms"]) },
+                          priorities: prompts.map { integer(($0 as? [String: Any])?["priority"]) })
     }
 }
