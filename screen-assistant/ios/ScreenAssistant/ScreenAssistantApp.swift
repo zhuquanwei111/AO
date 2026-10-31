@@ -52,6 +52,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var liveTimingInvalidItems = 0
     @Published private(set) var livePriorityInvalidItems = 0
     @Published private(set) var liveSourcesInvalidItems = 0
+    @Published private(set) var liveEntryInvalidItems = 0
     @Published var liveSummary: LiveSessionSummary?
     @Published var liveActive = false
     @Published var liveStopped = false
@@ -267,6 +268,7 @@ final class AppModel: ObservableObject {
         liveTimingInvalidItems = 0
         livePriorityInvalidItems = 0
         liveSourcesInvalidItems = 0
+        liveEntryInvalidItems = 0
         overviewLoading = false
         summaryRefreshInFlight = false
         overviewRequest.clear()
@@ -357,6 +359,7 @@ final class AppModel: ObservableObject {
                 ) else { return }
                 switch result {
                 case .success(let page):
+                    self.liveEntryInvalidItems += page.invalidEntryCount
                     self.liveCursor = page.nextCursor
                     let now = Int64(LiveOperationsClient.continuousNowNS() / 1_000_000)
                     let deadlines = page.prompts.map { prompt in
@@ -370,7 +373,7 @@ final class AppModel: ObservableObject {
                         return LivePromptDelivery.Item(id: prompt.promptID,
                             text: "【\(label)】" + prompt.displayText,
                             expiresAtMS: deadline ?? 0,
-                            priority: prompt.priority ?? 0, timingInvalid: deadline == nil,
+                            priority: prompt.priority, timingInvalid: deadline == nil,
                             priorityInvalid: prompt.priorityInvalid)
                     }
                     let beforeOverflow = self.liveDelivery.overflowCount
@@ -633,7 +636,14 @@ final class AppModel: ObservableObject {
             self.summaryRefreshInFlight = false
             guard !self.liveActive, !self.liveStarting, generation == self.liveStartGeneration,
                   Self.savedCredentials()?.sessionID == credentials.sessionID else { return }
-            if let events = fetchedEvents?.events { self.liveEvents = events }
+            if let page = fetchedEvents {
+                let knownIDs = Set(self.liveEvents.map(\.promptID))
+                let newlyRead = page.events.filter { !knownIDs.contains($0.promptID) }
+                self.livePriorityInvalidItems += newlyRead.filter(\.priorityInvalid).count
+                self.liveSourcesInvalidItems += newlyRead.filter(\.sourcesInvalid).count
+                self.liveEntryInvalidItems += page.invalidEntryCount
+                self.liveEvents = page.events
+            }
             self.liveSummary = fetchedSummary
             self.finishCredentialRetentionIfTerminal(fetchedSummary?.backstageRecap?.status)
             switch (fetchedEvents, fetchedSummary) {

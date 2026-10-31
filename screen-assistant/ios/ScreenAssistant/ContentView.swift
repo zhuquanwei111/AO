@@ -55,8 +55,8 @@ struct ContentView: View {
                             .font(.footnote)
                             .foregroundColor(.orange)
                     }
-                    if model.livePriorityInvalidItems > 0 || model.liveSourcesInvalidItems > 0 {
-                        Text("部分提示字段异常：优先级异常 \(model.livePriorityInvalidItems) 条，仅保留记录；来源异常 \(model.liveSourcesInvalidItems) 条，来源保持未知。")
+                    if model.livePriorityInvalidItems > 0 || model.liveSourcesInvalidItems > 0 || model.liveEntryInvalidItems > 0 {
+                        Text("部分提示字段异常：必需字段异常 \(model.liveEntryInvalidItems) 次；优先级异常 \(model.livePriorityInvalidItems) 条，仅保留记录；来源异常 \(model.liveSourcesInvalidItems) 条，无法解读的来源保持未知。")
                             .font(.footnote)
                             .foregroundColor(.orange)
                     }
@@ -493,6 +493,10 @@ private struct LiveSessionOverviewView: View {
                             .foregroundColor(.secondary)
                             Text(event.phenomenon).font(.subheadline)
                             Text(event.suggestion).font(.body)
+                            if event.priorityInvalid {
+                                Text("优先级异常，无法用于画中画调度")
+                                    .font(.footnote).foregroundColor(.orange)
+                            }
                         }
                         .padding(.vertical, 4)
                     }
@@ -637,6 +641,10 @@ private struct LiveEventListView: View {
                 .foregroundColor(.secondary)
                 Text(event.phenomenon).font(.subheadline)
                 Text(event.suggestion).font(.body)
+                if event.priorityInvalid {
+                    Text("优先级异常，无法用于画中画调度")
+                        .font(.footnote).foregroundColor(.orange)
+                }
             }
             .padding(.vertical, 4)
         }
