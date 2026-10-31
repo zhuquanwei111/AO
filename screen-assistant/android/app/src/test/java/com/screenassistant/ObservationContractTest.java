@@ -5,7 +5,7 @@ import org.junit.Test;
 import static org.junit.Assert.*;
 
 public class ObservationContractTest {
-    @Test public void capabilityRequiresExplicitBooleanAndSurvivesStoredSession() throws Exception {
+    @Test public void capabilityRequiresExplicitBooleanAndRestoredSessionFallsBack() throws Exception {
         JSONObject base = new JSONObject().put("session_id", "s").put("session_token", "t").put("started_at_ms", 1);
         assertFalse(LiveClient.sessionFromCreate("http://local", base).batchMetadata);
         base.put("capabilities", new JSONObject().put("observation_batch_metadata", "true"));
@@ -15,7 +15,7 @@ public class ObservationContractTest {
         base.put("capabilities", new JSONObject().put("observation_batch_metadata", true));
         LiveClient.Session s = LiveClient.sessionFromCreate("http://local", base);
         assertTrue(s.batchMetadata);
-        assertTrue(LiveClient.Session.from(s.json()).batchMetadata);
+        assertFalse(LiveClient.Session.from(s.json()).batchMetadata);
         assertTrue(s.asStopped().batchMetadata);
     }
 

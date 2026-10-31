@@ -32,14 +32,12 @@ public final class LiveClient {
 
         public JSONObject json() throws JSONException {
             return new JSONObject().put("base_url", baseUrl).put("session_id", id)
-                    .put("session_token", token).put("started_at_ms", startedAt).put("stopped", stopped)
-                    .put("batch_metadata", batchMetadata);
+                    .put("session_token", token).put("started_at_ms", startedAt).put("stopped", stopped);
         }
 
         public static Session from(JSONObject o) throws JSONException {
             return new Session(o.getString("base_url"), o.getString("session_id"),
-                    o.getString("session_token"), o.getLong("started_at_ms"), o.optBoolean("stopped"),
-                    Boolean.TRUE.equals(o.opt("batch_metadata")));
+                    o.getString("session_token"), o.getLong("started_at_ms"), o.optBoolean("stopped"));
         }
 
         public Session asStopped() { return new Session(baseUrl, id, token, startedAt, true, batchMetadata); }
