@@ -172,3 +172,30 @@ def test_batch_expiry_and_session_isolation(tmp_path):
         assert error.value.status_code == 409
     finally:
         store.close()
+
+
+def test_restart_does_not_complete_old_partial_batch_but_new_batch_works(tmp_path):
+    now = 1_790_000_000_000
+    path = str(tmp_path / "batch-restart.sqlite3")
+    store = LiveStore(path, lambda: now)
+    session = store.create("")
+    sid, token = session["session_id"], session["session_token"]
+    first = {"kind": "comment", "event_id": "e1", "source": "ios_replaykit_ocr",
+             "observed_at_ms": now, "availability": "available", "coverage": "ocr_visible_sample",
+             "reliability": "known", "content": {"text": "主播你是哪里人？"},
+             "capture_batch_id": "old-uuid", "line_index": 0, "capture_comment_count": 2}
+    assert store.add_observation(sid, token, first, now)["reason"] == "batch_incomplete"
+    store.close()
+    store = LiveStore(path, lambda: now + 1000)
+    try:
+        assert store.add_observation(sid, token, first, now + 1000)["reason"] == "duplicate_event"
+        last = {**first, "event_id": "e2", "line_index": 4}
+        assert store.add_observation(sid, token, last, now + 1000)["reason"] == "batch_incomplete"
+        assert not store.fusion_windows.get(sid)
+        assert store.events(sid, token)["events"] == []
+        fresh = {**first, "event_id": "e3", "capture_batch_id": "new-uuid",
+                 "capture_comment_count": 1, "observed_at_ms": now + 1000}
+        assert store.add_observation(sid, token, fresh, now + 1000)["_batch_ready"] is True
+        assert [row["event_id"] for row in store.fusion_windows[sid]] == ["e3"]
+    finally:
+        store.close()
