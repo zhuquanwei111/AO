@@ -52,6 +52,16 @@ private final class PollFixtureProtocol: URLProtocol {
 }
 
 final class PollTransportTests: XCTestCase {
+    func testStopPendingCredentialsRoundTripAndLegacyDecode() throws {
+        var pending = credentials
+        pending.stopPending = true
+        let restored = try JSONDecoder().decode(LiveSessionCredentials.self, from: JSONEncoder().encode(pending))
+        XCTAssertEqual(restored.sessionID, pending.sessionID)
+        XCTAssertEqual(restored.stopPending, true)
+        let legacy = Data("{\"session_id\":\"old\",\"session_token\":\"token\",\"started_at_ms\":1}".utf8)
+        XCTAssertNil(try JSONDecoder().decode(LiveSessionCredentials.self, from: legacy).stopPending)
+    }
+
     private func makeClient(_ scenario: String) -> (LiveOperationsClient, URLSession) {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [PollFixtureProtocol.self]

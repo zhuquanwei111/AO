@@ -117,7 +117,7 @@ final class AppModel: ObservableObject {
         let savedConnectionPending = savedLiveCredentials?.liveConnectionPending == true
         liveActive = LiveSessionState.isEnabled() && savedLiveCredentials != nil
         liveConnectionPending = liveActive && savedConnectionPending
-        if liveConnectionPending { captureWanted = false }
+        if liveConnectionPending || savedLiveCredentials?.stopPending == true { captureWanted = false }
         roundCounter = ControlState.roundCounter()
 
         // 轮询共享状态（扩展每完成一轮会 bump 计数器）。
@@ -150,14 +150,16 @@ final class AppModel: ObservableObject {
             PiPDisplayController.shared.setLiveSessionActive(true)
             liveCredentials = credentials
             liveClient = SharedConfig.serverBaseURL().flatMap { LiveOperationsClient(baseURL: $0) }
-            if liveConnectionPending {
+            if credentials.stopPending == true {
+                liveStatus = "本机采集已停止；服务未确认结束场次，可重试结束"
+            } else if liveConnectionPending {
                 liveStatus = "后台启动结果未确认；正在核验同一场实时连接"
             } else if credentials.backstageStartPending == true {
                 liveStatus = "恢复同场实时收件；后台复盘任务状态仍未知"
             } else {
                 liveStatus = "恢复当前场次收件"
             }
-            if liveClient != nil { pollLivePrompts() }
+            if liveClient != nil && credentials.stopPending != true { pollLivePrompts() }
         } else if LiveSessionState.isEnabled() {
             LiveSessionState.clear()
         } else if let credentials = savedLiveCredentials {
@@ -328,16 +330,20 @@ final class AppModel: ObservableObject {
         liveConnectionPending = false
         var stoppingCredentials = credentials
         stoppingCredentials.liveConnectionPending = false
-        _ = LiveSessionState.save(stoppingCredentials)
+        stoppingCredentials.stopPending = true
+        guard LiveSessionState.save(stoppingCredentials) else {
+            liveStatus = "本机采集已停止；结束状态无法保存，未发送结束请求，可重试"
+            return
+        }
         liveCredentials = stoppingCredentials
         liveStopping = true
-        liveStatus = "正在结束场次…"
+        liveStatus = "本机采集已停止；正在确认服务端结束…"
         client.stop(stoppingCredentials) { [weak self] ok in
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.liveStopping = false
                 guard ok else {
-                    self.liveStatus = "服务未确认结束场次；检查网络后可重试，当前场次授权仍保留"
+                    self.liveStatus = "本机采集已停止；服务未确认结束场次，检查网络后可重试"
                     return
                 }
                 self.audioSettings.appHostConfirmed = false

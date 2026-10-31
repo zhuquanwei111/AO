@@ -30,15 +30,17 @@ struct LiveSessionCredentials: Codable {
     let douyinAccount: String?
     var backstageTaskID: String?
     var backstageStatus: String?
-    /// Local-only markers; neither field is sent to the server.
+    /// 仅本地保存的状态标记，不发送给服务端。
     var backstageStartPending: Bool?
     var liveConnectionPending: Bool?
+    var stopPending: Bool? = nil
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id", token = "session_token", startedAtMS = "started_at_ms"
         case douyinAccount = "douyin_account"
         case backstageTaskID = "backstage_task_id", backstageStatus = "backstage_status"
         case backstageStartPending = "backstage_start_pending"
         case liveConnectionPending = "live_connection_pending"
+        case stopPending = "stop_pending"
     }
 }
 
