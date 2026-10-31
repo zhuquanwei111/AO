@@ -602,3 +602,117 @@ def test_reply_cooldown_is_scoped_and_failure_does_not_create_cooldown(tmp_path)
         submit("after-cooldown", "阿青：你想聊什么？")
         assert calls[-1] == ("你想聊什么？", "阿青")
         assert sum(text == "你想聊什么？" and name == "阿青" for text, name in calls) == 2
+
+
+@pytest.mark.parametrize("mode", ["unavailable", "timeout", "missing_key"])
+def test_transient_model_failure_keeps_batch_candidates_for_next_observation(tmp_path, mode):
+    from dataclasses import replace
+    from screen_assistant_server.model_client import ModelUnavailableError
+    now = 1_790_000_000_000
+    cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="" if mode == "missing_key" else "controlled",
+                   tianyi_base_url="http://model.invalid", tianyi_model="fake", dedup_ttl_seconds=60,
+                   max_sentence_chars=2000, model_timeout_seconds=0.1, model_connect_timeout_seconds=0.1,
+                   live_db_path=str(tmp_path / "transient-model.sqlite3"))
+    calls = []
+    class Model:
+        available = False
+        async def reply_to_comment(self, text, *, nickname, priority_eligible):
+            calls.append((text, nickname))
+            if not self.available:
+                if mode == "timeout":
+                    await asyncio.Event().wait()
+                raise ModelUnavailableError("controlled")
+            return "我们可以聊聊这个话题。"
+        async def aclose(self):
+            pass
+    model = Model()
+    app = create_app(cfg, live_clock=lambda: now)
+    with TestClient(app) as client:
+        app.state.model = model
+        session = client.post("/v1/live/sessions", json={}).json()
+        sid = session["session_id"]
+        headers = {"X-Live-Session-Token": session["session_token"]}
+        url = f"/v1/live/sessions/{sid}"
+        async def wait_idle():
+            async with asyncio.timeout(3):
+                while app.state.live.fusion_active or app.state.live.fusion_queue:
+                    await asyncio.sleep(0.005)
+        base = {"kind": "comment", "source": "ios_replaykit_ocr", "observed_at_ms": now,
+                "availability": "available", "coverage": "ocr_visible_sample", "reliability": "known",
+                "capture_batch_id": "batch", "capture_comment_count": 2}
+        for index, (name, text) in enumerate((("阿青", "你想聊什么？"), ("小林", "今天聊什么？"))):
+            row = {**base, "event_id": f"e{index}", "line_index": index,
+                   "content": {"text": f"{name}：{text}", "text_position":
+                               {"x": 0.1, "y": 0.3 + index * 0.3, "width": 0.4, "height": 0.04}}}
+            assert client.post(url + "/observations", headers=headers, json=row).status_code == 200
+        client.portal.call(wait_idle)
+        before_recovery = [] if mode == "missing_key" else [("你想聊什么？", "阿青")]
+        assert calls == before_recovery
+        assert client.get(url + "/events", headers=headers).json()["events"] == []
+        model.available = True
+        if mode == "missing_key":
+            app.state.settings = replace(cfg, tianyi_api_key="controlled")
+        next_row = {**base, "capture_batch_id": "next", "capture_comment_count": 1,
+                    "event_id": "e2", "line_index": 0, "content": {"text": "阿辉：你最喜欢什么？",
+                    "text_position": {"x": 0.1, "y": 0.8, "width": 0.4, "height": 0.04}}}
+        assert client.post(url + "/observations", headers=headers, json=next_row).status_code == 200
+        client.portal.call(wait_idle)
+        recovered = ([("你想聊什么？", "阿青"), ("今天聊什么？", "小林"), ("你最喜欢什么？", "阿辉")]
+                     if mode == "missing_key" else
+                     [("今天聊什么？", "小林"), ("你最喜欢什么？", "阿辉"), ("你想聊什么？", "阿青")])
+        assert calls == before_recovery + recovered
+        events = client.get(url + "/events", headers=headers).json()["events"]
+        assert len([event for event in events if event.get("prompt_type") == "comment_reply"]) == 3
+
+
+@pytest.mark.parametrize("mode", ["exhausted", "quiet", "invalid", "expired", "stopped"])
+def test_comment_attempt_terminal_and_lifetime_boundaries(tmp_path, mode):
+    from screen_assistant_server.model_client import ModelUnavailableError
+    clock = [1_790_000_000_000]
+    cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="controlled",
+                   tianyi_base_url="http://model.invalid", tianyi_model="fake", dedup_ttl_seconds=60,
+                   max_sentence_chars=2000, model_timeout_seconds=0.1, model_connect_timeout_seconds=0.1,
+                   live_db_path=str(tmp_path / f"attempt-{mode}.sqlite3"))
+    calls = []
+    class Model:
+        async def reply_to_comment(self, text, *, nickname, priority_eligible):
+            calls.append(text)
+            if mode == "quiet":
+                return None
+            raise ModelUnavailableError("model_output_invalid" if mode == "invalid" else "controlled")
+        async def aclose(self):
+            pass
+    app = create_app(cfg, live_clock=lambda: clock[0])
+    with TestClient(app) as client:
+        app.state.model = Model()
+        session = client.post("/v1/live/sessions", json={}).json()
+        sid = session["session_id"]
+        headers = {"X-Live-Session-Token": session["session_token"]}
+        url = f"/v1/live/sessions/{sid}"
+        async def wait_idle():
+            async with asyncio.timeout(3):
+                while app.state.live.fusion_active or app.state.live.fusion_queue:
+                    await asyncio.sleep(0.005)
+        def send(event, raw):
+            row = {"kind": "comment", "event_id": event, "source": "ios_replaykit_ocr",
+                   "observed_at_ms": clock[0], "availability": "available", "coverage": "ocr_visible_sample",
+                   "reliability": "known", "capture_batch_id": "batch-" + event, "line_index": 0,
+                   "capture_comment_count": 1, "content": {"text": raw, "text_position":
+                       {"x": 0.1, "y": 0.5, "width": 0.4, "height": 0.04}}}
+            return client.post(url + "/observations", headers=headers, json=row)
+        assert send("first", "阿青：你想聊什么？").status_code == 200
+        client.portal.call(wait_idle)
+        assert calls == ["你想聊什么？"]
+        if mode == "expired":
+            clock[0] += 10_001
+        if mode == "stopped":
+            assert client.post(url + "/stop", headers=headers).status_code == 200
+            assert send("after-stop", "小乙：嗯").status_code == 409
+        else:
+            assert send("next", "小乙：嗯").status_code == 200
+            client.portal.call(wait_idle)
+            assert send("third", "小丙：嗯").status_code == 200
+            client.portal.call(wait_idle)
+        assert len(calls) == (2 if mode == "exhausted" else 1)
+        events = client.get(url + "/events", headers=headers).json()["events"]
+        assert not any(event.get("prompt_type") == "comment_reply" for event in events)

@@ -28,6 +28,22 @@ def comment(event_id="legacy-1"):
             "reliability": "known", "content": {"text": "hello"}}
 
 
+@pytest.mark.parametrize("metadata", [
+    {"capture_batch_id": "batch"}, {"line_index": 0}, {"capture_comment_count": 1},
+    {"capture_batch_id": None, "line_index": None, "capture_comment_count": None},
+])
+def test_legacy_comments_reject_batch_metadata(live_client, metadata):
+    client, url, headers, path = live_client
+    legacy_url = url.removesuffix("/observations") + "/comments"
+    body = {"event_id": "legacy-comment", "input_mode": "live_observation",
+            "source": "ios_replaykit_ocr", "coverage": "ocr_visible_sample",
+            "reliability": "known", "text": "hello"}
+    assert client.post(legacy_url, headers=headers, json={**body, **metadata}).status_code == 422
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT count(*) FROM live_observations").fetchone()[0] == 0
+    assert client.post(legacy_url, headers=headers, json=body).status_code == 200
+
+
 def test_legacy_fingerprint_survives_upgrade_and_explicit_null(live_client):
     client, url, headers, path = live_client
     body = comment()
