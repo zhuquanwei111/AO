@@ -43,7 +43,7 @@ struct LivePromptDelivery {
     let capacity: Int
     let intervalMS: Int64
 
-    init(capacity: Int = 16, intervalMS: Int64 = 5_000) {
+    init(capacity: Int = 16, intervalMS: Int64 = 8_000) {
         self.capacity = capacity
         self.intervalMS = intervalMS
     }
