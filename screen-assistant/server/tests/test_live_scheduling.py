@@ -165,6 +165,47 @@ def test_batch_does_not_call_model_until_late_second_observation(tmp_path):
     asyncio.run(run())
 
 
+def test_incomplete_batch_does_not_block_legacy_observation(tmp_path, monkeypatch):
+    import screen_assistant_server.live as live
+    monkeypatch.setattr(live, "FUSION_SETTLE_MS", 0)
+    now = 1_790_000_000_000
+    async def run():
+        cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="fake",
+                       tianyi_base_url="http://model.invalid", tianyi_model="fake",
+                       dedup_ttl_seconds=60, max_sentence_chars=2000,
+                       model_timeout_seconds=2, model_connect_timeout_seconds=1,
+                       live_db_path=str(tmp_path / "batch-separate.sqlite3"))
+        app = create_app(cfg, live_clock=lambda: now)
+        calls = []
+        class Model:
+            async def suggest_live(self, text, *args, **kwargs):
+                calls.append(text)
+                return "可以顺着问题聊两句。"
+            async def aclose(self):
+                pass
+        async with app.router.lifespan_context(app):
+            app.state.model = Model()
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                session = (await client.post("/v1/live/sessions", json={})).json()
+                sid, token = session["session_id"], session["session_token"]
+                headers = {"X-Live-Session-Token": token}
+                partial = {"kind": "comment", "event_id": "batch-e1", "source": "ios_replaykit_ocr",
+                           "observed_at_ms": now, "availability": "available", "coverage": "ocr_visible_sample",
+                           "reliability": "known", "capture_batch_id": "batch", "line_index": 0,
+                           "capture_comment_count": 2, "content": {"text": "主播几点开播？"}}
+                response = await client.post(f"/v1/live/sessions/{sid}/observations", headers=headers, json=partial)
+                assert response.json()["reason"] == "batch_incomplete"
+                legacy = {"event_id": "legacy-e1", "input_mode": "live_observation",
+                          "source": "ios_replaykit_ocr", "coverage": "ocr_visible_sample",
+                          "reliability": "known", "text": "主播你是哪里人？"}
+                response = await client.post(f"/v1/live/sessions/{sid}/comments", headers=headers, json=legacy)
+                assert response.json()["reason"] == "scheduled"
+                await asyncio.wait_for(app.state.live.fusion_active[sid], 2)
+                assert calls == ["主播你是哪里人？"]
+                assert app.state.live.store.comment_batches[sid][("ios_replaykit_ocr", "batch")]["complete"] is False
+    asyncio.run(run())
+
+
 def test_observation_returns_while_model_is_blocked(tmp_path):
     async def run():
         cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="fake",
