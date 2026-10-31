@@ -6,9 +6,34 @@ import java.io.IOException;
 import java.net.ConnectException;
 import java.net.UnknownHostException;
 import java.util.function.LongSupplier;
+import java.util.function.BooleanSupplier;
 
 /** 现有场次 HTTP 契约的薄适配。连接结果不决定本地投影/窗口的生死。 */
 final class LiveConnection {
+    private static final Object RECOVERY_LOCK = new Object();
+    private static int activeWorkers;
+    private static final java.util.Set<LiveClient.Session> unpersistedTargets = new java.util.HashSet<>();
+
+    static void beginWorker() { synchronized (RECOVERY_LOCK) { activeWorkers++; } }
+    static void endWorker() { synchronized (RECOVERY_LOCK) { activeWorkers--; } }
+    static boolean canReleaseUnknownCreate(Store store, BooleanSupplier idle) {
+        synchronized (RECOVERY_LOCK) { return recoveryAllowed(store, idle); }
+    }
+    private static boolean recoveryAllowed(Store store, BooleanSupplier idle) {
+        return idle.getAsBoolean() && activeWorkers == 0 && unpersistedTargets.isEmpty()
+                && store.get() == null && !store.stopping() && store.creating();
+    }
+    static boolean releaseUnknownCreate(Store store, boolean confirmed, BooleanSupplier idle) throws IOException {
+        synchronized (RECOVERY_LOCK) {
+            if (!confirmed || !recoveryAllowed(store, idle)) return false;
+            try { store.creating(false); }
+            catch (IOException error) {
+                try { store.creating(true); } catch (IOException restore) { error.addSuppressed(restore); }
+                throw error;
+            }
+            return true;
+        }
+    }
     static final String CONNECTING = "正在连接服务\n屏幕采集已启动，暂无运营提示";
     static final String OFFLINE = "服务未连接\n本地屏幕采集继续，暂无新运营提示";
     static final String CREATE_UNKNOWN = "场次创建未确认\n请回到应用核对，未重复创建";
@@ -96,6 +121,7 @@ final class LiveConnection {
                         store.save(created);
                     } catch (IOException e) {
                         stopTarget = created;
+                        synchronized (RECOVERY_LOCK) { unpersistedTargets.add(created); }
                         saveFailure = e;
                     }
                     if (saveFailure == null && endRequested) { stopTarget = created; store.stopping(true); }
@@ -233,6 +259,7 @@ final class LiveConnection {
             store.stopping(false);
             if (stopTarget != null && stopTarget.id.equals(target.id)) stopTarget = null;
             if (session != null && session.id.equals(target.id)) session = target.asStopped();
+            synchronized (RECOVERY_LOCK) { unpersistedTargets.remove(target); }
         }
     }
 

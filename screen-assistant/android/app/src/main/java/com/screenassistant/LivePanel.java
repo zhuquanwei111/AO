@@ -10,6 +10,7 @@ import android.widget.TextView;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Consumer;
+import java.util.function.BooleanSupplier;
 
 /** 折叠设置中的场次参数和内部场次操作；首页只通过开始/结束辅助调用。 */
 final class LivePanel {
@@ -18,14 +19,17 @@ final class LivePanel {
     private final EditText description;
     private final EditText account;
     private final Button endIdleSession;
+    private final Button releaseUnknownCreate;
     private final Runnable stateChanged;
+    private final BooleanSupplier idle;
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private boolean working;
     private String lastError = "";
 
-    LivePanel(Activity activity, LinearLayout parent, Runnable stateChanged) {
+    LivePanel(Activity activity, LinearLayout parent, Runnable stateChanged, BooleanSupplier idle) {
         this.activity = activity;
         this.stateChanged = stateChanged;
+        this.idle = idle;
         state = new TextView(activity);
         parent.addView(state);
         account = new EditText(activity);
@@ -42,7 +46,26 @@ final class LivePanel {
         endIdleSession.setText("结束当前辅助场次并查看复盘");
         parent.addView(endIdleSession);
         endIdleSession.setOnClickListener(v -> stopOperationSession(() -> openRecap(), this::showError));
+        releaseUnknownCreate = new Button(activity);
+        releaseUnknownCreate.setText("解除本机开场限制");
+        parent.addView(releaseUnknownCreate);
+        releaseUnknownCreate.setOnClickListener(v -> new android.app.AlertDialog.Builder(activity)
+                .setMessage("上次开场可能已在服务器创建。此操作只解除本机开场限制，不证明服务器没有创建，也不会结束可能遗留的旧场。确认后请自行正常点击开始。")
+                .setPositiveButton("确认解除", (dialog, which) -> releaseCreateRestriction())
+                .setNegativeButton("取消", null).show());
         refresh();
+    }
+
+    private void releaseCreateRestriction() {
+        try {
+            boolean released = LiveConnection.releaseUnknownCreate(Prefs.liveStore(activity), true,
+                    () -> !working && idle.getAsBoolean());
+            lastError = released ? "本机开场限制已解除；服务器旧场状态仍未确认。可正常点击开始。"
+                    : "状态已变化或仍在收尾，本机开场限制未解除。请核对原场次后再试。";
+        } catch (java.io.IOException error) {
+            lastError = "本机状态保存失败，开场限制仍未解除。请检查存储后重试。";
+        }
+        refresh(); stateChanged.run();
     }
 
     void saveInputs() {
@@ -128,6 +151,10 @@ final class LivePanel {
         endIdleSession.setVisibility(active && CaptureService.phase == CaptureService.Phase.IDLE
                 ? android.view.View.VISIBLE : android.view.View.GONE);
         endIdleSession.setEnabled(!working && !CaptureService.stopInProgress);
+        releaseUnknownCreate.setVisibility(Prefs.createPending(activity)
+                ? android.view.View.VISIBLE : android.view.View.GONE);
+        releaseUnknownCreate.setEnabled(!working && LiveConnection.canReleaseUnknownCreate(
+                Prefs.liveStore(activity), idle));
     }
 
     void openRecap() {

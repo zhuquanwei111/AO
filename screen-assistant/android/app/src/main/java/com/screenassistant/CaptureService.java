@@ -720,7 +720,8 @@ public class CaptureService extends Service {
                 });
         liveConnection = connection;
         synchronized (connection) { connectionWorkerActive = true; }
-        promptExecutor.execute(() -> {
+        LiveConnection.beginWorker();
+        try { promptExecutor.execute(() -> {
             boolean prepared = false;
             try {
                 while (!tornDown && epoch == sessionEpoch && !connection.isClosed()) {
@@ -732,24 +733,29 @@ public class CaptureService extends Service {
                     }
                 }
             } finally {
-                boolean shouldEnd;
-                synchronized (connection) {
-                    shouldEnd = connection.shouldEnd();
-                    if (!shouldEnd) connectionWorkerActive = false;
-                }
-                if (shouldEnd) {
-                    try { audioCompletion.get(20, java.util.concurrent.TimeUnit.SECONDS); }
-                    catch (Exception ignored) { /* 仍请求幂等结束 */ }
-                    try { connection.finishStop(); }
-                    catch (Exception e) { logEvent("session_stop_unconfirmed", "error=" + e.getClass().getSimpleName()); }
-                    finally {
-                        synchronized (connection) { connectionWorkerActive = false; stopInProgress = false; }
+                try {
+                    boolean shouldEnd;
+                    synchronized (connection) {
+                        shouldEnd = connection.shouldEnd();
+                        if (!shouldEnd) connectionWorkerActive = false;
                     }
+                    if (shouldEnd) {
+                        try { audioCompletion.get(20, java.util.concurrent.TimeUnit.SECONDS); }
+                        catch (Exception ignored) { /* 仍请求幂等结束 */ }
+                        try { connection.finishStop(); }
+                        catch (Exception e) { logEvent("session_stop_unconfirmed", "error=" + e.getClass().getSimpleName()); }
+                    }
+                } finally {
+                    synchronized (connection) { connectionWorkerActive = false; stopInProgress = false; }
+                    LiveConnection.endWorker();
                     Intent changed = new Intent(Prefs.ACTION_STATE).setPackage(getPackageName());
                     sendBroadcast(changed);
                 }
             }
-        });
+        }); } catch (RuntimeException error) {
+            synchronized (connection) { connectionWorkerActive = false; stopInProgress = false; }
+            LiveConnection.endWorker(); throw error;
+        }
     }
 
     private void showMessage(String purpose, String reply, int epoch, long expiresAt) {
