@@ -510,12 +510,6 @@ def build_candidate(observations: list[dict]) -> dict | None:
                               "持续低头候选与近期可见问题同时出现",
                               "你刚才持续低头了一会儿，抬头看一下镜头，再接住这个问题。",
                               [person, topic_rows[-1]])
-        if len(topic_rows) >= 2:
-            label = question(topic_rows[-1]["content"]["text"])[1]
-            return _candidate("repeated_question:" + topic, 38,
-                              "近期可见公屏重复出现同一问题主题",
-                              f"近期重复出现“{label}”的问题，可以集中回应一次，再邀请大家接着聊。",
-                              topic_rows[-2:])
 
     if person and person["content"]["signal"] == "person_not_visible_candidate":
         return _candidate("person:head_down", 20,

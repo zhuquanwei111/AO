@@ -39,6 +39,19 @@ def test_group_feedback_requires_distinct_named_messages_within_window():
     assert group_feedback([one, row("c2", "小红", "很流畅", now)], now) is None
 
 
+def test_legacy_repeated_ocr_without_distinct_names_is_not_group_feedback():
+    def row(event_id):
+        return {"kind": "comment", "event_id": event_id, "source": "ios_replaykit_ocr",
+                "effective_at_ms": 1000, "received_at_ms": 1000, "observed_at_ms": 1000,
+                "availability": "available", "coverage": "ocr_visible_sample", "reliability": "known",
+                "confidence": None, "content": {"text": "主播你是哪里人？", "text_position": None}}
+    candidate = build_candidate([row("e1"), row("e2")])
+    assert candidate is not None
+    assert candidate["topic"].startswith("question:")
+    assert candidate["model_text"] == "主播你是哪里人？"
+    assert len(candidate["observations"]) == 1
+
+
 def test_confirmed_online_count_units_and_proxy_rejection():
     assert parse_online_count("在线人数 1.2万人", field_semantics_confirmed=True) == 12_000
     assert parse_online_count("当前在线：3.4万", field_semantics_confirmed=True) == 34_000
