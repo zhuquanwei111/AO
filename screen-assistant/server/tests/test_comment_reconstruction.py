@@ -68,6 +68,40 @@ def test_unreliable_neighbour_or_unlocated_gap_blocks_upgrade():
         assert comment["usability_reasons"]
 
 
+def test_two_clean_close_comments_are_both_usable():
+    rows = [row("a", "阿青：今天几点开播？", (.10, .30, .4, .04)),
+            row("b", "小林：晚上好", (.10, .346, .3, .04), index=1)]
+    comments = reconstruct_comments(rows, batch_complete=True, quality_gaps=[])
+    assert len(comments) == 2
+    assert all(c["field_status"]["text"] == "usable" for c in comments)
+    assert all(c["boundary_status"] == "locally_complete" for c in comments)
+
+
+def test_neighbour_fragment_assigned_to_another_comment_is_not_unassigned():
+    rows = [row("a", "阿青：你好", (.10, .30, .3, .04)),
+            row("b", "小林：", (.10, .346, .15, .04), index=1),
+            row("c", "晚上好", (.26, .346, .1, .04), index=2)]
+    comments = reconstruct_comments(rows, batch_complete=True, quality_gaps=[])
+    first = next(c for c in comments if c["text"] == "你好")
+    second = next(c for c in comments if c["text"] == "晚上好")
+    assert first["field_status"]["text"] == "usable"
+    assert set(second["source_event_ids"]) == {"b", "c"}
+
+
+def test_quality_gap_observations_never_supply_text_or_fragments():
+    rows = [row("a", "阿青：你好", (.10, .30, .3, .04)),
+            row("b", "不可靠文字", (.41, .30, .1, .04), index=1),
+            row("c", "小林：不可用内容", (.10, .5, .3, .04), index=2)]
+    gaps = [{"event_id": "b", "text_position": rows[1]["content"]["text_position"]},
+            {"event_id": "c", "text_position": rows[2]["content"]["text_position"]}]
+    comments = reconstruct_comments(rows, batch_complete=True, quality_gaps=gaps)
+    assert len(comments) == 1
+    assert comments[0]["text"] == "你好"
+    assert comments[0]["field_status"]["text"] != "usable"
+    assert comments[0]["source_event_ids"] == ["a"]
+    assert [fragment["text"] for fragment in comments[0]["fragments"]] == ["阿青：你好"]
+
+
 def test_unassigned_continuation_or_truncated_text_blocks_upgrade():
     rows = [row("a", "阿青：这是长评论的开头", (.1, .3, .45, .04)),
             row("b", "后面仍然有不少内容", (.1, .345, .4, .04), index=1)]
