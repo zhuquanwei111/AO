@@ -22,6 +22,23 @@ def test_comment_eligibility_level_boundaries_and_unknown():
     assert not comment_is_candidate("👍", consumption_level=True, fan_level=False)
 
 
+def test_group_feedback_requires_distinct_named_messages_within_window():
+    from screen_assistant_server.live_fusion import group_feedback
+    now = 100_000
+    def row(comment_id, nickname, text, seen):
+        return {"comment_id": comment_id, "nickname": nickname, "text": text,
+                "last_seen_at_ms": seen}
+    one = row("c1", "小明", "有点卡", now)
+    assert group_feedback([one, one], now) is None
+    assert group_feedback([one, row("c2", None, "有点卡", now)], now) is None
+    assert group_feedback([one, row("c2", "小明", "有点卡", now)], now) is None
+    assert group_feedback([one, row("c2", "小红", "有点卡", now - 10_001)], now) is None
+    result = group_feedback([one, row("c2", "小红", "有点卡", now - 10_000)], now)
+    assert result is not None
+    assert {item["comment_id"] for item in result} == {"c1", "c2"}
+    assert group_feedback([one, row("c2", "小红", "很流畅", now)], now) is None
+
+
 def test_confirmed_online_count_units_and_proxy_rejection():
     assert parse_online_count("在线人数 1.2万人", field_semantics_confirmed=True) == 12_000
     assert parse_online_count("当前在线：3.4万", field_semantics_confirmed=True) == 34_000

@@ -326,6 +326,26 @@ def comment_is_candidate(text: str, *, consumption_level: int | None,
     return len(meaningful) >= 2
 
 
+def group_feedback(comments: list[dict], now_ms: int) -> list[dict] | None:
+    """从调用方确认的正文和昵称中找同文反馈；昵称可区分不等于账号数。"""
+    groups: dict[str, dict[str, dict]] = {}
+    for item in comments:
+        name, text, seen = item.get("nickname"), item.get("text"), item.get("last_seen_at_ms")
+        if (not isinstance(name, str) or not name.strip() or not isinstance(text, str)
+                or not text.strip() or type(seen) is not int
+                or not now_ms - 10_000 <= seen <= now_ms):
+            continue
+        name_key = unicodedata.normalize("NFKC", name).strip().casefold()
+        text_key = "".join(unicodedata.normalize("NFKC", text).split()).casefold()
+        names = groups.setdefault(text_key, {})
+        names.setdefault(name_key, item)
+        if len(names) >= 2:
+            selected = list(names.values())
+            if len({row.get("comment_id") for row in selected}) >= 2:
+                return selected
+    return None
+
+
 def _candidate(topic: str, priority: int, phenomenon: str, suggestion: str | None,
                selected: list[dict], *, model_text: str | None = None,
                model_context: str = "") -> dict:
