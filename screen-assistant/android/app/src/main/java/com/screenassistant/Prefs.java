@@ -61,7 +61,7 @@ public final class Prefs {
         sp(c).edit().remove(K_REGION).apply();
     }
 
-    public static LiveClient.Session getSession(Context c) {
+    public static synchronized LiveClient.Session getSession(Context c) {
         try {
             String raw = sp(c).getString("live_session", null);
             return raw == null ? null : LiveClient.Session.from(new org.json.JSONObject(raw));
@@ -69,13 +69,36 @@ public final class Prefs {
     }
 
     /** 私有SharedPreferences；同步落盘后才报告创建成功，避免进程退出丢凭证。 */
-    public static boolean saveSession(Context c, LiveClient.Session session) {
-        try { return sp(c).edit().putString("live_session", session.json().toString()).commit(); }
+    public static synchronized boolean saveSession(Context c, LiveClient.Session session) {
+        try { return sp(c).edit().putString("live_session", session.json().toString())
+                .putBoolean("live_create_pending", false).commit(); }
         catch (org.json.JSONException e) { return false; }
+    }
+
+    static boolean createPending(Context c) { return sp(c).getBoolean("live_create_pending", false); }
+    static boolean stopPending(Context c) { return sp(c).getBoolean("live_stop_pending", false); }
+
+    static LiveConnection.Store liveStore(Context context) {
+        Context c = context.getApplicationContext();
+        return new LiveConnection.Store() {
+            public LiveClient.Session get() { return getSession(c); }
+            public void save(LiveClient.Session s) throws java.io.IOException {
+                if (!saveSession(c, s)) throw new java.io.IOException("场次凭证保存失败");
+            }
+            public boolean creating() { return createPending(c); }
+            public void creating(boolean value) throws java.io.IOException { flag("live_create_pending", value); }
+            public boolean stopping() { return stopPending(c); }
+            public void stopping(boolean value) throws java.io.IOException { flag("live_stop_pending", value); }
+            private void flag(String key, boolean value) throws java.io.IOException {
+                if (!sp(c).edit().putBoolean(key, value).commit()) throw new java.io.IOException("场次状态保存失败");
+            }
+        };
     }
 
     public static String getDouyinAccount(Context c) { return sp(c).getString("douyin_account", ""); }
     public static void setDouyinAccount(Context c, String value) { sp(c).edit().putString("douyin_account", value).apply(); }
+    static String getLiveDescription(Context c) { return sp(c).getString("live_description", ""); }
+    static void setLiveDescription(Context c, String value) { sp(c).edit().putString("live_description", value).apply(); }
 
     public static float[] getRegion(Context c, String kind) {
         if ("legacy".equals(kind)) return getRegion(c);
@@ -111,10 +134,10 @@ public final class Prefs {
         } catch (org.json.JSONException e) { return null; }
     }
     public static boolean hasCachedRecap(Context c) { return sp(c).contains("last_recap"); }
-    public static boolean cacheTerminalRecap(Context c,LiveClient.Session session,
+    public static synchronized boolean cacheTerminalRecap(Context c,LiveClient.Session session,
                                             org.json.JSONObject summary,org.json.JSONArray events) {
         LiveClient.Session current=getSession(c);
-        if (current==null || !current.id.equals(session.id) || !RecapText.terminal(summary)) return false;
+        if (!RecapRequest.sameSession(current,session) || !RecapText.terminal(summary)) return false;
         try {
             String raw=new org.json.JSONObject().put("summary",summary).put("events",events).toString();
             return sp(c).edit().putString("last_recap",raw).remove("live_session").commit();

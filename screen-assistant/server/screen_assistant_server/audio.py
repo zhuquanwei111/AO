@@ -126,6 +126,8 @@ class AudioService:
         self.tracks: dict[tuple[str, str], Track] = {}
         self.closing: set[str] = set()
         self.body_readers: dict[str, int] = {}
+        self.active_transcripts: dict[asyncio.Task, tuple[str, list[int]]] = {}
+        self.stop_transcripts: dict[str, bool] = {}
         self.vad_factory = lambda: SileroVAD(settings.silero_model_path)
         self.asr = FunASRSDK(settings.funasr_model_path, self.offload)
         self.reaper = asyncio.create_task(self.reap()) if settings.audio_enabled else None
@@ -147,6 +149,19 @@ class AudioService:
 
     def configure_for_test(self, vad_factory, asr):
         self.vad_factory, self.asr = vad_factory, asr
+
+    def begin_fusion_stop(self, sid):
+        # 仅保留此刻在途执行的产出；已结束的历史任务不参与补偿。
+        self.stop_transcripts[sid] = any(
+            session_id == sid and count[0] for session_id, count in self.active_transcripts.values()
+        )
+
+    def record_transcript(self, sid):
+        entry = self.active_transcripts.get(asyncio.current_task())
+        if entry is not None and entry[0] == sid:
+            entry[1][0] += 1
+        if sid in self.stop_transcripts:
+            self.stop_transcripts[sid] = True
 
     async def access(self, sid, token):
         return await self.live.run("audio_access", sid, token)
@@ -193,6 +208,7 @@ class AudioService:
             track.busy = True
         transcripts, gaps = [], []
         track.ingest_task = asyncio.current_task()
+        self.active_transcripts[track.ingest_task] = (sid, [0])
         try:
             if track.vad is None:
                 track.vad = await self.offload(self.vad_factory)
@@ -313,6 +329,7 @@ class AudioService:
             raise HTTPException(503, "audio engine unavailable or finalization failed") from error
         finally:
             track.busy, track.touched = False, time.monotonic()
+            self.active_transcripts.pop(track.ingest_task, None)
             track.ingest_task = None
             if track.vad is None:
                 self.tracks.pop(key, None)
@@ -341,23 +358,28 @@ class AudioService:
             track.coverage_start_ms = self.mapped_ms(track, snapshot.window_start)
             snapshot.coverage_start_ms = track.coverage_start_ms
         async def work():
+            task = asyncio.current_task()
+            self.active_transcripts[task] = (sid, [0])
             try:
                 async with asyncio.timeout(15):
-                    await self.analyze(sid, token, source, snapshot, track.transcripts,
-                                       app_source=app_source, owner=track)
+                    emitted = await self.analyze(sid, token, source, snapshot, track.transcripts,
+                                                 app_source=app_source, owner=track)
                 if hasattr(self, "deliver"):
-                    await self.deliver(sid, token)
+                    await self.deliver(sid, token, emitted > 0)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 track.job_error = True
                 track.gap()
+            finally:
+                self.active_transcripts.pop(task, None)
         track.job = asyncio.create_task(work())
         return True
 
     async def analyze(self, sid, token, source, track, output, *, app_source="ios_app", owner=None):
         if not track.pending:
-            return
+            return 0
+        emitted = 0
         pcm = bytes(track.pending)
         track.pending.clear()
         start = track.window_start
@@ -377,7 +399,7 @@ class AudioService:
             segment_start, segment_end = start+Fraction(left, RATE), start+Fraction(right, RATE)
             start_ms, end_ms = self.mapped_ms(track, segment_start), self.mapped_ms(track, segment_end)
             async def emit(text, final, mode):
-                nonlocal revision, previous_id
+                nonlocal revision, previous_id, emitted
                 if owner and owner.continuity_id != track.continuity_id:
                     raise AudioEngineUnavailable("audio continuity changed during recognition")
                 if revision > 99:
@@ -410,10 +432,21 @@ class AudioService:
                         }},
                 }
                 # 复用M4观察去重/时间窗/提示；原始音频不进入此路径。
-                await self.live.run("add_observation", sid, token, body, self.live.clock())
+                write = asyncio.create_task(self.live.run("add_observation", sid, token, body, self.live.clock()))
+                try:
+                    result = await asyncio.shield(write)
+                except asyncio.CancelledError:
+                    result = await write
+                    if result.get("status") == "accepted" and result.get("reason") == "windowed":
+                        self.record_transcript(sid)
+                    raise
+                if result.get("status") == "accepted" and result.get("reason") == "windowed":
+                    self.record_transcript(sid)
                 output.append(body)
+                emitted += 1
                 previous_id, revision = event_id, revision+1
             await self.asr.transcribe(pcm[left*2:right*2], segment_id, emit)
+        return emitted
 
     async def finish_session(self, sid, token):
         session = await self.access(sid, token)
@@ -494,5 +527,6 @@ async def audio_packet(session_id: str, request: Request,
         raise HTTPException(422, "invalid bounded PCM packet") from None
     result = await service.ingest(session_id, token, packet)
     if result["transcripts"]:
-        await request.app.state.live.deliver_fusion(session_id, token, request)
+        scheduled = request.app.state.live.schedule_audio_fusion(session_id, token, request)
+        result["fusion_schedule"] = "scheduled" if scheduled else "analysis_busy"
     return result

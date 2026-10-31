@@ -1,52 +1,147 @@
 package com.screenassistant;
 
-/** 只管理当前辅助覆盖层文字与过期时点，不持久化任何提示内容。 */
+import java.util.ArrayDeque;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.function.BiConsumer;
+
+/** 主线程内管理本场提示；时间参数均为elapsedRealtime毫秒，不持久化提示正文。 */
 final class OverlayMessageState {
     static final String WAITING_TEXT = "辅助中，等待内容";
+    static final long MIN_READ_MS = 8000;
+    static final int CAPACITY = 16;
+    private static final int SEEN_CAPACITY = 128;
 
-    private boolean running;
-    private String message = "";
-    private long expiresAtMs;
-
-    void start() {
-        running = true;
-        message = "";
-        expiresAtMs = 0;
+    private static final class Message {
+        final String id, text;
+        final int priority;
+        final long sourceExpiry, maxVisible;
+        Message(String id, String text, int priority, long sourceExpiry, long maxVisible) {
+            this.id = id; this.text = text; this.priority = priority;
+            this.sourceExpiry = sourceExpiry; this.maxVisible = maxVisible;
+        }
     }
 
-    void stop() {
-        running = false;
-        message = "";
-        expiresAtMs = 0;
+    private boolean running;
+    private final ArrayDeque<Message> pending = new ArrayDeque<>();
+    private final LinkedHashMap<String, Long> seen = new LinkedHashMap<>();
+    private Message current;
+    private long expiresAtMs, protectedUntilMs;
+    private int expiredCount, overflowCount;
+    private final BiConsumer<String,String> trace;
+
+    OverlayMessageState() { this((id, reason) -> {}); }
+    OverlayMessageState(BiConsumer<String,String> trace) { this.trace = trace; }
+
+    void start() { start(WAITING_TEXT); }
+    void start(String initialStatus) { clear(); running = true; }
+    void stop() { running = false; clear(); }
+
+    private void clear() {
+        current = null; pending.clear(); seen.clear();
+        expiresAtMs = 0; protectedUntilMs = 0;
+        expiredCount = 0; overflowCount = 0;
     }
 
     boolean update(String value, long sourceExpiryMs, long nowMs, long maxVisibleMs) {
-        if (!running || value == null || value.isEmpty()) return false;
-        if (value.equals(message) && !isExpired(nowMs)) return false;
-        message = value;
-        long localExpiry = nowMs + maxVisibleMs;
-        expiresAtMs = sourceExpiryMs > 0 ? Math.min(sourceExpiryMs, localExpiry) : localExpiry;
+        return update("", value, 0, sourceExpiryMs, nowMs, maxVisibleMs);
+    }
+
+    boolean update(String id, String value, int priority, long sourceExpiryMs, long nowMs, long maxVisibleMs) {
+        if (!running || value == null || value.isEmpty() || maxVisibleMs <= 0) return false;
+        advance(nowMs);
+        if (sourceExpiryMs > 0 && sourceExpiryMs <= nowMs) { expiredCount++; trace.accept(id, "source_expired_arrival"); return false; }
+        // 实时提示以ID幂等；兼容无ID的本地问答仅对当前/待显示文字去重。
+        String key = id == null ? "" : id;
+        // 保守截止点可能早于源TTL，不能据此遗忘ID并让重投续显；仍受128项容量限制。
+        if (!key.isEmpty() && (seen.containsKey(key) || containsId(key))) return false;
+        if (key.isEmpty() && ((current != null && value.equals(current.text))
+                || pending.stream().anyMatch(item -> value.equals(item.text)))) return false;
+        long sourceExpiry = sourceExpiryMs > 0 ? sourceExpiryMs : nowMs + maxVisibleMs;
+        if (!key.isEmpty()) {
+            if (seen.size() >= SEEN_CAPACITY) seen.remove(seen.keySet().iterator().next());
+            seen.put(key, sourceExpiry);
+        }
+        Message next = new Message(key, value, priority, sourceExpiry, maxVisibleMs);
+        if (pending.size() >= CAPACITY) {
+            overflowCount++;
+            if (priority < 100) { trace.accept(key, "queue_full"); return false; }
+            // 与现有iOS有界容器一致：紧急项满载时可淘汰最后一个普通等待项。
+            Iterator<Message> reverse = pending.descendingIterator();
+            boolean removed = false;
+            while (reverse.hasNext()) {
+                Message candidate = reverse.next();
+                if (candidate.priority < 100) { reverse.remove(); trace.accept(candidate.id, "queue_evicted"); removed = true; break; }
+            }
+            if (!removed) { trace.accept(key, "queue_full"); return false; }
+        }
+        pending.addLast(next);
+        advance(nowMs);
+        if (pending.contains(next)) trace.accept(key, "queued");
         return true;
     }
 
-    String textAt(long nowMs) {
-        if (!running) return "";
-        if (isExpired(nowMs)) {
-            message = "";
-            expiresAtMs = 0;
+    private boolean containsId(String id) {
+        return (current != null && id.equals(current.id)) || pending.stream().anyMatch(item -> id.equals(item.id));
+    }
+
+    private void advance(long nowMs) {
+        if (!running) return;
+        Iterator<Message> iterator = pending.iterator();
+        while (iterator.hasNext()) {
+            Message item = iterator.next();
+            if (item.sourceExpiry <= nowMs) { iterator.remove(); expiredCount++; trace.accept(item.id, "source_expired_queued"); }
         }
-        return message.isEmpty() ? WAITING_TEXT : message;
+        if (current != null && nowMs >= expiresAtMs) {
+            trace.accept(current.id, nowMs >= current.sourceExpiry ? "source_expired_visible" : "local_limit");
+            current = null;
+        }
+        Message urgent = null;
+        for (Message item : pending) if (item.priority >= 100) { urgent = item; break; }
+        Message next = null;
+        if (urgent != null && (current == null || current.priority < 100)) {
+            pending.remove(urgent); next = urgent;
+        } else if (current == null || (current.priority < 100 && nowMs >= protectedUntilMs)) {
+            next = pending.pollFirst();
+        }
+        if (next != null) {
+            current = next;
+            // 排队不改源TTL；开始显示时仍受传入的本机显示上限约束。
+            expiresAtMs = Math.min(next.sourceExpiry, nowMs + next.maxVisible);
+            protectedUntilMs = Math.min(expiresAtMs, nowMs + MIN_READ_MS);
+        } else if (current == null) { expiresAtMs = 0; protectedUntilMs = 0; }
     }
 
-    long expiresAtMs() {
-        return expiresAtMs;
+    String textAt(long nowMs) { advance(nowMs); return current == null ? "" : current.text; }
+
+    void setStatus(String value, boolean discardMessage) {
+        // 诊断由App/通知保存；连接、上传、复盘状态不能作为悬浮正文。
+        if (discardMessage) {
+            if (current != null) trace.accept(current.id, "connection_discard");
+            for (Message item : pending) trace.accept(item.id, "connection_discard");
+            current = null; pending.clear(); expiresAtMs = 0; protectedUntilMs = 0;
+        }
     }
 
-    boolean isMessageActive(long nowMs) {
-        return running && !message.isEmpty() && !isExpired(nowMs);
+    boolean shouldDisplay(boolean overlayAllowed, boolean assistantVisible) {
+        return running && overlayAllowed && !assistantVisible;
     }
 
-    private boolean isExpired(long nowMs) {
-        return !message.isEmpty() && expiresAtMs > 0 && nowMs >= expiresAtMs;
+    long expiresAtMs() { return expiresAtMs; }
+    long protectedUntilMs() { return protectedUntilMs; }
+    long sourceExpiryMs() { return current == null ? 0 : current.sourceExpiry; }
+    String currentId() { return current == null ? "" : current.id; }
+    int pendingCount() { return pending.size(); }
+    int expiredCount() { return expiredCount; }
+    int overflowCount() { return overflowCount; }
+    boolean isMessageActive(long nowMs) { advance(nowMs); return current != null; }
+
+    long nextChangeAtMs(long nowMs) {
+        advance(nowMs);
+        if (current == null) return 0;
+        long next = expiresAtMs;
+        if (!pending.isEmpty() && current.priority < 100) next = Math.min(next, protectedUntilMs);
+        for (Message item : pending) next = Math.min(next, item.sourceExpiry);
+        return next;
     }
 }

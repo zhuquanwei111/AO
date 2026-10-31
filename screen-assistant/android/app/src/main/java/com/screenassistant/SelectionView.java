@@ -29,8 +29,11 @@ public class SelectionView extends View {
     private final Paint strokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint handlePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint sizePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint labelBackground = new Paint(Paint.ANTI_ALIAS_FLAG);
 
     private RectF rect = new RectF();
+    private RectF[] selections;
+    private int selected;
     private int mode = MODE_NONE;
     private float lastX, lastY;
     private float anchorX, anchorY;
@@ -54,6 +57,7 @@ public class SelectionView extends View {
         sizePaint.setColor(Color.WHITE);
         sizePaint.setTextSize(13f * density);
         sizePaint.setTextAlign(Paint.Align.CENTER);
+        labelBackground.setColor(0xCC111111);
     }
 
     @Override
@@ -68,15 +72,32 @@ public class SelectionView extends View {
         return new RectF(rect);
     }
 
+    void setSelections(RectF[] values) {
+        selections=values; selected=0; rect=selections[0]; invalidate();
+    }
+    RectF[] getSelections() {
+        if (selections == null) return null;
+        return new RectF[]{new RectF(selections[0]),new RectF(selections[1])};
+    }
+
     @Override
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
         int w = getWidth(), h = getHeight();
-        // 区域外四条遮罩带
-        canvas.drawRect(0, 0, w, rect.top, dimPaint);
-        canvas.drawRect(0, rect.bottom, w, h, dimPaint);
-        canvas.drawRect(0, rect.top, rect.left, rect.bottom, dimPaint);
-        canvas.drawRect(rect.right, rect.top, w, rect.bottom, dimPaint);
+        if (selections != null) {
+            for (int i=0;i<selections.length;i++) {
+                strokePaint.setColor(i==selected ? Color.WHITE : Color.CYAN);
+                canvas.drawRect(selections[i],strokePaint);
+                String label=Regions.ACTIVE_LABELS[i];
+                float half=Math.min(w/2f, sizePaint.measureText(label)/2f + 6f);
+                float labelX=Math.max(half,Math.min(w-half,selections[i].centerX()));
+                float labelY=Math.max(selections[i].top-8f,sizePaint.getTextSize()+4f);
+                canvas.drawRect(labelX-half,labelY-sizePaint.getTextSize()-3f,
+                        labelX+half,labelY+4f,labelBackground);
+                canvas.drawText(label,labelX,labelY,sizePaint);
+            }
+            strokePaint.setColor(Color.WHITE);
+        }
         // 边框与四角
         canvas.drawRect(rect, strokePaint);
         float r = 7f * getResources().getDisplayMetrics().density;
@@ -84,8 +105,10 @@ public class SelectionView extends View {
         canvas.drawCircle(rect.right, rect.top, r, handlePaint);
         canvas.drawCircle(rect.left, rect.bottom, r, handlePaint);
         canvas.drawCircle(rect.right, rect.bottom, r, handlePaint);
-        String info = Math.round(rect.width()) + " × " + Math.round(rect.height());
-        canvas.drawText(info, rect.centerX(), Math.max(rect.top - 8f, sizePaint.getTextSize()), sizePaint);
+        if (selections == null) {
+            String info = Math.round(rect.width()) + " × " + Math.round(rect.height());
+            canvas.drawText(info, rect.centerX(), Math.max(rect.top - 8f, sizePaint.getTextSize()), sizePaint);
+        }
     }
 
     private int hitCorner(float x, float y) {
@@ -122,13 +145,25 @@ public class SelectionView extends View {
             case MotionEvent.ACTION_DOWN:
                 lastX = e.getX();
                 lastY = e.getY();
+                if (selections != null) {
+                    for (int i=0;i<selections.length;i++) {
+                        RectF candidate=selections[i];
+                        if (candidate.contains(lastX,lastY)
+                                || dist(lastX,lastY,candidate.left,candidate.top)<touchSlop
+                                || dist(lastX,lastY,candidate.right,candidate.top)<touchSlop
+                                || dist(lastX,lastY,candidate.left,candidate.bottom)<touchSlop
+                                || dist(lastX,lastY,candidate.right,candidate.bottom)<touchSlop) {
+                            selected=i; rect=candidate; break;
+                        }
+                    }
+                }
                 int corner = hitCorner(lastX, lastY);
                 if (corner != MODE_NONE) {
                     mode = corner;
                 } else if (rect.contains(lastX, lastY)) {
                     mode = MODE_MOVE;
                 } else {
-                    mode = MODE_CREATE;
+                    mode = selections == null ? MODE_CREATE : MODE_NONE;
                     anchorX = lastX;
                     anchorY = lastY;
                 }

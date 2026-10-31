@@ -1,0 +1,22 @@
+PaddleOCR PP-OCRv5_mobile ONNX models
+
+This application bundles the official PaddlePaddle PP-OCRv5_mobile_det_onnx
+and PP-OCRv5_mobile_rec_onnx inference.onnx files. The model cards identify
+both models as Apache-2.0 licensed. The Apache License 2.0 text is included in
+PaddleOCR-LICENSE.txt.
+
+Detection model:
+- Source: https://huggingface.co/PaddlePaddle/PP-OCRv5_mobile_det_onnx
+- Exact file revision: df0bd9dee2bc627e80a2a1798ccab35a332e22d6
+- File: inference.onnx
+- SHA-256: a431985659dc921974177a95adcfbb90fd9e51989a5e04d70d0b75f597b6e61d
+
+Recognition model:
+- Source: https://huggingface.co/PaddlePaddle/PP-OCRv5_mobile_rec_onnx
+- Exact file revision: ec1bd72732b2b5f52df0a66321403eebb520ba74
+- File: inference.onnx
+- SHA-256: da72dc72ca4dc220df0dfde68c1dedc31c58d3e76a25871122e5056227d50092
+
+The model files bundled in this application were verified byte-for-byte
+against the files at the revisions above. They were not downloaded or
+converted during this integration.

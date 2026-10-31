@@ -1,12 +1,12 @@
 # 屏识AI助手 V1.0
 
-Android 客户端按设定间隔采集屏幕区域，进行端上中文 OCR，并把单条文本发送到远端 `/v1/answer`；只把新回复显示在不抢焦点的悬浮条。画面、识别文本和回复不写入本地文件或历史记录。
+Android 客户端采集用户校准的评论和在线人数区域，使用固定版本 Paddle OCR，通过现有单条 observation DTO 上传，并轮询运营提示。画面、识别文本和回复不写入本地文件或历史记录；批次与行序仅在本机内存保留。
 
 ## 模块与当前集成状态
 
 | 目录 | 内容 | 当前状态 |
 |---|---|---|
-| `android/` | Java、MediaProjection、ML Kit Chinese OCR、HTTP、悬浮展示 | 38提交已集成；40负责本地集成和设备验证 |
+| `android/` | Java/Kotlin、MediaProjection、Paddle OCR、HTTP、悬浮展示 | Android 采集与提示候选，设备验证范围见对应交付证据 |
 | `server/` | FastAPI、Redis原子去重、天翼模型单轮回答 | 37提交`127ce11`、`e9034d1`及19180专用Compose`85a42df`已集成 |
 | `ios/` | ReplayKit广播扩展、Vision中文OCR、HTTP、PiP、通知与回复IPC | `c703f2f`、PiP切片`3499e4d`、UDS无文件模块`978b374`已集成；PiP回复适配和平台实测仍未完成 |
 
@@ -24,7 +24,17 @@ cd screen-assistant\android
 adb install -r .\app\build\outputs\apk\debug\app-debug.apk
 ```
 
-启动应用后填写同一局域网中的服务地址（模拟器访问宿主机用`http://10.0.2.2:8000`）及轮询间隔。首次使用须允许“显示在其他应用上层”、通知（Android 13+）和每次会话的系统屏幕采集授权。选区只在主动编辑时临时出现；完成或取消后移除。正常采集时回复窗口标记`NOT_FOCUSABLE|NOT_TOUCHABLE`，当前模拟器确认采集运行期间没有残留选区层；特定厂商系统与真机触摸穿透仍需目标设备复验。
+启动应用后填写同一局域网中的服务地址（模拟器访问宿主机用`http://10.0.2.2:8000`）及轮询间隔。首次使用须允许“显示在其他应用上层”、通知（Android 13+）和每次会话的系统屏幕采集授权。选区只在主动编辑时临时出现；完成或取消后移除。正常采集时回复窗口可触摸，48dp宽的手柄用于拖动；窗口 flags 为`NOT_FOCUSABLE|FLAG_SECURE|NOT_TOUCH_MODAL`。回复窗口范围内的触摸由窗口接收，不会穿透到下层直播应用；窗口外触摸可按系统规则传递。目标设备触摸行为仍需复验。
+
+create 响应中的能力分别门控，均只接受 JSON 布尔 true：`observation_batch_metadata` 仅允许新采样轮发送冻结的批次/行序/评论项总数，`typed_prompts` 仅允许将明确类型显示为“评论回复”或“运营提醒”。任一缺失或非法仅关闭该项能力，不从另一项推断；未启用类型能力时正文仍中性显示为“提示”。恢复旧凭证时两项都回退。此门控取决于实际服务已部署的能力，不能用源码候选代替线上响应。
+
+若开场请求结果未确认，应用保留本机阻断以避免自动重复创建；服务可能已创建旧场，即使网络返回错误或读取超时也不能推定未创建。停止本机采集并核对原服务后，可在连接与识别设置中主动选择“解除本机开场限制”，阅读说明并确认。该操作仅清除本机限制，不会创建新场、不证明服务器未创建，也不会结束可能遗留的旧场；完成后须自行点击开始。已有场次凭证、未确认的停止操作或连接仍在收尾时不可解除，保存失败会继续阻断。
+
+结束辅助会先释放本机投屏与服务，再确认原场停止。仅停止接口 HTTP 200 确认本场结束；超时或其他状态保留原场凭证及待确认标记，禁止新开，只能重试结束原场。结束确认与后台复盘数据就绪分别显示；迟到结果只刷新原场。
+
+悬浮正文只显示有效建议，空闲或到期后收起为48dp手柄，新有效建议再展开。连接、采样上传和复盘诊断留在应用/通知中。普通提示最短阅读窗口采用8秒、本机最多显示12秒；源TTL优先，剩余不足8秒时仅按剩余合法时效显示。延长保护可能使排队提示在显示前过期。等待队列最多16项，排队不重置源TTL，显示前清理过期项，按prompt ID幂等；沿后端既有`priority>=100`紧急契约插队，不从文案或消费等级推断紧急程度。
+
+提示时效要求`/prompts`提供同源整数`server_time_ms`与`server_processing_ms`（契约见[PR11冻结服务端说明](https://github.com/zhuquanwei111/AO/blob/90d0194c099ea5feb352c1ea55b891d89dce2e8f/screen-assistant/server/README.md)）。客户端在真实HTTP边界用包含休眠的`elapsedRealtimeNanos`测完整RTT并向上取整，扣除服务处理时长，再从源剩余时效扣传输预算和1ms余量；排队、8秒保护和12秒上限统一使用`elapsedRealtime`截止点。关屏移除窗口，亮屏先重算时效再附着。旧服务缺字段或公共时效锚非法时拒显整页；公共锚合法时，单条expires缺失、非严格整数、非正值或无法安全形成截止点只跳过该条并诊断，不清空同页合法项，合法已过期项仅跳过且不记非法。合法项截止点、原顺序、ID和优先级不变，沿用既有游标语义。App/通知显示诊断，采集、轮询和停止继续；不把设备墙钟、HTTP Date或首次`returned_at_ms`作为替代锚。该计算依赖响应未缓存及服务时钟未异常跳变。
 
 使用步骤：
 
@@ -77,12 +87,12 @@ Android 模拟器服务地址填`http://10.0.2.2:8000`；真机填电脑在同�
 | 项目 | 结果 |
 |---|---|
 | Debug构建、安装、启动 | 通过；私网IPv4地址校验已修复，`http://10.0.2.2:19180`通过启动流程并出现MediaProjection授权。新APK `screen-assistant-debug-urlfix.apk`。 |
-| MediaProjection、端侧OCR与选区交互 | 通过既有模拟器验收；区域选择只在编辑期间存在，确认/取消后退出。正常采集中回复窗 flags 为`NOT_FOCUSABLE|NOT_TOUCHABLE|NOT_TOUCH_MODAL`。 |
+| MediaProjection、端侧OCR与选区交互 | 通过既有模拟器验收；区域选择只在编辑期间存在，确认/取消后退出。正常采集中回复窗可触摸以支持拖动，flags 为`NOT_FOCUSABLE|FLAG_SECURE|NOT_TOUCH_MODAL`；窗口范围内触摸不穿透。目标设备触摸行为需复验。 |
 | Android旧客户端真实请求 | 2026-10-21 05:35:20.591Z收到HTTP 200；旧客户端未记录`X-Request-ID`。200表明服务端生成非空回复，但旧版没有客户端接收/悬浮展示证据；未重复该请求。 |
 | 新客户端固定响应→悬浮窗（不调用模型） | 本地stub的HTTP 200 JSON被解析为`SUCCESS`，回复非空；主线程分发后WindowManager attach回调确认`shown=true`。本地UI截图见artifact `screen-assistant-local-reply-ui.png`。 |
 | 新客户端真实服务端验证 | 2026-10-21 06:27:18Z HTTP 200，`X-Request-ID=61781edb75b049a4ab8a857f043ac46b`，端侧`SUCCESS`、非空reply长度73；WindowManager日志确认悬浮窗`shown=true`并完成attach。45核对服务端为`outcome=success`、`finish_reason=stop`，模型耗时2906ms/HTTP耗时2926ms，未记录正文。真实悬浮截图见artifact `android-real-reply-overlay.png`。 |
 | 重复204、断网恢复 | 同句后续请求收到204去重；一次未及时停止导致相同画面再次得到200（`X-Request-ID=7d8184d665924950a822b3bfae41a591`，服务端确认success/stop、模型耗时2899ms/HTTP耗时2901ms）及随后204。已force-stop采集。断网恢复未验证。 |
-| 回复窗底层点击穿透 | 日志确认窗口`focusable=false touchable=false`，并核对`NOT_FOCUSABLE|NOT_TOUCHABLE|NOT_TOUCH_MODAL`配置；本轮未在覆盖区域内实际点按，厂商系统与真机仍需验证。 |
+| 回复窗触摸与拖动 | 代码启用窗口触摸并给48dp宽拖动手柄处理拖动；窗口范围内触摸由回复窗接收，不穿透到底层应用，窗口外触摸由`NOT_TOUCH_MODAL`允许传递。本轮目标设备触摸行为未复验。 |
 | 系统外部撤销MediaProjection | 未验证；已覆盖应用内停止。 |
 | 不落盘、厂商策略、连续30分钟 | 代码设计为仅内存处理；未做文件系统取证、真机或长时间实测。 |
 

@@ -138,13 +138,7 @@
                 <TextView
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:text="兼容入口与暂停控制，仅供需要旧问答模式的用户使用。" />
-
-                <Button
-                    android:id="@+id/btn_legacy_answer"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:text="启动旧问答兼容模式" />
+                    android:text="暂停或继续屏幕辅助。" />
 
                 <Button
                     android:id="@+id/btn_pause_resume"
