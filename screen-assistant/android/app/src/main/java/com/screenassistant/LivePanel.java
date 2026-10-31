@@ -51,7 +51,7 @@ final class LivePanel {
     }
 
     void stopOperationSession(Runnable onComplete, Consumer<String> onError) {
-        if (CaptureService.phase != CaptureService.Phase.IDLE) return;
+        if (CaptureService.phase != CaptureService.Phase.IDLE || CaptureService.stopInProgress) return;
         LiveClient.Session session = Prefs.getSession(activity);
         if (session == null || session.stopped) {
             activity.runOnUiThread(onComplete);
@@ -98,12 +98,14 @@ final class LivePanel {
     boolean isWorking() { return working; }
 
     String getSummary() {
-        if (working) return "正在准备辅助场次…";
-        if (!lastError.isEmpty()) return lastError;
-        if (Prefs.createPending(activity)) return "场次创建未确认，未重复创建。请核对原服务端记录后再继续；本地状态提示仍可使用。";
-        if (Prefs.stopPending(activity)) return "本地采集已停止，上场结束未确认。请连接原服务后重试结束；暂不创建新场次。";
+        if (working) return "本机采集已停止，正在确认场次结束。";
         LiveClient.Session session = Prefs.getSession(activity);
-        if (session == null) return "尚未开始";
+        String stopStatus = RecapText.stopStatus(session != null, session != null && session.stopped,
+                Prefs.stopPending(activity), CaptureService.stopInProgress);
+        if (!stopStatus.isEmpty()) return stopStatus;
+        if (Prefs.createPending(activity)) return "场次创建未确认，未重复创建。请核对原服务端记录后再继续；本地状态提示仍可使用。";
+        if (!lastError.isEmpty()) return lastError;
+        if (session == null) return Prefs.hasCachedRecap(activity) ? "最近场次已结束，可查看已保存复盘。" : "尚未开始";
         if (session.stopped) return "上一场已结束，可查看复盘或开始新辅助";
         return CaptureService.phase == CaptureService.Phase.IDLE
                 ? "保留了原场次凭证，当前未确认在线。可继续连接或重试结束本场。"
@@ -125,7 +127,7 @@ final class LivePanel {
         boolean active = hasActiveSession();
         endIdleSession.setVisibility(active && CaptureService.phase == CaptureService.Phase.IDLE
                 ? android.view.View.VISIBLE : android.view.View.GONE);
-        endIdleSession.setEnabled(!working);
+        endIdleSession.setEnabled(!working && !CaptureService.stopInProgress);
     }
 
     void openRecap() {

@@ -124,8 +124,12 @@ public class MainActivity extends Activity {
                 break;
             default:
                 status = livePanel != null ? livePanel.getSummary() : "尚未开始";
+                LiveClient.Session current = Prefs.getSession(this);
                 if (!transientStatus.isEmpty()) status = transientStatus;
-                else if (!CaptureService.lastMessage.isEmpty()
+                else if (!Prefs.stopPending(this) && !CaptureService.stopInProgress
+                        && (current == null || !current.stopped)
+                        && (current != null || !Prefs.hasCachedRecap(this))
+                        && !CaptureService.lastMessage.isEmpty()
                         && !"已结束辅助".equals(CaptureService.lastMessage)) status = CaptureService.lastMessage;
                 break;
         }
@@ -145,7 +149,7 @@ public class MainActivity extends Activity {
             btnMain.setEnabled(false);
         } else {
             btnMain.setText(livePanel != null && livePanel.hasActiveSession() ? "继续辅助" : "开始辅助");
-            btnMain.setEnabled(!busy && !pendingStart);
+            btnMain.setEnabled(!busy && !pendingStart && !CaptureService.stopInProgress);
         }
         btnPause.setEnabled(phase == CaptureService.Phase.RUNNING || phase == CaptureService.Phase.PAUSED);
         btnPause.setText(phase == CaptureService.Phase.PAUSED ? "继续屏幕辅助" : "暂停屏幕辅助");
