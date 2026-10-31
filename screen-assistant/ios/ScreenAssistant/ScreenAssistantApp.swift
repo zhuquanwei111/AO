@@ -351,9 +351,11 @@ final class AppModel: ObservableObject {
         livePollTask = client.poll(credentials, after: liveCursor, waitMS: waitMS) { [weak self] result, response, transportError in
             DispatchQueue.main.async {
                 guard let self else { return }
-                guard self.liveCredentials?.token == credentials.token,
-                      let saved = Self.savedCredentials(), saved.sessionID == credentials.sessionID,
-                      saved.token == credentials.token else { return }
+                let saved = Self.savedCredentials()
+                guard PollCallbackGate.matchesCredentials(
+                    sessionID: credentials.sessionID, token: credentials.token,
+                    currentSessionID: self.liveCredentials?.sessionID, currentToken: self.liveCredentials?.token,
+                    savedSessionID: saved?.sessionID, savedToken: saved?.token) else { return }
                 guard PollCallbackGate.commitIfCurrent(
                     sessionID: credentials.sessionID, generation: generation,
                     currentSessionID: self.liveCredentials?.sessionID,

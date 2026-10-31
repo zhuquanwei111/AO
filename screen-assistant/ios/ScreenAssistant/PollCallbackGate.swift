@@ -2,6 +2,13 @@ import Foundation
 
 /// 调用方须在持有当前场次和代次的串行上下文中调用。
 enum PollCallbackGate {
+    static func matchesCredentials(sessionID: String, token: String,
+                                   currentSessionID: String?, currentToken: String?,
+                                   savedSessionID: String?, savedToken: String?) -> Bool {
+        sessionID == currentSessionID && token == currentToken &&
+            sessionID == savedSessionID && token == savedToken
+    }
+
     @discardableResult
     static func commitIfCurrent(sessionID: String, generation: Int,
                                 currentSessionID: String?, currentGeneration: Int,
