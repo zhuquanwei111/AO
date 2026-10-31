@@ -67,7 +67,17 @@ def _make(items: list[dict[str, Any]], nickname: str | None, text: str | None,
             "source_event_ids": ids, "first_observed_at_ms": min(times),
             "last_seen_at_ms": max(times), "boundary_status": boundary,
             "tracking_status": "new", "position": position, "header_evidence": header_evidence,
-            "fragments": [{"text": item["content"]["text"], "position": _box(item)} for item in items]}
+            "fragments": [{"text": item["content"]["text"],
+                           "position": ({k: _box(item)[k] for k in ("x", "y", "width", "height")}
+                                        if _box(item) else None)} for item in items]}
+
+
+def _near(box: dict[str, float], other: dict[str, float]) -> bool:
+    """判断观察是否可能影响本行或紧邻的续行。"""
+    return (other["y"] < box["y"] + box["height"] * 2.5
+            and other["y"] + other["height"] > box["y"] - box["height"] * 0.5
+            and other["x"] + other["width"] >= box["x"] - box["height"]
+            and other["x"] <= box["x"] + box["width"] + box["height"] * 2)
 
 
 def _shared_fragment_movement(old: dict[str, Any], current: dict[str, Any]) -> bool:
@@ -83,7 +93,8 @@ def _shared_fragment_movement(old: dict[str, Any], current: dict[str, Any]) -> b
     return len(shifts) >= 2 and max(shifts) - min(shifts) <= 0.03
 
 
-def reconstruct_comments(observations: list[dict[str, Any]], previous: list[dict[str, Any]] = ()) -> list[dict[str, Any]]:
+def reconstruct_comments(observations: list[dict[str, Any]], previous: list[dict[str, Any]] = (), *,
+                         batch_complete: bool = False, quality_gaps: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """Return OCR candidates; previous must be the immediately preceding capture.
 
     Callers isolate sessions, enforce capture completeness and decide expiry.
@@ -162,6 +173,59 @@ def reconstruct_comments(observations: list[dict[str, Any]], previous: list[dict
         for item in ordered:
             if item["event_id"] not in used:
                 result.append(_make([item], None, None, "ambiguous"))
+
+    # 可消费只表示本轮已观察到的局部结构满足窄规则，不代表平台真值。
+    lookup = {item["event_id"]: item for item in observations}
+    batch_keys = {(item.get("source", ""), item.get("capture_batch_id")) for item in observations}
+    for comment in result:
+        reasons = []
+        sources = comment["field_sources"]["text"]
+        item = lookup.get(sources[0]) if len(sources) == 1 else None
+        box = _box(item) if item else None
+        if (not batch_complete or quality_gaps is None or not item or item.get("capture_batch_id") is None
+                or len(batch_keys) != 1):
+            reasons.append("batch_or_quality_unverified")
+        if not comment["text"] or not box or not _split(item["content"]["text"] if item else ""):
+            reasons.append("body_or_geometry_uncertain")
+        if comment["text"] and comment["text"].rstrip().endswith(("…", "...", "⋯")):
+            reasons.append("visible_truncation")
+        if box:
+            # 提供的坐标上界附近可能被截断；其余位置不证明未触采集区域边缘。
+            if box["y"] <= 0.03 and box["y"] <= box["height"]:
+                reasons.append("near_top_edge")
+            for gap in quality_gaps or ():
+                gap_box = gap.get("text_position")
+                if not gap_box or not all(k in gap_box for k in ("x", "y", "width", "height")) or _near(box, gap_box):
+                    reasons.append("quality_gap")
+                    break
+            for other in observations:
+                if other["event_id"] in comment["source_event_ids"]:
+                    continue
+                if (other.get("source", "") != item.get("source", "")
+                        or other.get("capture_batch_id") != item.get("capture_batch_id")):
+                    continue
+                other_box = _box(other)
+                if not other_box:
+                    reasons.append("unlocated_observation")
+                    break
+                # 另一明确下一行标题是边界；其它邻近片段可能是续行或弹窗。
+                is_next_header = _split(other["content"]["text"]) and other_box["y"] >= box["y"] + box["height"] * 0.7
+                is_left_prefix = _overlap(box, other_box) and other_box["x"] + other_box["width"] <= box["x"]
+                if _near(box, other_box) and not is_next_header and not is_left_prefix:
+                    reasons.append("nearby_unassigned")
+                    break
+        comment["usability_reasons"] = reasons
+        if not reasons:
+            comment["field_status"]["text"] = "usable"
+            comment["boundary_status"] = "locally_complete"
+            if comment["nickname"] is not None and comment["nickname"][0].isalnum():
+                comment["field_status"]["nickname"] = "usable"
+        nickname_reasons = ([] if comment["field_status"]["nickname"] == "usable" else
+                            (["ambiguous_header"] if not comment["nickname"] or
+                             not comment["nickname"][0].isalnum() else list(reasons)))
+        comment["field_reasons"] = {"text": list(reasons), "nickname": nickname_reasons,
+                                    "consumption_level": ["not_classified"],
+                                    "fan_level": ["not_classified"], "fan_group": ["not_classified"]}
 
     # A unique text/geometry match remains ambiguous unless two fragments or
     # two neighbouring comments show a consistent upward movement.

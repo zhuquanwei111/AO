@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 from screen_assistant_server.comment_reconstruction import reconstruct_comments
 
 
@@ -19,6 +21,112 @@ def test_badge_sample_preserves_ambiguous_badges_but_recovers_text():
     assert comment["fan_level"] is None
     assert comment["fan_group"] is None
     assert "c" in comment["source_event_ids"]
+
+
+def test_complete_batch_can_use_real_badge_body_without_guessing_levels():
+    rows = [row("a", "049", (69/925, 47/128, 61/925, 35/128)),
+            row("b", "1爱哄人", (155/925, 44/128, 135/925, 38/128), index=1),
+            row("c", "紫菜蛋花汤：bless you", (384/925, 40/128, 459/925, 56/128), index=2)]
+    comment = next(c for c in reconstruct_comments(rows, batch_complete=True, quality_gaps=[])
+                   if c["text"] == "bless you")
+    assert comment["field_status"]["text"] == "usable"
+    assert comment["boundary_status"] == "locally_complete"
+    assert comment["field_sources"]["text"] == ["c"]
+    assert comment["fan_level"] is None and comment["consumption_level"] is None
+
+
+def test_clear_question_requires_explicit_complete_batch_and_quality_review():
+    rows = [row("a", "阿青：今天几点开播？", (.1, .3, .45, .04))]
+    eligible = reconstruct_comments(rows, batch_complete=True, quality_gaps=[])[0]
+    assert eligible["field_status"]["text"] == "usable"
+    assert eligible["field_status"]["nickname"] == "usable"
+    assert eligible["boundary_status"] == "locally_complete"
+    assert reconstruct_comments(rows)[0]["field_status"]["text"] == "candidate"
+    assert reconstruct_comments(rows, batch_complete=True)[0]["field_status"]["text"] == "candidate"
+
+
+def test_unreliable_neighbour_or_unlocated_gap_blocks_upgrade():
+    rows = [row("a", "阿青：今天几点开播？", (.1, .3, .45, .04))]
+    for gaps in ([{"event_id": "gap", "text_position": None}],
+                 [{"event_id": "gap", "text_position": {"x": .1, "y": .345, "width": .2, "height": .04}}]):
+        comment = reconstruct_comments(rows, batch_complete=True, quality_gaps=gaps)[0]
+        assert comment["field_status"]["text"] != "usable"
+        assert comment["boundary_status"] != "locally_complete"
+        assert comment["usability_reasons"]
+
+
+def test_unassigned_continuation_or_truncated_text_blocks_upgrade():
+    rows = [row("a", "阿青：这是长评论的开头", (.1, .3, .45, .04)),
+            row("b", "后面仍然有不少内容", (.1, .345, .4, .04), index=1)]
+    comment = next(c for c in reconstruct_comments(rows, batch_complete=True, quality_gaps=[])
+                   if c["text"] is not None)
+    assert comment["field_status"]["text"] != "usable"
+    truncated = reconstruct_comments([row("c", "阿青：还有更多…", (.1, .3, .3, .04))],
+                                     batch_complete=True, quality_gaps=[])[0]
+    assert truncated["field_status"]["text"] != "usable"
+    cropped = reconstruct_comments([row("d", "不补：对看的", (86/576, 13/580, 116/576, 14/580))],
+                                   batch_complete=True, quality_gaps=[])[0]
+    assert cropped["field_status"]["text"] != "usable"
+    assert "near_top_edge" in cropped["usability_reasons"]
+
+
+def test_real_a30_long_comment_with_unassigned_continuation_is_not_usable():
+    rows = [row("a", "别忽悠我就行：点点关注点点", (78/576, 45/580, 266/576, 23/580)),
+            row("b", "赞，亮个粉丝牌！", (31/576, 72/580, 150/576, 26/580), index=1)]
+    comment = next(c for c in reconstruct_comments(rows, batch_complete=True, quality_gaps=[])
+                   if c["text"] is not None)
+    assert comment["text"] == "点点关注点点"
+    assert comment["field_status"]["text"] == "candidate"
+    assert "nearby_unassigned" in comment["usability_reasons"]
+
+
+def test_unlocated_observation_and_multiple_batches_cannot_claim_complete():
+    first = row("a", "阿青：今天几点开播？", (.1, .3, .45, .04))
+    missing = row("b", "不明片段", (.1, .4, .2, .04), index=1)
+    missing["content"]["text_position"] = None
+    result = reconstruct_comments([first, missing], batch_complete=True, quality_gaps=[])
+    assert result[0]["field_status"]["text"] != "usable"
+    second = row("c", "小林：你好", (.1, .6, .3, .04), batch="other")
+    assert all(c["field_status"]["text"] != "usable" for c in
+               reconstruct_comments([first, second], batch_complete=True, quality_gaps=[]))
+
+
+def test_numeric_header_does_not_block_usable_body_or_invent_nickname():
+    comment = reconstruct_comments([row("a", "10交换余生：小匪宝宝", (.1, .3, .4, .04))],
+                                   batch_complete=True, quality_gaps=[])[0]
+    assert comment["field_status"]["text"] == "usable"
+    assert comment["nickname"] is None
+    assert comment["field_status"]["nickname"] == "unknown"
+    assert comment["field_reasons"]["nickname"] == ["ambiguous_header"]
+
+
+def test_decorated_header_is_not_used_as_a_confirmed_nickname():
+    comment = reconstruct_comments([row("a", "●14梦宝：小匪宝宝", (.1, .3, .4, .04))],
+                                   batch_complete=True, quality_gaps=[])[0]
+    assert comment["field_status"]["text"] == "usable"
+    assert comment["field_status"]["nickname"] != "usable"
+    assert comment["field_reasons"]["nickname"] == ["ambiguous_header"]
+
+
+def test_output_does_not_alias_observations_or_previous():
+    observations = [row("a", "阿青：你好", (.1, .5, .3, .04))]
+    original = deepcopy(observations)
+    previous = reconstruct_comments(observations)
+    saved_previous = deepcopy(previous)
+    new = reconstruct_comments([row("b", "阿青：你好", (.1, .3, .3, .04), at=2000)], previous)
+    assert previous == saved_previous
+    previous[0]["fragments"][0]["position"]["x"] = 0
+    assert observations == original
+    assert new[0]["first_observed_at_ms"] == 2000
+    observations[0]["content"]["text_position"]["y"] = 0
+    assert previous[0]["fragments"][0]["position"]["y"] == .5
+    current_rows = [row("c", "阿青：你好", (.1, .3, .3, .04), at=3000)]
+    current_snapshot = deepcopy(current_rows)
+    old_snapshot = deepcopy(saved_previous)
+    output = reconstruct_comments(current_rows, saved_previous)
+    output[0]["fragments"][0]["position"]["x"] = 0
+    assert current_rows == current_snapshot
+    assert saved_previous == old_snapshot
 
 
 def test_left_shifted_continuation_and_right_advertisement():
