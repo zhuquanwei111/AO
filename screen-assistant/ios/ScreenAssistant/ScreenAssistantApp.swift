@@ -347,9 +347,13 @@ final class AppModel: ObservableObject {
         guard liveActive, let credentials = liveCredentials, let client = liveClient else { return }
         livePollGeneration &+= 1
         let generation = livePollGeneration
-        livePollTask = client.poll(credentials, after: liveCursor) { [weak self] result, response, transportError in
+        let waitMS = liveConnectionPending ? 0 : 15_000
+        livePollTask = client.poll(credentials, after: liveCursor, waitMS: waitMS) { [weak self] result, response, transportError in
             DispatchQueue.main.async {
                 guard let self else { return }
+                guard self.liveCredentials?.token == credentials.token,
+                      let saved = Self.savedCredentials(), saved.sessionID == credentials.sessionID,
+                      saved.token == credentials.token else { return }
                 guard PollCallbackGate.commitIfCurrent(
                     sessionID: credentials.sessionID, generation: generation,
                     currentSessionID: self.liveCredentials?.sessionID,

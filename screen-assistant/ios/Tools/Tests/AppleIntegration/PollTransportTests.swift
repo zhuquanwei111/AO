@@ -16,6 +16,14 @@ private final class PollFixtureProtocol: URLProtocol {
 
     override func startLoading() {
         let path = request.url!.path
+        if path.hasPrefix("/immediate-") {
+            let query = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems
+            guard query?.first(where: { $0.name == "wait_ms" })?.value == "0",
+                  request.value(forHTTPHeaderField: "X-Live-Session-Token") == "fixture-token" else {
+                client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+                return
+            }
+        }
         if path.hasPrefix("/hold/") { return }
         if path.hasPrefix("/timeout/") {
             client?.urlProtocol(self, didFailWithError: URLError(.timedOut))
@@ -25,7 +33,7 @@ private final class PollFixtureProtocol: URLProtocol {
             client?.urlProtocol(self, didFailWithError: URLError(.cannotConnectToHost))
             return
         }
-        let status = path.hasPrefix("/http-error/") ? 503 : 200
+        let status = path.hasPrefix("/http-error/") ? 503 : (path.hasPrefix("/immediate-unauthorized/") ? 401 : 200)
         let response = HTTPURLResponse(url: request.url!, statusCode: status,
                                        httpVersion: "HTTP/1.1", headerFields: nil)!
         let timing: String
@@ -38,13 +46,16 @@ private final class PollFixtureProtocol: URLProtocol {
         }
         let promptFields = "\"input_mode\":\"live_observation\",\"start_at_ms\":1,\"end_at_ms\":1,\"phenomenon\":\"x\",\"suggestion\":\"x\",\"display_text\":\"x\",\"observation_count\":1"
         let prompts: String
-        if path.hasPrefix("/mixed-metadata/") {
+        if path.hasPrefix("/immediate-prompt/") {
+            prompts = "[{\"prompt_id\":\"first\",\(promptFields),\"expires_at_ms\":5000,\"priority\":25}]"
+        } else if path.hasPrefix("/mixed-metadata/") {
             prompts = "[{\"prompt_id\":\"a\",\(promptFields),\"expires_at_ms\":5000,\"priority\":100},{\"prompt_id\":\"bad\",\(promptFields),\"expires_at_ms\":5000,\"priority\":\"invalid\",\"sources\":false},{\"prompt_id\":\"broken\"},{\"prompt_id\":\"b\",\(promptFields),\"expires_at_ms\":6000,\"priority\":25,\"sources\":[{\"kind\":\"comment\"},false]},{\"prompt_id\":\"float\",\(promptFields),\"expires_at_ms\":6000,\"priority\":100.0},{\"prompt_id\":\"missing\",\(promptFields),\"expires_at_ms\":6000},{\"prompt_id\":\"null\",\(promptFields),\"expires_at_ms\":6000,\"priority\":null},{\"prompt_id\":\"bool\",\(promptFields),\"expires_at_ms\":6000,\"priority\":true}]"
         } else if path.hasPrefix("/mixed-timing/") {
             prompts = "[{\"prompt_id\":\"a\",\(promptFields),\"expires_at_ms\":5000},{\"prompt_id\":\"bad\",\(promptFields),\"expires_at_ms\":9.0},{\"prompt_id\":\"b\",\(promptFields),\"expires_at_ms\":6000}]"
         } else { prompts = "[]" }
+        let stopped = path.hasPrefix("/immediate-stopped/") ? "true" : "false"
         let json = status == 200
-            ? "{\"session_id\":\"fixture-session\",\"prompts\":\(prompts),\"stopped\":false,\"next_cursor\":\"next\",\(timing)}"
+            ? "{\"session_id\":\"fixture-session\",\"prompts\":\(prompts),\"stopped\":\(stopped),\"next_cursor\":\"next\",\(timing)}"
             : "{\"detail\":\"fixture\"}"
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Data(json.utf8))
@@ -106,6 +117,39 @@ final class PollTransportTests: XCTestCase {
     }
 
     func testSuccessfulPage() { check("success", expectedHTTP: 200) }
+    func testImmediatePollPreservesPromptAndStoppedState() {
+        for scenario in ["immediate-prompt", "immediate-stopped"] {
+            let (client, session) = makeClient(scenario)
+            let finished = expectation(description: scenario)
+            _ = client.poll(credentials, after: "", waitMS: 0) { result, _, _ in
+                guard case .success(let page) = result else {
+                    XCTFail("expected immediate page"); finished.fulfill(); return
+                }
+                XCTAssertEqual(page.sessionID, "fixture-session")
+                XCTAssertEqual(page.stopped, scenario == "immediate-stopped")
+                XCTAssertEqual(page.prompts.map(\.promptID), scenario == "immediate-prompt" ? ["first"] : [])
+                XCTAssertEqual(page.nextCursor, "next")
+                finished.fulfill()
+            }
+            wait(for: [finished], timeout: 5)
+            session.invalidateAndCancel()
+        }
+    }
+    func testImmediatePollRejectsUnauthorizedResponse() {
+        let (client, session) = makeClient("immediate-unauthorized")
+        defer { session.invalidateAndCancel() }
+        let before = ControlState.serviceConnection()
+        let finished = expectation(description: "immediate unauthorized")
+        _ = client.poll(credentials, after: "", waitMS: 0) { result, _, _ in
+            guard case .failure(let error) = result else {
+                XCTFail("expected unauthorized failure"); finished.fulfill(); return
+            }
+            XCTAssertEqual((error as? LiveOperationsHTTPError)?.statusCode, 401)
+            XCTAssertEqual(ControlState.serviceConnection(), before)
+            finished.fulfill()
+        }
+        wait(for: [finished], timeout: 5)
+    }
     func testMalformedTimingDoesNotFailPoll() { check("invalid-timing", expectedHTTP: 200) }
     func testFloatingTimingDoesNotFailPoll() { check("float-timing", expectedHTTP: 200) }
     func testMalformedPromptExpiryPreservesHistoryRecord() throws {
