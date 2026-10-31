@@ -130,7 +130,7 @@ public class LiveConnectionHttpTest {
 
     @Test public void createCapabilityControlsRealObservationBodies() throws Exception {
         try (Fixture fixture = new Fixture()) {
-            fixture.createCapabilities = ",\"capabilities\":{\"observation_batch_metadata\":true,\"typed_prompts\":true}";
+            fixture.createCapabilities = ",\"capabilities\":{\"observation_batch_metadata\":true}";
             LiveClient.Session session = LiveClient.create(fixture.base(), "", "");
             assertTrue(session.batchMetadata);
             CollectedRows<org.json.JSONObject> rows = new CollectedRows<>(3);
@@ -150,7 +150,7 @@ public class LiveConnectionHttpTest {
             LiveClient.call(session, "observations", rows.rows.get(0).value);
             assertEquals(fixture.observationBodies.get(0), fixture.observationBodies.get(3));
 
-            fixture.createCapabilities = ",\"capabilities\":{\"observation_batch_metadata\":true}";
+            fixture.createCapabilities = ",\"capabilities\":{\"typed_prompts\":true}";
             LiveClient.Session old = LiveClient.create(fixture.base(), "", "");
             assertFalse(old.batchMetadata);
             CollectedRows<org.json.JSONObject> legacy = new CollectedRows<>(1);
@@ -286,7 +286,10 @@ public class LiveConnectionHttpTest {
     }
 
     @Test public void typedPromptReachesDisplayWithServerAssociationAndLegacyNeutral() throws Exception {
+        for (boolean batch : new boolean[]{false, true}) for (boolean typed : new boolean[]{false, true})
         try (Fixture fixture = new Fixture()) {
+            fixture.createCapabilities = ",\"capabilities\":{\"observation_batch_metadata\":" + batch
+                    + ",\"typed_prompts\":" + typed + "}";
             fixture.promptsJson = "[{\"prompt_id\":\"a\",\"priority\":25,\"expires_at_ms\":16000,\"prompt_type\":\"comment_reply\","
                     + "\"display_text\":\"欢迎回来\",\"reply_to\":{\"comment_id\":\"c1\",\"nickname\":\"小明\",\"text\":\"来了\"}},"
                     + "{\"prompt_id\":\"b\",\"priority\":25,\"expires_at_ms\":16000,\"source\":\"comment\",\"display_text\":\"谢谢\"}]";
@@ -295,7 +298,7 @@ public class LiveConnectionHttpTest {
                     remote(fixture.base(), "", ""), display);
             assertTrue(connection.connect()); assertTrue(connection.poll());
             assertEquals(2, display.received.size());
-            assertEquals("评论回复", DisplayText.promptLabel(display.received.get(0)));
+            assertEquals(typed ? "评论回复" : "提示", DisplayText.promptLabel(display.received.get(0)));
             assertEquals("欢迎回来", display.received.get(0).getString("display_text"));
             assertEquals("c1", display.received.get(0).getJSONObject("reply_to").getString("comment_id"));
             assertEquals("提示", DisplayText.promptLabel(display.received.get(1)));

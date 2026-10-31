@@ -19,15 +19,16 @@ public final class LiveClient {
         public final String baseUrl, id, token;
         public final long startedAt;
         public final boolean stopped;
-        public final boolean batchMetadata;
+        public final boolean batchMetadata, typedPrompts;
 
         public Session(String baseUrl, String id, String token, long startedAt, boolean stopped) {
-            this(baseUrl, id, token, startedAt, stopped, false);
+            this(baseUrl, id, token, startedAt, stopped, false, false);
         }
-        Session(String baseUrl, String id, String token, long startedAt, boolean stopped, boolean batchMetadata) {
+        Session(String baseUrl, String id, String token, long startedAt, boolean stopped,
+                boolean batchMetadata, boolean typedPrompts) {
             this.baseUrl = baseUrl; this.id = id; this.token = token;
             this.startedAt = startedAt; this.stopped = stopped;
-            this.batchMetadata = batchMetadata;
+            this.batchMetadata = batchMetadata; this.typedPrompts = typedPrompts;
         }
 
         public JSONObject json() throws JSONException {
@@ -40,7 +41,7 @@ public final class LiveClient {
                     o.getString("session_token"), o.getLong("started_at_ms"), o.optBoolean("stopped"));
         }
 
-        public Session asStopped() { return new Session(baseUrl, id, token, startedAt, true, batchMetadata); }
+        public Session asStopped() { return new Session(baseUrl, id, token, startedAt, true, batchMetadata, typedPrompts); }
     }
 
     public static final class HttpError extends IOException {
@@ -67,10 +68,10 @@ public final class LiveClient {
 
     static Session sessionFromCreate(String baseUrl, JSONObject result) throws JSONException {
         JSONObject capabilities = result.optJSONObject("capabilities");
-        boolean batches = capabilities != null && Boolean.TRUE.equals(capabilities.opt("observation_batch_metadata"))
-                && Boolean.TRUE.equals(capabilities.opt("typed_prompts"));
+        boolean batches = capabilities != null && Boolean.TRUE.equals(capabilities.opt("observation_batch_metadata"));
+        boolean typed = capabilities != null && Boolean.TRUE.equals(capabilities.opt("typed_prompts"));
         return new Session(baseUrl, result.getString("session_id"), result.getString("session_token"),
-                result.getLong("started_at_ms"), false, batches);
+                result.getLong("started_at_ms"), false, batches, typed);
     }
 
     public static JSONObject call(Session s, String path, JSONObject body) throws IOException, JSONException {

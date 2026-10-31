@@ -191,7 +191,8 @@ final class LiveConnection {
                 }
                 if (deadline > 0) {
                     prompt.put(PromptTiming.DEADLINE_MS, deadline).put("_client_rtt_ms", timing.rttMs)
-                            .put("_client_processing_ms", timing.processingMs).put("_client_transport_ms", timing.transportMs);
+                            .put("_client_processing_ms", timing.processingMs).put("_client_transport_ms", timing.transportMs)
+                            .put(DisplayText.TYPED_PROMPTS, session.typedPrompts);
                     ready.put(prompt);
                 }
             }

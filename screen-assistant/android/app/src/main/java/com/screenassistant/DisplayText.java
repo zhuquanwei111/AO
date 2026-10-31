@@ -2,6 +2,7 @@ package com.screenassistant;
 
 /** 两种真实用途均整条替换；纯文本归一化后的相同内容不重新显示。 */
 public final class DisplayText {
+    static final String TYPED_PROMPTS = "_client_typed_prompts";
     private DisplayText() {}
     static String promptLabel(org.json.JSONObject prompt) {
         String type = promptType(prompt);
@@ -10,6 +11,7 @@ public final class DisplayText {
         return "提示";
     }
     static String promptType(org.json.JSONObject prompt) {
+        if (!Boolean.TRUE.equals(prompt.opt(TYPED_PROMPTS))) return "unknown";
         String type = prompt.optString("prompt_type", "");
         return "comment_reply".equals(type) || "operation_notice".equals(type) ? type : "unknown";
     }
