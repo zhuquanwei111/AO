@@ -197,7 +197,9 @@ public class RegionSelectorService extends Service {
                 float[] r=normalized[i]; Prefs.setRegion(this,Regions.ACTIVE_KEYS[i],r[0],r[1],r[2],r[3]);
             }
             if (onlineChanged) Prefs.setOnlineConfirmed(this, false);
-            Toast.makeText(this, onlineChanged ? "区域已保存，请重新核对人数框用途" : "识别区域已保存", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, !Prefs.onlineConfirmed(this)
+                    ? "区域已保存，请在连接与识别设置中核对人数框是否为当前在线人数"
+                    : "识别区域已保存", Toast.LENGTH_LONG).show();
             broadcastState();
             saved[0] = true;
             cancel.setText("完成");

@@ -65,7 +65,8 @@ public class MainActivity extends Activity {
         LinearLayout sessionContainer = findViewById(R.id.live_panel_container);
         regionPanel = new RegionPanel(this, regionContainer);
         audioPanel = new AudioPanel(this, audioContainer);
-        livePanel = new LivePanel(this, sessionContainer, this::refreshUi);
+        livePanel = new LivePanel(this, sessionContainer, this::refreshUi,
+                () -> !pendingStart && CaptureService.phase == CaptureService.Phase.IDLE);
 
         btnMain.setOnClickListener(v -> onMainAction());
         btnSettings.setOnClickListener(v -> {
@@ -117,15 +118,19 @@ public class MainActivity extends Activity {
                 status = "辅助已暂停。屏幕授权仍保留，可从高级功能继续或结束。";
                 break;
             case STOPPING:
-                status = "正在结束屏幕辅助…";
+                status = CaptureService.stopInProgress ? "本机采集已停止，正在确认场次结束。" : "正在结束屏幕辅助…";
                 break;
             case STARTING:
                 status = "正在启动本地屏幕采集…";
                 break;
             default:
                 status = livePanel != null ? livePanel.getSummary() : "尚未开始";
+                LiveClient.Session current = Prefs.getSession(this);
                 if (!transientStatus.isEmpty()) status = transientStatus;
-                else if (!CaptureService.lastMessage.isEmpty()
+                else if (!Prefs.stopPending(this) && !CaptureService.stopInProgress
+                        && (current == null || !current.stopped)
+                        && (current != null || !Prefs.hasCachedRecap(this))
+                        && !CaptureService.lastMessage.isEmpty()
                         && !"已结束辅助".equals(CaptureService.lastMessage)) status = CaptureService.lastMessage;
                 break;
         }
@@ -145,7 +150,7 @@ public class MainActivity extends Activity {
             btnMain.setEnabled(false);
         } else {
             btnMain.setText(livePanel != null && livePanel.hasActiveSession() ? "继续辅助" : "开始辅助");
-            btnMain.setEnabled(!busy && !pendingStart);
+            btnMain.setEnabled(!busy && !pendingStart && !CaptureService.stopInProgress);
         }
         btnPause.setEnabled(phase == CaptureService.Phase.RUNNING || phase == CaptureService.Phase.PAUSED);
         btnPause.setText(phase == CaptureService.Phase.PAUSED ? "继续屏幕辅助" : "暂停屏幕辅助");
@@ -161,9 +166,14 @@ public class MainActivity extends Activity {
     }
 
     private void startCapture(boolean legacyAnswer) {
+        startCapture(legacyAnswer, false);
+    }
+
+    private void startCapture(boolean legacyAnswer, boolean onlineNoticeSeen) {
         transientStatus = "";
         logFlow("assist_start_clicked", "entry=" + (legacyAnswer ? "advanced_legacy" : "primary"));
-        if (pendingStart || CaptureService.phase != CaptureService.Phase.IDLE || livePanel.isWorking()) return;
+        if (pendingStart || CaptureService.phase != CaptureService.Phase.IDLE
+                || CaptureService.stopInProgress || livePanel.isWorking()) return;
         String url = etUrl.getText().toString().trim();
         int interval;
         try { interval = Integer.parseInt(etInterval.getText().toString().trim()); }
@@ -172,6 +182,17 @@ public class MainActivity extends Activity {
         if (interval < 1 || interval > 3600) { showStartError("连接设置阶段：识别间隔须为 1 至 3600 秒。"); return; }
         if (legacyAnswer && livePanel.hasActiveSession()) {
             showStartError("旧问答兼容入口不可用于正在进行的辅助场次。请先结束该场次。"); return;
+        }
+        if (!legacyAnswer && !onlineNoticeSeen && !Prefs.onlineConfirmed(this)) {
+            new android.app.AlertDialog.Builder(this)
+                    .setMessage("人数框尚未确认。请在连接与识别设置中核对它是否为当前在线人数；未确认时不会把框内数字当作已确认在线人数。")
+                    .setPositiveButton("继续辅助", (dialog, which) -> startCapture(false, true))
+                    .setNegativeButton("去设置核对", (dialog, which) -> {
+                        settingsExpanded = true;
+                        settingsPanel.setVisibility(View.VISIBLE);
+                        btnSettings.setText("收起设置");
+                    }).show();
+            return;
         }
         Prefs.setServerUrl(this, url);
         Prefs.setIntervalSec(this, interval);
@@ -308,7 +329,7 @@ public class MainActivity extends Activity {
         CaptureService.Phase phase = CaptureService.phase;
         if (phase == CaptureService.Phase.IDLE) {
             btnMain.setText(livePanel != null && livePanel.hasActiveSession() ? "继续辅助" : "开始辅助");
-            btnMain.setEnabled(!pendingStart && (livePanel == null || !livePanel.isWorking()));
+            btnMain.setEnabled(!pendingStart && !CaptureService.stopInProgress && (livePanel == null || !livePanel.isWorking()));
         }
     }
 

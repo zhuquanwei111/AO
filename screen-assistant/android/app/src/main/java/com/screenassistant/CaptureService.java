@@ -95,6 +95,8 @@ public class CaptureService extends Service {
     private volatile LiveClient.Session liveSession;
     private boolean operationMode;
     private volatile LiveConnection liveConnection;
+    static volatile boolean stopInProgress;
+    private boolean connectionWorkerActive;
     private volatile String connectionStatus = "";
     private volatile LiveFrameAnalyzer liveAnalyzer;
     private long lastLiveOcr;
@@ -114,7 +116,8 @@ public class CaptureService extends Service {
     private int[] screenSize = new int[2];
     private String setupStage = "idle";
     private volatile String teardownReason = "none";
-    private final OverlayMessageState overlayState = new OverlayMessageState();
+    private final OverlayMessageState overlayState = new OverlayMessageState((id, reason) ->
+            logEvent("prompt_outcome", "id=" + safeId(id) + " reason=" + reason));
 
     private View replyOverlayView;
     private TextView replyTextView;
@@ -382,7 +385,12 @@ public class CaptureService extends Service {
             }
             case ACTION_STOP:
             default:
-                if (liveConnection != null) liveConnection.close(true);
+                if (liveConnection != null) {
+                    synchronized (liveConnection) {
+                        stopInProgress = connectionWorkerActive;
+                        liveConnection.close(true);
+                    }
+                }
                 teardown("已结束辅助", "app_stop_action");
                 break;
         }
@@ -692,12 +700,19 @@ public class CaptureService extends Service {
                     @Override public void prompt(org.json.JSONObject prompt) {
                         long expires = prompt.optLong(PromptTiming.DEADLINE_MS);
                         String id = prompt.optString("prompt_id");
-                        logEvent("prompt_received", "id=" + safeId(id) + " source_expires=" + prompt.optLong("expires_at_ms")
+                        Integer priority = LiveConnection.strictPriority(prompt);
+                        if (priority == null) return;
+                        logEvent("prompt_received", "id=" + safeId(id) + " type=" + DisplayText.promptType(prompt) + " source_expires=" + prompt.optLong("expires_at_ms")
                                 + " deadline_elapsed=" + expires + " rtt=" + prompt.optLong("_client_rtt_ms")
                                 + " processing=" + prompt.optLong("_client_processing_ms")
                                 + " transport=" + prompt.optLong("_client_transport_ms") + " epoch=" + epoch);
                         if (expires > SystemClock.elapsedRealtime() && !id.isEmpty())
-                            showMessage("运营", prompt.optString("display_text"), epoch, expires, id, prompt.optInt("priority"));
+                            showMessage(DisplayText.promptLabel(prompt), prompt.optString("display_text"), epoch, expires, id, priority);
+                        else if (!id.isEmpty())
+                            logEvent("prompt_outcome", "id=" + safeId(id) + " reason=source_expired_before_queue");
+                    }
+                    @Override public void promptDropped(String id, String reason) {
+                        logEvent("prompt_outcome", "id=" + safeId(id) + " reason=" + reason);
                     }
                     @Override public void ended() {
                         main.post(() -> {
@@ -706,7 +721,9 @@ public class CaptureService extends Service {
                     }
                 });
         liveConnection = connection;
-        promptExecutor.execute(() -> {
+        synchronized (connection) { connectionWorkerActive = true; }
+        LiveConnection.beginWorker();
+        try { promptExecutor.execute(() -> {
             boolean prepared = false;
             try {
                 while (!tornDown && epoch == sessionEpoch && !connection.isClosed()) {
@@ -718,16 +735,29 @@ public class CaptureService extends Service {
                     }
                 }
             } finally {
-                if (connection.shouldEnd()) {
-                    try { audioCompletion.get(20, java.util.concurrent.TimeUnit.SECONDS); }
-                    catch (Exception ignored) { /* 仍请求幂等结束 */ }
-                    try { connection.finishStop(); }
-                    catch (Exception e) { logEvent("session_stop_unconfirmed", "error=" + e.getClass().getSimpleName()); }
+                try {
+                    boolean shouldEnd;
+                    synchronized (connection) {
+                        shouldEnd = connection.shouldEnd();
+                        if (!shouldEnd) connectionWorkerActive = false;
+                    }
+                    if (shouldEnd) {
+                        try { audioCompletion.get(20, java.util.concurrent.TimeUnit.SECONDS); }
+                        catch (Exception ignored) { /* 仍请求幂等结束 */ }
+                        try { connection.finishStop(); }
+                        catch (Exception e) { logEvent("session_stop_unconfirmed", "error=" + e.getClass().getSimpleName()); }
+                    }
+                } finally {
+                    synchronized (connection) { connectionWorkerActive = false; stopInProgress = false; }
+                    LiveConnection.endWorker();
                     Intent changed = new Intent(Prefs.ACTION_STATE).setPackage(getPackageName());
                     sendBroadcast(changed);
                 }
             }
-        });
+        }); } catch (RuntimeException error) {
+            synchronized (connection) { connectionWorkerActive = false; stopInProgress = false; }
+            LiveConnection.endWorker(); throw error;
+        }
     }
 
     private void showMessage(String purpose, String reply, int epoch, long expiresAt) {
@@ -745,7 +775,9 @@ public class CaptureService extends Service {
         main.post(() -> {
             if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch || generation != messageGeneration) return;
             long now = SystemClock.elapsedRealtime();
-            if (expiresAt > 0 && expiresAt <= now) return;
+            if (expiresAt > 0 && expiresAt <= now) {
+                logEvent("prompt_outcome", "id=" + safeId(id) + " reason=source_expired_before_queue"); return;
+            }
             boolean accepted = overlayState.update(id, fullText, priority, expiresAt, now, REPLY_AUTO_HIDE_MS);
             logEvent("prompt_processed", "id=" + safeId(id) + " accepted=" + accepted
                     + " pending=" + overlayState.pendingCount() + " expired=" + overlayState.expiredCount()

@@ -4,6 +4,21 @@ import org.junit.Test;
 import static org.junit.Assert.*;
 
 public class OverlayMessageStateTest {
+    @Test public void reportsQueuedExpiryAndOverflowWithAffectedIds() {
+        java.util.List<String> events = new java.util.ArrayList<>();
+        OverlayMessageState state = new OverlayMessageState((id, reason) -> events.add(id + ":" + reason));
+        state.start();
+        assertTrue(state.update("A", "甲", 0, 30000, 1000, 12000));
+        assertTrue(state.update("B", "乙", 0, 3000, 1100, 12000));
+        assertTrue(events.contains("B:queued"));
+        state.textAt(3000);
+        assertTrue(events.contains("B:source_expired_queued"));
+        for (int i = 0; i < 16; i++) assertTrue(state.update("Q" + i, "等" + i, 0, 30000, 3100, 12000));
+        assertFalse(state.update("overflow", "满", 0, 30000, 3200, 12000));
+        assertTrue(events.contains("overflow:queue_full"));
+        assertTrue(state.update("urgent", "紧急", 100, 30000, 3300, 12000));
+        assertTrue(events.contains("Q15:queue_evicted"));
+    }
     private OverlayMessageState started() {
         OverlayMessageState state = new OverlayMessageState(); state.start(); return state;
     }

@@ -6,13 +6,46 @@ import java.io.IOException;
 import java.net.ConnectException;
 import java.net.UnknownHostException;
 import java.util.function.LongSupplier;
+import java.util.function.BooleanSupplier;
 
 /** 现有场次 HTTP 契约的薄适配。连接结果不决定本地投影/窗口的生死。 */
 final class LiveConnection {
+    private static final Object RECOVERY_LOCK = new Object();
+    private static int activeWorkers;
+    private static final java.util.Set<LiveClient.Session> unpersistedTargets = new java.util.HashSet<>();
+
+    static void beginWorker() { synchronized (RECOVERY_LOCK) { activeWorkers++; } }
+    static void endWorker() { synchronized (RECOVERY_LOCK) { activeWorkers--; } }
+    static boolean canReleaseUnknownCreate(Store store, BooleanSupplier idle) {
+        synchronized (RECOVERY_LOCK) { return recoveryAllowed(store, idle); }
+    }
+    private static boolean recoveryAllowed(Store store, BooleanSupplier idle) {
+        return idle.getAsBoolean() && activeWorkers == 0 && unpersistedTargets.isEmpty()
+                && store.get() == null && !store.stopping() && store.creating();
+    }
+    static boolean releaseUnknownCreate(Store store, boolean confirmed, BooleanSupplier idle) throws IOException {
+        synchronized (RECOVERY_LOCK) {
+            if (!confirmed || !recoveryAllowed(store, idle)) return false;
+            try { store.creating(false); }
+            catch (IOException error) {
+                try { store.creating(true); } catch (IOException restore) { error.addSuppressed(restore); }
+                throw error;
+            }
+            return true;
+        }
+    }
     static final String CONNECTING = "正在连接服务\n屏幕采集已启动，暂无运营提示";
     static final String OFFLINE = "服务未连接\n本地屏幕采集继续，暂无新运营提示";
     static final String CREATE_UNKNOWN = "场次创建未确认\n请回到应用核对，未重复创建";
     static final String TIME_UNKNOWN = "提示时效未核实，本次提示未显示；屏幕采集继续";
+    static final String PRIORITY_UNKNOWN = "个别提示优先级无效，已跳过；屏幕采集继续";
+
+    static Integer strictPriority(JSONObject prompt) {
+        Object value = prompt.opt("priority");
+        if (!(value instanceof Integer) && !(value instanceof Long)) return null;
+        long number = ((Number)value).longValue();
+        return number < Integer.MIN_VALUE || number > Integer.MAX_VALUE ? null : (int)number;
+    }
 
     interface Store {
         LiveClient.Session get();
@@ -33,6 +66,7 @@ final class LiveConnection {
         void status(String text, boolean discardMessage);
         void session(LiveClient.Session session);
         void prompt(JSONObject prompt);
+        default void promptDropped(String id, String reason) { }
         void ended();
     }
 
@@ -95,6 +129,7 @@ final class LiveConnection {
                         store.save(created);
                     } catch (IOException e) {
                         stopTarget = created;
+                        synchronized (RECOVERY_LOCK) { unpersistedTargets.add(created); }
                         saveFailure = e;
                     }
                     if (saveFailure == null && endRequested) { stopTarget = created; store.stopping(true); }
@@ -142,11 +177,18 @@ final class LiveConnection {
             if (page.optBoolean("stopped")) { serverStopped(); return false; }
             PromptTiming timing = PromptTiming.from(page);
             boolean timingProblem = timing == null;
+            boolean priorityProblem = false;
             JSONArray ready = new JSONArray();
             if (timing != null) for (int i = 0; i < prompts.length(); i++) {
                 JSONObject prompt = prompts.getJSONObject(i);
                 long deadline = timing.deadline(prompt);
-                if (deadline < 0) { timingProblem = true; continue; }
+                if (deadline < 0) { timingProblem = true; listener.promptDropped(prompt.optString("prompt_id"), "invalid_expiry"); continue; }
+                if (deadline == 0) { listener.promptDropped(prompt.optString("prompt_id"), "conservative_deadline_exhausted"); continue; }
+                if (strictPriority(prompt) == null) {
+                    priorityProblem = true;
+                    listener.promptDropped(prompt.optString("prompt_id"), "invalid_priority");
+                    continue;
+                }
                 if (deadline > 0) {
                     prompt.put(PromptTiming.DEADLINE_MS, deadline).put("_client_rtt_ms", timing.rttMs)
                             .put("_client_processing_ms", timing.processingMs).put("_client_transport_ms", timing.transportMs);
@@ -170,7 +212,8 @@ final class LiveConnection {
             synchronized (this) {
                 if (closed) return false;
                 if (!announced) { announced = true; listener.session(session); }
-                status("实时已连接，等待运营提示\n" + recap + (timingProblem ? "\n" + TIME_UNKNOWN : ""), false);
+                status("实时已连接，等待运营提示\n" + recap + (timingProblem ? "\n" + TIME_UNKNOWN : "")
+                        + (priorityProblem ? "\n" + PRIORITY_UNKNOWN : ""), false);
                 for (int i = 0; i < ready.length() && !closed; i++) listener.prompt(ready.getJSONObject(i));
                 cursor = next;
             }
@@ -231,6 +274,7 @@ final class LiveConnection {
             store.stopping(false);
             if (stopTarget != null && stopTarget.id.equals(target.id)) stopTarget = null;
             if (session != null && session.id.equals(target.id)) session = target.asStopped();
+            synchronized (RECOVERY_LOCK) { unpersistedTargets.remove(target); }
         }
     }
 

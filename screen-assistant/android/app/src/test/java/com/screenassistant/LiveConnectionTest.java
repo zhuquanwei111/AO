@@ -11,6 +11,64 @@ import java.util.List;
 import static org.junit.Assert.*;
 
 public class LiveConnectionTest {
+    @Test public void recoveryRequiresConfirmationIdleNoWorkerOrUnresolvedStop() throws Exception {
+        Memory store = new Memory(); store.creating = true;
+        assertFalse(LiveConnection.releaseUnknownCreate(store, false, () -> true));
+        assertFalse(LiveConnection.releaseUnknownCreate(store, true, () -> false));
+        store.stopping = true;
+        assertFalse(LiveConnection.releaseUnknownCreate(store, true, () -> true));
+        store.stopping = false; store.session = SESSION;
+        assertFalse(LiveConnection.releaseUnknownCreate(store, true, () -> true));
+        store.session = null;
+        LiveConnection.beginWorker();
+        try { assertFalse(LiveConnection.releaseUnknownCreate(store, true, () -> true)); }
+        finally { LiveConnection.endWorker(); }
+        assertTrue(store.creating);
+        assertTrue(LiveConnection.releaseUnknownCreate(store, true, () -> true));
+        assertFalse(store.creating);
+    }
+
+    @Test public void recoveryRechecksStateAndRetainsPendingWhenPersistenceFails() throws Exception {
+        Memory store = new Memory() {
+            @Override public void creating(boolean value) throws IOException {
+                if (!value) { creating = false; throw new IOException("disk full"); }
+                super.creating(value);
+            }
+        };
+        store.creating = true;
+        try { LiveConnection.releaseUnknownCreate(store, true, () -> true); fail(); }
+        catch (IOException expected) { assertTrue(store.creating); }
+        assertFalse(LiveConnection.releaseUnknownCreate(store, true, () -> { store.stopping = true; return true; }));
+        assertTrue(store.creating);
+    }
+
+    @Test public void inMemoryStopTargetBlocksRecoveryEvenIfStopFlagCouldNotPersist() throws Exception {
+        Memory store = new Memory(); store.failSaves = 1;
+        Remote remote = new Remote(); remote.stopError = new ConnectException("offline");
+        LiveConnection connection = new LiveConnection(store, remote, new Display());
+        assertFalse(connection.connect());
+        assertNull(store.session); assertTrue(store.creating);
+        store.stopping = false;
+        assertFalse(LiveConnection.releaseUnknownCreate(store, true, () -> true));
+        assertTrue(store.creating);
+        remote.stopError = null; connection.finishStop();
+        assertFalse(store.creating);
+    }
+
+    @Test public void createInFlightCannotReleasePending() throws Exception {
+        Memory store = new Memory(); Remote remote = new Remote();
+        remote.createError = new SocketTimeoutException("response lost");
+        remote.duringCreate = () -> {
+            try { assertFalse(LiveConnection.releaseUnknownCreate(store, true, () -> true)); }
+            catch (IOException error) { throw new AssertionError(error); }
+        };
+        LiveConnection.beginWorker();
+        try { assertFalse(new LiveConnection(store, remote, new Display()).connect()); }
+        finally { LiveConnection.endWorker(); }
+        assertTrue(store.creating); assertEquals(1, remote.creates);
+        assertTrue(LiveConnection.releaseUnknownCreate(store, true, () -> true));
+        assertEquals(1, remote.creates);
+    }
     static final LiveClient.Session SESSION = new LiveClient.Session("http://original:8000", "one", "secret", 10, false);
     static class Memory implements LiveConnection.Store {
         LiveClient.Session session;
@@ -22,7 +80,7 @@ public class LiveConnectionTest {
             session = s; creating = false;
         }
         public boolean creating() { return creating; }
-        public void creating(boolean value) { creating = value; }
+        public void creating(boolean value) throws IOException { creating = value; }
         public boolean stopping() { return stopping; }
         public void stopping(boolean value) { stopping = value; }
     }
@@ -105,11 +163,18 @@ public class LiveConnectionTest {
         assertTrue(display.diagnostic.contains("实时已连接"));
     }
 
+    @Test public void dnsFailureStillClearsPendingWithoutManualReset() {
+        Memory store = new Memory(); Remote remote = new Remote();
+        remote.createError = new java.net.UnknownHostException("unresolved");
+        assertFalse(new LiveConnection(store, remote, new Display()).connect());
+        assertFalse(store.creating); assertEquals(1, remote.creates);
+    }
+
     @Test public void recapFailureDoesNotStopKnownRealtimeSession() throws Exception {
         Memory store = new Memory(); store.session = SESSION;
         Remote remote = new Remote(); Display display = new Display();
         remote.startError = new LiveClient.HttpError(409);
-        remote.page.getJSONArray("prompts").put(new JSONObject().put("display_text", "实际运营建议").put("expires_at_ms", 16000));
+        remote.page.getJSONArray("prompts").put(new JSONObject().put("display_text", "实际运营建议").put("expires_at_ms", 16000).put("priority", 25));
         LiveConnection connection = new LiveConnection(store, remote, display);
         assertTrue(connection.connect()); assertTrue(connection.poll());
         assertEquals(0, remote.creates); assertEquals(0, remote.stops);
@@ -122,7 +187,7 @@ public class LiveConnectionTest {
         Remote remote = new Remote(); Display display = new Display();
         java.util.concurrent.atomic.AtomicLong clock = new java.util.concurrent.atomic.AtomicLong();
         remote.startStatus = "not_connected"; remote.summaryStatus = "not_connected";
-        remote.page.getJSONArray("prompts").put(new JSONObject().put("display_text", "实际运营建议").put("expires_at_ms", 16000));
+        remote.page.getJSONArray("prompts").put(new JSONObject().put("display_text", "实际运营建议").put("expires_at_ms", 16000).put("priority", 25));
         LiveConnection connection = new LiveConnection(store, remote, display, clock::get);
         assertTrue(connection.connect()); assertTrue(connection.poll());
         assertEquals(1, display.bindings); assertEquals("实际运营建议", display.messages.get(0));
