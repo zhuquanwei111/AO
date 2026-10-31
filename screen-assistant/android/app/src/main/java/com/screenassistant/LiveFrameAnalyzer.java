@@ -100,6 +100,19 @@ final class LiveFrameAnalyzer implements AutoCloseable {
         return true;
     }
 
+    static void freezeObservationMetadata(CollectedRows<JSONObject> rows, boolean enabled) throws Exception {
+        if (!enabled) return;
+        int count = 0;
+        for (CollectedRows.Row<JSONObject> row : rows.rows)
+            if ("comment".equals(row.value.optString("kind"))) count++;
+        for (CollectedRows.Row<JSONObject> row : rows.rows) {
+            String kind = row.value.optString("kind");
+            if ("comment".equals(kind)) row.value.put("capture_batch_id", rows.batchId)
+                    .put("line_index", row.index).put("capture_comment_count", count);
+            else if ("online_count".equals(kind)) row.value.put("capture_batch_id", rows.batchId);
+        }
+    }
+
     void analyze(Frame frame) throws Exception {
         if (frame.uptime<earliestUptime) return;
         long frameStartMs=SystemClock.elapsedRealtime();
@@ -135,6 +148,7 @@ final class LiveFrameAnalyzer implements AutoCloseable {
                 JSONObject position=Regions.position(left,top,right,bottom,frame.width,frame.height);
                 confidence=Math.min(confidence,score);
                 if (kind.equals("comment")) {
+                    if (session.batchMetadata && sourceIndex > 65535) { invalidComments++; continue; }
                     if (!collectComment(outgoing,sourceIndex,value,frame.wall,position,score)) invalidComments++;
                     continue;
                 }
@@ -164,6 +178,7 @@ final class LiveFrameAnalyzer implements AutoCloseable {
         boolean hadLoss=outgoing.dropped + invalidComments + skippedOnlineLines > 0;
         if (hadLoss)
             status.accept("本轮有 " + (outgoing.dropped + invalidComments + skippedOnlineLines) + " 行未上传，请检查识别区域");
+        freezeObservationMetadata(outgoing, session.batchMetadata);
         ledger.register(outgoing);
         BatchDispatch.submit(upload,outgoing,active,() -> fresh(frame),
                 row -> LiveClient.call(session,"observations",row),status,hadLoss,

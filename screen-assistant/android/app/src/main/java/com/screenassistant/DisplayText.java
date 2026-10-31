@@ -3,6 +3,12 @@ package com.screenassistant;
 /** 两种真实用途均整条替换；纯文本归一化后的相同内容不重新显示。 */
 public final class DisplayText {
     private DisplayText() {}
+    static String promptLabel(org.json.JSONObject prompt) {
+        String type = prompt.optString("prompt_type", "");
+        if ("comment_reply".equals(type)) return "评论回复";
+        if ("operation_notice".equals(type)) return "运营提醒";
+        return "提示";
+    }
     public static String observed(String raw) { return raw == null ? "" : raw.trim().replaceAll("\\s+", " "); }
     public static String plain(String raw) {
         if (raw == null) return "";

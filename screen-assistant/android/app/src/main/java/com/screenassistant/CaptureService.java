@@ -697,7 +697,7 @@ public class CaptureService extends Service {
                                 + " processing=" + prompt.optLong("_client_processing_ms")
                                 + " transport=" + prompt.optLong("_client_transport_ms") + " epoch=" + epoch);
                         if (expires > SystemClock.elapsedRealtime() && !id.isEmpty())
-                            showMessage("运营", prompt.optString("display_text"), epoch, expires, id, prompt.optInt("priority"));
+                            showMessage(DisplayText.promptLabel(prompt), prompt.optString("display_text"), epoch, expires, id, prompt.optInt("priority"));
                     }
                     @Override public void ended() {
                         main.post(() -> {

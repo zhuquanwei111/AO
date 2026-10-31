@@ -19,23 +19,30 @@ public final class LiveClient {
         public final String baseUrl, id, token;
         public final long startedAt;
         public final boolean stopped;
+        public final boolean batchMetadata;
 
         public Session(String baseUrl, String id, String token, long startedAt, boolean stopped) {
+            this(baseUrl, id, token, startedAt, stopped, false);
+        }
+        Session(String baseUrl, String id, String token, long startedAt, boolean stopped, boolean batchMetadata) {
             this.baseUrl = baseUrl; this.id = id; this.token = token;
             this.startedAt = startedAt; this.stopped = stopped;
+            this.batchMetadata = batchMetadata;
         }
 
         public JSONObject json() throws JSONException {
             return new JSONObject().put("base_url", baseUrl).put("session_id", id)
-                    .put("session_token", token).put("started_at_ms", startedAt).put("stopped", stopped);
+                    .put("session_token", token).put("started_at_ms", startedAt).put("stopped", stopped)
+                    .put("batch_metadata", batchMetadata);
         }
 
         public static Session from(JSONObject o) throws JSONException {
             return new Session(o.getString("base_url"), o.getString("session_id"),
-                    o.getString("session_token"), o.getLong("started_at_ms"), o.optBoolean("stopped"));
+                    o.getString("session_token"), o.getLong("started_at_ms"), o.optBoolean("stopped"),
+                    Boolean.TRUE.equals(o.opt("batch_metadata")));
         }
 
-        public Session asStopped() { return new Session(baseUrl, id, token, startedAt, true); }
+        public Session asStopped() { return new Session(baseUrl, id, token, startedAt, true, batchMetadata); }
     }
 
     public static final class HttpError extends IOException {
@@ -57,8 +64,14 @@ public final class LiveClient {
         JSONObject payload = new JSONObject().put("description", description);
         if (!account.isEmpty()) payload.put("douyin_account", account);
         JSONObject result = request(baseUrl, "/v1/live/sessions", "POST", null, payload, 15000);
+        return sessionFromCreate(baseUrl, result);
+    }
+
+    static Session sessionFromCreate(String baseUrl, JSONObject result) throws JSONException {
+        JSONObject capabilities = result.optJSONObject("capabilities");
+        boolean batches = capabilities != null && Boolean.TRUE.equals(capabilities.opt("observation_batch_metadata"));
         return new Session(baseUrl, result.getString("session_id"), result.getString("session_token"),
-                result.getLong("started_at_ms"), false);
+                result.getLong("started_at_ms"), false, batches);
     }
 
     public static JSONObject call(Session s, String path, JSONObject body) throws IOException, JSONException {

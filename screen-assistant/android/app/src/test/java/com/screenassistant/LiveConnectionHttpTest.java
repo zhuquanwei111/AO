@@ -28,6 +28,7 @@ public class LiveConnectionHttpTest {
         final ExecutorService executor = Executors.newCachedThreadPool();
         final AtomicInteger creates = new AtomicInteger(), polls = new AtomicInteger(), stops = new AtomicInteger();
         final List<String> requests = Collections.synchronizedList(new ArrayList<>());
+        final List<String> observationBodies = Collections.synchronizedList(new ArrayList<>());
         final CountDownLatch polling = new CountDownLatch(1), releasePoll = new CountDownLatch(1);
         volatile boolean loseCreate, offline, delayPoll;
         volatile String summaryStatus="failed";
@@ -36,6 +37,7 @@ public class LiveConnectionHttpTest {
         volatile String clockFields = ",\"server_time_ms\":1000,\"server_processing_ms\":0";
         volatile String expiryJson = "16000";
         volatile String promptsJson;
+        volatile String createCapabilities = "";
         volatile int pollBodyDelayMs;
         volatile Runnable beforePollResponse;
         Fixture() throws IOException {
@@ -78,7 +80,7 @@ public class LiveConnectionHttpTest {
             if (path.equals("/v1/live/sessions")) {
                 creates.incrementAndGet();
                 if (loseCreate) return; // 模拟服务器已创建、响应却丢失。
-                respond(e, 201, "{\"session_id\":\"one\",\"session_token\":\"private-token\",\"started_at_ms\":10}");
+                respond(e, 201, "{\"session_id\":\"one\",\"session_token\":\"private-token\",\"started_at_ms\":10" + createCapabilities + "}");
             } else if (path.endsWith("/summary")) {
                 respond(e, summaryHttp, "{\"session_id\":\"one\",\"stopped_at_ms\":" + (summaryStopped ? "123" : "null")
                         + ",\"backstage_recap\":{\"status\":\"" + summaryStatus + "\"}}");
@@ -98,6 +100,9 @@ public class LiveConnectionHttpTest {
                         : "[{\"prompt_id\":\"fixture\",\"expires_at_ms\":" + expiryJson + ",\"display_text\":\"真实接口夹具建议\"}]";
                 respond(e, 200, "{\"session_id\":\"one\"" + clockFields + ",\"prompts\":" + prompts + ","
                         + "\"next_cursor\":\"cursor-one\",\"stopped\":false}");
+            } else if (path.endsWith("/observations")) {
+                observationBodies.add(body);
+                respond(e, 200, "{}");
             } else if (path.endsWith("/stop")) {
                 stops.incrementAndGet();
                 respond(e, 200, "{\"session_id\":\"one\",\"stopped_at_ms\":20}");
@@ -114,6 +119,42 @@ public class LiveConnectionHttpTest {
             e.getOutputStream().write(bytes);
         }
         public void close() throws IOException { releasePoll.countDown(); server.close(); executor.shutdownNow(); }
+    }
+
+    @Test public void createCapabilityControlsRealObservationBodies() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.createCapabilities = ",\"capabilities\":{\"observation_batch_metadata\":true}";
+            LiveClient.Session session = LiveClient.create(fixture.base(), "", "");
+            assertTrue(session.batchMetadata);
+            CollectedRows<org.json.JSONObject> rows = new CollectedRows<>(3);
+            LiveFrameAnalyzer.collectComment(rows, 2, "甲", 100, new org.json.JSONObject(), .9);
+            LiveFrameAnalyzer.collectComment(rows, 7, "乙", 100, new org.json.JSONObject(), .2);
+            rows.add(new org.json.JSONObject().put("kind", "online_count"));
+            LiveFrameAnalyzer.freezeObservationMetadata(rows, session.batchMetadata);
+            BatchDispatch.submit(Runnable::run, rows, () -> true, () -> true,
+                    row -> LiveClient.call(session, "observations", row), ignored -> {}, false);
+            assertEquals(3, fixture.observationBodies.size());
+            org.json.JSONObject first = new org.json.JSONObject(fixture.observationBodies.get(0));
+            org.json.JSONObject second = new org.json.JSONObject(fixture.observationBodies.get(1));
+            assertEquals(2, first.getInt("capture_comment_count"));
+            assertEquals(2, second.getInt("capture_comment_count"));
+            assertEquals(2, first.getInt("line_index")); assertEquals(7, second.getInt("line_index"));
+            assertEquals(first.getString("capture_batch_id"), second.getString("capture_batch_id"));
+            LiveClient.call(session, "observations", rows.rows.get(0).value);
+            assertEquals(fixture.observationBodies.get(0), fixture.observationBodies.get(3));
+
+            fixture.createCapabilities = "";
+            LiveClient.Session old = LiveClient.create(fixture.base(), "", "");
+            assertFalse(old.batchMetadata);
+            CollectedRows<org.json.JSONObject> legacy = new CollectedRows<>(1);
+            LiveFrameAnalyzer.collectComment(legacy, 5, "旧行", 100, new org.json.JSONObject(), .9);
+            LiveFrameAnalyzer.freezeObservationMetadata(legacy, old.batchMetadata);
+            LiveClient.call(old, "observations", legacy.rows.get(0).value);
+            org.json.JSONObject oldBody = new org.json.JSONObject(fixture.observationBodies.get(4));
+            assertFalse(oldBody.has("capture_batch_id"));
+            assertFalse(oldBody.has("line_index"));
+            assertFalse(oldBody.has("capture_comment_count"));
+        }
     }
 
     @Test public void actualConnectionRefusedKeepsDiagnosticAndHandle() throws Exception {
@@ -235,6 +276,23 @@ public class LiveConnectionHttpTest {
             received.add(prompt);
         }
         void clear() { received.clear(); messages.clear(); }
+    }
+
+    @Test public void typedPromptReachesDisplayWithServerAssociationAndLegacyNeutral() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.promptsJson = "[{\"prompt_id\":\"a\",\"expires_at_ms\":16000,\"prompt_type\":\"comment_reply\","
+                    + "\"display_text\":\"欢迎回来\",\"reply_to\":{\"comment_id\":\"c1\",\"nickname\":\"小明\",\"text\":\"来了\"}},"
+                    + "{\"prompt_id\":\"b\",\"expires_at_ms\":16000,\"source\":\"comment\",\"display_text\":\"谢谢\"}]";
+            ReceivedDisplay display = new ReceivedDisplay();
+            LiveConnection connection = new LiveConnection(new LiveConnectionTest.Memory(),
+                    remote(fixture.base(), "", ""), display);
+            assertTrue(connection.connect()); assertTrue(connection.poll());
+            assertEquals(2, display.received.size());
+            assertEquals("评论回复", DisplayText.promptLabel(display.received.get(0)));
+            assertEquals("欢迎回来", display.received.get(0).getString("display_text"));
+            assertEquals("c1", display.received.get(0).getJSONObject("reply_to").getString("comment_id"));
+            assertEquals("提示", DisplayText.promptLabel(display.received.get(1)));
+        }
     }
 
     static String item(String id, String expiry) {
