@@ -680,7 +680,11 @@ class LiveStore:
         now = self.clock()
         rows = [row for row in self.fusion_windows.get(sid, ())
                 if now - MAX_OBSERVATION_AGE_MS <= row["effective_at_ms"] <= now + FUSION_FUTURE_SKEW_MS]
-        candidate = build_candidate(rows)
+        # 带完整性门控的原始 OCR 项须先经评论重建，不能退回旧单句模型路径。
+        legacy_rows = [row for row in rows if not (
+            row["kind"] == "comment" and row.get("capture_comment_count") is not None
+        )]
+        candidate = build_candidate(legacy_rows)
         if candidate is None:
             return None
         topic_hash = digest(candidate["topic"])

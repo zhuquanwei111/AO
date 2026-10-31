@@ -128,7 +128,7 @@ def test_comment_reply_without_valid_model_result_writes_no_prompt(tmp_path, mon
     asyncio.run(run())
 
 
-def test_batch_does_not_call_model_until_late_second_observation(tmp_path):
+def test_batch_waits_for_late_second_observation_and_never_uses_raw_legacy_path(tmp_path):
     now = 1_790_000_000_000
     async def run():
         cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="fake",
@@ -161,7 +161,8 @@ def test_batch_does_not_call_model_until_late_second_observation(tmp_path):
                 second = {**first, "event_id": "e2", "line_index": 7, "content": {"text": "续句"}}
                 assert (await client.post(url, headers=headers, json=second)).json()["reason"] == "scheduled"
                 await asyncio.wait_for(app.state.live.fusion_active[sid], 2)
-                assert len(calls) == 1
+                assert calls == []
+                assert [row["event_id"] for row in app.state.live.store.fusion_windows[sid]] == ["e1", "e2"]
     asyncio.run(run())
 
 
