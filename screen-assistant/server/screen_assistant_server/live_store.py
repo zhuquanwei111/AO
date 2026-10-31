@@ -24,6 +24,7 @@ from .live_rules import (
 from .live_fusion import (
     build_candidate, observation_source_allowed, online_count_details,
     validate_observation_content, comment_has_priority, comment_is_candidate, group_feedback,
+    COMMENT_REPLY_MAX_AGE_MS, COMMENT_REPLY_COOLDOWN_MS, GROUP_NOTICE_COOLDOWN_MS,
 )
 from .comment_reconstruction import reconstruct_comments
 
@@ -32,6 +33,18 @@ logger = logging.getLogger("screen_assistant.app")
 
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def fusion_topic_cooldown(candidate: dict) -> int:
+    if candidate.get("prompt_type") == "comment_reply":
+        return COMMENT_REPLY_COOLDOWN_MS
+    topic = candidate["topic"]
+    if topic == "person:head_down":
+        return 90_000
+    if (candidate["priority"] >= 100 or topic.startswith(("person", "quality:"))
+            or any(row["source"].startswith("fixture:") for row in candidate["observations"])):
+        return COOLDOWN_MS
+    return GROUP_NOTICE_COOLDOWN_MS
 
 
 class LiveStore:
@@ -138,10 +151,12 @@ class LiveStore:
             return
         self.comment_batch_sweeps[sid] = now
         for batch in self.comment_batches.get(sid, {}).values():
-            if now > batch["deadline"]:
+            retention_deadline = batch.get("reply_deadline", batch["deadline"])
+            if now > retention_deadline:
                 batch["rows"].clear()
                 batch["quality_gaps"].clear()
                 batch.pop("records", None)
+                batch.pop("reply_rows", None)
                 if not batch.get("expired") and not batch["complete"]:
                     logger.info("live_comment_batch outcome=expired")
                 batch["expired"] = True
@@ -459,11 +474,24 @@ class LiveStore:
                     batch["records"] = reconstruct_comments(
                         observed_rows, batch_complete=True, quality_gaps=batch["quality_gaps"]
                     )
+                    batch["reply_deadline"] = max(
+                        (record["first_observed_at_ms"] + COMMENT_REPLY_MAX_AGE_MS
+                         for record in batch["records"] if type(record.get("first_observed_at_ms")) is int),
+                        default=batch["deadline"],
+                    )
+                    logger.info("live_data stage=batch session=%s reason=complete received=%d usable=%d",
+                                sid[:8], len(batch["indices"]), sum(
+                                    record.get("field_status", {}).get("text") == "usable"
+                                    and record.get("boundary_status") == "locally_complete"
+                                    for record in batch["records"]))
+                    batch["reply_rows"] = rows
                     window = self.fusion_windows.setdefault(sid, deque(maxlen=MAX_WINDOW_OBSERVATIONS))
                     window.extend(rows)
                     result["_batch_ready"] = True
                     if usable:
                         result["reason"] = "windowed"
+            logger.info("live_data stage=observation session=%s kind=%s reason=%s",
+                        sid[:8], body["kind"], result["reason"])
             return result
         if usable:
             item = dict(body)
@@ -477,6 +505,8 @@ class LiveStore:
                 (row for row in window if row["effective_at_ms"] >= cutoff),
                 maxlen=MAX_WINDOW_OBSERVATIONS,
             )
+        logger.info("live_data stage=observation session=%s kind=%s reason=%s",
+                    sid[:8], body["kind"], result["reason"])
         return result
 
     def session_summary(self, sid: str, token: str | None):
@@ -719,12 +749,15 @@ class LiveStore:
         )]
         candidate = build_candidate(legacy_rows)
         by_event = {row["event_id"]: row for row in rows}
+        reply_by_event = {row["event_id"]: row for batch in self.comment_batches.get(sid, {}).values()
+                          if batch["complete"] and now <= batch.get("reply_deadline", batch["deadline"])
+                          for row in batch.get("reply_rows", [])}
         attempted = self.comment_attempted.setdefault(sid, set())
         counts = self.comment_attempt_counts.get(sid, {})
         failed_epochs = self.comment_failed_epochs.get(sid, {})
         comment_candidate = None
         records = [record for batch in self.comment_batches.get(sid, {}).values()
-                   if batch["complete"] and now <= batch["deadline"]
+                   if batch["complete"] and now <= batch.get("reply_deadline", batch["deadline"])
                    for record in batch.get("records", [])]
         for record in sorted(records, key=lambda item: counts.get(item.get("comment_id"), 0)):
             status = record.get("field_status", {})
@@ -735,15 +768,15 @@ class LiveStore:
                     or not isinstance(text, str) or not isinstance(comment_id, str)
                     or comment_id in attempted or counts.get(comment_id, 0) >= 2
                     or failed_epochs.get(comment_id, -1) >= trigger_epoch or type(first) is not int
-                    or not now - MAX_OBSERVATION_AGE_MS <= first <= now + FUSION_FUTURE_SKEW_MS):
+                    or not now - COMMENT_REPLY_MAX_AGE_MS <= first <= now + FUSION_FUTURE_SKEW_MS):
                 continue
             ids = record.get("source_event_ids") or []
             field_sources = record.get("field_sources") or {}
             text_sources = field_sources.get("text") or []
             if (not ids or not text_sources or any(event_id not in ids for event_id in text_sources)
-                    or any(event_id not in by_event for event_id in ids)):
+                    or any(event_id not in reply_by_event for event_id in ids)):
                 continue
-            selected = [by_event[event_id] for event_id in ids]
+            selected = [reply_by_event[event_id] for event_id in ids]
             if any(row["source"] != record.get("source") for row in selected):
                 continue
             def usable_field(name):
@@ -752,6 +785,7 @@ class LiveStore:
             consumption = record.get("consumption_level") if usable_field("consumption_level") else None
             fan = record.get("fan_level") if usable_field("fan_level") else None
             if not comment_is_candidate(text, consumption_level=consumption, fan_level=fan):
+                logger.info("live_data stage=filter session=%s type=comment_reply reason=noise_or_level", sid[:8])
                 continue
             nickname = record.get("nickname") if usable_field("nickname") else None
             if not isinstance(nickname, str) or not nickname.strip():
@@ -766,7 +800,8 @@ class LiveStore:
                 "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash=?",
                 (sid, digest(topic)),
             ).fetchone()[0]
-            if last_reply is not None and now - last_reply < COOLDOWN_MS:
+            if last_reply is not None and now - last_reply < COMMENT_REPLY_COOLDOWN_MS:
+                logger.info("live_data stage=filter session=%s type=comment_reply reason=cooldown", sid[:8])
                 continue
             comment_candidate = {
                 "topic": topic, "priority": 25, "phenomenon": "公屏评论",
@@ -804,7 +839,8 @@ class LiveStore:
                     "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash=?",
                     (sid, digest(topic)),
                 ).fetchone()[0]
-                if last_group is not None and now - last_group < COOLDOWN_MS:
+                group_cooldown = COOLDOWN_MS if group[0]["source"].startswith("fixture:") else GROUP_NOTICE_COOLDOWN_MS
+                if last_group is not None and now - last_group < group_cooldown:
                     continue
                 event_ids = list(dict.fromkeys(event_id for item in group for event_id in item["source_event_ids"]))
                 candidate = {
@@ -815,27 +851,33 @@ class LiveStore:
                 }
                 break
         if candidate is None:
+            logger.info("live_data stage=candidate session=%s reason=quiet", sid[:8])
             return None
         topic_hash = digest(candidate["topic"])
         last_same_topic = self.db.execute(
             "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash=?",
             (sid, topic_hash),
         ).fetchone()[0]
-        topic_cooldown = 90_000 if candidate["topic"] == "person:head_down" else COOLDOWN_MS
+        topic_cooldown = fusion_topic_cooldown(candidate)
         if last_same_topic is not None and now - last_same_topic < topic_cooldown:
+            logger.info("live_data stage=filter session=%s type=%s reason=cooldown", sid[:8],
+                        candidate.get("prompt_type", "operation_notice"))
             return None
-        if candidate["priority"] < 100:
+        if candidate["priority"] < 100 and candidate.get("prompt_type") != "comment_reply":
             recent = self.db.execute(
                 "SELECT payload FROM live_events WHERE session_id=? AND generated_at_ms>?",
                 (sid, now - COOLDOWN_MS),
             ).fetchall()
             if any(json.loads(row["payload"]).get("priority", 0) > candidate["priority"]
                    for row in recent):
+                logger.info("live_data stage=filter session=%s type=%s reason=priority", sid[:8],
+                            candidate.get("prompt_type", "operation_notice"))
                 return None
         candidate["description"] = session["description"]
         candidate.setdefault("prompt_type", "operation_notice")
         if candidate.get("prompt_type") == "comment_reply":
             attempted.add(candidate["reply_to"]["comment_id"])
+        logger.info("live_data stage=candidate session=%s type=%s reason=selected", sid[:8], candidate["prompt_type"])
         return candidate
 
     def finish_comment_attempt(self, sid: str, comment_id: str, trigger_epoch: int,
@@ -863,20 +905,21 @@ class LiveStore:
         now = self.clock()
         rows = candidate["observations"]
         latest = max(row["effective_at_ms"] for row in rows)
-        if now - latest > MAX_OBSERVATION_AGE_MS:
+        age_limit = COMMENT_REPLY_MAX_AGE_MS if candidate.get("prompt_type") == "comment_reply" else MAX_OBSERVATION_AGE_MS
+        if now - latest > age_limit:
             return {"reason": "candidate_expired", "prompt_id": None}
         if (candidate.get("prompt_type") == "comment_reply"
-                and now - candidate["first_observed_at_ms"] > MAX_OBSERVATION_AGE_MS):
+                and now - candidate["first_observed_at_ms"] > COMMENT_REPLY_MAX_AGE_MS):
             return {"reason": "candidate_expired", "prompt_id": None}
         topic_hash = digest(candidate["topic"])
         last = self.db.execute(
             "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash=?",
             (sid, topic_hash),
         ).fetchone()[0]
-        topic_cooldown = 90_000 if candidate["topic"] == "person:head_down" else COOLDOWN_MS
+        topic_cooldown = fusion_topic_cooldown(candidate)
         if last is not None and now-last < topic_cooldown:
             return {"reason": "cooldown", "prompt_id": None}
-        if candidate["priority"] < 100:
+        if candidate["priority"] < 100 and candidate.get("prompt_type") != "comment_reply":
             higher = self.db.execute(
                 "SELECT payload FROM live_events WHERE session_id=? AND generated_at_ms>?",
                 (sid, now-COOLDOWN_MS),
@@ -1046,6 +1089,10 @@ class LiveStore:
             if event["returned_at_ms"] is None:
                 event.update(returned_at_ms=now, delivery_state="returned_to_client")
             prompts.append(event)
+        if prompts:
+            logger.info("live_data stage=poll session=%s reason=returned reply=%d notice=%d", sid[:8],
+                        sum(event.get("prompt_type") == "comment_reply" for event in prompts),
+                        sum(event.get("prompt_type") == "operation_notice" for event in prompts))
         maximum = self.db.execute(
             "SELECT COALESCE(MAX(seq),0) FROM live_events WHERE session_id=?", (sid,)
         ).fetchone()[0]

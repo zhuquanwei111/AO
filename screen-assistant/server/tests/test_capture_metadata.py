@@ -30,6 +30,7 @@ def comment(event_id="legacy-1"):
 
 @pytest.mark.parametrize("metadata", [
     {"capture_batch_id": "batch"}, {"line_index": 0}, {"capture_comment_count": 1},
+    {"capture_batch_id": "batch", "line_index": 0, "capture_comment_count": 1},
     {"capture_batch_id": None, "line_index": None, "capture_comment_count": None},
 ])
 def test_legacy_comments_reject_batch_metadata(live_client, metadata):

@@ -23,7 +23,7 @@ from .live_store import LiveStore, digest
 from .model_client import ModelTimeoutError, ModelUnavailableError
 from .live_fusion import (
     Observation, ObservationSource, TEST_COMMENT_FIXTURE_SOURCES,
-    observation_source_allowed,
+    observation_source_allowed, COMMENT_REPLY_MAX_AGE_MS,
 )
 from .person_observation import PersonObservation as PersonObservationValue, PersonPolicy
 
@@ -452,15 +452,23 @@ class LiveService:
                 if candidate["model_text"]:
                     cfg = request.app.state.settings
                     if not cfg.tianyi_api_key:
+                        logger.info("live_data stage=model session=%s type=%s reason=config_unavailable",
+                                    sid[:8], candidate.get("prompt_type"))
                         return {"reason": "model_unavailable", "prompt_id": None}
                     try:
                         if is_comment:
+                            remaining_ms = COMMENT_REPLY_MAX_AGE_MS - (self.clock() - candidate["first_observed_at_ms"])
+                            if remaining_ms <= 0:
+                                terminal = True
+                                logger.info("live_data stage=model session=%s type=comment_reply reason=expired", sid[:8])
+                                return {"reason": "candidate_expired", "prompt_id": None}
                             model_called = True
+                            logger.info("live_data stage=model session=%s type=comment_reply reason=attempt", sid[:8])
                             suggestion = await asyncio.wait_for(
                                 request.app.state.model.reply_to_comment(
                                     candidate["model_text"], nickname=candidate["reply_to"]["nickname"],
                                     priority_eligible=candidate.get("priority_eligible", False),
-                                ), timeout=cfg.model_timeout_seconds,
+                                ), timeout=min(cfg.model_timeout_seconds, remaining_ms / 1000),
                             )
                         else:
                             source = ",".join(dict.fromkeys(
@@ -475,15 +483,21 @@ class LiveService:
                             )
                     except (asyncio.TimeoutError, ModelTimeoutError):
                         logger.info("live_fusion outcome=timeout")
+                        logger.info("live_data stage=model session=%s type=%s reason=timeout",
+                                    sid[:8], candidate.get("prompt_type"))
                         return {"reason": "model_unavailable", "prompt_id": None}
                     except ModelUnavailableError as exc:
                         if is_comment and exc.error_code == "model_output_invalid":
                             terminal = True
+                            logger.info("live_data stage=model session=%s type=comment_reply reason=invalid", sid[:8])
                             return {"reason": "model_output_invalid", "prompt_id": None}
                         logger.info("live_fusion outcome=model_unavailable")
+                        logger.info("live_data stage=model session=%s type=%s reason=unavailable",
+                                    sid[:8], candidate.get("prompt_type"))
                         return {"reason": "model_unavailable", "prompt_id": None}
                     if is_comment and suggestion is None:
                         terminal = True
+                        logger.info("live_data stage=model session=%s type=comment_reply reason=quiet", sid[:8])
                         return {"reason": "quiet", "prompt_id": None}
                     if not is_comment and not valid_operation_suggestion(suggestion):
                         return {"reason": "model_output_invalid", "prompt_id": None}
@@ -500,6 +514,8 @@ class LiveService:
                     terminal = result.get("reason") in {
                         "generated", "candidate_expired", "cooldown", "suppressed_by_priority"
                     }
+                    logger.info("live_data stage=save session=%s type=%s reason=%s", sid[:8],
+                                candidate.get("prompt_type"), result.get("reason"))
                     return result
             finally:
                 if is_comment:
@@ -669,6 +685,8 @@ async def process_fusion_observation(service: LiveService, session_id: str,
         scheduled = service.schedule_fusion(session_id, token, request)
         if result.get("reason") == "windowed":
             result.update(reason="scheduled" if scheduled else "analysis_busy", prompt_id=None)
+        logger.info("live_data stage=dispatch session=%s kind=%s reason=%s", session_id[:8],
+                    body["kind"], result.get("reason"))
         return result
     delivered = await service.deliver_fusion(session_id, token, request, urgent=urgent)
     if delivered.get("reason") == "generated":

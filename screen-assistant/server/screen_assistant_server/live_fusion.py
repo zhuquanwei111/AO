@@ -10,6 +10,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .live_rules import COUNT_TREND_SAMPLES, INTERACTION_SPARSE_MAX, question
 from .audio import AudioSpan, OriginalFormat
 
+COMMENT_REPLY_MAX_AGE_MS = 20_000
+COMMENT_REPLY_COOLDOWN_MS = 20_000
+GROUP_NOTICE_COOLDOWN_MS = 30_000
+
 
 ObservationSource = Literal[
     "ios_replaykit_ocr", "ios_replaykit_online_count_roi",

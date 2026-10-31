@@ -94,7 +94,7 @@ def test_reconstructed_reply_does_not_refresh_its_first_observed_time(tmp_path):
                      "observations": [row], "prompt_type": "comment_reply",
                      "first_observed_at_ms": now,
                      "reply_to": {"comment_id": "c1", "nickname": None, "text": "你好"}}
-        clock[0] = now + 10_001
+        clock[0] = now + 20_001
         assert store.save_fusion_candidate(sid, token, candidate, "你好呀。") == {
             "reason": "candidate_expired", "prompt_id": None}
         assert store.events(sid, token)["events"] == []
@@ -271,11 +271,157 @@ def test_expired_batch_discards_transient_raw_payloads_on_poll(tmp_path):
         store.add_observation(sid, token, row, now)
         batch = store.comment_batches[sid][("ios_replaykit_ocr", "batch")]
         assert batch["records"][0]["fragments"]
-        clock[0] += 10_001
+        clock[0] += 20_001
         store.prompts(sid, token, "")
         assert "records" not in batch and batch["rows"] == []
     finally:
         store.close()
+
+
+@pytest.mark.parametrize("age,eligible", [(10_001, True), (20_000, True), (20_001, False)])
+def test_completed_batch_reply_lifetime_uses_first_observation(tmp_path, age, eligible):
+    now = 1_790_000_000_000
+    clock = [now]
+    store = LiveStore(str(tmp_path / f"reply-age-{age}.sqlite3"), lambda: clock[0])
+    try:
+        session = store.create("")
+        sid, token = session["session_id"], session["session_token"]
+        row = {"kind": "comment", "event_id": "e1", "source": "ios_replaykit_ocr",
+               "observed_at_ms": now, "availability": "available", "coverage": "ocr_visible_sample",
+               "reliability": "known", "confidence": 0.95, "capture_batch_id": "batch",
+               "line_index": 0, "capture_comment_count": 1,
+               "content": {"text": "阿青：你想聊什么？", "text_position":
+                           {"x": 0.1, "y": 0.5, "width": 0.4, "height": 0.04}}}
+        assert store.add_observation(sid, token, row, now)["_batch_ready"]
+        clock[0] += age
+        store.prompts(sid, token, "")
+        candidate = store.fusion_candidate(sid, token)
+        assert (candidate is not None) is eligible
+        if candidate:
+            assert candidate["first_observed_at_ms"] == now
+            assert store.save_fusion_candidate(sid, token, candidate, "我们聊聊吧。")["reason"] == "generated"
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("age,reason", [(19_999, "cooldown"), (20_000, "generated")])
+def test_comment_reply_cooldown_boundary(tmp_path, age, reason):
+    now = 1_790_000_000_000
+    clock = [now]
+    store = LiveStore(str(tmp_path / f"reply-cooldown-{age}.sqlite3"), lambda: clock[0])
+    try:
+        session = store.create("")
+        sid, token = session["session_id"], session["session_token"]
+        def candidate():
+            row = {"event_id": str(clock[0]), "kind": "comment", "source": "ios_replaykit_ocr",
+                   "coverage": "ocr_visible_sample", "reliability": "known", "confidence": 0.9,
+                   "observed_at_ms": clock[0], "effective_at_ms": clock[0], "received_at_ms": clock[0],
+                   "content": {"text": "问题", "text_position": None}}
+            return {"topic": "comment_reply:same", "priority": 25, "phenomenon": "评论",
+                    "observations": [row], "prompt_type": "comment_reply", "first_observed_at_ms": clock[0],
+                    "reply_to": {"comment_id": str(clock[0]), "nickname": None, "text": "问题"}}
+        assert store.save_fusion_candidate(sid, token, candidate(), "你好。")["reason"] == "generated"
+        clock[0] += age
+        assert store.save_fusion_candidate(sid, token, candidate(), "你好。")["reason"] == reason
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("topic,source,age,reason", [
+    ("group_feedback:same", "ios_replaykit_ocr", 29_999, "cooldown"),
+    ("group_feedback:same", "ios_replaykit_ocr", 30_000, "generated"),
+    ("comment_concern", "ios_replaykit_ocr", 30_000, "generated"),
+    ("comment_concern", "fixture:ocr_comment", 30_000, "cooldown"),
+    ("person:head_down", "ios_replaykit_ocr", 60_000, "cooldown"),
+])
+def test_group_notice_cooldown_boundary(tmp_path, topic, source, age, reason):
+    now = 1_790_000_000_000
+    clock = [now]
+    store = LiveStore(str(tmp_path / f"notice-cooldown-{age}.sqlite3"), lambda: clock[0])
+    try:
+        session = store.create("")
+        sid, token = session["session_id"], session["session_token"]
+        def candidate():
+            row = {"event_id": str(clock[0]), "kind": "comment", "source": source,
+                   "coverage": "ocr_visible_sample", "reliability": "known", "confidence": 0.9,
+                   "observed_at_ms": clock[0], "effective_at_ms": clock[0], "received_at_ms": clock[0],
+                   "content": {"text": "问题", "text_position": None}}
+            return {"topic": topic, "priority": 25, "phenomenon": "多人反馈",
+                    "observations": [row], "prompt_type": "operation_notice"}
+        assert store.save_fusion_candidate(sid, token, candidate(), "可以回应反馈。")["reason"] == "generated"
+        clock[0] += age
+        assert store.save_fusion_candidate(sid, token, candidate(), "可以回应反馈。")["reason"] == reason
+    finally:
+        store.close()
+
+
+def test_past_urgent_event_does_not_block_new_comment_reply(tmp_path):
+    now = 1_790_000_000_000
+    store = LiveStore(str(tmp_path / "urgent-reply.sqlite3"), lambda: now)
+    try:
+        session = store.create("")
+        sid, token = session["session_id"], session["session_token"]
+        row = {"kind": "comment", "event_id": "comment", "source": "ios_replaykit_ocr",
+               "observed_at_ms": now, "availability": "available", "coverage": "ocr_visible_sample",
+               "reliability": "known", "confidence": 0.95, "capture_batch_id": "batch",
+               "line_index": 0, "capture_comment_count": 1,
+               "content": {"text": "阿青：你想聊什么？", "text_position":
+                           {"x": 0.1, "y": 0.5, "width": 0.4, "height": 0.04}}}
+        assert store.add_observation(sid, token, row, now)["_batch_ready"]
+        urgent_row = {**row, "effective_at_ms": now, "received_at_ms": now}
+        urgent = {"topic": "urgent-test", "priority": 100, "phenomenon": "紧急提醒",
+                  "observations": [urgent_row], "prompt_type": "operation_notice"}
+        assert store.save_fusion_candidate(sid, token, urgent, "请及时处理。")["reason"] == "generated"
+        candidate = store.fusion_candidate(sid, token)
+        assert candidate and candidate["prompt_type"] == "comment_reply"
+        assert store.save_fusion_candidate(sid, token, candidate, "我们聊聊吧。")["reason"] == "generated"
+    finally:
+        store.close()
+
+
+def test_reply_model_timeout_respects_remaining_candidate_age(tmp_path):
+    from screen_assistant_server.model_client import ModelUnavailableError
+    clock = [1_790_000_000_000]
+    cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="controlled",
+                   tianyi_base_url="http://model.invalid", tianyi_model="fake", dedup_ttl_seconds=60,
+                   max_sentence_chars=2000, model_timeout_seconds=1, model_connect_timeout_seconds=1,
+                   live_db_path=str(tmp_path / "remaining-time.sqlite3"))
+    calls = []
+    class Model:
+        async def reply_to_comment(self, text, *, nickname, priority_eligible):
+            calls.append(text)
+            if len(calls) == 1:
+                raise ModelUnavailableError("controlled")
+            await asyncio.sleep(0.2)
+            return "我们聊聊吧。"
+        async def aclose(self):
+            pass
+    app = create_app(cfg, live_clock=lambda: clock[0])
+    with TestClient(app) as client:
+        app.state.model = Model()
+        session = client.post("/v1/live/sessions", json={}).json()
+        sid = session["session_id"]
+        headers = {"X-Live-Session-Token": session["session_token"]}
+        url = f"/v1/live/sessions/{sid}"
+        async def wait_idle():
+            async with asyncio.timeout(3):
+                while app.state.live.fusion_active or app.state.live.fusion_queue:
+                    await asyncio.sleep(0.005)
+        row = {"kind": "comment", "event_id": "first", "source": "ios_replaykit_ocr",
+               "observed_at_ms": clock[0], "availability": "available", "coverage": "ocr_visible_sample",
+               "reliability": "known", "capture_batch_id": "batch", "line_index": 0,
+               "capture_comment_count": 1, "content": {"text": "阿青：你想聊什么？", "text_position":
+                   {"x": 0.1, "y": 0.5, "width": 0.4, "height": 0.04}}}
+        assert client.post(url + "/observations", headers=headers, json=row).status_code == 200
+        client.portal.call(wait_idle)
+        clock[0] += 19_950
+        row.update(event_id="next", capture_batch_id="next", observed_at_ms=clock[0],
+                   content={"text": "小乙：嗯", "text_position": row["content"]["text_position"]})
+        assert client.post(url + "/observations", headers=headers, json=row).status_code == 200
+        client.portal.call(wait_idle)
+        assert len(calls) == 2
+        assert not any(event.get("prompt_type") == "comment_reply"
+                       for event in client.get(url + "/events", headers=headers).json()["events"])
 
 
 def test_unreliable_batch_item_keeps_only_boundary_geometry(tmp_path):
@@ -704,7 +850,7 @@ def test_comment_attempt_terminal_and_lifetime_boundaries(tmp_path, mode):
         client.portal.call(wait_idle)
         assert calls == ["你想聊什么？"]
         if mode == "expired":
-            clock[0] += 10_001
+            clock[0] += 20_001
         if mode == "stopped":
             assert client.post(url + "/stop", headers=headers).status_code == 200
             assert send("after-stop", "小乙：嗯").status_code == 409
