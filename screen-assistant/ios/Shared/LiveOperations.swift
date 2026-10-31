@@ -318,12 +318,13 @@ struct LiveOperationsClient {
         }.resume()
     }
 
-    func stop(_ credentials: LiveSessionCredentials, completion: @escaping (Bool) -> Void) {
+    func stop(_ credentials: LiveSessionCredentials, recordResponse: Bool = true,
+              completion: @escaping (Bool, URLResponse?, Error?) -> Void) {
         var request = authorized(endpoint("v1", "live", "sessions", credentials.sessionID, "stop"), token: credentials.token)
         request.httpMethod = "POST"
         session.dataTask(with: request) { _, response, error in
-            ControlState.recordServiceResponse(error: error, response: response)
-            completion(error == nil && (response as? HTTPURLResponse)?.statusCode == 200)
+            if recordResponse { ControlState.recordServiceResponse(error: error, response: response) }
+            completion(error == nil && (response as? HTTPURLResponse)?.statusCode == 200, response, error)
         }.resume()
     }
 
@@ -524,8 +525,13 @@ enum LiveSessionState {
     }
 
     static func save(_ value: LiveSessionCredentials, enableCapture: Bool = true) -> Bool {
-        guard let fileURL, let defaults = AppGroup.defaults,
-              let data = try? JSONEncoder().encode(value) else { return false }
+        guard let fileURL, let defaults = AppGroup.defaults else { return false }
+        return save(value, fileURL: fileURL, defaults: defaults, enableCapture: enableCapture)
+    }
+
+    static func save(_ value: LiveSessionCredentials, fileURL: URL, defaults: UserDefaults,
+                     enableCapture: Bool = true) -> Bool {
+        guard let data = try? JSONEncoder().encode(value) else { return false }
         do {
             try data.write(to: fileURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
             defaults.set(enableCapture, forKey: enabledKey)
@@ -536,7 +542,11 @@ enum LiveSessionState {
     }
 
     static func credentials() -> LiveSessionCredentials? {
-        guard let fileURL, let data = try? Data(contentsOf: fileURL) else { return nil }
+        guard let fileURL else { return nil }
+        return credentials(fileURL: fileURL)
+    }
+    static func credentials(fileURL: URL) -> LiveSessionCredentials? {
+        guard let data = try? Data(contentsOf: fileURL) else { return nil }
         return try? JSONDecoder().decode(LiveSessionCredentials.self, from: data)
     }
     static func isEnabled() -> Bool { AppGroup.defaults?.bool(forKey: enabledKey) ?? false }

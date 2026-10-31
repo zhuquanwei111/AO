@@ -215,7 +215,7 @@ final class AppModel: ObservableObject {
                     pendingCredentials.liveConnectionPending = true
                     self.captureWanted = false
                     guard LiveSessionState.save(pendingCredentials, enableCapture: true) else {
-                        client.stop(credentials) { _ in }
+                        client.stop(credentials) { _, _, _ in }
                         self.liveStarting = false
                         self.liveStatus = "无法安全保存本场授权，已请求取消场次"
                         return
@@ -318,6 +318,7 @@ final class AppModel: ObservableObject {
             return
         }
         liveStartGeneration &+= 1
+        let stopGeneration = liveStartGeneration
         liveStarting = false
         livePollGeneration &+= 1
         livePollTask?.cancel()
@@ -338,9 +339,16 @@ final class AppModel: ObservableObject {
         liveCredentials = stoppingCredentials
         liveStopping = true
         liveStatus = "本机采集已停止；正在确认服务端结束…"
-        client.stop(stoppingCredentials) { [weak self] ok in
+        client.stop(stoppingCredentials, recordResponse: false) { [weak self] ok, response, error in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, let saved = Self.savedCredentials(),
+                      saved.token == stoppingCredentials.token, PollCallbackGate.commitIfCurrent(
+                    sessionID: stoppingCredentials.sessionID, generation: stopGeneration,
+                    currentSessionID: saved.sessionID,
+                    currentGeneration: self.liveStartGeneration, active: self.liveStopping,
+                    stopping: false, commit: {
+                        ControlState.recordServiceResponse(error: error, response: response)
+                    }) else { return }
                 self.liveStopping = false
                 guard ok else {
                     self.liveStatus = "本机采集已停止；服务未确认结束场次，检查网络后可重试"
@@ -352,7 +360,11 @@ final class AppModel: ObservableObject {
                 PiPDisplayController.shared.setLiveSessionActive(false)
                 self.liveStopped = true
                 self.liveCredentials = nil
-                LiveSessionState.disableCapturePreservingCredentials()
+                var confirmedCredentials = stoppingCredentials
+                confirmedCredentials.stopPending = false
+                if !LiveSessionState.save(confirmedCredentials, enableCapture: false) {
+                    LiveSessionState.disableCapturePreservingCredentials()
+                }
                 self.liveStatus = "已结束，正在读取本场记录"
                 self.loadStoppedOverview(credentials, client: client)
             }
