@@ -33,4 +33,21 @@ let mixed = inspect("{\"server_time_ms\":1000,\"server_processing_ms\":0,\"promp
 let expired = LivePromptDelivery.displayExpiry(mixed.expiries[0], serverTimeMS: mixed.serverTimeMS,
                                                 processingMS: mixed.processingMS, startNS: 0, endNS: 1_000_000)!
 assert(expired == 1)
+let strictPriority = inspect("{\"server_time_ms\":1000,\"server_processing_ms\":0,\"prompts\":[{\"priority\":100},{\"priority\":100.0},{\"priority\":true},{\"priority\":null},{}]}")
+assert(strictPriority.priorities == [100, nil, nil, nil, nil])
+for invalid in ["null", "true", "100.0", "1e2", "\"100\"", "9223372036854775808"] {
+    let input = inspect("{\"server_time_ms\":1000,\"server_processing_ms\":0,\"prompts\":[{\"priority\":\(invalid)}]}")
+    assert(input.priorities == [nil])
+}
+var guardedPriority = LivePromptDelivery(intervalMS: 0)
+let urgent = LivePromptDelivery.Item(id: "urgent", text: "urgent", expiresAtMS: 20,
+                                     priority: 100)
+let malformed = LivePromptDelivery.Item(id: "bad", text: "bad", expiresAtMS: 20,
+                                        priority: nil, priorityInvalid: true)
+let expiredOrdinary = LivePromptDelivery.Item(id: "expired", text: "expired", expiresAtMS: 1,
+                                               priority: 25)
+assert(guardedPriority.receive([urgent, malformed, expiredOrdinary], nowMS: 1).count == 3)
+assert(guardedPriority.expiredCount == 1)
+let urgentFrame = guardedPriority.take(nowMS: 1) { _ in true }
+assert(urgentFrame.map(\.id) == ["urgent"] && urgentFrame[0].expiresAtMS == 20)
 print("OK: mixed prompt deadlines and shared timing anchors")
