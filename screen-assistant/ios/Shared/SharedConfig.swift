@@ -140,12 +140,16 @@ struct SharedConfig {
                          heightKey: Keys.onlineCountROIHeight)
     }
 
-    static func onlineCountSemanticsConfirmed() -> Bool {
-        AppGroup.defaults?.bool(forKey: Keys.onlineCountSemanticsConfirmed) ?? false
+    static func onlineCountSemanticsConfirmed(defaults: UserDefaults? = AppGroup.defaults) -> Bool {
+        defaults?.bool(forKey: Keys.onlineCountSemanticsConfirmed) ?? false
     }
 
-    static func setOnlineCountSemanticsConfirmed(_ confirmed: Bool) {
-        AppGroup.defaults?.set(confirmed, forKey: Keys.onlineCountSemanticsConfirmed)
+    static func setOnlineCountSemanticsConfirmed(_ confirmed: Bool, defaults: UserDefaults? = AppGroup.defaults) {
+        defaults?.set(confirmed, forKey: Keys.onlineCountSemanticsConfirmed)
+    }
+
+    static func retainedOnlineCountConfirmation(previous: CGRect?, next: CGRect?, confirmed: Bool) -> Bool {
+        next != nil && previous == next && confirmed
     }
 
     static func platformNoticeROI() -> CGRect? {

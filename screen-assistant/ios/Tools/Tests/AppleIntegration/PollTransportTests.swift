@@ -58,6 +58,22 @@ private final class PollFixtureProtocol: URLProtocol {
 }
 
 final class PollTransportTests: XCTestCase {
+    func testOnlineCountConfirmationPersistsOnlyForSameRegion() throws {
+        let suite = "count-confirmation-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let roi = CGRect(x: 0.1, y: 0.2, width: 0.3, height: 0.4)
+        let other = CGRect(x: 0.2, y: 0.2, width: 0.3, height: 0.4)
+        XCTAssertFalse(SharedConfig.onlineCountSemanticsConfirmed(defaults: defaults))
+        SharedConfig.setOnlineCountSemanticsConfirmed(true, defaults: defaults)
+        let restored = try XCTUnwrap(UserDefaults(suiteName: suite))
+        XCTAssertTrue(SharedConfig.onlineCountSemanticsConfirmed(defaults: restored))
+        XCTAssertTrue(SharedConfig.retainedOnlineCountConfirmation(previous: roi, next: roi, confirmed: true))
+        XCTAssertFalse(SharedConfig.retainedOnlineCountConfirmation(previous: roi, next: other, confirmed: true))
+        XCTAssertFalse(SharedConfig.retainedOnlineCountConfirmation(previous: roi, next: nil, confirmed: true))
+        XCTAssertFalse(SharedConfig.retainedOnlineCountConfirmation(previous: roi, next: roi, confirmed: false))
+    }
+
     func testPromptTypesAndReliableReplyDecodeWithLegacyFallback() throws {
         let prefix = "{\"prompt_id\":\"p\",\"input_mode\":\"live_observation\",\"start_at_ms\":1,\"end_at_ms\":1,\"phenomenon\":\"comment\",\"suggestion\":\"suggestion\",\"display_text\":\"speak\",\"observation_count\":1"
         let typed = prefix + ",\"prompt_type\":\"comment_reply\",\"reply_to\":{\"comment_id\":\"local\",\"nickname\":null,\"text\":\"hello\"}}"
