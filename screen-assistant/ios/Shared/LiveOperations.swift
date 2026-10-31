@@ -524,6 +524,14 @@ enum LiveSessionState {
         AppGroup.containerURL?.appendingPathComponent("live-session.json", isDirectory: false)
     }
 
+    static func recoverActive(_ value: LiveSessionCredentials?, captureEnabled: Bool) -> Bool {
+        value != nil && (captureEnabled || value?.stopPending == true)
+    }
+
+    static func holdCaptureOnRecovery(_ value: LiveSessionCredentials?) -> Bool {
+        value?.stopPending == true || value?.liveConnectionPending == true
+    }
+
     static func save(_ value: LiveSessionCredentials, enableCapture: Bool = true) -> Bool {
         guard let fileURL, let defaults = AppGroup.defaults else { return false }
         return save(value, fileURL: fileURL, defaults: defaults, enableCapture: enableCapture)
@@ -548,6 +556,15 @@ enum LiveSessionState {
     static func credentials(fileURL: URL) -> LiveSessionCredentials? {
         guard let data = try? Data(contentsOf: fileURL) else { return nil }
         return try? JSONDecoder().decode(LiveSessionCredentials.self, from: data)
+    }
+    static func confirmStopped(_ value: LiveSessionCredentials) -> Bool {
+        guard let fileURL, let defaults = AppGroup.defaults else { return false }
+        return confirmStopped(value, fileURL: fileURL, defaults: defaults)
+    }
+    static func confirmStopped(_ value: LiveSessionCredentials, fileURL: URL, defaults: UserDefaults) -> Bool {
+        var confirmed = value
+        confirmed.stopPending = false
+        return save(confirmed, fileURL: fileURL, defaults: defaults, enableCapture: false)
     }
     static func isEnabled() -> Bool { AppGroup.defaults?.bool(forKey: enabledKey) ?? false }
     static func disableCapturePreservingCredentials() {

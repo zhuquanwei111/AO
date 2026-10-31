@@ -115,9 +115,10 @@ final class AppModel: ObservableObject {
         }
         let savedLiveCredentials = LiveSessionState.credentials()
         let savedConnectionPending = savedLiveCredentials?.liveConnectionPending == true
-        liveActive = LiveSessionState.isEnabled() && savedLiveCredentials != nil
+        liveActive = LiveSessionState.recoverActive(savedLiveCredentials,
+                                                   captureEnabled: LiveSessionState.isEnabled())
         liveConnectionPending = liveActive && savedConnectionPending
-        if liveConnectionPending || savedLiveCredentials?.stopPending == true { captureWanted = false }
+        if liveActive && LiveSessionState.holdCaptureOnRecovery(savedLiveCredentials) { captureWanted = false }
         roundCounter = ControlState.roundCounter()
 
         // 轮询共享状态（扩展每完成一轮会 bump 计数器）。
@@ -360,9 +361,7 @@ final class AppModel: ObservableObject {
                 PiPDisplayController.shared.setLiveSessionActive(false)
                 self.liveStopped = true
                 self.liveCredentials = nil
-                var confirmedCredentials = stoppingCredentials
-                confirmedCredentials.stopPending = false
-                if !LiveSessionState.save(confirmedCredentials, enableCapture: false) {
+                if !LiveSessionState.confirmStopped(stoppingCredentials) {
                     LiveSessionState.disableCapturePreservingCredentials()
                 }
                 self.liveStatus = "已结束，正在读取本场记录"
