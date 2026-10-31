@@ -44,6 +44,52 @@ def test_trigger_after_task_completion_is_not_lost(tmp_path, monkeypatch):
     asyncio.run(run())
 
 
+def test_comment_reply_candidate_uses_bounded_scheduler_and_prompt_dto(tmp_path, monkeypatch):
+    import screen_assistant_server.live as live
+    monkeypatch.setattr(live, "FUSION_SETTLE_MS", 0)
+    now = 1_790_000_000_000
+
+    async def run():
+        cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="fake",
+                       tianyi_base_url="http://model.invalid", tianyi_model="fake",
+                       dedup_ttl_seconds=60, max_sentence_chars=2000,
+                       model_timeout_seconds=2, model_connect_timeout_seconds=1,
+                       live_db_path=str(tmp_path / "reply.sqlite3"))
+        app = create_app(cfg, live_clock=lambda: now)
+        calls = []
+        class Model:
+            async def reply_to_comment(self, text, *, nickname, priority_eligible):
+                calls.append((text, nickname, priority_eligible))
+                return "谢谢你的祝福。"
+            async def aclose(self):
+                pass
+        async with app.router.lifespan_context(app):
+            app.state.model = Model()
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                session = (await client.post("/v1/live/sessions", json={})).json()
+                sid, token = session["session_id"], session["session_token"]
+                row = {"event_id": "e1", "kind": "comment", "source": "ios_replaykit_ocr",
+                       "coverage": "ocr_visible_sample", "reliability": "known", "confidence": 0.9,
+                       "observed_at_ms": now, "effective_at_ms": now, "received_at_ms": now,
+                       "content": {"text": "小明：bless you", "text_position": None}}
+                candidate = {"topic": "comment:c1", "priority": 25, "phenomenon": "公屏评论",
+                             "observations": [row], "model_text": "bless you", "suggestion": None,
+                             "prompt_type": "comment_reply", "priority_eligible": True,
+                             "reply_to": {"comment_id": "c1", "nickname": "小明", "text": "bless you"}}
+                app.state.live.store.fusion_candidate = lambda *_: candidate
+                app.state.live.schedule_fusion(sid, token, type("Request", (), {"app": app})())
+                task = app.state.live.fusion_active[sid]
+                await asyncio.wait_for(task, 2)
+                response = await client.get(f"/v1/live/sessions/{sid}/prompts",
+                                            headers={"X-Live-Session-Token": token})
+                prompt = response.json()["prompts"][0]
+                assert calls == [("bless you", "小明", True)]
+                assert prompt["prompt_type"] == "comment_reply"
+                assert prompt["reply_to"] == candidate["reply_to"]
+                assert prompt["display_text"] == "谢谢你的祝福。"
+    asyncio.run(run())
+
+
 def test_observation_returns_while_model_is_blocked(tmp_path):
     async def run():
         cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="fake",

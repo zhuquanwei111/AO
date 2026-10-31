@@ -442,23 +442,33 @@ class LiveService:
                 if not cfg.tianyi_api_key:
                     return {"reason": "model_unavailable", "prompt_id": None}
                 try:
-                    source = ",".join(dict.fromkeys(
-                        row["source"] for row in candidate["observations"]
-                    ))
-                    observed_at = max(row["effective_at_ms"] for row in candidate["observations"])
-                    suggestion = await asyncio.wait_for(
-                        request.app.state.model.suggest_live(
-                            candidate["model_text"], candidate["description"], source,
-                            observed_at, context=candidate["model_context"],
-                        ), timeout=cfg.model_timeout_seconds,
-                    )
+                    if candidate.get("prompt_type") == "comment_reply":
+                        suggestion = await asyncio.wait_for(
+                            request.app.state.model.reply_to_comment(
+                                candidate["model_text"], nickname=candidate["reply_to"]["nickname"],
+                                priority_eligible=candidate.get("priority_eligible", False),
+                            ), timeout=cfg.model_timeout_seconds,
+                        )
+                    else:
+                        source = ",".join(dict.fromkeys(
+                            row["source"] for row in candidate["observations"]
+                        ))
+                        observed_at = max(row["effective_at_ms"] for row in candidate["observations"])
+                        suggestion = await asyncio.wait_for(
+                            request.app.state.model.suggest_live(
+                                candidate["model_text"], candidate["description"], source,
+                                observed_at, context=candidate["model_context"],
+                            ), timeout=cfg.model_timeout_seconds,
+                        )
                 except (asyncio.TimeoutError, ModelTimeoutError):
                     logger.info("live_fusion outcome=timeout")
                     return {"reason": "model_unavailable", "prompt_id": None}
                 except ModelUnavailableError:
                     logger.info("live_fusion outcome=model_unavailable")
                     return {"reason": "model_unavailable", "prompt_id": None}
-                if not valid_operation_suggestion(suggestion):
+                if candidate.get("prompt_type") == "comment_reply" and suggestion is None:
+                    return {"reason": "quiet", "prompt_id": None}
+                if candidate.get("prompt_type") != "comment_reply" and not valid_operation_suggestion(suggestion):
                     return {"reason": "model_output_invalid", "prompt_id": None}
             elif not suggestion or len(suggestion) > 100 or "\n" in suggestion or "\r" in suggestion:
                 return {"reason": "candidate_invalid", "prompt_id": None}
