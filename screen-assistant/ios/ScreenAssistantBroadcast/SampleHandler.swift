@@ -432,7 +432,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         }
         let batchID = UUID()
         var queuedEvents = builder.events
-        if credentials.capabilities?.observationBatchMetadata == true {
+        if credentials.capabilities?.supportsObservationBatch == true {
             let counts = builder.events.filter { !$0.isComment }
             let comments = builder.events.filter(\.isComment)
             let occupiedBytes = counts.reduce(0) { $0 + $1.body.count }

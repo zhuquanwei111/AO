@@ -94,13 +94,17 @@ final class PollTransportTests: XCTestCase {
         let prefix = "{\"session_id\":\"fixture-session\",\"session_token\":\"fixture-token\",\"started_at_ms\":1"
         for (suffix, supported) in [
             ("}", false),
-            (",\"capabilities\":{\"observation_batch_metadata\":true}}", true),
+            (",\"capabilities\":{\"observation_batch_metadata\":true}}", false),
+            (",\"capabilities\":{\"observation_batch_metadata\":true,\"typed_prompts\":true}}", true),
+            (",\"capabilities\":{\"observation_batch_metadata\":true,\"typed_prompts\":false}}", false),
+            (",\"capabilities\":{\"observation_batch_metadata\":true,\"typed_prompts\":1}}", false),
+            (",\"capabilities\":{\"observation_batch_metadata\":false,\"typed_prompts\":true}}", false),
             (",\"capabilities\":{\"observation_batch_metadata\":false}}", false),
             (",\"capabilities\":{\"observation_batch_metadata\":1}}", false),
             (",\"capabilities\":\"invalid\"}", false)
         ] {
             let decoded = try JSONDecoder().decode(LiveSessionCredentials.self, from: Data((prefix + suffix).utf8))
-            XCTAssertEqual(decoded.capabilities?.observationBatchMetadata == true, supported)
+            XCTAssertEqual(decoded.capabilities?.supportsObservationBatch == true, supported)
         }
     }
 

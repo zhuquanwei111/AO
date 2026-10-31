@@ -26,6 +26,9 @@ enum LiveCommentFilter {
 struct LiveCapabilities: Codable {
     let observationBatchMetadata: Bool?
     let typedPrompts: Bool?
+    var supportsObservationBatch: Bool {
+        observationBatchMetadata == true && typedPrompts == true
+    }
     enum CodingKeys: String, CodingKey {
         case observationBatchMetadata = "observation_batch_metadata", typedPrompts = "typed_prompts"
     }
