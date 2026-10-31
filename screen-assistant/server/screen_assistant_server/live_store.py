@@ -763,6 +763,11 @@ class LiveStore:
             ),
             "sources": sources, "priority": candidate["priority"],
         }
+        if candidate.get("prompt_type") == "comment_reply":
+            event["prompt_type"] = "comment_reply"
+            event["reply_to"] = candidate["reply_to"]
+        elif candidate.get("prompt_type") == "operation_notice":
+            event["prompt_type"] = "operation_notice"
         with self.db:
             self.db.execute(
                 "INSERT INTO live_events (session_id,topic_hash,generated_at_ms,expires_at_ms,payload) VALUES (?,?,?,?,?)",
