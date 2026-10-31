@@ -4,9 +4,11 @@
 
 2026-10-31 补充：新协议 `capture_comment_count` 用于调用方的传输完整性门控，并非语义评论数量。模块不自行判定批次是否收齐；生产调用方应先按协议确认收到全部合法项，再调用本模块。`partial` 和 `ambiguous` 只描述语义边界，不能证明传输完成；旧 DTO 缺批次时仍仅作单条处理。
 
-本模块不以 OCR confidence 推断语义角色，也不自行过滤不可靠观察；调用方须在完整性计数后按既定质量契约选择可供语义处理的项，已收到的不可靠项仍计入传输收齐。
+本模块不以 OCR confidence 推断语义角色。调用方须先把已收到的不可靠项计入传输收齐，然后显式提供 `batch_complete=True` 和 `quality_gaps`：每个不能供重建的项传 `{event_id, text_position}`，位置未知为 null；经检查无缺口传空列表。缺口文字不能用于重建；位置未知阻止整批升级，邻近缺口阻止相应评论升级。默认 `batch_complete=False, quality_gaps=None` 不升级；缺 batch、多个 batch 或来源混合也不升级。调用方仍负责会话隔离、质量检查和真实时效，本参数只是调用方断言，模块不能验证传输收齐。旧 DTO 不可伪称新批次完整。
 
-输出字典包括临时 `comment_id`、`source`、`nickname`、`text`、`consumption_level`、`fan_level`、`fan_group`、每字段 `field_status`/`field_sources`、`source_event_ids`、真实 `first_observed_at_ms`/`last_seen_at_ms`、`boundary_status`、`tracking_status`、归一化 `position` 和未经分类的 `header_evidence`。临时 ID 由首项来源、事件 ID 和观察时间确定，同输入重复调用结果一致；调用方仍须按会话隔离，不得当跨会话全局身份。`field_status=candidate` 是基于有限文字和几何的候选，**不是确认字段**；`unknown` 对应 null。`boundary_status=partial/ambiguous` 均不证明完整评论。不得直接将 candidate 当作可靠正文或作者，更不得把 `header_evidence` 当用户身份；它可能含昵称等原始文字，不应写入常规日志或默认发给模型。没有可确认的徽章分类能力，两个等级和团名保持未知，不由前导数字或人工真值补猜。
+输出字典包括临时 `comment_id`、`source`、`nickname`、`text`、`consumption_level`、`fan_level`、`fan_group`、每字段 `field_status`/`field_sources`、`source_event_ids`、真实 `first_observed_at_ms`/`last_seen_at_ms`、`boundary_status`、`tracking_status`、归一化 `position`、`usability_reasons` 和未经分类的 `header_evidence`。临时 ID 由首项来源、事件 ID 和观察时间确定，同输入重复调用结果一致；调用方仍须按会话隔离，不得当跨会话全局身份。`field_status` 对五个业务字段使用 `usable/candidate/unknown`：`usable` 仅可按下述局部规则使用，`candidate` 是未确认候选，`unknown` 对应 null。`field_sources` 同五键，值为真实输入 event_id 数组。`boundary_status` 为 `locally_complete/partial/ambiguous`；只有正文同时为 `usable` 和 `locally_complete` 才可按调用方业务规则消费，昵称仅在自身为 `usable` 时使用。`header_evidence` 不得用作身份；它可能含昵称等原始文字，不应写入常规日志或默认发给模型。两个等级和团名保持未知，不由前导数字或人工真值补猜。
+
+首版仅在完整批次及质量信息均经调用方明确提供、同一框内唯一分隔出非空正文及可用矩形、无紧邻未归属观察或质量缺口、无省略号或上缘裁断迹象时升级；拼接正文暂不升级。数字开头的头部昵称仍为 unknown，装饰符开头的昵称仍为 candidate，正文可单独升级。`usability_reasons` 为正文不升级的机器原因数组：`batch_or_quality_unverified`、`body_or_geometry_uncertain`、`visible_truncation`、`near_top_edge`、`quality_gap`、`unlocated_observation`、`nearby_unassigned`；空数组只表示局部规则通过。`field_reasons` 按五字段给出原因数组：正文沿用上述原因，昵称可为 `ambiguous_header`，未分类的等级和团名为 `not_classified`。上缘规则只识别坐标明显靠上的风险；无 ROI 边界时无法证明没有裁断、遮挡或 OCR 漏检。`usable` 不是平台原文、完整采集或真实身份的保证，右侧浮层和误分隔仍可能误判。
 
 `tracking_status=continuous_candidate` 表示唯一头部、正文相似度、相近横向位置、上移和时间同时满足，且至少两个相同片段或两个相邻评论呈一致上移与顺序的连续观察候选，并沿用临时 ID；单条匹配没有邻近证据时为 `ambiguous_single`，不沿用 ID。它不是平台消息ID或真实用户ID，不证明同名同文不是新消息。调用方不可仅凭此状态或相同 `comment_id` 将其作为确定的独立人数，也不可据此宣称零重复/零误吞。`previous` 必须为同会话紧邻上一采集轮的输出；空轮、缺帧、遮挡、离屏后重发、不同人同名同文和多重匹配均无法确认，调用方须保守处理。关联保留原始事件ID与首次真实观察时间；不会因后续观察重置首次时间。
 
@@ -22,4 +24,6 @@
 
 扩测25号独立小集8帧的30条人工标注（以其原始 JSONL 的 Paddle 检测项、框和该报告逐条真值人工对照；标点/emoji差异按其口径忽略）：正文候选 **22正确、1部分/错误、7未知**；昵称候选 **12正确、0已识别错误、18未知**；消费等级 **0正确、0错误、30未知**；4条可判灯牌 **0正确、0错误、4未知**。团名在该30条无可评分真值，结构图的团名未知。统计仅针对这30条已标注目标，不包括目标外候选；存在截断上缘文字和无分隔符文本等额外候选，不能据此声称误报为零。A30“点点关注点点赞，亮个粉丝牌！”仅输出首行，作为部分/错误；B52三条无分隔符候选目前未知。局部跨行回归曾暴露数字徽章和下一人无冒号文本误并，现有针对性测试覆盖这两例；不证明其他版面不会误并。统计基于 ROI 局部归一化框，与完整屏幕坐标条件不同，需要进一步同源验收。
 
-这些计数是一次人工对照而非泛化准确率或生产可用结论。缺少可靠的现成业务角色归属与完整性检测，候选进入业务前仍需独立验证或保守降级。模块未接现有接口，不改变服务、客户端、规则或协议；最终产品链路的批次完整性、采集覆盖、显示与业务筛选均需另行验证。
+2026-10-31 可用资格复测：以同一八帧原始 Paddle 框构造**仅供离线规则测试的合成批次**，假设没有已知质量缺口；这不是旧素材真实存在 `capture_batch_id/count` 的证据。30 条目标中，按忽略一般标点的正文精确值自动比较，18 条有唯一匹配，其中 **7 条标记 usable**；7 条没有精确匹配，另有 5 条正文重复而无法仅按正文唯一归属。八帧合计产生 18 个 usable 输出，其中有不在30条目标分母内的输出，不能声称全为正确或用它们计算准确率。人工对照的原候选正确/部分/未知计数见上一段，不能混同于 usable 统计。真实结构图的 `bless you` 为 usable，等级仍未知；A30 截断上缘的“对看的”因上缘风险被降级，未归属长续行和右侧浮层不能靠收齐证明完整。同文不同人未合并；多片段正文当前仍保守为候选。
+
+这些计数不是泛化准确率或生产可用结论。模块未接现有接口；最终产品链路的批次完整性、质量缺口传递、采集覆盖、显示与业务筛选均需另行验证。字段来源只说明 OCR 输入，并不证明正文或昵称为平台真值。
