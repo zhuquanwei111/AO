@@ -24,6 +24,7 @@ from .live_fusion import (
     build_candidate, observation_source_allowed, online_count_details,
     validate_observation_content,
 )
+from .comment_reconstruction import reconstruct_comments
 
 logger = logging.getLogger("screen_assistant.app")
 
@@ -42,6 +43,7 @@ class LiveStore:
         self.windows: dict[str, deque] = {}
         self.fusion_windows: dict[str, deque] = {}
         self.comment_batches: dict[str, dict[tuple[str, str], dict]] = {}
+        self.comment_batch_sweeps: dict[str, int] = {}
         self.db = sqlite3.connect(path, check_same_thread=False, timeout=0.5)
         self.db.row_factory = sqlite3.Row
         self.db.executescript("""
@@ -125,6 +127,19 @@ class LiveStore:
 
     def close(self):
         self.db.close()
+
+    def _expire_comment_payloads(self, sid: str, now: int) -> None:
+        previous = self.comment_batch_sweeps.get(sid)
+        if previous is not None and now >= previous and now - previous < 1000:
+            return
+        self.comment_batch_sweeps[sid] = now
+        for batch in self.comment_batches.get(sid, {}).values():
+            if now > batch["deadline"]:
+                batch["rows"].clear()
+                batch.pop("records", None)
+                if not batch.get("expired") and not batch["complete"]:
+                    logger.info("live_comment_batch outcome=expired")
+                batch["expired"] = True
 
     def authorize(self, sid: str, token: str | None):
         row = self.db.execute(
@@ -260,6 +275,7 @@ class LiveStore:
         self.windows.pop(sid, None)
         self.fusion_windows.pop(sid, None)
         batches = self.comment_batches.pop(sid, {})
+        self.comment_batch_sweeps.pop(sid, None)
         if any(not batch["complete"] for batch in batches.values()):
             logger.info("live_comment_batch outcome=stopped_incomplete")
         task = self.db.execute(
@@ -274,6 +290,7 @@ class LiveStore:
 
     def add_observation(self, sid: str, token: str | None, body: dict, received_at_ms: int):
         session = self.authorize(sid, token)
+        self._expire_comment_payloads(sid, received_at_ms)
         if session["stopped_at_ms"] is not None:
             raise HTTPException(409, "live session stopped")
         if not observation_source_allowed(body["kind"], body["source"],
@@ -426,6 +443,8 @@ class LiveStore:
                 rows = batch["rows"]
                 batch["rows"] = []
                 if rows and received_at_ms <= batch["deadline"]:
+                    observed_rows = [row for row in rows if row.get("observed_at_ms") is not None]
+                    batch["records"] = reconstruct_comments(observed_rows)
                     window = self.fusion_windows.setdefault(sid, deque(maxlen=MAX_WINDOW_OBSERVATIONS))
                     window.extend(rows)
                     result["_batch_ready"] = True
@@ -876,6 +895,7 @@ class LiveStore:
     def prompts(self, sid: str, token: str | None, after: str):
         session = self.authorize(sid, token)
         seq, now = self.sequence(sid, after), self.clock()
+        self._expire_comment_payloads(sid, now)
         stopped = session["stopped_at_ms"] is not None
         rows = [] if stopped else self.db.execute(
             "SELECT * FROM live_events WHERE session_id=? AND seq>? AND expires_at_ms>? ORDER BY seq LIMIT 50",

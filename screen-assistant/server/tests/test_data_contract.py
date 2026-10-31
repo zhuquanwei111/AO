@@ -199,3 +199,52 @@ def test_restart_does_not_complete_old_partial_batch_but_new_batch_works(tmp_pat
         assert [row["event_id"] for row in store.fusion_windows[sid]] == ["e3"]
     finally:
         store.close()
+
+
+def test_complete_batch_runs_real_reconstructor_without_promoting_candidate(tmp_path):
+    now = 1_790_000_000_000
+    store = LiveStore(str(tmp_path / "reconstruct.sqlite3"), lambda: now)
+    try:
+        session = store.create("")
+        sid, token = session["session_id"], session["session_token"]
+        first = {"kind": "comment", "event_id": "e1", "source": "ios_replaykit_ocr",
+                 "observed_at_ms": now, "availability": "available", "coverage": "ocr_visible_sample",
+                 "reliability": "known", "confidence": 0.95,
+                 "content": {"text": "紫菜蛋花汤：bless you", "text_position":
+                             {"x": 0.1, "y": 0.5, "width": 0.4, "height": 0.04}},
+                 "capture_batch_id": "batch", "line_index": 0, "capture_comment_count": 2}
+        assert store.add_observation(sid, token, first, now)["reason"] == "batch_incomplete"
+        assert store.comment_batches[sid][("ios_replaykit_ocr", "batch")].get("records") is None
+        last = {**first, "event_id": "e2", "line_index": 3, "availability": "unreliable"}
+        store.add_observation(sid, token, last, now + 1000)
+        records = store.comment_batches[sid][("ios_replaykit_ocr", "batch")]["records"]
+        assert len(records) == 1
+        assert records[0]["text"] == "bless you"
+        assert records[0]["source_event_ids"] == ["e1"]
+        assert records[0]["field_status"]["text"] == "candidate"
+        assert records[0]["boundary_status"] == "partial"
+        assert store.fusion_candidate(sid, token) is None
+    finally:
+        store.close()
+
+
+def test_expired_batch_discards_transient_raw_payloads_on_poll(tmp_path):
+    now = 1_790_000_000_000
+    clock = [now]
+    store = LiveStore(str(tmp_path / "batch-cleanup.sqlite3"), lambda: clock[0])
+    try:
+        session = store.create("")
+        sid, token = session["session_id"], session["session_token"]
+        row = {"kind": "comment", "event_id": "e1", "source": "ios_replaykit_ocr",
+               "observed_at_ms": now, "availability": "available", "coverage": "ocr_visible_sample",
+               "reliability": "known", "content": {"text": "小明：你好", "text_position":
+                   {"x": 0.1, "y": 0.5, "width": 0.4, "height": 0.04}},
+               "capture_batch_id": "batch", "line_index": 0, "capture_comment_count": 1}
+        store.add_observation(sid, token, row, now)
+        batch = store.comment_batches[sid][("ios_replaykit_ocr", "batch")]
+        assert batch["records"][0]["fragments"]
+        clock[0] += 10_001
+        store.prompts(sid, token, "")
+        assert "records" not in batch and batch["rows"] == []
+    finally:
+        store.close()
