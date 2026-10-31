@@ -1,5 +1,12 @@
 import Foundation
 
+var malformedPriority = LivePromptDelivery(intervalMS: 0)
+let unsafePriority = LivePromptDelivery.Item(id: "bad", text: "bad", expiresAtMS: 100,
+                                             priority: 0, priorityInvalid: true)
+let validPriority = LivePromptDelivery.Item(id: "valid", text: "valid", expiresAtMS: 100, priority: 100)
+assert(malformedPriority.receive([unsafePriority, validPriority], nowMS: 1).map(\.id) == ["bad", "valid"])
+assert(malformedPriority.take(nowMS: 1) { _ in true }.map(\.id) == ["valid"])
+
 func item(_ id: String, expires: Int64 = 20_000, priority: Int = 0) -> LivePromptDelivery.Item {
     .init(id: id, text: id, expiresAtMS: expires, priority: priority)
 }

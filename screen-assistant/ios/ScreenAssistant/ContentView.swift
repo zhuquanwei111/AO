@@ -55,6 +55,11 @@ struct ContentView: View {
                             .font(.footnote)
                             .foregroundColor(.orange)
                     }
+                    if model.livePriorityInvalidItems > 0 || model.liveSourcesInvalidItems > 0 {
+                        Text("部分提示字段异常：优先级异常 \(model.livePriorityInvalidItems) 条，仅保留记录；来源异常 \(model.liveSourcesInvalidItems) 条，来源保持未知。")
+                            .font(.footnote)
+                            .foregroundColor(.orange)
+                    }
                     Label(model.serviceStatusText, systemImage: "network")
                         .font(.footnote)
                         .foregroundColor(model.serviceStatusText.contains("未收到") ||

@@ -79,6 +79,8 @@ struct LivePrompt: Codable, Identifiable {
     var expiresAtMS: Int64?
     let priority: Int?
     let sources: [LivePromptSource]?
+    let priorityInvalid: Bool
+    let sourcesInvalid: Bool
     var id: String { promptID }
     enum CodingKeys: String, CodingKey {
         case promptID = "prompt_id", inputMode = "input_mode"
@@ -98,8 +100,10 @@ struct LivePrompt: Codable, Identifiable {
         displayText = try values.decode(String.self, forKey: .displayText)
         observationCount = try values.decode(Int.self, forKey: .observationCount)
         expiresAtMS = try? values.decode(Int64.self, forKey: .expiresAtMS)
-        priority = try values.decodeIfPresent(Int.self, forKey: .priority)
-        sources = try values.decodeIfPresent([LivePromptSource].self, forKey: .sources)
+        priority = try? values.decode(Int.self, forKey: .priority)
+        sources = try? values.decode([LivePromptSource].self, forKey: .sources)
+        priorityInvalid = values.contains(.priority) && ((try? values.decodeNil(forKey: .priority)) == false) && priority == nil
+        sourcesInvalid = values.contains(.sources) && ((try? values.decodeNil(forKey: .sources)) == false) && sources == nil
     }
 }
 

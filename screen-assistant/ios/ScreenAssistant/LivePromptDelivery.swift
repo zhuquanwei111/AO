@@ -24,13 +24,16 @@ struct LivePromptDelivery {
         let expiresAtMS: Int64
         let priority: Int
         let timingInvalid: Bool
+        let priorityInvalid: Bool
 
-        init(id: String, text: String, expiresAtMS: Int64, priority: Int, timingInvalid: Bool = false) {
+        init(id: String, text: String, expiresAtMS: Int64, priority: Int,
+             timingInvalid: Bool = false, priorityInvalid: Bool = false) {
             self.id = id
             self.text = text
             self.expiresAtMS = expiresAtMS
             self.priority = priority
             self.timingInvalid = timingInvalid
+            self.priorityInvalid = priorityInvalid
         }
     }
 
@@ -53,7 +56,7 @@ struct LivePromptDelivery {
         expire(nowMS: nowMS)
         for item in items where seen.insert(item.id).inserted {
             fresh.append(item)
-            if item.timingInvalid { continue }
+            if item.timingInvalid || item.priorityInvalid { continue }
             if item.expiresAtMS <= nowMS {
                 expiredCount += 1
             } else if pending.count >= capacity {
