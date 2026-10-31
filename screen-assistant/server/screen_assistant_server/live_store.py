@@ -330,12 +330,12 @@ class LiveStore:
             else:
                 parsed = count_details["nominal_value"]
         message_hash = None
-        if usable and body["kind"] == "comment" and not body.get("capture_batch_id"):
+        if usable and body["kind"] == "comment":
             content = body["content"]
             stable_id = content.get("platform_message_id")
             if stable_id:
                 message_hash = digest(json.dumps([body["source"], stable_id]))
-            elif body["source"] == "ios_replaykit_ocr":
+            elif body["source"] == "ios_replaykit_ocr" and not body.get("capture_batch_id"):
                 normalized = "".join(content["text"].split())
                 identity = content.get("author_id")
                 position = content.get("text_position")

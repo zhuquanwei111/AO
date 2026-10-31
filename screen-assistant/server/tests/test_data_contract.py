@@ -32,3 +32,8 @@ def test_batch_capability_and_ios_distinct_rows_preserve_legacy_dedup(tmp_path):
         assert client.post(url, headers=headers, json=row2).json()["reason"] == "scheduled"
         assert client.post(url, headers=headers, json=row1).json()["reason"] == "duplicate_event"
         assert client.post(url, headers=headers, json={**row1, "line_index": 2}).status_code == 409
+        identified = {**row1, "event_id": "identified-1", "content": {
+            **body["content"], "platform_message_id": "platform-1"}}
+        assert client.post(url, headers=headers, json=identified).json()["reason"] == "scheduled"
+        duplicate = {**identified, "event_id": "identified-2", "line_index": 2}
+        assert client.post(url, headers=headers, json=duplicate).json()["reason"] == "duplicate_message"
