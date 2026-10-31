@@ -136,7 +136,7 @@ class LiveStore:
         for batch in self.comment_batches.get(sid, {}).values():
             if now > batch["deadline"]:
                 batch["rows"].clear()
-                batch["boundary_context"].clear()
+                batch["quality_gaps"].clear()
                 batch.pop("records", None)
                 if not batch.get("expired") and not batch["complete"]:
                     logger.info("live_comment_batch outcome=expired")
@@ -386,7 +386,7 @@ class LiveStore:
             batches = self.comment_batches.setdefault(sid, {})
             batch = batches.get(key)
             if batch is None:
-                batch = {"count": batch_count, "indices": {}, "rows": [], "boundary_context": [],
+                batch = {"count": batch_count, "indices": {}, "rows": [], "quality_gaps": [],
                          "deadline": min(effective, received_at_ms) + MAX_OBSERVATION_AGE_MS,
                          "complete": False}
                 batches[key] = batch
@@ -436,8 +436,8 @@ class LiveStore:
             batch["indices"][body["line_index"]] = event_hash
             if (not usable or observed is None) and received_at_ms <= batch["deadline"]:
                 box = (body.get("content") or {}).get("text_position")
-                batch["boundary_context"].append({"event_id": body["event_id"],
-                                                  "text_position": dict(box) if box else None})
+                batch["quality_gaps"].append({"event_id": body["event_id"],
+                                              "text_position": dict(box) if box else None})
             if usable:
                 item = dict(body)
                 item.update(received_at_ms=received_at_ms, effective_at_ms=effective,

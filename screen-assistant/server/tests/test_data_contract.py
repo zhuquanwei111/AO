@@ -129,7 +129,7 @@ def test_batch_waits_for_distinct_indices_and_counts_unreliable_arrivals(tmp_pat
         result = store.add_observation(sid, token, last, now + 1000)
         assert result["reason"] == "source_unreliable"
         assert result["_batch_ready"] is True
-        assert store.comment_batches[sid][("ios_replaykit_ocr", "batch")]["boundary_context"] == [
+        assert store.comment_batches[sid][("ios_replaykit_ocr", "batch")]["quality_gaps"] == [
             {"event_id": "e2", "text_position": None}]
         assert [row["event_id"] for row in store.fusion_windows[sid]] == ["e1"]
     finally:
@@ -264,7 +264,7 @@ def test_unreliable_batch_item_keeps_only_boundary_geometry(tmp_path):
                "reliability": "unknown", "content": {"text": "不可靠原文", "text_position": rect},
                "capture_batch_id": "batch", "line_index": 1, "capture_comment_count": 2}
         assert store.add_observation(sid, token, bad, now)["reason"] == "source_unreliable"
-        context = store.comment_batches[sid][("ios_replaykit_ocr", "batch")]["boundary_context"]
+        context = store.comment_batches[sid][("ios_replaykit_ocr", "batch")]["quality_gaps"]
         assert context == [{"event_id": "quality-gap", "text_position": rect}]
         assert "text" not in context[0]
         assert context[0]["text_position"] is not rect
