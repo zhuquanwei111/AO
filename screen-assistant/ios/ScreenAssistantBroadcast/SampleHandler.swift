@@ -557,8 +557,12 @@ final class SampleHandler: RPBroadcastSampleHandler {
         guard count > 0 else { return }
         guard let defaults = AppGroup.defaults else { return }
         let key = "observation.upload.\(reason)"
-        defaults.set(defaults.integer(forKey: key) + count, forKey: key)
+        let total = defaults.integer(forKey: key) + count
+        defaults.set(total, forKey: key)
         defaults.set(reason, forKey: "observation.upload.lastReason")
+        if !["received", "duplicate", "merged", "analysis_busy"].contains(reason) {
+            NSLog("采样上传异常：原因=%@，累计=%d", reason, total)
+        }
     }
 
     private func updateObservationQueueStatus() {
