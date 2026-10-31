@@ -52,6 +52,8 @@ agent/RAG/历史上下文/个性化；不持久化句子或回复日志。
 
 `/observations` 的 `comment` 与 `online_count` 可在顶层提供 `capture_batch_id`（1–128 字符）；`comment` 还可提供 `line_index`（0–65535 的整数，必须同时提供批次）与 `capture_comment_count`（严格整数 1–128，必须同时提供批次和行号）。数量是该采集轮冻结待发送的评论 OCR 观察项总数，不是语义评论数或观众数；同批每项须使用相同总数和不同的行号，行号允许有洞。收齐前不将该批评论送入融合；未收齐到期的批次不生成提示。未提供数量的旧请求走原兼容路径，不视为已确认的完整批次。字段缺省兼容旧客户端；重试沿用相同 `event_id` 及完整请求。只有服务端实际部署支持此契约后，客户端才能发送新字段；旧服务会拒绝这些字段。
 
+评论项的 `reason=batch_incomplete` 表示该合法项已接收但批次尚未收齐；`batch_expired` 表示该项到达时已超过批次收齐期限。同事件原样重试为 `duplicate_event`，事件 ID 改内容或批次行号、预期数冲突按现有规则返回 409。收齐的末项如本身可用，成功安排分析为 `scheduled`、队列满为 `analysis_busy`；末项不可靠或重复消息等则保留 `source_unreliable`、`duplicate_message` 等行级原因，即使它已计入批次收齐。行级原因本身不证明整批是否安排分析或模型是否生成；末项不可靠且队列满时通过 `stage=scheduler` 的 `scheduler_full` 诊断区分，不增加复合响应字段。
+
 创建场次的 `capabilities` 指示已支持的可选能力：`observation_batch_metadata` 为真时表示支持批次 ID、行号、评论观察项总数及收齐门控；`typed_prompts` 为假时不要依赖提示类型。服务端缺少能力对象或相应字段时视为不支持。带采集批次的评论仍按事件 ID 和完整请求做幂等校验，有平台消息 ID 时继续按该 ID 去重；不套用旧 iOS 文本与位置的粗粒度去重。无批次的旧请求继续原规则。
 
 新生成的融合提示可含 `prompt_type`：`comment_reply` 的 `display_text` 为主播可直接说出的话，`reply_to` 包含场次内临时 `comment_id`、可空 `nickname` 和从 OCR 识别提取的 `text`；这些不是平台身份或原文保证。`operation_notice` 的 `display_text` 是运营行动提醒。旧事件可能没有类型，未知类型应中性展示；旧提示字段、游标与服务端时间元数据继续保留。可用正文只表示已观察 OCR 内局部来源与边界满足规则，不证明画面外无遗漏或识别绝对正确；没有独立可用证据的昵称不点名，未知等级仅筛选时按零处理。
