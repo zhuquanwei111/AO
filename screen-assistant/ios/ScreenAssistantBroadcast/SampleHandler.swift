@@ -179,6 +179,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         guard regions.contains(where: { $0.image != nil }) else { endRound(generation: generation); return }
         logMemory(stage: "roi-rendered")
         let sampleObservedAtMS = Int64(Date().timeIntervalSince1970 * 1000)
+        let countSemanticsConfirmed = SharedConfig.onlineCountSemanticsConfirmed()
         let sampledCredentials = LiveSessionState.isEnabled() ? LiveSessionState.credentials() : nil
 
         // 同一个有界OCR任务串行识别评论和可选人数裁剪图。
@@ -203,7 +204,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
                 if let countROI = regionROIs["online_count"] {
                     let lines = results.first(where: { $0.identifier == "online_count" })?.lines ?? []
                     countPayload = Self.onlineCountPayload(lines: lines, roi: countROI,
-                                                           observedAtMS: sampleObservedAtMS)
+                                                           observedAtMS: sampleObservedAtMS,
+                                                           semanticsConfirmed: countSemanticsConfirmed)
                 }
                 self.enqueueSample(commentLines: commentLines, commentROI: observationROI,
                                    countPayload: countPayload, observedAtMS: sampleObservedAtMS,
@@ -326,13 +328,13 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     private static func onlineCountPayload(lines: [OCRService.TextLine], roi: CGRect,
-                                           observedAtMS: Int64) -> [String: Any] {
+                                           observedAtMS: Int64, semanticsConfirmed: Bool) -> [String: Any] {
         let rawText = String(lines.map(\.text).joined(separator: " ").prefix(120))
         let available = !rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let content: Any
         if available {
             content = [
-                "raw_text": rawText, "field_semantics_confirmed": true,
+                "raw_text": rawText, "field_semantics_confirmed": semanticsConfirmed,
                 "text_position": mergedPosition(lines: lines, roi: roi),
                 "ocr_lines": Array(lines.prefix(20)).map { ocrLinePayload($0, roi: roi) }
             ] as [String: Any]

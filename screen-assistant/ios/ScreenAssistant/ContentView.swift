@@ -253,6 +253,11 @@ private struct AdvancedSettingsView: View {
                         Text("在线人数：\(roiSummary(for: roi))")
                             .font(.footnote)
                             .foregroundColor(.secondary)
+                        Toggle("我已确认此区域显示实时在线人数", isOn: $model.onlineCountSemanticsConfirmed)
+                            .disabled(model.liveActive)
+                        Text("未确认时读数保持待核验；热度、累计观看不等于在线人数。")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
                     }
                     if model.onlineCountROI != nil {
                         Button("停用在线人数采集", role: .destructive) { model.onlineCountROI = nil }

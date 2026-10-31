@@ -28,7 +28,13 @@ final class AppModel: ObservableObject {
         didSet { SharedConfig.setROI(roi) }
     }
     @Published var onlineCountROI: CGRect? {
-        didSet { SharedConfig.setOnlineCountROI(onlineCountROI) }
+        didSet {
+            onlineCountSemanticsConfirmed = false
+            SharedConfig.setOnlineCountROI(onlineCountROI)
+        }
+    }
+    @Published var onlineCountSemanticsConfirmed: Bool {
+        didSet { SharedConfig.setOnlineCountSemanticsConfirmed(onlineCountSemanticsConfirmed) }
     }
     @Published var platformNoticeROI: CGRect? {
         didSet { SharedConfig.setPlatformNoticeROI(platformNoticeROI) }
@@ -85,7 +91,9 @@ final class AppModel: ObservableObject {
         intervalSeconds = SharedConfig.intervalSeconds()
         requestTimeout = SharedConfig.requestTimeoutSeconds()
         roi = SharedConfig.roi()
-        onlineCountROI = SharedConfig.onlineCountROI()
+        let initialOnlineCountROI = SharedConfig.onlineCountROI()
+        onlineCountROI = initialOnlineCountROI
+        onlineCountSemanticsConfirmed = SharedConfig.onlineCountSemanticsConfirmed() && initialOnlineCountROI != nil
         platformNoticeROI = SharedConfig.platformNoticeROI()
         let diagnosticRegion = InputDiagnosticsStore.configuration().region.clamped
         personROI = SharedConfig.personROI() ?? CGRect(x: CGFloat(diagnosticRegion.x),
