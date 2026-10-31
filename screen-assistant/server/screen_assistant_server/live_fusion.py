@@ -334,7 +334,9 @@ def group_feedback(comments: list[dict], now_ms: int) -> list[dict] | None:
     groups: dict[str, dict[str, dict]] = {}
     for item in comments:
         name, text, seen = item.get("nickname"), item.get("text"), item.get("last_seen_at_ms")
-        if (not isinstance(name, str) or not name.strip() or not isinstance(text, str)
+        comment_id = item.get("comment_id")
+        if (not isinstance(comment_id, str) or not comment_id.strip()
+                or not isinstance(name, str) or not name.strip() or not isinstance(text, str)
                 or not text.strip() or type(seen) is not int
                 or not now_ms - 10_000 <= seen <= now_ms):
             continue

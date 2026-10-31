@@ -32,6 +32,8 @@ def test_group_feedback_requires_distinct_named_messages_within_window():
     assert group_feedback([one, one], now) is None
     assert group_feedback([one, row("c2", None, "有点卡", now)], now) is None
     assert group_feedback([one, row("c2", "小明", "有点卡", now)], now) is None
+    assert group_feedback([one, row(None, "小红", "有点卡", now)], now) is None
+    assert group_feedback([one, row("c1", "小红", "有点卡", now)], now) is None
     assert group_feedback([one, row("c2", "小红", "有点卡", now - 10_001)], now) is None
     result = group_feedback([one, row("c2", "小红", "有点卡", now - 10_000)], now)
     assert result is not None
