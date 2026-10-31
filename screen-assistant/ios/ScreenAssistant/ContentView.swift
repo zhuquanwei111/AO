@@ -514,8 +514,13 @@ private struct LiveSessionOverviewView: View {
                             }
                             .font(.caption)
                             .foregroundColor(.secondary)
+                            Text(LivePromptDelivery.promptLabel(event.promptType)).font(.caption)
                             Text(event.phenomenon).font(.subheadline)
-                            Text(event.suggestion).font(.body)
+                            Text(event.displayText).font(.body)
+                            if event.promptType == "comment_reply", let reply = event.replyTo {
+                                Text("原评论：\(reply.nickname.flatMap { $0.isEmpty ? nil : "\($0)：" } ?? "")\(reply.text)")
+                                    .font(.footnote).foregroundColor(.secondary)
+                            }
                             if event.priorityInvalid {
                                 Text("优先级异常，无法用于画中画调度")
                                     .font(.footnote).foregroundColor(.orange)
@@ -662,8 +667,13 @@ private struct LiveEventListView: View {
                 }
                 .font(.caption)
                 .foregroundColor(.secondary)
+                Text(LivePromptDelivery.promptLabel(event.promptType)).font(.caption)
                 Text(event.phenomenon).font(.subheadline)
-                Text(event.suggestion).font(.body)
+                Text(event.displayText).font(.body)
+                if event.promptType == "comment_reply", let reply = event.replyTo {
+                    Text("原评论：\(reply.nickname.flatMap { $0.isEmpty ? nil : "\($0)：" } ?? "")\(reply.text)")
+                        .font(.footnote).foregroundColor(.secondary)
+                }
                 if event.priorityInvalid {
                     Text("优先级异常，无法用于画中画调度")
                         .font(.footnote).foregroundColor(.orange)

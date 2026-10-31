@@ -16,6 +16,42 @@ assert(Set(commentDTO.keys) == Set(["event_id", "input_mode", "source", "coverag
 assert(commentDTO["event_id"] as? String == stableID.uuidString.lowercased())
 assert(commentDTO["observed_at_ms"] as? Int == 123_456 && commentDTO["reliability"] as? String == "known")
 assert(commentDTO["text"] as? String == "昵称 你好😀\n下一行")
+let metadataBatchID = UUID()
+let metadataIndices: [Int] = [0, 7]
+let metadataRows = metadataIndices.map { index in
+    ObservationUploadBuffer.comment(text: "片段\(index)", position: nil, confidence: nil,
+        observedAtMS: 123_456, lineIndex: index)!
+}
+let encodedMetadata = ObservationUploadBuffer.metadataComments(metadataRows, batchID: metadataBatchID,
+    occupiedBytes: 0)
+assert(encodedMetadata.events.count == 2 && encodedMetadata.dropped == 0)
+for (index, encoded) in encodedMetadata.events.enumerated() {
+    let dto = try! JSONSerialization.jsonObject(with: encoded.body) as! [String: Any]
+    assert(dto["capture_comment_count"] as? Int == 2)
+    assert(dto["capture_batch_id"] as? String == metadataBatchID.uuidString.lowercased())
+    assert(dto["line_index"] as? Int == [0, 7][index])
+    assert(dto["event_id"] as? String == metadataRows[index].id.uuidString.lowercased())
+    assert(dto["observed_at_ms"] as? Int == 123_456 && dto["kind"] as? String == "comment")
+    assert(dto["input_mode"] == nil && encoded.useObservationEndpoint)
+}
+let limited = ObservationUploadBuffer.metadataComments(metadataRows, batchID: metadataBatchID,
+    occupiedBytes: ObservationUploadBuffer.BatchBuilder.maxBytes - encodedMetadata.events[0].body.count)
+assert(limited.events.count == 1 && limited.dropped == 1)
+let limitedDTO = try! JSONSerialization.jsonObject(with: limited.events[0].body) as! [String: Any]
+assert(limitedDTO["capture_comment_count"] as? Int == 1)
+let many = (0..<129).map { (index: Int) in
+    ObservationUploadBuffer.comment(text: "评论\(index)😀", position: nil, confidence: nil,
+        observedAtMS: 123_456, lineIndex: index)!
+}
+let prefix = ObservationUploadBuffer.metadataComments(many, batchID: metadataBatchID, occupiedBytes: 0)
+assert(prefix.events.count == 128 && prefix.dropped == 1)
+assert(prefix.events.reduce(0) { $0 + $1.body.count } <= ObservationUploadBuffer.BatchBuilder.maxBytes)
+for (index, encoded) in prefix.events.enumerated() {
+    let dto = try! JSONSerialization.jsonObject(with: encoded.body) as! [String: Any]
+    assert(dto["capture_comment_count"] as? Int == 128 && dto["line_index"] as? Int == index)
+    assert(dto["event_id"] as? String == many[index].id.uuidString.lowercased())
+}
+assert(ObservationUploadBuffer.metadataComments([], batchID: metadataBatchID, occupiedBytes: 0).events.isEmpty)
 if let _ = ObservationUploadBuffer.comment(text: String(repeating: "😀", count: 501), position: nil,
     confidence: nil, observedAtMS: 0) { assertionFailure("超长正文必须整项拒绝") }
 

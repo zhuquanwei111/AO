@@ -29,7 +29,9 @@ final class AppModel: ObservableObject {
     }
     @Published var onlineCountROI: CGRect? {
         didSet {
-            onlineCountSemanticsConfirmed = false
+            let retained = SharedConfig.retainedOnlineCountConfirmation(
+                previous: oldValue, next: onlineCountROI, confirmed: onlineCountSemanticsConfirmed)
+            if retained != onlineCountSemanticsConfirmed { onlineCountSemanticsConfirmed = retained }
             SharedConfig.setOnlineCountROI(onlineCountROI)
         }
     }
@@ -408,16 +410,19 @@ final class AppModel: ObservableObject {
                     let anchorValid = LivePromptDelivery.displayExpiry(page.serverTimeMS, serverTimeMS: page.serverTimeMS,
                         processingMS: page.serverProcessingMS, startNS: page.requestStartNS, endNS: page.responseEndNS) != nil
                     let items = zip(page.prompts, deadlines).map { prompt, deadline in
-                        let label = prompt.sources?.contains(where: { $0.kind == "comment" }) == true ? "问答" : "运营"
+                        let label = LivePromptDelivery.promptLabel(prompt.promptType)
                         return LivePromptDelivery.Item(id: prompt.promptID,
                             text: "【\(label)】" + prompt.displayText,
                             expiresAtMS: deadline ?? 0,
                             priority: prompt.priority, timingInvalid: deadline == nil,
-                            priorityInvalid: prompt.priorityInvalid)
+                            priorityInvalid: prompt.priorityInvalid, promptType: prompt.promptType)
                     }
+                    for item in items { Self.logPrompt(item, stage: "http_returned", reason: "page_received") }
                     let beforeOverflow = self.liveDelivery.overflowCount
                     let beforeExpired = self.liveDelivery.expiredCount
-                    let freshItems = self.liveDelivery.receive(items, nowMS: now)
+                    let freshItems = self.liveDelivery.receive(items, nowMS: now) { item, reason in
+                        Self.logPrompt(item, stage: reason == "received" ? "received" : "queue", reason: reason)
+                    }
                     if !freshItems.isEmpty {
                         if !anchorValid { self.liveTimingAnchorFailures += 1 }
                         else { self.liveTimingInvalidItems += freshItems.filter(\.timingInvalid).count }
@@ -481,6 +486,9 @@ final class AppModel: ObservableObject {
     private func deliverLivePrompts() {
         let now = Int64(LiveOperationsClient.continuousNowNS() / 1_000_000)
         if let expiry = liveDisplayedUntilMS, expiry <= now {
+            for item in liveDisplayedItems where item.expiresAtMS <= now {
+                Self.logPrompt(item, stage: "display_schedule", reason: "deadline_elapsed")
+            }
             liveDisplayedItems = LivePromptDelivery.unexpired(liveDisplayedItems, nowMS: now)
             liveDisplayedUntilMS = liveDisplayedItems.map(\.expiresAtMS).min()
             if liveDisplayedItems.isEmpty {
@@ -494,15 +502,28 @@ final class AppModel: ObservableObject {
             _ = PiPDisplayController.shared.showLiveFrame(liveDisplayedItems)
         }
         let beforeExpired = liveDelivery.expiredCount
-        let frame = liveDelivery.take(nowMS: now) { PiPDisplayController.shared.liveFrameFits($0) }
+        let frame = liveDelivery.take(nowMS: now, onDecision: { item, reason in
+            Self.logPrompt(item, stage: "queue", reason: reason)
+        }) { PiPDisplayController.shared.liveFrameFits($0) }
         if liveDelivery.expiredCount != beforeExpired {
             NSLog("Live prompt delivery: expired=%d", liveDelivery.expiredCount)
         }
-        if !frame.isEmpty, PiPDisplayController.shared.showLiveFrame(frame) {
-            liveDisplayedItems = frame
-            liveDisplayedUntilMS = frame.map(\.expiresAtMS).min()
-            NSLog("Live prompt delivery: selected=%d", frame.count)
+        if !frame.isEmpty {
+            if PiPDisplayController.shared.showLiveFrame(frame) {
+                liveDisplayedItems = frame
+                liveDisplayedUntilMS = frame.map(\.expiresAtMS).min()
+                for item in frame { Self.logPrompt(item, stage: "display_schedule", reason: "frame_rendered") }
+                NSLog("Live prompt delivery: selected=%d", frame.count)
+            } else {
+                for item in frame { Self.logPrompt(item, stage: "display_schedule", reason: "renderer_rejected") }
+            }
         }
+    }
+
+    private static func logPrompt(_ item: LivePromptDelivery.Item, stage: String, reason: String) {
+        let type = ["comment_reply", "operation_notice"].contains(item.promptType ?? "")
+            ? item.promptType! : "unknown"
+        NSLog("Live prompt id=%@ type=%@ stage=%@ reason=%@", item.id, type, stage, reason)
     }
 
     private func scheduleLivePromptRetry(sessionID: String, generation: Int) {

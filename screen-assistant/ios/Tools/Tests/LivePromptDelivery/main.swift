@@ -1,5 +1,36 @@
 import Foundation
 
+assert(LivePromptDelivery.promptLabel("comment_reply") == "评论回复")
+assert(LivePromptDelivery.promptLabel("operation_notice") == "运营提醒")
+assert(LivePromptDelivery.promptLabel(nil) == "提示")
+assert(LivePromptDelivery.promptLabel("future") == "提示")
+
+var decisions: [String] = []
+var recorded = LivePromptDelivery(capacity: 1, intervalMS: 0)
+let tracked = LivePromptDelivery.Item(id: "tracked", text: "private", expiresAtMS: 10,
+                                      priority: 0, promptType: "comment_reply")
+let dropped = LivePromptDelivery.Item(id: "dropped", text: "private", expiresAtMS: 20,
+                                      priority: 0, promptType: "operation_notice")
+_ = recorded.receive([tracked, dropped], nowMS: 0) { item, reason in
+    decisions.append("\(item.id):\(item.promptType ?? "unknown"):\(reason)")
+}
+assert(decisions == ["tracked:comment_reply:received", "tracked:comment_reply:queued",
+                     "dropped:operation_notice:received", "dropped:operation_notice:queue_full"])
+_ = recorded.take(nowMS: 10, onDecision: { item, reason in decisions.append("\(item.id):\(reason)") }) { _ in true }
+assert(decisions.last == "tracked:expired_in_queue")
+var urgentDecisions: [String] = []
+var urgentRecorder = LivePromptDelivery(capacity: 1, intervalMS: 0)
+let urgentItem = LivePromptDelivery.Item(id: "urgent", text: "private", expiresAtMS: 20,
+                                         priority: 100, promptType: "operation_notice")
+let invalid = LivePromptDelivery.Item(id: "invalid", text: "private", expiresAtMS: 0,
+                                      priority: 0, timingInvalid: true, promptType: "comment_reply")
+_ = urgentRecorder.receive([tracked, urgentItem, invalid], nowMS: 0) { item, reason in
+    urgentDecisions.append("\(item.id):\(reason)")
+}
+assert(urgentDecisions == ["tracked:received", "tracked:queued", "urgent:received",
+                           "tracked:displaced_by_urgent", "urgent:queued",
+                           "invalid:received", "invalid:invalid_timing"])
+assert(urgentRecorder.take(nowMS: 1) { _ in true }.map(\.id) == ["urgent"])
 var malformedPriority = LivePromptDelivery(intervalMS: 0)
 let unsafePriority = LivePromptDelivery.Item(id: "bad", text: "bad", expiresAtMS: 100,
                                              priority: nil, priorityInvalid: true)

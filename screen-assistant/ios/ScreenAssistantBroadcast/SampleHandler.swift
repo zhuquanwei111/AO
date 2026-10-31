@@ -410,7 +410,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
             } else { note("invalid_count") }
         }
         for (index, line) in commentLines.enumerated() {
-            guard index < ObservationUploadBuffer.BatchBuilder.maxComments else {
+            guard index <= 65535 else {
                 note("limit_comment")
                 continue
             }
@@ -424,20 +424,31 @@ final class SampleHandler: RPBroadcastSampleHandler {
             let confidence = line.confidence.isFinite && (0...1).contains(line.confidence)
                 ? Double(line.confidence) : nil
             guard let event = ObservationUploadBuffer.comment(text: line.text, position: validPosition,
-                    confidence: confidence, observedAtMS: observedAtMS) else {
+                    confidence: confidence, observedAtMS: observedAtMS, lineIndex: index) else {
                 note("invalid_comment")
                 continue
             }
             append(event)
+        }
+        let batchID = UUID()
+        var queuedEvents = builder.events
+        if credentials.capabilities?.supportsObservationBatch == true {
+            let counts = builder.events.filter { !$0.isComment }
+            let comments = builder.events.filter(\.isComment)
+            let occupiedBytes = counts.reduce(0) { $0 + $1.body.count }
+            let finalized = ObservationUploadBuffer.metadataComments(comments, batchID: batchID,
+                                                                      occupiedBytes: occupiedBytes)
+            queuedEvents = counts + finalized.events
+            if finalized.dropped > 0 { rejected["bytes_comment", default: 0] += finalized.dropped }
         }
         stateQueue.sync {
             guard observationContextValid(generation: generation, captureGeneration: captureGeneration,
                                           sessionID: credentials.sessionID, token: credentials.token) else { return }
             for (reason, count) in rejected { recordObservationIssue(reason, count: count) }
             let nowMS = Int64(Date().timeIntervalSince1970 * 1000)
-            let fresh = builder.events.filter { !ObservationUploadBuffer.isExpired($0, nowMS: nowMS) }
-            recordObservationIssue("expired", count: builder.events.count - fresh.count)
-            let batch = ObservationUploadBuffer.Batch(id: UUID(), events: fresh,
+            let fresh = queuedEvents.filter { !ObservationUploadBuffer.isExpired($0, nowMS: nowMS) }
+            recordObservationIssue("expired", count: queuedEvents.count - fresh.count)
+            let batch = ObservationUploadBuffer.Batch(id: batchID, events: fresh,
                 observedAtMS: observedAtMS, generation: captureGeneration,
                 sessionID: credentials.sessionID, token: credentials.token, baseURL: baseURL)
             guard !batch.events.isEmpty else { return }
@@ -493,7 +504,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
             return
         }
         let endpoint = ["v1", "live", "sessions", batch.sessionID,
-                        item.isComment ? "comments" : "observations"].reduce(batch.baseURL) {
+                        item.isComment && !item.useObservationEndpoint ? "comments" : "observations"].reduce(batch.baseURL) {
             $0.appendingPathComponent($1, isDirectory: false)
         }
         var request = URLRequest(url: endpoint, timeoutInterval: 20)

@@ -2,6 +2,13 @@ import Foundation
 
 /// 仅管理本场待显示的提示；调用方在主线程持有并按实际排版选择帧。
 struct LivePromptDelivery {
+    static func promptLabel(_ type: String?) -> String {
+        switch type {
+        case "comment_reply": return "评论回复"
+        case "operation_notice": return "运营提醒"
+        default: return "提示"
+        }
+    }
     /// 截止点使用本机连续单调毫秒；无法验证时间锚时返回 nil。
     static func displayExpiry(_ serverExpiry: Int64?, serverTimeMS: Int64?, processingMS: Int64?,
                               startNS: UInt64?, endNS: UInt64?) -> Int64? {
@@ -24,15 +31,17 @@ struct LivePromptDelivery {
         let expiresAtMS: Int64
         let priority: Int?
         let timingInvalid: Bool
+        let promptType: String?
         let priorityInvalid: Bool
 
         init(id: String, text: String, expiresAtMS: Int64, priority: Int?,
-             timingInvalid: Bool = false, priorityInvalid: Bool = false) {
+             timingInvalid: Bool = false, priorityInvalid: Bool = false, promptType: String? = nil) {
             self.id = id
             self.text = text
             self.expiresAtMS = expiresAtMS
             self.priority = priority
             self.timingInvalid = timingInvalid
+            self.promptType = promptType
             self.priorityInvalid = priorityInvalid
         }
     }
@@ -55,30 +64,38 @@ struct LivePromptDelivery {
         items.filter { $0.expiresAtMS > nowMS }
     }
 
-    mutating func receive(_ items: [Item], nowMS: Int64) -> [Item] {
+    mutating func receive(_ items: [Item], nowMS: Int64,
+                          onDecision: ((Item, String) -> Void)? = nil) -> [Item] {
         var fresh: [Item] = []
-        expire(nowMS: nowMS)
+        expire(nowMS: nowMS, onDecision: onDecision)
         for item in items where seen.insert(item.id).inserted {
             fresh.append(item)
-            if item.timingInvalid || item.priorityInvalid || item.priority == nil { continue }
+            onDecision?(item, "received")
+            if item.timingInvalid { onDecision?(item, "invalid_timing"); continue }
+            if item.priorityInvalid || item.priority == nil { onDecision?(item, "invalid_priority"); continue }
             if item.expiresAtMS <= nowMS {
                 expiredCount += 1
+                onDecision?(item, "expired_before_queue")
             } else if pending.count >= capacity {
                 overflowCount += 1
                 if let priority = item.priority, priority >= 100,
                    let index = pending.lastIndex(where: { ($0.priority ?? Int.min) < 100 }) {
-                    pending.remove(at: index)
+                    let displaced = pending.remove(at: index)
+                    onDecision?(displaced, "displaced_by_urgent")
                     pending.append(item)
-                }
+                    onDecision?(item, "queued")
+                } else { onDecision?(item, "queue_full") }
             } else {
                 pending.append(item)
+                onDecision?(item, "queued")
             }
         }
         return fresh
     }
 
-    mutating func take(nowMS: Int64, fits: ([Item]) -> Bool) -> [Item] {
-        expire(nowMS: nowMS)
+    mutating func take(nowMS: Int64, onDecision: ((Item, String) -> Void)? = nil,
+                       fits: ([Item]) -> Bool) -> [Item] {
+        expire(nowMS: nowMS, onDecision: onDecision)
         guard !pending.isEmpty else { return [] }
         let urgent = pending.firstIndex(where: { ($0.priority ?? Int.min) >= 100 })
         if urgent == nil, let until = urgentUntilMS, nowMS < until { return [] }
@@ -106,8 +123,11 @@ struct LivePromptDelivery {
         urgentUntilMS = nil
     }
 
-    private mutating func expire(nowMS: Int64) {
+    private mutating func expire(nowMS: Int64, onDecision: ((Item, String) -> Void)?) {
         let before = pending.count
+        if let onDecision {
+            for item in pending where item.expiresAtMS <= nowMS { onDecision(item, "expired_in_queue") }
+        }
         pending.removeAll { $0.expiresAtMS <= nowMS }
         expiredCount += before - pending.count
     }

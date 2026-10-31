@@ -7,13 +7,15 @@ struct ObservationUploadBuffer {
         let body: Data
         let isComment: Bool
         let observedAtMS: Int64
+        var lineIndex: Int? = nil
+        var useObservationEndpoint = false
     }
     static let maxAgeMS: Int64 = 10_000
     static func isExpired(_ event: Event, nowMS: Int64) -> Bool {
         nowMS >= event.observedAtMS && nowMS - event.observedAtMS > maxAgeMS
     }
     static func comment(text: String, position: [String: Double]?, confidence: Double?,
-                        observedAtMS: Int64, id: UUID = UUID()) -> Event? {
+                        observedAtMS: Int64, id: UUID = UUID(), lineIndex: Int? = nil) -> Event? {
         let stripped = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !stripped.isEmpty, stripped.unicodeScalars.count <= 500 else { return nil }
         var payload: [String: Any] = [
@@ -24,7 +26,45 @@ struct ObservationUploadBuffer {
         if let position { payload["text_position"] = position }
         if let confidence { payload["confidence"] = confidence }
         guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
-        return Event(id: id, body: body, isComment: true, observedAtMS: observedAtMS)
+        return Event(id: id, body: body, isComment: true, observedAtMS: observedAtMS, lineIndex: lineIndex)
+    }
+
+    /// 固定评论前缀后再编码总数；额外元数据同样计入实际 UTF-8 字节上限。
+    static func metadataComments(_ candidates: [Event], batchID: UUID,
+                                 occupiedBytes: Int) -> (events: [Event], dropped: Int) {
+        guard occupiedBytes >= 0, occupiedBytes <= BatchBuilder.maxBytes else {
+            return ([], candidates.count)
+        }
+        var count = min(candidates.count, BatchBuilder.maxComments)
+        while count > 0 {
+            var result: [Event] = []
+            var bytes = occupiedBytes
+            for original in candidates.prefix(count) {
+                guard let index = original.lineIndex, (0...65535).contains(index),
+                      var payload = (try? JSONSerialization.jsonObject(with: original.body)) as? [String: Any],
+                      let text = payload.removeValue(forKey: "text") as? String else { break }
+                var content: [String: Any] = ["text": text]
+                if let position = payload.removeValue(forKey: "text_position") { content["text_position"] = position }
+                payload.removeValue(forKey: "input_mode")
+                payload["kind"] = "comment"
+                payload["availability"] = "available"
+                payload["capture_batch_id"] = batchID.uuidString.lowercased()
+                payload["line_index"] = index
+                payload["capture_comment_count"] = count
+                payload["content"] = content
+                guard let body = try? JSONSerialization.data(withJSONObject: payload),
+                      body.count <= BatchBuilder.maxItemBytes,
+                      body.count <= BatchBuilder.maxBytes - bytes else { break }
+                bytes += body.count
+                let event = Event(id: original.id, body: body, isComment: true,
+                                  observedAtMS: original.observedAtMS, lineIndex: index,
+                                  useObservationEndpoint: true)
+                result.append(event)
+            }
+            if result.count == count { return (result, candidates.count - count) }
+            count = min(count - 1, result.count)
+        }
+        return ([], candidates.count)
     }
     struct Batch {
         let id: UUID

@@ -59,6 +59,8 @@ private final class PollFixtureProtocol: URLProtocol {
             prompts = "[{\"prompt_id\":\"first\",\(promptFields),\"expires_at_ms\":5000,\"priority\":25}]"
         } else if path.hasPrefix("/mixed-metadata/") {
             prompts = "[{\"prompt_id\":\"a\",\(promptFields),\"expires_at_ms\":5000,\"priority\":100},{\"prompt_id\":\"bad\",\(promptFields),\"expires_at_ms\":5000,\"priority\":\"invalid\",\"sources\":false},{\"prompt_id\":\"broken\"},{\"prompt_id\":\"b\",\(promptFields),\"expires_at_ms\":6000,\"priority\":25,\"sources\":[{\"kind\":\"comment\"},false]},{\"prompt_id\":\"float\",\(promptFields),\"expires_at_ms\":6000,\"priority\":100.0},{\"prompt_id\":\"missing\",\(promptFields),\"expires_at_ms\":6000},{\"prompt_id\":\"null\",\(promptFields),\"expires_at_ms\":6000,\"priority\":null},{\"prompt_id\":\"bool\",\(promptFields),\"expires_at_ms\":6000,\"priority\":true}]"
+        } else if path.hasPrefix("/typed-prompt/") {
+            prompts = "[{\"prompt_id\":\"typed\",\(promptFields),\"expires_at_ms\":5000,\"priority\":25,\"prompt_type\":\"comment_reply\",\"reply_to\":{\"comment_id\":\"local\",\"nickname\":null,\"text\":\"hello\"}}]"
         } else if path.hasPrefix("/mixed-timing/") {
             prompts = "[{\"prompt_id\":\"a\",\(promptFields),\"expires_at_ms\":5000},{\"prompt_id\":\"bad\",\(promptFields),\"expires_at_ms\":9.0},{\"prompt_id\":\"b\",\(promptFields),\"expires_at_ms\":6000}]"
         } else { prompts = "[]" }
@@ -75,6 +77,78 @@ private final class PollFixtureProtocol: URLProtocol {
 }
 
 final class PollTransportTests: XCTestCase {
+    func testOnlineCountConfirmationPersistsOnlyForSameRegion() throws {
+        let suite = "count-confirmation-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let roi = CGRect(x: 0.1, y: 0.2, width: 0.3, height: 0.4)
+        let other = CGRect(x: 0.2, y: 0.2, width: 0.3, height: 0.4)
+        XCTAssertFalse(SharedConfig.onlineCountSemanticsConfirmed(defaults: defaults))
+        SharedConfig.setOnlineCountSemanticsConfirmed(true, defaults: defaults)
+        let restored = try XCTUnwrap(UserDefaults(suiteName: suite))
+        XCTAssertTrue(SharedConfig.onlineCountSemanticsConfirmed(defaults: restored))
+        XCTAssertTrue(SharedConfig.retainedOnlineCountConfirmation(previous: roi, next: roi, confirmed: true))
+        XCTAssertFalse(SharedConfig.retainedOnlineCountConfirmation(previous: roi, next: other, confirmed: true))
+        XCTAssertFalse(SharedConfig.retainedOnlineCountConfirmation(previous: roi, next: nil, confirmed: true))
+        XCTAssertFalse(SharedConfig.retainedOnlineCountConfirmation(previous: roi, next: roi, confirmed: false))
+    }
+
+    func testPromptTypesAndReliableReplyDecodeWithLegacyFallback() throws {
+        let prefix = "{\"prompt_id\":\"p\",\"input_mode\":\"live_observation\",\"start_at_ms\":1,\"end_at_ms\":1,\"phenomenon\":\"comment\",\"suggestion\":\"suggestion\",\"display_text\":\"speak\",\"observation_count\":1"
+        let typed = prefix + ",\"prompt_type\":\"comment_reply\",\"reply_to\":{\"comment_id\":\"local\",\"nickname\":null,\"text\":\"hello\"}}"
+        let reply = try JSONDecoder().decode(LivePrompt.self, from: Data(typed.utf8))
+        XCTAssertEqual(reply.promptType, "comment_reply")
+        XCTAssertEqual(reply.replyTo?.text, "hello")
+        XCTAssertNil(reply.replyTo?.nickname)
+        XCTAssertEqual(reply.displayText, "speak")
+        let legacy = try JSONDecoder().decode(LivePrompt.self, from: Data((prefix + "}").utf8))
+        XCTAssertNil(legacy.promptType)
+        XCTAssertEqual(LivePromptDelivery.promptLabel(legacy.promptType), "提示")
+    }
+
+    func testCreateCapabilitiesRequireExplicitBooleanTrue() throws {
+        let prefix = "{\"session_id\":\"fixture-session\",\"session_token\":\"fixture-token\",\"started_at_ms\":1"
+        for (suffix, supported) in [
+            ("}", false),
+            (",\"capabilities\":{\"observation_batch_metadata\":true}}", true),
+            (",\"capabilities\":{\"observation_batch_metadata\":true,\"typed_prompts\":true}}", true),
+            (",\"capabilities\":{\"observation_batch_metadata\":true,\"typed_prompts\":false}}", true),
+            (",\"capabilities\":{\"observation_batch_metadata\":true,\"typed_prompts\":1}}", true),
+            (",\"capabilities\":{\"observation_batch_metadata\":false,\"typed_prompts\":true}}", false),
+            (",\"capabilities\":{\"observation_batch_metadata\":false}}", false),
+            (",\"capabilities\":{\"observation_batch_metadata\":1}}", false),
+            (",\"capabilities\":\"invalid\"}", false)
+        ] {
+            let decoded = try JSONDecoder().decode(LiveSessionCredentials.self, from: Data((prefix + suffix).utf8))
+            XCTAssertEqual(decoded.capabilities?.supportsObservationBatch == true, supported)
+        }
+    }
+
+    func testPollTypesFollowIndependentTypedCapability() throws {
+        let prefix = "{\"session_id\":\"fixture-session\",\"session_token\":\"fixture-token\",\"started_at_ms\":1"
+        for (suffix, supported) in [
+            ("}", false),
+            (",\"capabilities\":{\"observation_batch_metadata\":true,\"typed_prompts\":false}}", false),
+            (",\"capabilities\":{\"observation_batch_metadata\":false,\"typed_prompts\":true}}", true),
+            (",\"capabilities\":{\"typed_prompts\":1}}", false)
+        ] {
+            let credentials = try JSONDecoder().decode(LiveSessionCredentials.self, from: Data((prefix + suffix).utf8))
+            let (client, session) = makeClient("typed-prompt")
+            let finished = expectation(description: "typed capability")
+            _ = client.poll(credentials, after: "") { result, _, _ in
+                guard case .success(let page) = result, let prompt = page.prompts.first else {
+                    XCTFail("expected typed fixture"); finished.fulfill(); return
+                }
+                XCTAssertEqual(prompt.promptType, supported ? "comment_reply" : nil)
+                XCTAssertEqual(prompt.replyTo?.text, supported ? "hello" : nil)
+                XCTAssertEqual(prompt.displayText, "x")
+                finished.fulfill()
+            }
+            wait(for: [finished], timeout: 5)
+            session.invalidateAndCancel()
+        }
+    }
+
     func testStopPendingCredentialsRoundTripAndLegacyDecode() throws {
         var pending = credentials
         pending.stopPending = true
