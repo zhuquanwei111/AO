@@ -1,3 +1,4 @@
+import asyncio
 from fastapi.testclient import TestClient
 import pytest
 
@@ -17,7 +18,7 @@ def test_batch_capability_and_ios_distinct_rows_preserve_legacy_dedup(tmp_path):
     with TestClient(create_app(cfg, live_clock=lambda: now)) as client:
         session = client.post("/v1/live/sessions", json={}).json()
         assert session["capabilities"] == {"observation_batch_metadata": True,
-                                           "typed_prompts": False}
+                                           "typed_prompts": True}
         url = f"/v1/live/sessions/{session['session_id']}/observations"
         headers = {"X-Live-Session-Token": session["session_token"]}
         body = {"kind": "comment", "source": "ios_replaykit_ocr",
@@ -57,6 +58,7 @@ def test_typed_prompt_keeps_existing_event_fields_and_source(tmp_path):
                "content": {"text": "小明：bless you", "text_position": None}}
         candidate = {"topic": "comment:1", "priority": 25, "phenomenon": "公屏评论",
                      "observations": [row], "prompt_type": "comment_reply",
+                     "first_observed_at_ms": now,
                      "reply_to": {"comment_id": "c1", "nickname": "小明", "text": "bless you"}}
         result = store.save_fusion_candidate(sid, token, candidate, "谢谢你的祝福。")
         assert result["reason"] == "generated"
@@ -72,6 +74,30 @@ def test_typed_prompt_keeps_existing_event_fields_and_source(tmp_path):
         events = store.prompts(sid, token, "")["prompts"]
         assert events[1]["prompt_type"] == "operation_notice"
         assert "reply_to" not in events[1]
+    finally:
+        store.close()
+
+
+def test_reconstructed_reply_does_not_refresh_its_first_observed_time(tmp_path):
+    now = 1_790_000_000_000
+    clock = [now]
+    store = LiveStore(str(tmp_path / "first-time.sqlite3"), lambda: clock[0])
+    try:
+        session = store.create("")
+        sid, token = session["session_id"], session["session_token"]
+        row = {"event_id": "e2", "kind": "comment", "source": "ios_replaykit_ocr",
+               "coverage": "ocr_visible_sample", "reliability": "known", "confidence": 0.9,
+               "observed_at_ms": now + 3000, "effective_at_ms": now + 3000,
+               "received_at_ms": now + 3000,
+               "content": {"text": "后续片段", "text_position": None}}
+        candidate = {"topic": "comment:c1", "priority": 25, "phenomenon": "公屏评论",
+                     "observations": [row], "prompt_type": "comment_reply",
+                     "first_observed_at_ms": now,
+                     "reply_to": {"comment_id": "c1", "nickname": None, "text": "你好"}}
+        clock[0] = now + 10_001
+        assert store.save_fusion_candidate(sid, token, candidate, "你好呀。") == {
+            "reason": "candidate_expired", "prompt_id": None}
+        assert store.events(sid, token)["events"] == []
     finally:
         store.close()
 
@@ -320,3 +346,259 @@ def test_legacy_phone_observation_samples_keep_http_time_and_source_classificati
             assert (result["status"], result["reason"], result["effective_at_ms"], result["time_basis"]) == (
                 "accepted", expected, observed, "observed")
             assert result["received_at_ms"] == received
+
+
+def test_complete_batch_real_reconstruction_produces_typed_direct_reply(tmp_path):
+    now = 1_790_000_000_000
+    cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="controlled",
+                   tianyi_base_url="http://model.invalid", tianyi_model="fake",
+                   dedup_ttl_seconds=60, max_sentence_chars=2000,
+                   model_timeout_seconds=1, model_connect_timeout_seconds=1,
+                   live_db_path=str(tmp_path / "real-reconstruction.sqlite3"))
+    calls = []
+    class ControlledModel:
+        async def reply_to_comment(self, text, *, nickname, priority_eligible):
+            calls.append((text, nickname, priority_eligible))
+            return "我们可以聊聊最近喜欢的事情。"
+        async def aclose(self):
+            pass
+    app = create_app(cfg, live_clock=lambda: now)
+    with TestClient(app) as client:
+        app.state.model = ControlledModel()
+        session = client.post("/v1/live/sessions", json={}).json()
+        sid = session["session_id"]
+        assert session["capabilities"]["typed_prompts"] is True
+        headers = {"X-Live-Session-Token": session["session_token"]}
+        row = {"kind": "comment", "event_id": "e1", "source": "ios_replaykit_ocr",
+               "observed_at_ms": now, "availability": "available", "coverage": "ocr_visible_sample",
+               "reliability": "known", "confidence": 0.98,
+               "content": {"text": "阿青：你想聊什么？", "text_position":
+                           {"x": 0.1, "y": 0.5, "width": 0.4, "height": 0.04}},
+               "capture_batch_id": "batch", "line_index": 0, "capture_comment_count": 1}
+        result = client.post(f"/v1/live/sessions/{sid}/observations", headers=headers, json=row)
+        assert result.status_code == 200 and result.json()["reason"] == "scheduled"
+        async def wait_idle():
+            async with asyncio.timeout(3):
+                while app.state.live.fusion_active or app.state.live.fusion_queue:
+                    await asyncio.sleep(0.005)
+        client.portal.call(wait_idle)
+        prompts = client.get(f"/v1/live/sessions/{sid}/prompts", headers=headers).json()["prompts"]
+        assert calls == [("你想聊什么？", "阿青", False)]
+        assert len(prompts) == 1
+        assert prompts[0]["prompt_type"] == "comment_reply"
+        assert prompts[0]["reply_to"]["text"] == "你想聊什么？"
+        assert prompts[0]["reply_to"]["nickname"] == "阿青"
+        assert prompts[0]["display_text"] == "我们可以聊聊最近喜欢的事情。"
+        retry = client.post(f"/v1/live/sessions/{sid}/observations", headers=headers, json=row)
+        assert retry.json()["reason"] == "duplicate_event"
+        client.portal.call(wait_idle)
+        assert calls == [("你想聊什么？", "阿青", False)]
+
+
+def test_complete_batch_handles_two_comments_and_group_without_extra_model_calls(tmp_path):
+    now = 1_790_000_000_000
+    cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="controlled",
+                   tianyi_base_url="http://model.invalid", tianyi_model="fake",
+                   dedup_ttl_seconds=60, max_sentence_chars=2000,
+                   model_timeout_seconds=1, model_connect_timeout_seconds=1,
+                   live_db_path=str(tmp_path / "group.sqlite3"))
+    calls = []
+    class Model:
+        async def reply_to_comment(self, text, *, nickname, priority_eligible):
+            calls.append((text, nickname))
+            return "我们聊聊最近喜欢的事情。"
+        async def aclose(self):
+            pass
+    app = create_app(cfg, live_clock=lambda: now)
+    with TestClient(app) as client:
+        app.state.model = Model()
+        session = client.post("/v1/live/sessions", json={}).json()
+        sid, token = session["session_id"], session["session_token"]
+        headers = {"X-Live-Session-Token": token}
+        base = {"kind": "comment", "source": "ios_replaykit_ocr", "observed_at_ms": now,
+                "availability": "available", "coverage": "ocr_visible_sample", "reliability": "known",
+                "capture_batch_id": "batch", "capture_comment_count": 2}
+        for index, name in enumerate(("小明", "小红")):
+            row = {**base, "event_id": f"e{index}", "line_index": index,
+                   "content": {"text": f"{name}：今晚聊什么？", "text_position":
+                               {"x": 0.1, "y": 0.3 + index * 0.3, "width": 0.4, "height": 0.04}}}
+            response = client.post(f"/v1/live/sessions/{sid}/observations", headers=headers, json=row)
+            assert response.status_code == 200
+        async def wait_idle():
+            async with asyncio.timeout(4):
+                while app.state.live.fusion_active or app.state.live.fusion_queue:
+                    await asyncio.sleep(0.005)
+        client.portal.call(wait_idle)
+        events = client.get(f"/v1/live/sessions/{sid}/events", headers=headers).json()["events"]
+        assert calls == [("今晚聊什么？", "小明"), ("今晚聊什么？", "小红")]
+        assert [event["prompt_type"] for event in events] == ["comment_reply", "comment_reply", "operation_notice"]
+        assert "集中" in events[2]["display_text"]
+        assert len(events[2]["sources"]) == 2
+        for index, name in enumerate(("小明", "小红")):
+            row = {**base, "capture_batch_id": "next-batch", "event_id": f"next-{index}",
+                   "line_index": index, "content": {"text": f"{name}：今晚聊什么？",
+                   "text_position": {"x": 0.1, "y": 0.3 + index * 0.3, "width": 0.4, "height": 0.04}}}
+            assert client.post(f"/v1/live/sessions/{sid}/observations", headers=headers, json=row).status_code == 200
+        client.portal.call(wait_idle)
+        events = client.get(f"/v1/live/sessions/{sid}/events", headers=headers).json()["events"]
+        # 不同批次同昵称同正文只限制重复输出，不删除观察；群体提醒也保持独立冷却。
+        assert len(calls) == 2
+        assert len([event for event in events if event["prompt_type"] == "operation_notice"]) == 1
+        assert app.state.live.store.db.execute(
+            "SELECT COUNT(*) FROM live_observations WHERE session_id=?", (sid,)
+        ).fetchone()[0] == 4
+        for index, (name, text) in enumerate((("小明", "今晚聊什么？"), ("小花", "你有什么建议？"))):
+            row = {**base, "capture_batch_id": "mixed-batch", "event_id": f"mixed-{index}",
+                   "line_index": index, "content": {"text": f"{name}：{text}",
+                   "text_position": {"x": 0.1, "y": 0.3 + index * 0.3, "width": 0.4, "height": 0.04}}}
+            assert client.post(f"/v1/live/sessions/{sid}/observations", headers=headers, json=row).status_code == 200
+        client.portal.call(wait_idle)
+        assert calls[-1] == ("你有什么建议？", "小花") and len(calls) == 3
+
+
+def test_unknown_quality_gap_prevents_real_reconstructor_from_calling_model(tmp_path):
+    now = 1_790_000_000_000
+    cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="controlled",
+                   tianyi_base_url="http://model.invalid", tianyi_model="fake",
+                   dedup_ttl_seconds=60, max_sentence_chars=2000,
+                   model_timeout_seconds=1, model_connect_timeout_seconds=1,
+                   live_db_path=str(tmp_path / "gap.sqlite3"))
+    calls = []
+    class Model:
+        async def reply_to_comment(self, *args, **kwargs):
+            calls.append(args)
+            return "你好。"
+        async def aclose(self):
+            pass
+    app = create_app(cfg, live_clock=lambda: now)
+    with TestClient(app) as client:
+        app.state.model = Model()
+        session = client.post("/v1/live/sessions", json={}).json()
+        sid = session["session_id"]
+        headers = {"X-Live-Session-Token": session["session_token"]}
+        row = {"kind": "comment", "event_id": "e1", "source": "ios_replaykit_ocr",
+               "observed_at_ms": now, "availability": "available", "coverage": "ocr_visible_sample",
+               "reliability": "known", "content": {"text": "阿青：你想聊什么？", "text_position":
+                   {"x": 0.1, "y": 0.5, "width": 0.4, "height": 0.04}},
+               "capture_batch_id": "batch", "line_index": 0, "capture_comment_count": 2}
+        assert client.post(f"/v1/live/sessions/{sid}/observations", headers=headers, json=row).json()["reason"] == "batch_incomplete"
+        gap = {**row, "event_id": "e2", "line_index": 1, "availability": "missing", "content": None}
+        assert client.post(f"/v1/live/sessions/{sid}/observations", headers=headers, json=gap).json()["reason"] == "source_missing"
+        async def wait_idle():
+            async with asyncio.timeout(3):
+                while app.state.live.fusion_active or app.state.live.fusion_queue:
+                    await asyncio.sleep(0.005)
+        client.portal.call(wait_idle)
+        batch = app.state.live.store.comment_batches[sid][("ios_replaykit_ocr", "batch")]
+        assert "quality_gap" in batch["records"][0]["usability_reasons"]
+        assert calls == []
+        assert client.get(f"/v1/live/sessions/{sid}/prompts", headers=headers).json()["prompts"] == []
+
+
+@pytest.mark.parametrize("raw,rect,expected_text,expected_nickname,controlled_reply", [
+    ("邪恶四眼：牙今晚还玩鹅鸭杀吗", (0.14126984126984127, 0.8114285714285714, 0.4785714285714286, 0.016428571428571428),
+     "牙今晚还玩鹅鸭杀吗", "邪恶四眼", "今晚的安排到时候再和大家说。"),
+    ("大梦i：现在华多少分了？", (0.14047619047619048, 0.7589285714285714, 0.37142857142857144, 0.018214285714285714),
+     "现在华多少分了？", "大梦i", "这个分数我得先确认一下。"),
+])
+def test_phone_ocr_sample_real_reconstruction_through_controlled_reply(
+        tmp_path, raw, rect, expected_text, expected_nickname, controlled_reply):
+    # 原流没有批次字段；此处仅用本地合成的单项批次验证产品链，不称原流真实批次。
+    now = 1_790_000_000_000
+    cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="controlled",
+                   tianyi_base_url="http://model.invalid", tianyi_model="fake",
+                   dedup_ttl_seconds=60, max_sentence_chars=2000, model_timeout_seconds=1,
+                   model_connect_timeout_seconds=1, live_db_path=str(tmp_path / "phone-reply.sqlite3"))
+    calls = []
+    class Model:
+        async def reply_to_comment(self, text, *, nickname, priority_eligible):
+            calls.append((text, nickname, priority_eligible))
+            return controlled_reply
+        async def aclose(self):
+            pass
+    app = create_app(cfg, live_clock=lambda: now)
+    with TestClient(app) as client:
+        app.state.model = Model()
+        session = client.post("/v1/live/sessions", json={}).json()
+        sid = session["session_id"]
+        url = f"/v1/live/sessions/{sid}"
+        headers = {"X-Live-Session-Token": session["session_token"]}
+        assert client.post(url + "/start", headers=headers, json={"source": "android_app"}).status_code == 200
+        row = {"kind": "comment", "event_id": "sample", "source": "android_media_projection_ocr",
+               "observed_at_ms": now, "availability": "available", "coverage": "ocr_visible_sample",
+               "reliability": "known", "capture_batch_id": "local-controlled", "line_index": 0,
+               "capture_comment_count": 1, "content": {"text": raw,
+                   "text_position": dict(zip(("x", "y", "width", "height"), rect))}}
+        assert client.post(url + "/observations", headers=headers, json=row).json()["reason"] == "scheduled"
+        async def wait_idle():
+            async with asyncio.timeout(3):
+                while app.state.live.fusion_active or app.state.live.fusion_queue:
+                    await asyncio.sleep(0.005)
+        client.portal.call(wait_idle)
+        prompts = client.get(url + "/prompts", headers=headers).json()["prompts"]
+        assert calls == [(expected_text, expected_nickname, False)]
+        assert len(prompts) == 1 and prompts[0]["prompt_type"] == "comment_reply"
+        assert prompts[0]["reply_to"]["text"] == expected_text
+        assert prompts[0]["display_text"] == controlled_reply
+
+
+def test_reply_cooldown_is_scoped_and_failure_does_not_create_cooldown(tmp_path):
+    from screen_assistant_server.model_client import ModelUnavailableError
+    clock = [1_790_000_000_000]
+    cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="controlled",
+                   tianyi_base_url="http://model.invalid", tianyi_model="fake",
+                   dedup_ttl_seconds=60, max_sentence_chars=2000, model_timeout_seconds=1,
+                   model_connect_timeout_seconds=1, live_db_path=str(tmp_path / "cooldown.sqlite3"))
+    calls = []
+    class Model:
+        async def reply_to_comment(self, text, *, nickname, priority_eligible):
+            calls.append((text, nickname))
+            if text == "失败后还可以吗？" and sum(t == text for t, _ in calls) == 1:
+                raise ModelUnavailableError("controlled")
+            return "我们可以聊聊这个话题。"
+        async def aclose(self):
+            pass
+    app = create_app(cfg, live_clock=lambda: clock[0])
+    with TestClient(app) as client:
+        app.state.model = Model()
+        session = client.post("/v1/live/sessions", json={}).json()
+        sid = session["session_id"]
+        headers = {"X-Live-Session-Token": session["session_token"]}
+        url = f"/v1/live/sessions/{sid}"
+        async def wait_idle():
+            async with asyncio.timeout(3):
+                while app.state.live.fusion_active or app.state.live.fusion_queue:
+                    await asyncio.sleep(0.005)
+        def submit(event, raw):
+            row = {"kind": "comment", "event_id": event, "source": "ios_replaykit_ocr",
+                   "observed_at_ms": clock[0], "availability": "available", "coverage": "ocr_visible_sample",
+                   "reliability": "known", "capture_batch_id": "batch-" + event, "line_index": 0,
+                   "capture_comment_count": 1, "content": {"text": raw, "text_position":
+                       {"x": 0.1, "y": 0.5, "width": 0.4, "height": 0.04}}}
+            assert client.post(url + "/observations", headers=headers, json=row).json()["reason"] == "scheduled"
+            client.portal.call(wait_idle)
+        submit("one", "阿青：你想聊什么？")
+        submit("duplicate", "阿青：你想聊什么？")
+        submit("different-text", "阿青：今天聊什么？")
+        submit("different-name", "小林：你想聊什么？")
+        submit("unknown-one", "123：你想聊什么？")
+        submit("unknown-repeat", "456：你想聊什么？")
+        assert calls == [("你想聊什么？", "阿青"), ("今天聊什么？", "阿青"),
+                         ("你想聊什么？", "小林"), ("你想聊什么？", None)]
+        submit("fail-one", "阿青：失败后还可以吗？")
+        submit("fail-two", "阿青：失败后还可以吗？")
+        assert calls[-2:] == [("失败后还可以吗？", "阿青")] * 2
+        quality = {"kind": "quality", "event_id": "quality", "source": "ios_replaykit_ocr",
+                   "observed_at_ms": clock[0], "availability": "available", "coverage": "ocr_visible_sample",
+                   "reliability": "known", "content": {"signal": "video_input_unclear"}}
+        assert client.post(url + "/observations", headers=headers, json=quality).json()["reason"] == "scheduled"
+        client.portal.call(wait_idle)
+        events = client.get(url + "/events", headers=headers).json()["events"]
+        assert any(event.get("prompt_type") == "operation_notice" for event in events)
+        assert app.state.live.store.db.execute(
+            "SELECT COUNT(*) FROM live_observations WHERE session_id=?", (sid,)
+        ).fetchone()[0] == 9
+        clock[0] += 60_001
+        submit("after-cooldown", "阿青：你想聊什么？")
+        assert calls[-1] == ("你想聊什么？", "阿青")
+        assert sum(text == "你想聊什么？" and name == "阿青" for text, name in calls) == 2

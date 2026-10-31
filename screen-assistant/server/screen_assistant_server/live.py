@@ -436,6 +436,9 @@ class LiveService:
             candidate = await self.run("fusion_candidate", sid, token)
             if candidate is None:
                 return {"reason": "quiet", "prompt_id": None}
+            if candidate.get("prompt_type") == "comment_reply" and sid in self.fusion_active:
+                # 下一轮复用同一执行槽，处理同批剩余候选，直到无新候选。
+                self.fusion_dirty.add(sid)
             suggestion = candidate["suggestion"]
             if candidate["model_text"]:
                 cfg = request.app.state.settings

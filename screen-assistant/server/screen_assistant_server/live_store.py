@@ -9,6 +9,7 @@ import json
 import logging
 import secrets
 import sqlite3
+import unicodedata
 import uuid
 from collections import Counter, deque
 from pathlib import Path
@@ -22,7 +23,7 @@ from .live_rules import (
 )
 from .live_fusion import (
     build_candidate, observation_source_allowed, online_count_details,
-    validate_observation_content,
+    validate_observation_content, comment_has_priority, comment_is_candidate, group_feedback,
 )
 from .comment_reconstruction import reconstruct_comments
 
@@ -44,6 +45,7 @@ class LiveStore:
         self.fusion_windows: dict[str, deque] = {}
         self.comment_batches: dict[str, dict[tuple[str, str], dict]] = {}
         self.comment_batch_sweeps: dict[str, int] = {}
+        self.comment_attempted: dict[str, set[str]] = {}
         self.db = sqlite3.connect(path, check_same_thread=False, timeout=0.5)
         self.db.row_factory = sqlite3.Row
         self.db.executescript("""
@@ -173,7 +175,7 @@ class LiveStore:
             "session_id": sid, "session_token": token, "started_at_ms": now,
             "douyin_account": douyin_account, "backstage_task_id": None,
             "backstage_status": "not_started" if douyin_account else "not_configured",
-            "capabilities": {"observation_batch_metadata": True, "typed_prompts": False},
+            "capabilities": {"observation_batch_metadata": True, "typed_prompts": True},
         }
 
     def _stored_app_source(self, sid: str, session) -> str:
@@ -277,6 +279,7 @@ class LiveStore:
         self.fusion_windows.pop(sid, None)
         batches = self.comment_batches.pop(sid, {})
         self.comment_batch_sweeps.pop(sid, None)
+        self.comment_attempted.pop(sid, None)
         if any(not batch["complete"] for batch in batches.values()):
             logger.info("live_comment_batch outcome=stopped_incomplete")
         task = self.db.execute(
@@ -449,7 +452,9 @@ class LiveStore:
                 batch["rows"] = []
                 if rows and received_at_ms <= batch["deadline"]:
                     observed_rows = [row for row in rows if row.get("observed_at_ms") is not None]
-                    batch["records"] = reconstruct_comments(observed_rows)
+                    batch["records"] = reconstruct_comments(
+                        observed_rows, batch_complete=True, quality_gaps=batch["quality_gaps"]
+                    )
                     window = self.fusion_windows.setdefault(sid, deque(maxlen=MAX_WINDOW_OBSERVATIONS))
                     window.extend(rows)
                     result["_batch_ready"] = True
@@ -709,6 +714,101 @@ class LiveStore:
             row["kind"] == "comment" and row.get("capture_comment_count") is not None
         )]
         candidate = build_candidate(legacy_rows)
+        by_event = {row["event_id"]: row for row in rows}
+        attempted = self.comment_attempted.setdefault(sid, set())
+        comment_candidate = None
+        for batch in self.comment_batches.get(sid, {}).values():
+            if not batch["complete"] or now > batch["deadline"]:
+                continue
+            for record in batch.get("records", []):
+                status = record.get("field_status", {})
+                text = record.get("text")
+                comment_id = record.get("comment_id")
+                first = record.get("first_observed_at_ms")
+                if (status.get("text") != "usable" or record.get("boundary_status") != "locally_complete"
+                        or not isinstance(text, str) or not isinstance(comment_id, str)
+                        or comment_id in attempted or type(first) is not int
+                        or not now - MAX_OBSERVATION_AGE_MS <= first <= now + FUSION_FUTURE_SKEW_MS):
+                    continue
+                ids = record.get("source_event_ids") or []
+                field_sources = record.get("field_sources") or {}
+                text_sources = field_sources.get("text") or []
+                if (not ids or not text_sources or any(event_id not in ids for event_id in text_sources)
+                        or any(event_id not in by_event for event_id in ids)):
+                    continue
+                selected = [by_event[event_id] for event_id in ids]
+                if any(row["source"] != record.get("source") for row in selected):
+                    continue
+                def usable_field(name):
+                    sources = field_sources.get(name) or []
+                    return status.get(name) == "usable" and bool(sources) and all(source in ids for source in sources)
+                consumption = record.get("consumption_level") if usable_field("consumption_level") else None
+                fan = record.get("fan_level") if usable_field("fan_level") else None
+                if not comment_is_candidate(text, consumption_level=consumption, fan_level=fan):
+                    continue
+                nickname = record.get("nickname") if usable_field("nickname") else None
+                if not isinstance(nickname, str) or not nickname.strip():
+                    nickname = None
+                clean_text = "".join(unicodedata.normalize("NFKC", text).split()).casefold()
+                clean_name = ("".join(unicodedata.normalize("NFKC", nickname).split()).casefold()
+                              if nickname is not None else None)
+                topic = "comment_reply:" + digest(json.dumps(
+                    [record["source"], "comment_reply", clean_name, clean_text], ensure_ascii=True
+                ))
+                last_reply = self.db.execute(
+                    "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash=?",
+                    (sid, digest(topic)),
+                ).fetchone()[0]
+                if last_reply is not None and now - last_reply < COOLDOWN_MS:
+                    continue
+                comment_candidate = {
+                    "topic": topic, "priority": 25, "phenomenon": "公屏评论",
+                    "observations": selected, "suggestion": None, "model_text": text,
+                    "prompt_type": "comment_reply", "priority_eligible": comment_has_priority(consumption, fan),
+                    "first_observed_at_ms": first,
+                    "reply_to": {"comment_id": comment_id, "nickname": nickname, "text": text},
+                }
+                break
+            if comment_candidate:
+                break
+        if comment_candidate is not None and (candidate is None or candidate["priority"] <= 25):
+            candidate = comment_candidate
+        elif comment_candidate is None and (candidate is None or candidate["priority"] < 25):
+            grouped: dict[str, list[dict]] = {}
+            for batch in self.comment_batches.get(sid, {}).values():
+                if not batch["complete"] or now > batch["deadline"]:
+                    continue
+                for record in batch.get("records", []):
+                    status, fields = record.get("field_status", {}), record.get("field_sources", {})
+                    ids = record.get("source_event_ids") or []
+                    if (status.get("text") != "usable" or status.get("nickname") != "usable"
+                            or record.get("boundary_status") != "locally_complete" or not ids
+                            or any(event_id not in by_event for event_id in ids)
+                            or not fields.get("text") or not fields.get("nickname")
+                            or any(event_id not in ids for event_id in fields["text"] + fields["nickname"])
+                            or any(by_event[event_id]["source"] != record.get("source") for event_id in ids)):
+                        continue
+                    grouped.setdefault(record["source"], []).append(record)
+            for records in grouped.values():
+                group = group_feedback(records, now)
+                if not group:
+                    continue
+                normalized = "".join(unicodedata.normalize("NFKC", group[0]["text"]).split()).casefold()
+                topic = "group_feedback:" + digest(normalized)
+                last_group = self.db.execute(
+                    "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash=?",
+                    (sid, digest(topic)),
+                ).fetchone()[0]
+                if last_group is not None and now - last_group < COOLDOWN_MS:
+                    continue
+                event_ids = list(dict.fromkeys(event_id for item in group for event_id in item["source_event_ids"]))
+                candidate = {
+                    "topic": topic, "priority": 25, "phenomenon": "评论区集中反馈相同内容",
+                    "suggestion": "评论区集中反馈了相同内容，可以结合已知信息回应。",
+                    "model_text": None, "model_context": "", "observations": [by_event[event_id] for event_id in event_ids],
+                    "prompt_type": "operation_notice",
+                }
+                break
         if candidate is None:
             return None
         topic_hash = digest(candidate["topic"])
@@ -728,6 +828,9 @@ class LiveStore:
                    for row in recent):
                 return None
         candidate["description"] = session["description"]
+        candidate.setdefault("prompt_type", "operation_notice")
+        if candidate.get("prompt_type") == "comment_reply":
+            attempted.add(candidate["reply_to"]["comment_id"])
         return candidate
 
     def save_fusion_candidate(self, sid: str, token: str | None,
@@ -739,6 +842,9 @@ class LiveStore:
         rows = candidate["observations"]
         latest = max(row["effective_at_ms"] for row in rows)
         if now - latest > MAX_OBSERVATION_AGE_MS:
+            return {"reason": "candidate_expired", "prompt_id": None}
+        if (candidate.get("prompt_type") == "comment_reply"
+                and now - candidate["first_observed_at_ms"] > MAX_OBSERVATION_AGE_MS):
             return {"reason": "candidate_expired", "prompt_id": None}
         topic_hash = digest(candidate["topic"])
         last = self.db.execute(
