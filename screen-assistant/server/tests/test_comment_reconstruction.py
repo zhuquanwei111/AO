@@ -70,6 +70,16 @@ def test_unassigned_continuation_or_truncated_text_blocks_upgrade():
     assert "near_top_edge" in cropped["usability_reasons"]
 
 
+def test_empty_or_whitespace_ocr_box_below_comment_does_not_crash_or_join():
+    for text in ("", "  \t"):
+        rows = [row("a", "阿青：你好", (.1, .3, .3, .04)),
+                row("b", text, (.1, .345, .2, .04), index=1)]
+        comments = reconstruct_comments(rows, batch_complete=True, quality_gaps=[])
+        comment = next(c for c in comments if c["text"] == "你好")
+        assert comment["field_sources"]["text"] == ["a"]
+        assert comment["field_status"]["text"] != "usable"
+
+
 def test_real_a30_long_comment_with_unassigned_continuation_is_not_usable():
     rows = [row("a", "别忽悠我就行：点点关注点点", (78/576, 45/580, 266/576, 23/580)),
             row("b", "赞，亮个粉丝牌！", (31/576, 72/580, 150/576, 26/580), index=1)]
