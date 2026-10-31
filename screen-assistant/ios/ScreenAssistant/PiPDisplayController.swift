@@ -187,6 +187,7 @@ final class PiPDisplayController: NSObject, ObservableObject {
         ControlState.setUserWantsCapture(false)
         hostView.removeFromSuperview()
         pipController = nil
+        liveContentActive = false
         lastRenderedCGImage = nil
         lastDisplayedText = nil
         lastDisplayedKind = nil
