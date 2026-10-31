@@ -207,11 +207,14 @@ class CommentObservation(ObservationBase):
     content: CommentContent | None = None
     capture_batch_id: str | None = Field(default=None, min_length=1, max_length=128)
     line_index: int | None = Field(default=None, ge=0, le=65535, strict=True)
+    capture_comment_count: int | None = Field(default=None, ge=1, le=128, strict=True)
 
     @model_validator(mode="after")
     def valid_capture_line(self):
         if self.line_index is not None and self.capture_batch_id is None:
             raise ValueError("line_index requires capture_batch_id")
+        if self.capture_comment_count is not None and (self.capture_batch_id is None or self.line_index is None):
+            raise ValueError("capture_comment_count requires capture_batch_id and line_index")
         return self
 
 

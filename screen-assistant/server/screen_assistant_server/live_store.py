@@ -6,6 +6,7 @@ import binascii
 import hashlib
 import hmac
 import json
+import logging
 import secrets
 import sqlite3
 import uuid
@@ -24,6 +25,8 @@ from .live_fusion import (
     validate_observation_content,
 )
 
+logger = logging.getLogger("screen_assistant.app")
+
 
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
@@ -38,6 +41,7 @@ class LiveStore:
         self.clock = clock
         self.windows: dict[str, deque] = {}
         self.fusion_windows: dict[str, deque] = {}
+        self.comment_batches: dict[str, dict[tuple[str, str], dict]] = {}
         self.db = sqlite3.connect(path, check_same_thread=False, timeout=0.5)
         self.db.row_factory = sqlite3.Row
         self.db.executescript("""
@@ -255,6 +259,9 @@ class LiveStore:
                     )
         self.windows.pop(sid, None)
         self.fusion_windows.pop(sid, None)
+        batches = self.comment_batches.pop(sid, {})
+        if any(not batch["complete"] for batch in batches.values()):
+            logger.info("live_comment_batch outcome=stopped_incomplete")
         task = self.db.execute(
             "SELECT task_id,status FROM live_backstage_tasks WHERE session_id=?", (sid,)
         ).fetchone()
@@ -353,8 +360,33 @@ class LiveStore:
             (sid, message_hash),
         ).fetchone():
             usable, reason, message_hash = False, "duplicate_message", None
+
+        batch = None
+        batch_count = body.get("capture_comment_count")
+        if body["kind"] == "comment" and batch_count is not None:
+            key = (body["source"], body["capture_batch_id"])
+            batches = self.comment_batches.setdefault(sid, {})
+            batch = batches.get(key)
+            if batch is None:
+                batch = {"count": batch_count, "indices": {}, "rows": [],
+                         "deadline": min(effective, received_at_ms) + MAX_OBSERVATION_AGE_MS,
+                         "complete": False}
+                batches[key] = batch
+            if batch["count"] != batch_count:
+                raise HTTPException(409, "capture batch count mismatch")
+            if body["line_index"] in batch["indices"] or batch["complete"]:
+                raise HTTPException(409, "capture batch index already used")
+            batch["deadline"] = min(batch["deadline"], effective + MAX_OBSERVATION_AGE_MS)
+            if received_at_ms > batch["deadline"]:
+                batch["rows"].clear()
+                if not batch.get("expired"):
+                    logger.info("live_comment_batch outcome=expired")
+                    batch["expired"] = True
+                usable, reason = False, "batch_expired"
         if not usable:
             result["reason"] = reason or "unavailable"
+        elif batch is not None:
+            result["reason"] = "batch_incomplete"
         else:
             result["reason"] = "windowed"
 
@@ -382,6 +414,24 @@ class LiveStore:
                     json.dumps(content["text_position"], ensure_ascii=False) if content.get("text_position") else None,
                     json.dumps(content.get("ocr_lines", []), ensure_ascii=False), result["reason"],
                 ))
+        if batch is not None:
+            batch["indices"][body["line_index"]] = event_hash
+            if usable:
+                item = dict(body)
+                item.update(received_at_ms=received_at_ms, effective_at_ms=effective,
+                            normalized_count=None)
+                batch["rows"].append(item)
+            if len(batch["indices"]) == batch["count"]:
+                batch["complete"] = True
+                rows = batch["rows"]
+                batch["rows"] = []
+                if rows and received_at_ms <= batch["deadline"]:
+                    window = self.fusion_windows.setdefault(sid, deque(maxlen=MAX_WINDOW_OBSERVATIONS))
+                    window.extend(rows)
+                    result["_batch_ready"] = True
+                    if usable:
+                        result["reason"] = "windowed"
+            return result
         if usable:
             item = dict(body)
             item["received_at_ms"] = received_at_ms

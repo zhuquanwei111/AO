@@ -128,6 +128,43 @@ def test_comment_reply_without_valid_model_result_writes_no_prompt(tmp_path, mon
     asyncio.run(run())
 
 
+def test_batch_does_not_call_model_until_late_second_observation(tmp_path):
+    now = 1_790_000_000_000
+    async def run():
+        cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="fake",
+                       tianyi_base_url="http://model.invalid", tianyi_model="fake",
+                       dedup_ttl_seconds=60, max_sentence_chars=2000,
+                       model_timeout_seconds=2, model_connect_timeout_seconds=1,
+                       live_db_path=str(tmp_path / "batch-gate.sqlite3"))
+        app = create_app(cfg, live_clock=lambda: now)
+        calls = []
+        class Model:
+            async def suggest_live(self, text, *args, **kwargs):
+                calls.append(text)
+                return "可以顺着问题聊两句。"
+            async def aclose(self):
+                pass
+        async with app.router.lifespan_context(app):
+            app.state.model = Model()
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                session = (await client.post("/v1/live/sessions", json={})).json()
+                sid, token = session["session_id"], session["session_token"]
+                url = f"/v1/live/sessions/{sid}/observations"
+                headers = {"X-Live-Session-Token": token}
+                first = {"kind": "comment", "event_id": "e1", "source": "ios_replaykit_ocr",
+                         "observed_at_ms": now, "availability": "available", "coverage": "ocr_visible_sample",
+                         "reliability": "known", "capture_batch_id": "batch", "line_index": 0,
+                         "capture_comment_count": 2, "content": {"text": "主播你是哪里人？"}}
+                assert (await client.post(url, headers=headers, json=first)).json()["reason"] == "batch_incomplete"
+                await asyncio.sleep(0.25)
+                assert calls == []
+                second = {**first, "event_id": "e2", "line_index": 7, "content": {"text": "续句"}}
+                assert (await client.post(url, headers=headers, json=second)).json()["reason"] == "scheduled"
+                await asyncio.wait_for(app.state.live.fusion_active[sid], 2)
+                assert len(calls) == 1
+    asyncio.run(run())
+
+
 def test_observation_returns_while_model_is_blocked(tmp_path):
     async def run():
         cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="fake",

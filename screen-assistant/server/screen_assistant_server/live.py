@@ -635,11 +635,13 @@ async def add_comment(session_id: str, payload: CommentObservation, request: Req
 async def process_fusion_observation(service: LiveService, session_id: str,
                                      token: str | None, request: Request,
                                      result: dict, body: dict, *, urgent: bool):
-    if result.get("reason") != "windowed":
+    batch_ready = result.pop("_batch_ready", False)
+    if result.get("reason") != "windowed" and not batch_ready:
         return result
     if not urgent:
         scheduled = service.schedule_fusion(session_id, token, request)
-        result.update(reason="scheduled" if scheduled else "analysis_busy", prompt_id=None)
+        if result.get("reason") == "windowed":
+            result.update(reason="scheduled" if scheduled else "analysis_busy", prompt_id=None)
         return result
     delivered = await service.deliver_fusion(session_id, token, request, urgent=urgent)
     if delivered.get("reason") == "generated":
@@ -659,7 +661,7 @@ async def add_typed_observation(session_id: str, payload: Observation, request: 
     service = request.app.state.live
     body = payload.model_dump()
     # 新字段缺省时保留旧版本的指纹输入，避免跨版本重试冲突。
-    for key in ("capture_batch_id", "line_index"):
+    for key in ("capture_batch_id", "line_index", "capture_comment_count"):
         if key in body and body[key] is None:
             del body[key]
     result = await service.run("add_observation", session_id, token, body, service.clock())

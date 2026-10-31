@@ -1,8 +1,10 @@
 from fastapi.testclient import TestClient
+import pytest
 
 from screen_assistant_server.app import create_app
 from screen_assistant_server.config import Settings
 from screen_assistant_server.live_store import LiveStore
+from fastapi import HTTPException
 
 
 def test_batch_capability_and_ios_distinct_rows_preserve_legacy_dedup(tmp_path):
@@ -26,6 +28,9 @@ def test_batch_capability_and_ios_distinct_rows_preserve_legacy_dedup(tmp_path):
         old1 = {**body, "event_id": "old-1"}
         old2 = {**body, "event_id": "old-2"}
         assert client.post(url, headers=headers, json=old1).json()["reason"] == "scheduled"
+        assert client.post(url, headers=headers, json={**old1, "capture_comment_count": None}).json()["reason"] == "duplicate_event"
+        assert client.post(url, headers=headers, json={**old1, "capture_batch_id": "new-batch",
+                                                       "line_index": 0, "capture_comment_count": 1}).status_code == 409
         assert client.post(url, headers=headers, json=old2).json()["reason"] == "duplicate_message"
         row1 = {**body, "event_id": "new-1", "capture_batch_id": "batch-1", "line_index": 0}
         row2 = {**body, "event_id": "new-2", "capture_batch_id": "batch-1", "line_index": 1}
@@ -67,5 +72,94 @@ def test_typed_prompt_keeps_existing_event_fields_and_source(tmp_path):
         events = store.prompts(sid, token, "")["prompts"]
         assert events[1]["prompt_type"] == "operation_notice"
         assert "reply_to" not in events[1]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("bad", [0, 129, True, 1.0, -1])
+def test_capture_count_rejects_invalid_values(bad):
+    from pydantic import TypeAdapter, ValidationError
+    from screen_assistant_server.live_fusion import Observation
+    body = {"kind": "comment", "event_id": "e", "source": "ios_replaykit_ocr",
+            "observed_at_ms": 1000, "availability": "available", "coverage": "ocr_visible_sample",
+            "reliability": "known", "content": {"text": "你好"}, "capture_batch_id": "b",
+            "line_index": 3, "capture_comment_count": bad}
+    with pytest.raises(ValidationError):
+        TypeAdapter(Observation).validate_python(body)
+
+
+def test_capture_count_requires_batch_and_index_and_online_rejects_count():
+    from pydantic import TypeAdapter, ValidationError
+    from screen_assistant_server.live_fusion import Observation
+    base = {"kind": "comment", "event_id": "e", "source": "ios_replaykit_ocr",
+            "observed_at_ms": 1000, "availability": "available", "coverage": "ocr_visible_sample",
+            "reliability": "known", "content": {"text": "你好"}, "capture_comment_count": 1}
+    adapter = TypeAdapter(Observation)
+    for body in (base, {**base, "capture_batch_id": "b"},
+                 {**base, "line_index": 0},
+                 {**base, "kind": "online_count", "source": "ios_replaykit_online_count_roi",
+                  "content": {"raw_text": "1"}, "capture_batch_id": "b"}):
+        with pytest.raises(ValidationError):
+            adapter.validate_python(body)
+    valid = adapter.validate_python({**base, "capture_batch_id": "b", "line_index": 7})
+    assert valid.capture_comment_count == 1
+
+
+def test_batch_waits_for_distinct_indices_and_counts_unreliable_arrivals(tmp_path):
+    now = 1_790_000_000_000
+    store = LiveStore(str(tmp_path / "batch.sqlite3"), lambda: now)
+    try:
+        session = store.create("")
+        sid, token = session["session_id"], session["session_token"]
+        first = {"kind": "comment", "event_id": "e1", "source": "ios_replaykit_ocr",
+                 "observed_at_ms": now, "availability": "available", "coverage": "ocr_visible_sample",
+                 "reliability": "known", "content": {"text": "主播你是哪里人？"},
+                 "capture_batch_id": "batch", "line_index": 1, "capture_comment_count": 2}
+        result = store.add_observation(sid, token, first, now)
+        assert result["reason"] == "batch_incomplete"
+        assert not store.fusion_windows.get(sid)
+        assert store.add_observation(sid, token, first, now)["reason"] == "duplicate_event"
+        assert not store.fusion_windows.get(sid)
+        for bad in ({**first, "event_id": "other"},
+                    {**first, "event_id": "e2", "line_index": 5, "capture_comment_count": 3}):
+            with pytest.raises(HTTPException) as error:
+                store.add_observation(sid, token, bad, now + 1000)
+            assert error.value.status_code == 409
+        last = {**first, "event_id": "e2", "line_index": 5, "availability": "unreliable"}
+        result = store.add_observation(sid, token, last, now + 1000)
+        assert result["reason"] == "source_unreliable"
+        assert result["_batch_ready"] is True
+        assert [row["event_id"] for row in store.fusion_windows[sid]] == ["e1"]
+    finally:
+        store.close()
+
+
+def test_batch_expiry_and_session_isolation(tmp_path):
+    now = 1_790_000_000_000
+    clock = [now]
+    store = LiveStore(str(tmp_path / "batch-expiry.sqlite3"), lambda: clock[0])
+    try:
+        a, b = store.create(""), store.create("")
+        first = {"kind": "comment", "event_id": "e1", "source": "ios_replaykit_ocr",
+                 "observed_at_ms": now, "availability": "available", "coverage": "ocr_visible_sample",
+                 "reliability": "known", "content": {"text": "你好"},
+                 "capture_batch_id": "shared", "line_index": 1, "capture_comment_count": 2}
+        for session in (a, b):
+            result = store.add_observation(session["session_id"], session["session_token"], first, now)
+            assert result["reason"] == "batch_incomplete"
+        second = {**first, "event_id": "e2", "line_index": 9}
+        ready = store.add_observation(b["session_id"], b["session_token"], second, now + 1000)
+        assert ready["_batch_ready"] is True
+        assert not store.fusion_windows.get(a["session_id"])
+        clock[0] += 10_001
+        late = store.add_observation(a["session_id"], a["session_token"], second, clock[0])
+        assert late["reason"] == "batch_expired"
+        assert not store.fusion_windows.get(a["session_id"])
+        store.stop(a["session_id"], a["session_token"])
+        assert a["session_id"] not in store.comment_batches
+        with pytest.raises(HTTPException) as error:
+            store.add_observation(a["session_id"], a["session_token"],
+                                  {**first, "event_id": "e3"}, clock[0])
+        assert error.value.status_code == 409
     finally:
         store.close()
