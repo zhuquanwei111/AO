@@ -129,6 +129,8 @@ def test_batch_waits_for_distinct_indices_and_counts_unreliable_arrivals(tmp_pat
         result = store.add_observation(sid, token, last, now + 1000)
         assert result["reason"] == "source_unreliable"
         assert result["_batch_ready"] is True
+        assert store.comment_batches[sid][("ios_replaykit_ocr", "batch")]["boundary_context"] == [
+            {"event_id": "e2", "text_position": None}]
         assert [row["event_id"] for row in store.fusion_windows[sid]] == ["e1"]
     finally:
         store.close()
@@ -246,6 +248,26 @@ def test_expired_batch_discards_transient_raw_payloads_on_poll(tmp_path):
         clock[0] += 10_001
         store.prompts(sid, token, "")
         assert "records" not in batch and batch["rows"] == []
+    finally:
+        store.close()
+
+
+def test_unreliable_batch_item_keeps_only_boundary_geometry(tmp_path):
+    now = 1_790_000_000_000
+    store = LiveStore(str(tmp_path / "batch-boundary.sqlite3"), lambda: now)
+    try:
+        session = store.create("")
+        sid, token = session["session_id"], session["session_token"]
+        rect = {"x": 0.1, "y": 0.55, "width": 0.3, "height": 0.04}
+        bad = {"kind": "comment", "event_id": "quality-gap", "source": "ios_replaykit_ocr",
+               "observed_at_ms": now, "availability": "unreliable", "coverage": "ocr_visible_sample",
+               "reliability": "unknown", "content": {"text": "不可靠原文", "text_position": rect},
+               "capture_batch_id": "batch", "line_index": 1, "capture_comment_count": 2}
+        assert store.add_observation(sid, token, bad, now)["reason"] == "source_unreliable"
+        context = store.comment_batches[sid][("ios_replaykit_ocr", "batch")]["boundary_context"]
+        assert context == [{"event_id": "quality-gap", "text_position": rect}]
+        assert "text" not in context[0]
+        assert context[0]["text_position"] is not rect
     finally:
         store.close()
 
