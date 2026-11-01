@@ -118,12 +118,13 @@ final class AppModel: ObservableObject {
             isolatedStopAvailable = true
             isolatedStopStatus = "有原场结束尚未确认，可手动重试"
         } else if unknownStopRecord {
+            isolatedStopAvailable = true
             isolatedStopStatus = "原场结束尚未确认，原服务信息不足或记录不可读取"
         }
         let pendingOwnsSaved = pendingIsolatedStop.map {
             $0.credentials.sessionID == savedLiveCredentials?.sessionID &&
             $0.credentials.token == savedLiveCredentials?.token &&
-            $0.serviceURL.absoluteString == SharedConfig.serverBaseURL()?.absoluteString
+            $0.serviceURL.absoluteString == savedLiveCredentials?.boundServiceURL?.absoluteString
         } ?? false
         let savedConnectionPending = savedLiveCredentials?.liveConnectionPending == true
         liveActive = !pendingOwnsSaved && !unknownStopRecord && LiveSessionState.isEnabled() && savedLiveCredentials != nil
@@ -188,8 +189,12 @@ final class AppModel: ObservableObject {
             liveClient = credentials.boundServiceURL.flatMap {
                 IsolatedStopIntent.safeServiceURL($0) ? LiveOperationsClient(baseURL: $0) : nil
             }
-            liveStatus = "本场已结束，正在检查后台汇总"
-            if let client = liveClient { loadStoppedOverview(credentials, client: client) }
+            if let client = liveClient {
+                liveStatus = "本场已结束，正在检查后台汇总"
+                loadStoppedOverview(credentials, client: client)
+            } else {
+                liveStatus = "本场原服务地址未确认，暂不能读取后台汇总"
+            }
         }
     }
 
@@ -207,6 +212,10 @@ final class AppModel: ObservableObject {
     func startLiveSession() {
         guard !isolatedStopInFlight else { return }
         guard !liveStarting, !liveStopping else { return }
+        guard !LiveSessionState.isolatedStopRecordUnreadable() else {
+            liveStatus = "原场结束记录无法读取，未创建新场；可重试读取"
+            return
+        }
         guard !LiveSessionState.isEnabled() || Self.savedCredentials() != nil else {
             liveStatus = "已有场次授权无法读取，不能创建新场"
             return
@@ -404,7 +413,10 @@ final class AppModel: ObservableObject {
     }
 
     private func pollLivePrompts() {
-        guard liveActive, let credentials = liveCredentials, let client = liveClient else { return }
+        guard !LiveSessionState.isolatedStopRecordUnreadable(), liveActive,
+              let credentials = liveCredentials, let bound = credentials.boundServiceURL,
+              IsolatedStopIntent.safeServiceURL(bound), let client = liveClient,
+              client.baseURL.absoluteString == bound.absoluteString else { return }
         livePollGeneration &+= 1
         let generation = livePollGeneration
         let waitMS = liveConnectionPending ? 0 : 15_000
@@ -412,6 +424,8 @@ final class AppModel: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 let saved = Self.savedCredentials()
+                guard !LiveSessionState.isolatedStopRecordUnreadable(),
+                      self.liveCredentials?.boundServiceURL?.absoluteString == bound.absoluteString else { return }
                 let disposition = PollCallbackGate.disposition(
                     sessionID: credentials.sessionID, token: credentials.token, generation: generation,
                     currentSessionID: self.liveCredentials?.sessionID, currentToken: self.liveCredentials?.token,
@@ -419,7 +433,7 @@ final class AppModel: ObservableObject {
                     savedSessionID: saved?.sessionID, savedToken: saved?.token,
                     active: self.liveActive, stopping: self.liveStopping)
                 guard disposition != .stale else { return }
-                if disposition == .savedCredentialsMismatch {
+                if disposition == .savedCredentialsMismatch || saved?.boundServiceURL?.absoluteString != bound.absoluteString {
                     if self.liveConnectionPending {
                         self.livePollTask = nil
                         self.liveVerificationNeedsRetry = true
@@ -584,6 +598,11 @@ final class AppModel: ObservableObject {
                 if self.liveCredentials?.sessionID == credentials.sessionID,
                    self.liveCredentials?.token == credentials.token,
                    self.liveClient?.baseURL.absoluteString == intent.serviceURL.absoluteString {
+                    if let saved = Self.savedCredentials(), saved.sessionID == credentials.sessionID,
+                       saved.token == credentials.token,
+                       saved.boundServiceURL?.absoluteString == intent.serviceURL.absoluteString {
+                        LiveSessionState.disableCapturePreservingCredentials()
+                    }
                     self.liveActive = false
                     self.liveStopped = true
                     self.liveConnectionPending = false
@@ -766,6 +785,9 @@ final class AppModel: ObservableObject {
     }
 
     private func loadStoppedOverview(_ credentials: LiveSessionCredentials, client: LiveOperationsClient) {
+        guard !LiveSessionState.isolatedStopRecordUnreadable(),
+              let bound = credentials.boundServiceURL, IsolatedStopIntent.safeServiceURL(bound),
+              client.baseURL.absoluteString == bound.absoluteString else { return }
         let generation = liveStartGeneration
         let onResponse = overviewResponseHandler(credentials, generation: generation)
         let group = DispatchGroup()
@@ -823,7 +845,8 @@ final class AppModel: ObservableObject {
     }
 
     func refreshStoppedOverview() {
-        guard !liveActive, !liveStarting, !summaryRefreshInFlight,
+        guard !LiveSessionState.isolatedStopRecordUnreadable(),
+              !liveActive, !liveStarting, !summaryRefreshInFlight,
               let credentials = Self.savedCredentials(),
               let bound = credentials.boundServiceURL, IsolatedStopIntent.safeServiceURL(bound),
               let client = liveClient ?? LiveOperationsClient(baseURL: bound),

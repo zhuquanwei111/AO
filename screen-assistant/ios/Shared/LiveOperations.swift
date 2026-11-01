@@ -645,6 +645,14 @@ enum LiveSessionState {
         return FileManager.default.fileExists(atPath: url.path)
     }
 
+    static func isolatedStopRecordUnreadable() -> Bool {
+        guard let url = isolatedStopURL else { return true }
+        return isolatedStopRecordUnreadable(fileURL: url)
+    }
+    static func isolatedStopRecordUnreadable(fileURL: URL) -> Bool {
+        FileManager.default.fileExists(atPath: fileURL.path) && isolatedStopIntent(fileURL: fileURL) == nil
+    }
+
     static func isolatedStopIntent() -> IsolatedStopIntent? {
         guard let url = isolatedStopURL else { return nil }
         return isolatedStopIntent(fileURL: url)

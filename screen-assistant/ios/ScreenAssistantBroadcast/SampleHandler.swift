@@ -139,7 +139,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         var generation = 0
         var captureGeneration = 0
         stateQueue.sync {
-            let wantsCapture = ControlState.userWantsCapture()
+            let wantsCapture = ControlState.userWantsCapture() && !LiveSessionState.isolatedStopRecordUnreadable()
             let configuredGeneration = ControlState.captureGeneration()
             if (roundActive || observationTask != nil || !observationBuffer.pending.isEmpty) &&
                 (!wantsCapture || activeCaptureGeneration != configuredGeneration) {
@@ -306,7 +306,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
     /// M7数值出口使用取样时的场次凭据；只保留一个HTTP请求在途，不等待服务端响应。
     private func submitPersonObservation(_ observation: LivePersonObservation,
                                          sessionID: String, token: String) {
-        guard LiveSessionState.isEnabled(), ControlState.userWantsCapture(),
+        guard !LiveSessionState.isolatedStopRecordUnreadable(),
+              LiveSessionState.isEnabled(), ControlState.userWantsCapture(),
               let credentials = LiveSessionState.credentials(),
               credentials.sessionID == sessionID, credentials.token == token,
               let baseURL = credentials.captureServiceURL(configured: SharedConfig.serverBaseURL()),
@@ -325,6 +326,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
                   let current = LiveSessionState.credentials(),
                   current.sessionID == sessionID, current.token == token,
                   current.captureServiceURL(configured: SharedConfig.serverBaseURL())?.absoluteString == baseURL.absoluteString,
+                  !LiveSessionState.isolatedStopRecordUnreadable(),
                   LiveSessionState.isEnabled(), ControlState.userWantsCapture() else { return }
             let task = self.personObservationSession.dataTask(with: request) { [weak self] _, _, _ in
                 guard let self else { return }
@@ -444,7 +446,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
     private func observationContextValid(generation: Int, captureGeneration: Int,
                                          sessionID: String, token: String, baseURL: URL? = nil) -> Bool {
-        guard !isBroadcastPaused, roundGeneration == generation,
+        guard !LiveSessionState.isolatedStopRecordUnreadable(), !isBroadcastPaused, roundGeneration == generation,
               ControlState.userWantsCapture(), ControlState.captureGeneration() == captureGeneration,
               LiveSessionState.isEnabled(), let current = LiveSessionState.credentials() else { return false }
         guard current.sessionID == sessionID && current.token == token,
@@ -523,7 +525,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     /// 结束一轮：清 roundActive 并按配置间隔排定下一轮可开始时刻。
     private func isCurrentRound(_ generation: Int, captureGeneration: Int) -> Bool {
         stateQueue.sync {
-            !isBroadcastPaused && roundGeneration == generation &&
+            !LiveSessionState.isolatedStopRecordUnreadable() && !isBroadcastPaused && roundGeneration == generation &&
                 ControlState.userWantsCapture() &&
                 ControlState.captureGeneration() == captureGeneration
         }
