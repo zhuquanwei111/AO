@@ -34,6 +34,18 @@ struct LiveSessionCredentials: Codable {
     var backstageStartPending: Bool?
     var liveConnectionPending: Bool?
     var stopPending: Bool? = nil
+    /// 仅保存在本地，由创建场次时实际使用的 client 确定。
+    var boundServiceURL: URL? = nil
+    func captureServiceURL(configured: URL?) -> URL? {
+        guard let bound = boundServiceURL, IsolatedStopIntent.safeServiceURL(bound),
+              configured?.absoluteString == bound.absoluteString else { return nil }
+        return bound
+    }
+    func hasSameBoundIdentity(as other: LiveSessionCredentials?) -> Bool {
+        guard let bound = boundServiceURL, IsolatedStopIntent.safeServiceURL(bound), let other else { return false }
+        return sessionID == other.sessionID && token == other.token &&
+            bound.absoluteString == other.boundServiceURL?.absoluteString
+    }
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id", token = "session_token", startedAtMS = "started_at_ms"
         case douyinAccount = "douyin_account"
@@ -41,6 +53,7 @@ struct LiveSessionCredentials: Codable {
         case backstageStartPending = "backstage_start_pending"
         case liveConnectionPending = "live_connection_pending"
         case stopPending = "stop_pending"
+        case boundServiceURL = "local_bound_service_url"
     }
 }
 
@@ -637,6 +650,14 @@ enum LiveSessionState {
     static func isolatedStopRecordExists() -> Bool {
         guard let url = isolatedStopURL else { return false }
         return FileManager.default.fileExists(atPath: url.path)
+    }
+
+    static func isolatedStopRecordUnreadable() -> Bool {
+        guard let url = isolatedStopURL else { return true }
+        return isolatedStopRecordUnreadable(fileURL: url)
+    }
+    static func isolatedStopRecordUnreadable(fileURL: URL) -> Bool {
+        FileManager.default.fileExists(atPath: fileURL.path) && isolatedStopIntent(fileURL: fileURL) == nil
     }
 
     static func isolatedStopIntent() -> IsolatedStopIntent? {
