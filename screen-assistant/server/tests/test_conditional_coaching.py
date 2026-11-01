@@ -83,15 +83,15 @@ def test_usable_comment_can_produce_both_types_without_replaying_same_frame(tmp_
         assert len(client.get(url + "/events", headers=headers).json()["events"]) == 3
         assert calls[-1] == ("reply", "晚上好")
         clock[0] = now + 30_000
-        submit("fourth", "batch-4")
+        submit("fourth", "batch-4", "阿青：这首歌的旋律很好")
         client.portal.call(wait_idle)
         events = client.get(url + "/events", headers=headers).json()["events"]
         assert [event["prompt_type"] for event in events] == [
             "comment_reply", "operation_notice", "comment_reply", "comment_reply", "operation_notice"]
-        assert calls[-1] == ("reply", "这首歌很好听") and len(calls) == 3
+        assert calls[-1] == ("reply", "这首歌的旋律很好") and len(calls) == 3
         for index, offset in enumerate((60_000, 90_000), start=5):
             clock[0] = now + offset
-            submit(f"later-{index}", f"batch-{index}")
+            submit(f"later-{index}", f"batch-{index}", f"阿青：这首歌的旋律不错{index}")
             client.portal.call(wait_idle)
         events = client.get(url + "/events", headers=headers).json()["events"]
         notices = [event for event in events if event["prompt_type"] == "operation_notice"]

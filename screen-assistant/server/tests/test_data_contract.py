@@ -351,7 +351,7 @@ def test_completed_batch_reply_lifetime_uses_first_observation(tmp_path, age, el
         store.close()
 
 
-@pytest.mark.parametrize("age,reason", [(19_999, "cooldown"), (20_000, "generated")])
+@pytest.mark.parametrize("age,reason", [(20_000, "cooldown"), (89_999, "cooldown"), (90_000, "generated")])
 def test_comment_reply_cooldown_boundary(tmp_path, age, reason):
     now = 1_790_000_000_000
     clock = [now]
@@ -912,7 +912,7 @@ def test_reply_cooldown_is_scoped_and_failure_does_not_create_cooldown(tmp_path)
         assert app.state.live.store.db.execute(
             "SELECT COUNT(*) FROM live_observations WHERE session_id=?", (sid,)
         ).fetchone()[0] == 9
-        clock[0] += 60_001
+        clock[0] += 90_000
         submit("after-cooldown", "阿青：你想聊什么？")
         assert calls[-1] == ("你想聊什么？", "阿青")
         assert sum(text == "你想聊什么？" and name == "阿青" for text, name in calls) == 2
