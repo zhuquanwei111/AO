@@ -776,14 +776,29 @@ def test_reply_context_is_memory_only_and_history_remains_readable(tmp_path):
         stored = app.state.live.store.db.execute("SELECT payload FROM live_events WHERE session_id=?", (sid1,)).fetchone()[0]
         assert "今晚月亮真漂亮" not in stored and "阿青" not in stored
         assert json.loads(stored)["reply_to"] == {"comment_id": prompt["reply_to"]["comment_id"]}
+        legacy = json.loads(stored)
+        legacy["reply_to"] = prompt["reply_to"]
+        with app.state.live.store.db:
+            app.state.live.store.db.execute("UPDATE live_events SET payload=? WHERE session_id=?",
+                                           (json.dumps(legacy, ensure_ascii=False), sid1))
         history = client.get(f"/v1/live/sessions/{sid1}/events", headers=h1).json()["events"][0]
         assert "reply_to" not in history and history["display_text"] == "欢迎参与。"
+        unchanged = app.state.live.store.db.execute("SELECT payload FROM live_events WHERE session_id=?", (sid1,)).fetchone()[0]
+        assert json.loads(unchanged)["reply_to"] == prompt["reply_to"]
+        live_again = client.get(f"/v1/live/sessions/{sid1}/prompts", headers=h1).json()["prompts"][0]
+        assert live_again["reply_to"] == prompt["reply_to"]
         assert client.post(f"/v1/live/sessions/{sid1}/stop", headers=h1).status_code == 200
         assert sid1 not in app.state.live.store.reply_context
         assert sid2 in app.state.live.store.reply_context
         clock[0] += 1
         h3 = submit(third, "c", "小周：这首歌非常动听")
         sid3 = third["session_id"]
+        third_row = app.state.live.store.db.execute("SELECT payload FROM live_events WHERE session_id=?", (sid3,)).fetchone()[0]
+        third_legacy = json.loads(third_row)
+        third_legacy["reply_to"].update(nickname="小周", text="这首歌非常动听")
+        with app.state.live.store.db:
+            app.state.live.store.db.execute("UPDATE live_events SET payload=? WHERE session_id=?",
+                                           (json.dumps(third_legacy, ensure_ascii=False), sid3))
         clock[0] += 14_999
         expired_history = client.get(f"/v1/live/sessions/{sid2}/events", headers=h2).json()
         assert expired_history["events"][0]["display_text"] == "欢迎参与。"
