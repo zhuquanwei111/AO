@@ -49,7 +49,7 @@ def test_usable_comment_can_produce_both_types_without_replaying_same_frame(tmp_
         url = f"/v1/live/sessions/{session['session_id']}"
         headers = {"X-Live-Session-Token": session["session_token"]}
 
-        def submit(event, batch, text="阿青：这首歌很好听"):
+        def submit(event, batch, text="阿青：这首歌很好听", reason="scheduled"):
             body = {"kind": "comment", "event_id": event, "source": "ios_replaykit_ocr",
                     "observed_at_ms": clock[0], "availability": "available",
                     "coverage": "ocr_visible_sample", "reliability": "known", "confidence": .98,
@@ -57,7 +57,7 @@ def test_usable_comment_can_produce_both_types_without_replaying_same_frame(tmp_
                     "content": {"text": text, "text_position":
                                 {"x": .1, "y": .5, "width": .4, "height": .04}}}
             result = client.post(url + "/observations", headers=headers, json=body)
-            assert result.status_code == 200 and result.json()["reason"] == "scheduled"
+            assert result.status_code == 200 and result.json()["reason"] == reason
 
         async def wait_idle():
             async with asyncio.timeout(5):
@@ -67,38 +67,46 @@ def test_usable_comment_can_produce_both_types_without_replaying_same_frame(tmp_
         submit("first", "batch-1")
         client.portal.call(wait_idle)
         events = client.get(url + "/prompts", headers=headers).json()["prompts"]
-        assert [event["prompt_type"] for event in events] == ["comment_reply", "operation_notice"]
+        assert [event["prompt_type"] for event in events] == ["comment_reply"]
         assert calls == [("reply", "这首歌很好听")]
-        assert events[1]["expires_at_ms"] == now + 30_000
-        assert events[1]["phenomenon"] == "基于可用评论的条件式话术训练"
-        assert events[1]["display_text"] and events[1]["display_text"] == events[1]["suggestion"]
+        submit("first", "batch-1", reason="duplicate_event")
+        client.portal.call(wait_idle)
+        assert [event["prompt_type"] for event in client.get(url + "/events", headers=headers).json()["events"]] == ["comment_reply"]
         clock[0] += 1000
         submit("second", "batch-2")
         client.portal.call(wait_idle)
-        assert len(client.get(url + "/events", headers=headers).json()["events"]) == 2
+        events = client.get(url + "/events", headers=headers).json()["events"]
+        assert [event["prompt_type"] for event in events] == ["comment_reply", "operation_notice"]
+        assert events[1]["expires_at_ms"] == now + 30_000
+        assert events[1]["phenomenon"] == "基于可用评论的条件式话术训练"
+        assert events[1]["display_text"] and events[1]["display_text"] == events[1]["suggestion"]
         assert len(calls) == 1
         clock[0] += 1000
         submit("third", "batch-3", "小林：晚上好")
         client.portal.call(wait_idle)
         assert len(client.get(url + "/events", headers=headers).json()["events"]) == 3
         assert calls[-1] == ("reply", "晚上好")
-        clock[0] = now + 30_000
+        clock[0] = now + 31_000
         submit("fourth", "batch-4", "阿青：这首歌的旋律很好")
+        client.portal.call(wait_idle)
+        submit("fourth-trigger", "batch-4-trigger", "阿青：这首歌的旋律很好")
         client.portal.call(wait_idle)
         events = client.get(url + "/events", headers=headers).json()["events"]
         assert [event["prompt_type"] for event in events] == [
             "comment_reply", "operation_notice", "comment_reply", "comment_reply", "operation_notice"]
         assert calls[-1] == ("reply", "这首歌的旋律很好") and len(calls) == 3
-        for index, offset in enumerate((60_000, 90_000), start=5):
+        for index, offset in enumerate((61_000, 91_000), start=5):
             clock[0] = now + offset
             submit(f"later-{index}", f"batch-{index}", f"阿青：这首歌的旋律不错{index}")
+            client.portal.call(wait_idle)
+            submit(f"later-trigger-{index}", f"batch-trigger-{index}", f"阿青：这首歌的旋律不错{index}")
             client.portal.call(wait_idle)
         events = client.get(url + "/events", headers=headers).json()["events"]
         notices = [event for event in events if event["prompt_type"] == "operation_notice"]
         assert len(notices) == 4
         assert len({event["display_text"] for event in notices[:3]}) == 3
         assert notices[0]["display_text"] == notices[3]["display_text"]
-        assert [event["expires_at_ms"] for event in notices] == [now + n for n in (30_000, 60_000, 90_000, 120_000)]
+        assert [event["expires_at_ms"] for event in notices] == [now + n for n in (30_000, 61_000, 91_000, 121_000)]
 
 
 def test_incomplete_or_quality_gap_does_not_create_coaching(tmp_path):
@@ -135,6 +143,61 @@ def test_incomplete_or_quality_gap_does_not_create_coaching(tmp_path):
         assert client.get(url + "/events", headers=headers).json()["events"] == []
 
 
+def test_observation_during_model_call_does_not_unlock_training(tmp_path):
+    now = 1_790_000_000_000
+    cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="controlled",
+                   tianyi_base_url="http://model.invalid", tianyi_model="fake",
+                   dedup_ttl_seconds=60, max_sentence_chars=2000,
+                   model_timeout_seconds=5, model_connect_timeout_seconds=1,
+                   live_db_path=str(tmp_path / "inflight.sqlite3"))
+
+    class Model:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def reply_to_comment(self, text, *, nickname, priority_eligible):
+            self.started.set()
+            await self.release.wait()
+            return "我们聊聊这个话题。"
+
+        async def aclose(self):
+            pass
+
+    app = create_app(cfg, live_clock=lambda: now)
+    with TestClient(app) as client:
+        client.portal.call(app.state.model.aclose)
+        model = Model()
+        app.state.model = model
+        data = client.post("/v1/live/sessions", json={}).json()
+        url = "/v1/live/sessions/" + data["session_id"]
+        headers = {"X-Live-Session-Token": data["session_token"]}
+
+        def send(event):
+            row = {"kind": "comment", "event_id": event, "source": "ios_replaykit_ocr",
+                   "observed_at_ms": now, "availability": "available", "coverage": "ocr_visible_sample",
+                   "reliability": "known", "confidence": .98, "capture_batch_id": event,
+                   "line_index": 0, "capture_comment_count": 1, "content": {
+                       "text": "阿青：这首歌很好听", "text_position":
+                       {"x": .1, "y": .5, "width": .4, "height": .04}}}
+            assert client.post(url + "/observations", headers=headers, json=row).status_code == 200
+
+        async def wait_idle():
+            async with asyncio.timeout(5):
+                while app.state.live.fusion_active or app.state.live.fusion_queue:
+                    await asyncio.sleep(.005)
+
+        send("first")
+        client.portal.call(model.started.wait)
+        send("during")
+        client.portal.call(model.release.set)
+        client.portal.call(wait_idle)
+        assert [e["prompt_type"] for e in client.get(url + "/events", headers=headers).json()["events"]] == ["comment_reply"]
+        send("after")
+        client.portal.call(wait_idle)
+        assert [e["prompt_type"] for e in client.get(url + "/events", headers=headers).json()["events"]] == ["comment_reply", "operation_notice"]
+
+
 @pytest.mark.parametrize("sources", [
     ("ios_replaykit_ocr", "fixture:ocr_comment"),
     ("fixture:ocr_comment", "ios_replaykit_ocr"),
@@ -166,7 +229,7 @@ def test_training_considers_replied_comment_from_each_source(tmp_path, sources):
         assert second["prompt_type"] == "comment_reply"
         store.finish_comment_attempt(sid, second["reply_to"]["comment_id"], 0, True, True)
 
-        training = store.fusion_candidate(sid, token)
+        training = store.fusion_candidate(sid, token, trigger_epoch=1)
         assert training is not None and training["prompt_type"] == "operation_notice"
         assert training["observations"][0]["source"] == sources[0]
     finally:

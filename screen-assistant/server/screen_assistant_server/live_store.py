@@ -94,6 +94,7 @@ class LiveStore:
         self.comment_attempted: dict[str, set[str]] = {}
         self.comment_attempt_counts: dict[str, dict[str, int]] = {}
         self.comment_failed_epochs: dict[str, dict[str, int]] = {}
+        self.coaching_success_epoch: dict[str, int] = {}
         self.reply_context: dict[str, dict[str, tuple[int, dict]]] = {}
         self.db = sqlite3.connect(path, check_same_thread=False, timeout=0.5)
         self.db.row_factory = sqlite3.Row
@@ -343,6 +344,7 @@ class LiveStore:
         self.comment_attempted.pop(sid, None)
         self.comment_attempt_counts.pop(sid, None)
         self.comment_failed_epochs.pop(sid, None)
+        self.coaching_success_epoch.pop(sid, None)
         self.reply_context.pop(sid, None)
         if any(not batch["complete"] for batch in batches.values()):
             logger.info("live_comment_batch outcome=stopped_incomplete")
@@ -893,7 +895,8 @@ class LiveStore:
                     "prompt_type": "operation_notice",
                 }
                 break
-        if candidate is None:
+        if (candidate is None and sid in self.coaching_success_epoch
+                and trigger_epoch > self.coaching_success_epoch[sid]):
             # 使用已处理的可靠评论提供可选训练建议；不推断人数或直播状态。
             topic_hashes = [digest(topic) for topic, _ in COACHING_TOPICS]
             recent_training = self.db.execute(
@@ -997,7 +1000,7 @@ class LiveStore:
             self.comment_failed_epochs.setdefault(sid, {})[comment_id] = trigger_epoch
 
     def save_fusion_candidate(self, sid: str, token: str | None,
-                              candidate: dict, suggestion: str):
+                              candidate: dict, suggestion: str, trigger_epoch: int = 0):
         session = self.authorize(sid, token)
         if session["stopped_at_ms"] is not None:
             raise HTTPException(409, "live session stopped")
@@ -1136,6 +1139,7 @@ class LiveStore:
             )
         self._expire_reply_context(now)
         if candidate.get("prompt_type") == "comment_reply":
+            self.coaching_success_epoch[sid] = trigger_epoch
             self.reply_context.setdefault(sid, {})[event["prompt_id"]] = (
                 now + PROMPT_TTL_MS, dict(candidate["reply_to"])
             )

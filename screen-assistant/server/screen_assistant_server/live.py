@@ -507,7 +507,8 @@ class LiveService:
                 async with self.lock:
                     if self.fusion_closed or (sid in self.fusion_stopping and not allow_stopping):
                         return {"reason": "cancelled", "prompt_id": None}
-                    result = await self.call("save_fusion_candidate", sid, token, candidate, suggestion)
+                    result = await self.call("save_fusion_candidate", sid, token, candidate, suggestion,
+                                             self.fusion_trigger_epoch.get(sid, 0))
                     if result.get("prompt_id"):
                         for future in self.waiters.get(sid, ()):
                             if not future.done():
