@@ -61,6 +61,7 @@ class LiveStore:
         self.comment_attempted: dict[str, set[str]] = {}
         self.comment_attempt_counts: dict[str, dict[str, int]] = {}
         self.comment_failed_epochs: dict[str, dict[str, int]] = {}
+        self.reply_context: dict[str, dict[str, tuple[int, dict]]] = {}
         self.db = sqlite3.connect(path, check_same_thread=False, timeout=0.5)
         self.db.row_factory = sqlite3.Row
         self.db.executescript("""
@@ -143,7 +144,17 @@ class LiveStore:
             )
 
     def close(self):
+        self.reply_context.clear()
         self.db.close()
+
+    def _expire_reply_context(self, now: int) -> None:
+        # 按现有请求边界惰性回收；读取前严格检查提示到期时间。
+        for sid, contexts in list(self.reply_context.items()):
+            for prompt_id, (expires_at, _) in list(contexts.items()):
+                if now >= expires_at:
+                    del contexts[prompt_id]
+            if not contexts:
+                del self.reply_context[sid]
 
     def _expire_comment_payloads(self, sid: str, now: int) -> None:
         previous = self.comment_batch_sweeps.get(sid)
@@ -299,6 +310,7 @@ class LiveStore:
         self.comment_attempted.pop(sid, None)
         self.comment_attempt_counts.pop(sid, None)
         self.comment_failed_epochs.pop(sid, None)
+        self.reply_context.pop(sid, None)
         if any(not batch["complete"] for batch in batches.values()):
             logger.info("live_comment_batch outcome=stopped_incomplete")
         task = self.db.execute(
@@ -313,6 +325,7 @@ class LiveStore:
 
     def add_observation(self, sid: str, token: str | None, body: dict, received_at_ms: int):
         session = self.authorize(sid, token)
+        self._expire_reply_context(received_at_ms)
         if session["stopped_at_ms"] is not None:
             raise HTTPException(409, "live session stopped")
         if not observation_source_allowed(body["kind"], body["source"],
@@ -1015,7 +1028,7 @@ class LiveStore:
         }
         if candidate.get("prompt_type") == "comment_reply":
             event["prompt_type"] = "comment_reply"
-            event["reply_to"] = candidate["reply_to"]
+            event["reply_to"] = {"comment_id": candidate["reply_to"]["comment_id"]}
         elif candidate.get("prompt_type") == "operation_notice":
             event["prompt_type"] = "operation_notice"
         with self.db:
@@ -1023,6 +1036,11 @@ class LiveStore:
                 "INSERT INTO live_events (session_id,topic_hash,generated_at_ms,expires_at_ms,payload) VALUES (?,?,?,?,?)",
                 (sid, topic_hash, now, now + PROMPT_TTL_MS,
                  json.dumps(event, ensure_ascii=False)),
+            )
+        self._expire_reply_context(now)
+        if candidate.get("prompt_type") == "comment_reply":
+            self.reply_context.setdefault(sid, {})[event["prompt_id"]] = (
+                now + PROMPT_TTL_MS, dict(candidate["reply_to"])
             )
         return {"reason": "generated", "prompt_id": event["prompt_id"]}
 
@@ -1050,6 +1068,9 @@ class LiveStore:
     @staticmethod
     def event(row):
         payload = json.loads(row["payload"])
+        reply = payload.get("reply_to")
+        if isinstance(reply, dict) and "text" not in reply:
+            payload.pop("reply_to")
         payload.update(generated_at_ms=row["generated_at_ms"],
                        expires_at_ms=row["expires_at_ms"],
                        returned_at_ms=row["returned_at_ms"],
@@ -1058,6 +1079,7 @@ class LiveStore:
 
     def events(self, sid: str, token: str | None, after: str = "", limit: int = 50):
         row = self.authorize(sid, token)
+        self._expire_reply_context(self.clock())
         seq = self.sequence(sid, after)
         records = self.db.execute(
             "SELECT * FROM live_events WHERE session_id=? AND seq>? ORDER BY seq LIMIT ?",
@@ -1072,6 +1094,7 @@ class LiveStore:
     def prompts(self, sid: str, token: str | None, after: str):
         session = self.authorize(sid, token)
         seq, now = self.sequence(sid, after), self.clock()
+        self._expire_reply_context(now)
         self._expire_comment_payloads(sid, now)
         stopped = session["stopped_at_ms"] is not None
         rows = [] if stopped else self.db.execute(
@@ -1087,6 +1110,9 @@ class LiveStore:
         prompts = []
         for row in rows:
             event = self.event(row)
+            context = self.reply_context.get(sid, {}).get(event["prompt_id"])
+            if context is not None and now < context[0]:
+                event["reply_to"] = dict(context[1])
             if event["returned_at_ms"] is None:
                 event.update(returned_at_ms=now, delivery_state="returned_to_client")
             prompts.append(event)

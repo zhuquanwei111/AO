@@ -1,4 +1,5 @@
 import asyncio
+import json
 from fastapi.testclient import TestClient
 import pytest
 
@@ -732,6 +733,112 @@ def test_phone_ocr_sample_real_reconstruction_through_controlled_reply(
         assert len(prompts) == 1 and prompts[0]["prompt_type"] == "comment_reply"
         assert prompts[0]["reply_to"]["text"] == expected_text
         assert prompts[0]["display_text"] == controlled_reply
+
+
+def test_reply_context_is_memory_only_and_history_remains_readable(tmp_path):
+    clock = [1_790_000_000_000]
+    cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="controlled",
+                   tianyi_base_url="http://model.invalid", tianyi_model="fake", dedup_ttl_seconds=60,
+                   max_sentence_chars=2000, model_timeout_seconds=1, model_connect_timeout_seconds=1,
+                   live_db_path=str(tmp_path / "transient-reference.sqlite3"))
+    class Model:
+        async def reply_to_comment(self, text, *, nickname, priority_eligible):
+            return "欢迎参与。"
+        async def aclose(self):
+            pass
+    async def wait_idle(app):
+        async with asyncio.timeout(3):
+            while app.state.live.fusion_active or app.state.live.fusion_queue:
+                await asyncio.sleep(0.005)
+    app = create_app(cfg, live_clock=lambda: clock[0])
+    with TestClient(app) as client:
+        app.state.model = Model()
+        first = client.post("/v1/live/sessions", json={}).json()
+        second = client.post("/v1/live/sessions", json={}).json()
+        third = client.post("/v1/live/sessions", json={}).json()
+        def submit(session, eid, raw):
+            sid = session["session_id"]
+            headers = {"X-Live-Session-Token": session["session_token"]}
+            row = {"kind": "comment", "event_id": eid, "source": "ios_replaykit_ocr",
+                   "observed_at_ms": clock[0], "availability": "available", "coverage": "ocr_visible_sample",
+                   "reliability": "known", "capture_batch_id": "batch-" + eid, "line_index": 0,
+                   "capture_comment_count": 1, "content": {"text": raw, "text_position":
+                       {"x": 0.1, "y": 0.5, "width": 0.4, "height": 0.04}}}
+            assert client.post(f"/v1/live/sessions/{sid}/observations", headers=headers, json=row).json()["reason"] == "scheduled"
+            client.portal.call(wait_idle, app)
+            return headers
+        h1 = submit(first, "a", "阿青：今晚月亮真漂亮")
+        h2 = submit(second, "b", "小林：今天天气真不错")
+        sid1, sid2 = first["session_id"], second["session_id"]
+        prompt = client.get(f"/v1/live/sessions/{sid1}/prompts", headers=h1).json()["prompts"][0]
+        assert prompt["reply_to"]["text"] == "今晚月亮真漂亮"
+        assert prompt["reply_to"]["nickname"] == "阿青"
+        stored = app.state.live.store.db.execute("SELECT payload FROM live_events WHERE session_id=?", (sid1,)).fetchone()[0]
+        assert "今晚月亮真漂亮" not in stored and "阿青" not in stored
+        assert json.loads(stored)["reply_to"] == {"comment_id": prompt["reply_to"]["comment_id"]}
+        history = client.get(f"/v1/live/sessions/{sid1}/events", headers=h1).json()["events"][0]
+        assert "reply_to" not in history and history["display_text"] == "欢迎参与。"
+        assert client.post(f"/v1/live/sessions/{sid1}/stop", headers=h1).status_code == 200
+        assert sid1 not in app.state.live.store.reply_context
+        assert sid2 in app.state.live.store.reply_context
+        clock[0] += 1
+        h3 = submit(third, "c", "小周：这首歌非常动听")
+        sid3 = third["session_id"]
+        clock[0] += 14_999
+        expired_history = client.get(f"/v1/live/sessions/{sid2}/events", headers=h2).json()
+        assert expired_history["events"][0]["display_text"] == "欢迎参与。"
+        assert sid2 not in app.state.live.store.reply_context
+        assert sid3 in app.state.live.store.reply_context
+    reopened = create_app(cfg, live_clock=lambda: clock[0])
+    with TestClient(reopened) as client:
+        resumed = client.get(f"/v1/live/sessions/{sid3}/prompts", headers=h3).json()
+        assert len(resumed["prompts"]) == 1
+        assert resumed["prompts"][0]["prompt_type"] == "comment_reply"
+        assert resumed["prompts"][0]["display_text"] == "欢迎参与。"
+        assert "reply_to" not in resumed["prompts"][0]
+        clock[0] += 1
+        assert client.get(f"/v1/live/sessions/{sid3}/prompts", headers=h3).json()["prompts"] == []
+        page = client.get(f"/v1/live/sessions/{sid3}/events", headers=h3).json()
+        assert len(page["events"]) == 1 and page["events"][0]["display_text"] == "欢迎参与。"
+        assert "reply_to" not in page["events"][0] and page["next_cursor"]
+
+
+def test_reply_context_respects_existing_event_capacity(tmp_path, monkeypatch):
+    import screen_assistant_server.live_store as store_module
+    monkeypatch.setattr(store_module, "MAX_EVENTS", 2)
+    now = 1_790_000_000_000
+    cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="controlled",
+                   tianyi_base_url="http://model.invalid", tianyi_model="fake", dedup_ttl_seconds=60,
+                   max_sentence_chars=2000, model_timeout_seconds=1, model_connect_timeout_seconds=1,
+                   live_db_path=str(tmp_path / "reference-limit.sqlite3"))
+    class Model:
+        async def reply_to_comment(self, text, *, nickname, priority_eligible):
+            return "欢迎参与。"
+        async def aclose(self):
+            pass
+    app = create_app(cfg, live_clock=lambda: now)
+    with TestClient(app) as client:
+        app.state.model = Model()
+        session = client.post("/v1/live/sessions", json={}).json()
+        sid = session["session_id"]
+        headers = {"X-Live-Session-Token": session["session_token"]}
+        async def wait_idle():
+            async with asyncio.timeout(3):
+                while app.state.live.fusion_active or app.state.live.fusion_queue:
+                    await asyncio.sleep(0.005)
+        for index, text in enumerate(("第一条有趣评论", "第二条有趣评论", "第三条有趣评论")):
+            row = {"kind": "comment", "event_id": str(index), "source": "ios_replaykit_ocr",
+                   "observed_at_ms": now, "availability": "available", "coverage": "ocr_visible_sample",
+                   "reliability": "known", "capture_batch_id": "batch-" + str(index), "line_index": 0,
+                   "capture_comment_count": 1, "content": {"text": "小林：" + text, "text_position":
+                       {"x": 0.1, "y": 0.5, "width": 0.4, "height": 0.04}}}
+            assert client.post(f"/v1/live/sessions/{sid}/observations", headers=headers, json=row).json()["reason"] == "scheduled"
+            client.portal.call(wait_idle)
+        events = client.get(f"/v1/live/sessions/{sid}/events", headers=headers).json()["events"]
+        assert len(events) == 2
+        assert len(app.state.live.store.reply_context[sid]) == 2
+        assert client.post(f"/v1/live/sessions/{sid}/stop", headers=headers).status_code == 200
+        assert sid not in app.state.live.store.reply_context
 
 
 def test_reply_cooldown_is_scoped_and_failure_does_not_create_cooldown(tmp_path):
