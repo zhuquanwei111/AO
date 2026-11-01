@@ -147,6 +147,25 @@ public class LiveConnectionTest {
         catch (Exception e) { throw new AssertionError(e); }
     }
 
+    @Test public void sameSessionPollPublishesAndInvalidatesObservationClock() throws Exception {
+        Memory store=new Memory(); Remote remote=new Remote();
+        List<ObservationClock> clocks=new ArrayList<>();
+        Display display=new Display() {
+            @Override public void observationClock(LiveClient.Session session, PromptTiming timing) {
+                clocks.add(ObservationClock.from(session.id,session.startedAt,timing));
+            }
+        };
+        LiveConnection connection=new LiveConnection(store,remote,display);
+        assertTrue(connection.connect()); assertTrue(connection.poll());
+        assertEquals(1,display.bindings); assertNotNull(clocks.get(0));
+        remote.page.remove("server_time_ms");
+        assertTrue(connection.poll()); assertNull(clocks.get(1));
+        remote.pollError=new IOException("offline");
+        assertFalse(connection.poll()); assertNull(clocks.get(2));
+        connection.close(false);
+        assertFalse(connection.poll()); assertEquals(3,clocks.size());
+    }
+
     @Test public void backendUnreachableStillRequestsStatusOverlayWithoutFakePrompts() throws Exception {
         Memory store = new Memory(); Remote remote = new Remote(); Display display = new Display();
         remote.createError = new ConnectException("refused");

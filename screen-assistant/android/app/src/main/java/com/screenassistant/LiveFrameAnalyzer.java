@@ -35,13 +35,18 @@ final class LiveFrameAnalyzer implements AutoCloseable {
     static final class Frame implements AutoCloseable {
         final Map<String,Bitmap> images=new LinkedHashMap<>();
         final Map<String,Rect> rects=new LinkedHashMap<>();
-        final long wall=System.currentTimeMillis(), uptime=SystemClock.elapsedRealtime();
+        final long captureNs=SystemClock.elapsedRealtimeNanos(), uptime=captureNs/1_000_000L;
+        final Long wall;
         final int width,height;
-        Frame(int width,int height) { this.width=width; this.height=height; }
+        Frame(int width,int height, ObservationClock clock, String sessionId) {
+            this.width=width; this.height=height;
+            wall=clock==null ? null : clock.observedAt(sessionId,captureNs);
+        }
         @Override public void close() { for (Bitmap b:images.values()) b.recycle(); }
     }
-    static Frame snapshot(Context context, Image image, boolean ocr, boolean person) {
-        Frame f=new Frame(image.getWidth(),image.getHeight());
+    static Frame snapshot(Context context, Image image, boolean ocr, boolean person,
+                          ObservationClock clock, String sessionId) {
+        Frame f=new Frame(image.getWidth(),image.getHeight(),clock,sessionId);
         try {
             for (String key:Regions.ACTIVE_KEYS) {
                 if (!ocr) continue;
@@ -128,6 +133,7 @@ final class LiveFrameAnalyzer implements AutoCloseable {
 
     void analyze(Frame frame) throws Exception {
         if (frame.uptime<earliestUptime) return;
+        if (frame.wall==null) { status.accept("采样时间未核实，本轮未上传"); return; }
         long frameStartMs=SystemClock.elapsedRealtime();
         long coldLoadMs=text.initializeBlocking();
         if (reset) {

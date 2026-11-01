@@ -99,6 +99,7 @@ public class CaptureService extends Service {
     private boolean connectionWorkerActive;
     private volatile String connectionStatus = "";
     private volatile LiveFrameAnalyzer liveAnalyzer;
+    private volatile ObservationClock observationClock;
     private long lastLiveOcr;
     private long lastLivePerson, lastFrameTimestamp;
     private AudioCapture audioCapture;
@@ -488,6 +489,7 @@ public class CaptureService extends Service {
             setupStage = "display_metrics";
             serverUrl = Prefs.getServerUrl(this);
             liveSession = null; // 实际场次/收件校验后才绑定，不从本地存储推断在线。
+            observationClock = null;
             intervalMs = Prefs.getIntervalSec(this) * 1000;
             int[] size = ScreenMetrics.realSizeDpi(this);
             screenSize = size;
@@ -593,7 +595,9 @@ public class CaptureService extends Service {
                 lastFrameTimestamp = image.getTimestamp();
                 boolean ocr = now - lastLiveOcr >= intervalMs;
                 boolean person = false;
-                frame = LiveFrameAnalyzer.snapshot(this, image, ocr, person);
+                LiveClient.Session currentSession=liveSession;
+                frame = LiveFrameAnalyzer.snapshot(this, image, ocr, person, observationClock,
+                        currentSession == null ? null : currentSession.id);
                 if (ocr) lastLiveOcr = now;
                 if (person) lastLivePerson = now;
             }
@@ -669,6 +673,13 @@ public class CaptureService extends Service {
         LiveConnection connection = new LiveConnection(Prefs.liveStore(this),
                 LiveClient.remote(serverUrl, Prefs.getLiveDescription(this), Prefs.getDouyinAccount(this)),
                 new LiveConnection.Listener() {
+                    @Override public void observationClock(LiveClient.Session session, PromptTiming timing) {
+                        if (tornDown || epoch != sessionEpoch) return;
+                        ObservationClock next=ObservationClock.from(session.id, session.startedAt, timing);
+                        observationClock=next;
+                        if (next==null && liveAnalyzer!=null)
+                            liveAnalyzer.invalidateBefore(SystemClock.elapsedRealtime()+1);
+                    }
                     @Override public void status(String text, boolean discard) {
                         main.post(() -> {
                             if (tornDown || epoch != sessionEpoch || text.equals(connectionStatus)) return;
@@ -1056,6 +1067,7 @@ public class CaptureService extends Service {
     private void teardownInternal() {
         if (liveConnection != null) liveConnection.close(false);
         tornDown = true;
+        observationClock = null;
         phase = Phase.IDLE;
         sessionEpoch++;
         messageGeneration++;

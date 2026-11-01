@@ -65,6 +65,7 @@ final class LiveConnection {
     interface Listener {
         void status(String text, boolean discardMessage);
         void session(LiveClient.Session session);
+        default void observationClock(LiveClient.Session session, PromptTiming timing) { }
         void prompt(JSONObject prompt);
         default void promptDropped(String id, String reason) { }
         void ended();
@@ -213,13 +214,14 @@ final class LiveConnection {
             synchronized (this) {
                 if (closed) return false;
                 if (!announced) { announced = true; listener.session(session); }
+                listener.observationClock(session, timing);
                 status("实时已连接，等待运营提示\n" + recap + (timingProblem ? "\n" + TIME_UNKNOWN : "")
                         + (priorityProblem ? "\n" + PRIORITY_UNKNOWN : ""), false);
                 for (int i = 0; i < ready.length() && !closed; i++) listener.prompt(ready.getJSONObject(i));
                 cursor = next;
             }
             return true;
-        } catch (Exception e) { status(OFFLINE, true); return false; }
+        } catch (Exception e) { if (!closed) listener.observationClock(session, null); status(OFFLINE, true); return false; }
     }
 
     private void registerRecap() {

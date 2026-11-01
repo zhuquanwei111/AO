@@ -227,6 +227,33 @@ public class LiveConnectionHttpTest {
         }
     }
 
+    @Test public void realPollClockProducesFrozenObservationForSameSession() throws Exception {
+        try (Fixture fixture=new Fixture()) {
+            fixture.createCapabilities=",\"capabilities\":{\"observation_batch_metadata\":true}";
+            final ObservationClock[] clock={null}; final PromptTiming[] timing={null};
+            LiveConnectionTest.Memory store=new LiveConnectionTest.Memory();
+            LiveConnectionTest.Display display=new LiveConnectionTest.Display() {
+                @Override public void observationClock(LiveClient.Session session, PromptTiming page) {
+                    timing[0]=page; clock[0]=ObservationClock.from(session.id,session.startedAt,page);
+                }
+            };
+            LiveConnection connection=new LiveConnection(store,remote(fixture.base(),"",""),display);
+            assertTrue(connection.connect()); assertTrue(connection.poll()); assertNotNull(clock[0]);
+            long sampled=clock[0].observedAt(store.session.id,timing[0].receivedNs+500_000_000L);
+            CollectedRows<org.json.JSONObject> rows=new CollectedRows<>(4);
+            LiveFrameAnalyzer.collectComment(rows,3,"合成评论",sampled,new org.json.JSONObject(),.8);
+            LiveFrameAnalyzer.freezeObservationMetadata(rows,true);
+            String frozen=rows.rows.get(0).value.toString();
+            assertTrue(connection.poll());
+            LiveClient.call(store.session,"observations",rows.rows.get(0).value);
+            assertEquals(frozen,fixture.observationBodies.get(0));
+            assertEquals(1500,rows.rows.get(0).value.getLong("observed_at_ms"));
+            assertEquals(3,rows.rows.get(0).value.getInt("line_index"));
+            assertEquals(1,rows.rows.get(0).value.getInt("capture_comment_count"));
+            connection.close(false);
+        }
+    }
+
     @Test public void createCapabilityControlsRealObservationBodies() throws Exception {
         try (Fixture fixture = new Fixture()) {
             fixture.createCapabilities = ",\"capabilities\":{\"observation_batch_metadata\":true}";

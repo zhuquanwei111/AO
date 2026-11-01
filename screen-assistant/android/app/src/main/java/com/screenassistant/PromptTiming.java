@@ -7,11 +7,11 @@ final class PromptTiming {
     static final String SENT_NS = "_client_sent_elapsed_ns";
     static final String RECEIVED_NS = "_client_received_elapsed_ns";
     static final String DEADLINE_MS = "_client_expires_elapsed_ms";
-    final long serverTimeMs, processingMs, rttMs, receivedMs, transportMs;
+    final long serverTimeMs, processingMs, rttMs, receivedMs, receivedNs, transportMs;
 
     private PromptTiming(long serverTime, long processing, long rtt, long received) {
         serverTimeMs = serverTime; processingMs = processing; rttMs = rtt;
-        receivedMs = received; transportMs = rtt - processing;
+        receivedNs = received; receivedMs = received / 1_000_000L; transportMs = rtt - processing;
     }
 
     static PromptTiming from(JSONObject page) {
@@ -22,7 +22,7 @@ final class PromptTiming {
         long duration = received - sent;
         long rtt = duration / 1_000_000L + (duration % 1_000_000L == 0 ? 0 : 1);
         if (processing > rtt) return null;
-        return new PromptTiming(server, processing, rtt, received / 1_000_000L);
+        return new PromptTiming(server, processing, rtt, received);
     }
 
     /** 负数表示非法时效，0表示已过期；不按接收时刻重建源TTL。 */
