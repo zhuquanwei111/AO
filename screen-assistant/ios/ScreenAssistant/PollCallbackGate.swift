@@ -2,6 +2,18 @@ import Foundation
 
 /// 调用方须在持有当前场次和代次的串行上下文中调用。
 enum PollCallbackGate {
+    enum Disposition { case stale, savedCredentialsMismatch, current }
+
+    static func disposition(sessionID: String, token: String, generation: Int,
+                            currentSessionID: String?, currentToken: String?, currentGeneration: Int,
+                            savedSessionID: String?, savedToken: String?,
+                            active: Bool, stopping: Bool) -> Disposition {
+        guard active, !stopping, generation == currentGeneration,
+              sessionID == currentSessionID, token == currentToken else { return .stale }
+        guard sessionID == savedSessionID, token == savedToken else { return .savedCredentialsMismatch }
+        return .current
+    }
+
     static func matchesCredentials(sessionID: String, token: String,
                                    currentSessionID: String?, currentToken: String?,
                                    savedSessionID: String?, savedToken: String?) -> Bool {

@@ -43,13 +43,24 @@ struct ContentView: View {
                         if model.liveActive { model.stopLiveSession() }
                         else { model.startLiveSession() }
                     }
-                    .disabled(model.liveStarting || model.liveStopping)
+                    .disabled(model.liveStarting || model.liveStopping || model.isolatedStopInFlight)
                     if model.liveStarting || model.liveStopping {
                         ProgressView(model.liveStarting ? "正在创建后台场次…" : "正在结束本场…")
                     }
                     Text(model.liveStatus)
                         .font(.footnote)
                         .foregroundColor(.secondary)
+                    if !model.isolatedStopStatus.isEmpty {
+                        Text(model.isolatedStopStatus).font(.footnote).foregroundColor(.secondary)
+                    }
+                    if model.isolatedStopAvailable {
+                        Button("重试结束原场") { model.retryIsolatedStop() }
+                            .disabled(model.isolatedStopInFlight || model.liveStopping)
+                    }
+                    if model.liveVerificationNeedsRetry {
+                        Button("重试核验本场") { model.retryLiveVerification() }
+                            .disabled(model.liveStarting || model.liveStopping || model.isolatedStopInFlight)
+                    }
                     if model.liveTimingWarning {
                         Text("部分提示缺少可靠时效信息，未在画中画显示；实时采集仍可继续。时间锚异常 \(model.liveTimingAnchorFailures) 次，单条时效异常 \(model.liveTimingInvalidItems) 条。")
                             .font(.footnote)

@@ -22,6 +22,18 @@ private final class PollFixtureProtocol: URLProtocol {
             client?.urlProtocol(self, didFailWithError: URLError(.userAuthenticationRequired))
             return
         }
+        if path.hasPrefix("/isolated-stop") {
+            guard request.url?.host == "poll-fixture.invalid", request.url?.port == 8443,
+                  path.hasSuffix("/v1/live/sessions/fixture-session/stop"),
+                  request.value(forHTTPHeaderField: "X-Live-Session-Token") == "fixture-token" else {
+                client?.urlProtocol(self, didFailWithError: URLError(.userAuthenticationRequired))
+                return
+            }
+            if path.hasPrefix("/isolated-stop-timeout/") {
+                client?.urlProtocol(self, didFailWithError: URLError(.timedOut))
+                return
+            }
+        }
         if path.hasPrefix("/immediate-") {
             let query = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems
             guard query?.first(where: { $0.name == "wait_ms" })?.value == "0",
@@ -339,6 +351,70 @@ final class PollTransportTests: XCTestCase {
         XCTAssertFalse(PollCallbackGate.matchesCredentials(sessionID: "fixture-session", token: "old",
             currentSessionID: "fixture-session", currentToken: "old",
             savedSessionID: "fixture-session", savedToken: "new"))
+    }
+    func testPollDispositionSeparatesStaleAndSavedIdentityMismatch() {
+        func check(currentToken: String?, savedToken: String?, generation: Int = 1,
+                   active: Bool = true, stopping: Bool = false) -> PollCallbackGate.Disposition {
+            PollCallbackGate.disposition(sessionID: "fixture-session", token: "fixture-token", generation: 1,
+                currentSessionID: "fixture-session", currentToken: currentToken, currentGeneration: generation,
+                savedSessionID: savedToken == nil ? nil : "fixture-session", savedToken: savedToken,
+                active: active, stopping: stopping)
+        }
+        XCTAssertEqual(check(currentToken: "fixture-token", savedToken: "fixture-token"), .current)
+        XCTAssertEqual(check(currentToken: "fixture-token", savedToken: nil), .savedCredentialsMismatch)
+        XCTAssertEqual(check(currentToken: "fixture-token", savedToken: "other"), .savedCredentialsMismatch)
+        XCTAssertEqual(check(currentToken: "other", savedToken: "fixture-token"), .stale)
+        XCTAssertEqual(check(currentToken: "fixture-token", savedToken: "fixture-token", generation: 2), .stale)
+        XCTAssertEqual(check(currentToken: "fixture-token", savedToken: "fixture-token", stopping: true), .stale)
+    }
+    func testIsolatedStopUsesFrozenServiceAndKeepsSharedState() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let slot = directory.appendingPathComponent("pending.json")
+        let otherSession = directory.appendingPathComponent("current.json")
+        let otherBytes = Data("{\"session_id\":\"other\",\"session_token\":\"other-token\",\"started_at_ms\":1}".utf8)
+        try otherBytes.write(to: otherSession)
+        for (path, expected) in [("isolated-stop", true), ("isolated-stop-timeout", false)] {
+            let url = try XCTUnwrap(URL(string: "https://poll-fixture.invalid:8443/\(path)"))
+            let intent = IsolatedStopIntent(credentials: credentials, serviceURL: url)
+            XCTAssertTrue(LiveSessionState.saveIsolatedStop(intent, fileURL: slot))
+            let restored = try XCTUnwrap(LiveSessionState.isolatedStopIntent(fileURL: slot))
+            XCTAssertEqual(restored.serviceURL, url)
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [PollFixtureProtocol.self]
+            let session = URLSession(configuration: configuration)
+            let client = try XCTUnwrap(LiveOperationsClient(baseURL: restored.serviceURL, session: session))
+            let beforeConnection = ControlState.serviceConnection()
+            let beforeCapture = ControlState.userWantsCapture()
+            let beforeEnabled = LiveSessionState.isEnabled()
+            let finished = expectation(description: path)
+            client.stop(restored.credentials, recordResponse: false) { ok, _, _ in
+                XCTAssertEqual(ok, expected)
+                XCTAssertEqual(ControlState.serviceConnection(), beforeConnection)
+                XCTAssertEqual(ControlState.userWantsCapture(), beforeCapture)
+                XCTAssertEqual(LiveSessionState.isEnabled(), beforeEnabled)
+                finished.fulfill()
+            }
+            wait(for: [finished], timeout: 5)
+            session.invalidateAndCancel()
+            XCTAssertEqual(try Data(contentsOf: otherSession), otherBytes)
+            if expected { XCTAssertTrue(LiveSessionState.clearIsolatedStop(restored, fileURL: slot)) }
+            else { XCTAssertTrue(LiveSessionState.isolatedStopIntent(fileURL: slot)?.matches(restored) == true) }
+        }
+        let unknown = directory.appendingPathComponent("unknown.json")
+        try Data("{\"credentials\":{\"session_id\":\"fixture-session\",\"session_token\":\"fixture-token\",\"started_at_ms\":1}}".utf8).write(to: unknown)
+        XCTAssertNil(LiveSessionState.isolatedStopIntent(fileURL: unknown))
+        let safe = IsolatedStopIntent(credentials: credentials, serviceURL: try XCTUnwrap(URL(string: "https://poll-fixture.invalid:8443/isolated-stop")))
+        XCTAssertFalse(LiveSessionState.saveIsolatedStop(safe, fileURL: unknown))
+        XCTAssertFalse(LiveSessionState.saveIsolatedStop(safe, fileURL: directory.appendingPathComponent("missing/pending.json")))
+        let otherService = IsolatedStopIntent(credentials: credentials, serviceURL: try XCTUnwrap(URL(string: "https://poll-fixture.invalid:9443/isolated-stop")))
+        XCTAssertFalse(LiveSessionState.saveIsolatedStop(otherService, fileURL: slot))
+        XCTAssertFalse(LiveSessionState.clearIsolatedStop(otherService, fileURL: slot))
+        for text in ["https://u:p@poll-fixture.invalid/", "https://poll-fixture.invalid/?secret=x", "https://poll-fixture.invalid/#fragment"] {
+            let invalid = IsolatedStopIntent(credentials: credentials, serviceURL: try XCTUnwrap(URL(string: text)))
+            XCTAssertFalse(LiveSessionState.saveIsolatedStop(invalid, fileURL: directory.appendingPathComponent(UUID().uuidString)))
+        }
     }
     func testMalformedTimingDoesNotFailPoll() { check("invalid-timing", expectedHTTP: 200) }
     func testFloatingTimingDoesNotFailPoll() { check("float-timing", expectedHTTP: 200) }

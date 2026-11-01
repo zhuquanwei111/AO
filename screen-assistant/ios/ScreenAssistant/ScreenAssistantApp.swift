@@ -67,6 +67,10 @@ final class AppModel: ObservableObject {
     @Published var liveStarting = false
     @Published var liveStopping = false
     @Published var liveConnectionPending = false
+    @Published private(set) var liveVerificationNeedsRetry = false
+    @Published private(set) var isolatedStopAvailable = false
+    @Published private(set) var isolatedStopInFlight = false
+    @Published private(set) var isolatedStopStatus = ""
     @Published var broadcastStatusText = "系统屏幕广播状态尚未确认"
     @Published var serviceStatusText = "服务连接尚未通过请求核验"
     @Published var observationUploadStatus = "采样上传暂无诊断"
@@ -82,6 +86,7 @@ final class AppModel: ObservableObject {
     private var livePollTask: URLSessionDataTask?
     private var livePollGeneration = 0
     private var liveStartGeneration = 0
+    private var isolatedStopGeneration = 0
     private var liveCursor = ""
     private var liveDelivery = LivePromptDelivery()
     private var liveDisplayedUntilMS: Int64?
@@ -113,17 +118,30 @@ final class AppModel: ObservableObject {
             now: Date()
         )
         serviceStatusText = Self.serviceStatusDescription(ControlState.serviceConnection(), now: Date())
-        if LiveSessionState.credentials() == nil {
+        if LiveSessionState.credentials() == nil && !LiveSessionState.isolatedStopRecordExists() {
             audioSettings.appHostConfirmed = false
             audioSettings.micHostConfirmed = false
             AudioCaptureSettings.save(audioSettings)
         }
         let savedLiveCredentials = LiveSessionState.credentials()
+        let pendingIsolatedStop = LiveSessionState.isolatedStopIntent()
+        let unknownStopRecord = pendingIsolatedStop == nil && LiveSessionState.isolatedStopRecordExists()
+        if pendingIsolatedStop != nil {
+            isolatedStopAvailable = true
+            isolatedStopStatus = "有原场结束尚未确认，可手动重试"
+        } else if unknownStopRecord {
+            isolatedStopStatus = "原场结束尚未确认，原服务信息不足或记录不可读取"
+        }
+        let pendingOwnsSaved = pendingIsolatedStop.map {
+            $0.credentials.sessionID == savedLiveCredentials?.sessionID &&
+            $0.credentials.token == savedLiveCredentials?.token &&
+            $0.serviceURL.absoluteString == SharedConfig.serverBaseURL()?.absoluteString
+        } ?? false
         let savedConnectionPending = savedLiveCredentials?.liveConnectionPending == true
-        liveActive = LiveSessionState.recoverActive(savedLiveCredentials,
+        liveActive = !pendingOwnsSaved && !unknownStopRecord && LiveSessionState.recoverActive(savedLiveCredentials,
                                                    captureEnabled: LiveSessionState.isEnabled())
         liveConnectionPending = liveActive && savedConnectionPending
-        if liveActive && LiveSessionState.holdCaptureOnRecovery(savedLiveCredentials) { captureWanted = false }
+        if pendingOwnsSaved || (liveActive && LiveSessionState.holdCaptureOnRecovery(savedLiveCredentials)) { captureWanted = false }
         roundCounter = ControlState.roundCounter()
 
         // 轮询共享状态（扩展每完成一轮会 bump 计数器）。
@@ -152,7 +170,11 @@ final class AppModel: ObservableObject {
                 self.deliverLivePrompts()
             }
 
-        if liveActive, let credentials = Self.savedCredentials() {
+        if pendingOwnsSaved {
+            liveStatus = "原场结束尚未确认，采集未恢复"
+        } else if unknownStopRecord {
+            liveStatus = "原场结束记录无法确认，未自动恢复场次"
+        } else if liveActive, let credentials = Self.savedCredentials() {
             PiPDisplayController.shared.setLiveSessionActive(true)
             liveCredentials = credentials
             liveClient = SharedConfig.serverBaseURL().flatMap { LiveOperationsClient(baseURL: $0) }
@@ -166,7 +188,7 @@ final class AppModel: ObservableObject {
                 liveStatus = "恢复当前场次收件"
             }
             if liveClient != nil && credentials.stopPending != true { pollLivePrompts() }
-        } else if LiveSessionState.isEnabled() {
+        } else if LiveSessionState.isEnabled() && !LiveSessionState.isolatedStopRecordExists() {
             LiveSessionState.clear()
         } else if let credentials = savedLiveCredentials {
             liveStopped = true
@@ -188,6 +210,7 @@ final class AppModel: ObservableObject {
     }
 
     func startLiveSession() {
+        guard !isolatedStopInFlight else { return }
         guard !liveStarting, !liveStopping else { return }
         let account = douyinAccount.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !account.isEmpty else {
@@ -280,6 +303,7 @@ final class AppModel: ObservableObject {
         livePollGeneration &+= 1
         livePollTask?.cancel()
         livePollTask = nil
+        liveVerificationNeedsRetry = false
         liveEvents = []
         liveTimingWarning = false
         liveTimingAnchorFailures = 0
@@ -320,14 +344,26 @@ final class AppModel: ObservableObject {
     }
 
     func stopLiveSession() {
-        guard !liveStopping else { return }
+        guard !liveStopping, !isolatedStopInFlight else { return }
         guard let credentials = liveCredentials ?? Self.savedCredentials(),
               let client = liveClient ?? SharedConfig.serverBaseURL().flatMap({ LiveOperationsClient(baseURL: $0) }) else {
             liveStatus = "没有可停止的场次"
             return
         }
+        let saved = Self.savedCredentials()
+        if saved?.sessionID != credentials.sessionID || saved?.token != credentials.token ||
+            (liveClient != nil && liveClient?.baseURL.absoluteString != SharedConfig.serverBaseURL()?.absoluteString) {
+            guard let originalClient = liveClient else {
+                isolatedStopStatus = "原场服务信息不足，未发送结束请求"
+                return
+            }
+            let intent = IsolatedStopIntent(credentials: credentials, serviceURL: originalClient.baseURL)
+            beginIsolatedStop(intent, client: originalClient)
+            return
+        }
         liveStartGeneration &+= 1
         let stopGeneration = liveStartGeneration
+        liveVerificationNeedsRetry = false
         liveStarting = false
         livePollGeneration &+= 1
         livePollTask?.cancel()
@@ -350,7 +386,9 @@ final class AppModel: ObservableObject {
         liveStatus = "本机采集已停止；正在确认服务端结束…"
         client.stop(stoppingCredentials, recordResponse: false) { [weak self] ok, response, error in
             DispatchQueue.main.async {
-                guard let self, let saved = Self.savedCredentials(),
+                guard let self, self.liveClient?.baseURL.absoluteString == client.baseURL.absoluteString,
+                      SharedConfig.serverBaseURL()?.absoluteString == client.baseURL.absoluteString,
+                      let saved = Self.savedCredentials(),
                       saved.token == stoppingCredentials.token, PollCallbackGate.commitIfCurrent(
                     sessionID: stoppingCredentials.sessionID, generation: stopGeneration,
                     currentSessionID: saved.sessionID,
@@ -387,10 +425,22 @@ final class AppModel: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 let saved = Self.savedCredentials()
-                guard PollCallbackGate.matchesCredentials(
-                    sessionID: credentials.sessionID, token: credentials.token,
+                let disposition = PollCallbackGate.disposition(
+                    sessionID: credentials.sessionID, token: credentials.token, generation: generation,
                     currentSessionID: self.liveCredentials?.sessionID, currentToken: self.liveCredentials?.token,
-                    savedSessionID: saved?.sessionID, savedToken: saved?.token) else { return }
+                    currentGeneration: self.livePollGeneration,
+                    savedSessionID: saved?.sessionID, savedToken: saved?.token,
+                    active: self.liveActive, stopping: self.liveStopping)
+                guard disposition != .stale else { return }
+                if disposition == .savedCredentialsMismatch {
+                    if self.liveConnectionPending {
+                        self.livePollTask = nil
+                        self.liveVerificationNeedsRetry = true
+                        self.liveStatus = "本场尚未核验，采集未开启；请检查本场授权后重试"
+                    }
+                    return
+                }
+                self.liveVerificationNeedsRetry = false
                 guard PollCallbackGate.commitIfCurrent(
                     sessionID: credentials.sessionID, generation: generation,
                     currentSessionID: self.liveCredentials?.sessionID,
@@ -478,6 +528,86 @@ final class AppModel: ObservableObject {
                         ? Self.liveVerificationFailureMessage(error)
                         : "运营收件暂不可用，正在重试"
                     self.scheduleLivePromptRetry(sessionID: credentials.sessionID, generation: generation)
+                }
+            }
+        }
+    }
+
+    func retryLiveVerification() {
+        guard liveVerificationNeedsRetry, liveConnectionPending, liveActive, !liveStarting, !liveStopping,
+              !isolatedStopInFlight,
+              let credentials = liveCredentials else { return }
+        if let pending = LiveSessionState.isolatedStopIntent(),
+           pending.credentials.sessionID == credentials.sessionID,
+           pending.credentials.token == credentials.token,
+           pending.serviceURL.absoluteString == liveClient?.baseURL.absoluteString { return }
+        let saved = Self.savedCredentials()
+        guard PollCallbackGate.matchesCredentials(sessionID: credentials.sessionID, token: credentials.token,
+            currentSessionID: liveCredentials?.sessionID, currentToken: liveCredentials?.token,
+            savedSessionID: saved?.sessionID, savedToken: saved?.token) else {
+            liveStatus = "本场尚未核验，采集未开启；请检查本场授权后重试"
+            return
+        }
+        liveVerificationNeedsRetry = false
+        liveStatus = "正在重新核验本场实时连接"
+        pollLivePrompts()
+    }
+
+    func retryIsolatedStop() {
+        guard !isolatedStopInFlight, let intent = LiveSessionState.isolatedStopIntent(),
+              let client = LiveOperationsClient(baseURL: intent.serviceURL) else {
+            isolatedStopStatus = "原场结束记录或服务地址不可用，未发送请求，可重试"
+            return
+        }
+        beginIsolatedStop(intent, client: client)
+    }
+
+    private func beginIsolatedStop(_ intent: IsolatedStopIntent, client: LiveOperationsClient) {
+        guard !isolatedStopInFlight else { return }
+        guard client.baseURL.absoluteString == intent.serviceURL.absoluteString,
+              LiveSessionState.saveIsolatedStop(intent) else {
+            isolatedStopStatus = "原场结束意图未能安全保存，未发送请求，可重试"
+            return
+        }
+        let credentials = intent.credentials
+        isolatedStopAvailable = true
+        isolatedStopInFlight = true
+        isolatedStopGeneration &+= 1
+        let generation = isolatedStopGeneration
+        let startGeneration = liveStartGeneration
+        if liveCredentials?.sessionID == credentials.sessionID && liveCredentials?.token == credentials.token &&
+            liveClient?.baseURL.absoluteString == intent.serviceURL.absoluteString {
+            livePollGeneration &+= 1
+            livePollTask?.cancel()
+            livePollTask = nil
+            liveVerificationNeedsRetry = false
+        }
+        isolatedStopStatus = "正在确认原场结束"
+        client.stop(credentials, recordResponse: false) { [weak self] ok, _, _ in
+            DispatchQueue.main.async {
+                guard let self, self.isolatedStopGeneration == generation,
+                      self.liveStartGeneration == startGeneration,
+                      let pending = LiveSessionState.isolatedStopIntent(), pending.matches(intent) else { return }
+                self.isolatedStopInFlight = false
+                guard ok else {
+                    self.isolatedStopStatus = "原场结束尚未确认，可重试"
+                    return
+                }
+                guard LiveSessionState.clearIsolatedStop(intent) else {
+                    self.isolatedStopStatus = "原场结束已确认，但待结束记录未清除，可重试核销"
+                    return
+                }
+                self.isolatedStopAvailable = false
+                self.isolatedStopStatus = "原场结束已确认"
+                if self.liveCredentials?.sessionID == credentials.sessionID,
+                   self.liveCredentials?.token == credentials.token,
+                   self.liveClient?.baseURL.absoluteString == intent.serviceURL.absoluteString {
+                    self.liveActive = false
+                    self.liveStopped = true
+                    self.liveConnectionPending = false
+                    self.liveVerificationNeedsRetry = false
+                    self.liveCredentials = nil
+                    self.liveStatus = "原场结束已确认"
                 }
             }
         }
