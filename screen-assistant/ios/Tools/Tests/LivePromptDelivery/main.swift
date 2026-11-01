@@ -1,5 +1,36 @@
 import Foundation
 
+assert(LivePromptDelivery.promptLabel("comment_reply") == "评论回复")
+assert(LivePromptDelivery.promptLabel("operation_notice") == "运营提醒")
+assert(LivePromptDelivery.promptLabel(nil) == "提示")
+assert(LivePromptDelivery.promptLabel("future") == "提示")
+
+var decisions: [String] = []
+var recorded = LivePromptDelivery(capacity: 1, intervalMS: 0)
+let tracked = LivePromptDelivery.Item(id: "tracked", text: "private", expiresAtMS: 10_000,
+                                      priority: 0, promptType: "comment_reply")
+let dropped = LivePromptDelivery.Item(id: "dropped", text: "private", expiresAtMS: 20_000,
+                                      priority: 0, promptType: "operation_notice")
+_ = recorded.receive([tracked, dropped], nowMS: 0) { item, reason in
+    decisions.append("\(item.id):\(item.promptType ?? "unknown"):\(reason)")
+}
+assert(decisions == ["tracked:comment_reply:received", "tracked:comment_reply:queued",
+                     "dropped:operation_notice:received", "dropped:operation_notice:queue_full"])
+_ = recorded.take(nowMS: 10_000, onDecision: { item, reason in decisions.append("\(item.id):\(reason)") }) { _ in true }
+assert(decisions.last == "tracked:expired_in_queue")
+var urgentDecisions: [String] = []
+var urgentRecorder = LivePromptDelivery(capacity: 1, intervalMS: 0)
+let urgentItem = LivePromptDelivery.Item(id: "urgent", text: "private", expiresAtMS: 20,
+                                         priority: 100, promptType: "operation_notice")
+let invalid = LivePromptDelivery.Item(id: "invalid", text: "private", expiresAtMS: 0,
+                                      priority: 0, timingInvalid: true, promptType: "comment_reply")
+_ = urgentRecorder.receive([tracked, urgentItem, invalid], nowMS: 0) { item, reason in
+    urgentDecisions.append("\(item.id):\(reason)")
+}
+assert(urgentDecisions == ["tracked:received", "tracked:queued", "urgent:received",
+                           "tracked:displaced_by_urgent", "urgent:queued",
+                           "invalid:received", "invalid:invalid_timing"])
+assert(urgentRecorder.take(nowMS: 1) { _ in true }.map(\.id) == ["urgent"])
 var malformedPriority = LivePromptDelivery(intervalMS: 0)
 let unsafePriority = LivePromptDelivery.Item(id: "bad", text: "bad", expiresAtMS: 100,
                                              priority: nil, priorityInvalid: true)
@@ -17,15 +48,15 @@ assert(LivePromptDelivery.unexpired(displayed, nowMS: 9_000).isEmpty)
 var readable = LivePromptDelivery()
 _ = readable.receive([item("A", expires: 10_000)], nowMS: 0)
 assert(readable.take(nowMS: 0, fits: fitsTwo).map(\.id) == ["A"])
-_ = readable.receive([item("B", expires: 10_000)], nowMS: 887)
+_ = readable.receive([item("B", expires: 12_000)], nowMS: 887)
 assert(readable.take(nowMS: 887, fits: fitsTwo).isEmpty)
 assert(readable.take(nowMS: 7_999, fits: fitsTwo).isEmpty)
 assert(readable.take(nowMS: 8_000, fits: fitsTwo).map(\.id) == ["B"])
 readable.clear()
-_ = readable.receive([item("A", expires: 2_000)], nowMS: 0)
+_ = readable.receive([item("A", expires: 3_000)], nowMS: 0)
 let shortFrame = readable.take(nowMS: 0, fits: fitsTwo)
 _ = readable.receive([item("B", expires: 4_000)], nowMS: 887)
-assert(LivePromptDelivery.unexpired(shortFrame, nowMS: 2_000).isEmpty)
+assert(LivePromptDelivery.unexpired(shortFrame, nowMS: 3_000).isEmpty)
 assert(readable.take(nowMS: 8_000, fits: fitsTwo).isEmpty)
 assert(readable.expiredCount == 1)
 readable.clear()
@@ -70,7 +101,7 @@ assert(LivePromptDelivery.displayExpiry(16_000, serverTimeMS: 1_000, processingM
 assert(LivePromptDelivery.displayExpiry(16_000, serverTimeMS: 1_000, processingMS: 15_000, startNS: 0, endNS: 16_000_000_000) == 29_999)
 assert(LivePromptDelivery.displayExpiry(1_002, serverTimeMS: 1_000, processingMS: 0, startNS: 0, endNS: 1_000_000) == 1)
 _ = delivery.receive([item("timed", expires: expiry)], nowMS: 15_010)
-assert(delivery.take(nowMS: 29_998, fits: fitsTwo).map(\.id) == ["timed"])
+assert(delivery.take(nowMS: 29_998, fits: fitsTwo).isEmpty)
 delivery.clear()
 _ = delivery.receive([item("slept", expires: expiry)], nowMS: 15_010)
 assert(delivery.take(nowMS: 30_000, fits: fitsTwo).isEmpty)
@@ -84,7 +115,7 @@ assert(delivery.take(nowMS: 20_000, fits: fitsTwo).isEmpty)
 delivery.clear()
 _ = delivery.receive([item("long-urgent", expires: 100_000, priority: 100)], nowMS: 100)
 assert(delivery.take(nowMS: 100, fits: fitsTwo).map(\.id) == ["long-urgent"])
-_ = delivery.receive([item("ordinary", expires: 5_000)], nowMS: 101)
+_ = delivery.receive([item("ordinary", expires: 7_000)], nowMS: 101)
 assert(delivery.take(nowMS: 3_099, fits: fitsTwo).isEmpty)
 assert(delivery.take(nowMS: 3_100, fits: fitsTwo).map(\.id) == ["ordinary"])
 print("OK: live prompt deduplication, capacity, interval, expiry, priority and reset")

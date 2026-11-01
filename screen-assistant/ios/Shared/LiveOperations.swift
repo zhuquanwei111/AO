@@ -23,6 +23,22 @@ enum LiveCommentFilter {
     }
 }
 
+struct LiveCapabilities: Codable {
+    let observationBatchMetadata: Bool?
+    let typedPrompts: Bool?
+    var supportsObservationBatch: Bool {
+        observationBatchMetadata == true
+    }
+    enum CodingKeys: String, CodingKey {
+        case observationBatchMetadata = "observation_batch_metadata", typedPrompts = "typed_prompts"
+    }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        observationBatchMetadata = try? values.decode(Bool.self, forKey: .observationBatchMetadata)
+        typedPrompts = try? values.decode(Bool.self, forKey: .typedPrompts)
+    }
+}
+
 struct LiveSessionCredentials: Codable {
     let sessionID: String
     let token: String
@@ -34,6 +50,7 @@ struct LiveSessionCredentials: Codable {
     var backstageStartPending: Bool?
     var liveConnectionPending: Bool?
     var stopPending: Bool? = nil
+    var capabilities: LiveCapabilities? = nil
     /// 仅保存在本地，由创建场次时实际使用的 client 确定。
     var boundServiceURL: URL? = nil
     func captureServiceURL(configured: URL?) -> URL? {
@@ -53,7 +70,31 @@ struct LiveSessionCredentials: Codable {
         case backstageStartPending = "backstage_start_pending"
         case liveConnectionPending = "live_connection_pending"
         case stopPending = "stop_pending"
+        case capabilities
         case boundServiceURL = "local_bound_service_url"
+    }
+    init(sessionID: String, token: String, startedAtMS: Int64, douyinAccount: String?,
+         backstageTaskID: String?, backstageStatus: String?, backstageStartPending: Bool?,
+         liveConnectionPending: Bool?, stopPending: Bool? = nil, capabilities: LiveCapabilities? = nil) {
+        self.sessionID = sessionID; self.token = token; self.startedAtMS = startedAtMS
+        self.douyinAccount = douyinAccount; self.backstageTaskID = backstageTaskID
+        self.backstageStatus = backstageStatus; self.backstageStartPending = backstageStartPending
+        self.liveConnectionPending = liveConnectionPending; self.stopPending = stopPending
+        self.capabilities = capabilities
+    }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try values.decode(String.self, forKey: .sessionID)
+        token = try values.decode(String.self, forKey: .token)
+        startedAtMS = try values.decode(Int64.self, forKey: .startedAtMS)
+        douyinAccount = try values.decodeIfPresent(String.self, forKey: .douyinAccount)
+        backstageTaskID = try values.decodeIfPresent(String.self, forKey: .backstageTaskID)
+        backstageStatus = try values.decodeIfPresent(String.self, forKey: .backstageStatus)
+        backstageStartPending = try values.decodeIfPresent(Bool.self, forKey: .backstageStartPending)
+        liveConnectionPending = try values.decodeIfPresent(Bool.self, forKey: .liveConnectionPending)
+        stopPending = try values.decodeIfPresent(Bool.self, forKey: .stopPending)
+        capabilities = try? values.decode(LiveCapabilities.self, forKey: .capabilities)
+        boundServiceURL = try? values.decode(URL.self, forKey: .boundServiceURL)
     }
 }
 
@@ -94,15 +135,24 @@ struct LivePrompt: Codable, Identifiable {
     var expiresAtMS: Int64?
     var priority: Int?
     let sources: [LivePromptSource]?
+    var promptType: String?
+    var replyTo: LivePromptReplyTo?
     var priorityInvalid: Bool
     let sourcesInvalid: Bool
     var id: String { promptID }
+    mutating func applyCapabilities(_ capabilities: LiveCapabilities?) {
+        if capabilities?.typedPrompts != true {
+            promptType = nil
+            replyTo = nil
+        }
+    }
     enum CodingKeys: String, CodingKey {
         case promptID = "prompt_id", inputMode = "input_mode"
         case startAtMS = "start_at_ms", endAtMS = "end_at_ms"
         case phenomenon, suggestion, displayText = "display_text"
         case observationCount = "observation_count"
         case expiresAtMS = "expires_at_ms", priority, sources
+        case promptType = "prompt_type", replyTo = "reply_to"
     }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -134,6 +184,17 @@ struct LivePrompt: Codable, Identifiable {
             sources = nil
             sourcesInvalid = true
         }
+        promptType = try? values.decode(String.self, forKey: .promptType)
+        replyTo = try? values.decode(LivePromptReplyTo.self, forKey: .replyTo)
+    }
+}
+
+struct LivePromptReplyTo: Codable {
+    let commentID: String
+    let nickname: String?
+    let text: String
+    enum CodingKeys: String, CodingKey {
+        case commentID = "comment_id", nickname, text
     }
 }
 
@@ -419,6 +480,9 @@ struct LiveOperationsClient {
                     completion(.failure(NSError(domain: "LiveOperations", code: -3)), response, error)
                     return
                 }
+                for index in page.prompts.indices {
+                    page.prompts[index].applyCapabilities(credentials.capabilities)
+                }
                 if let timing = PromptTimingJSON.inspect(data),
                    page.rawPromptIndices.allSatisfy({ $0 < timing.expiries.count && $0 < timing.priorities.count }) {
                     page.serverTimeMS = timing.serverTimeMS
@@ -477,6 +541,9 @@ struct LiveOperationsClient {
                                recordResponse: false) {
             case .failure(let error): completion(.failure(error))
             case .success(var page):
+                for index in page.events.indices {
+                    page.events[index].applyCapabilities(credentials.capabilities)
+                }
                 let timing = PromptTimingJSON.inspect(data, collectionKey: "events")
                 Self.applyStrictPriorities(&page.events, rawIndices: page.rawEventIndices,
                                            priorities: timing?.priorities ?? [])
