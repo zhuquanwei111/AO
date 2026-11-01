@@ -509,6 +509,10 @@ class LiveService:
                         return {"reason": "cancelled", "prompt_id": None}
                     result = await self.call("save_fusion_candidate", sid, token, candidate, suggestion,
                                              self.fusion_trigger_epoch.get(sid, 0))
+                    if (candidate.get("training_seq") is not None and result.get("reason") == "generated"
+                            and sid in self.fusion_active and sid not in self.fusion_stopping):
+                        # 完成一次训练后继续处理已就绪的普通评论，失败不自旋。
+                        self.fusion_dirty.add(sid)
                     if result.get("prompt_id"):
                         for future in self.waiters.get(sid, ()):
                             if not future.done():

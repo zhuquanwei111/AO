@@ -86,7 +86,7 @@ def test_usable_comment_can_produce_both_types_without_replaying_same_frame(tmp_
         client.portal.call(wait_idle)
         assert len(client.get(url + "/events", headers=headers).json()["events"]) == 3
         assert calls[-1] == ("reply", "晚上好")
-        clock[0] = now + 31_000
+        clock[0] = now + 32_000
         submit("fourth", "batch-4")
         client.portal.call(wait_idle)
         submit("fourth-trigger", "batch-4-trigger")
@@ -95,7 +95,7 @@ def test_usable_comment_can_produce_both_types_without_replaying_same_frame(tmp_
         assert [event["prompt_type"] for event in events] == [
             "comment_reply", "operation_notice", "comment_reply", "comment_reply", "operation_notice"]
         assert calls[-1] == ("reply", "这首歌很好听") and len(calls) == 3
-        for index, offset in enumerate((61_000, 91_000), start=5):
+        for index, offset in enumerate((62_000, 92_000), start=5):
             clock[0] = now + offset
             submit(f"later-{index}", f"batch-{index}")
             client.portal.call(wait_idle)
@@ -106,7 +106,7 @@ def test_usable_comment_can_produce_both_types_without_replaying_same_frame(tmp_
         assert len(notices) == 4
         assert len({event["display_text"] for event in notices[:3]}) == 3
         assert notices[0]["display_text"] == notices[3]["display_text"]
-        assert [event["expires_at_ms"] for event in notices] == [now + n for n in (30_000, 61_000, 91_000, 121_000)]
+        assert [event["expires_at_ms"] for event in notices] == [now + n for n in (30_000, 62_000, 92_000, 122_000)]
 
 
 def test_incomplete_or_quality_gap_does_not_create_coaching(tmp_path):
@@ -243,25 +243,34 @@ def test_failed_training_save_does_not_consume_cooldown_or_extend_deadline(tmp_p
     try:
         session = store.create("")
         sid, token = session["session_id"], session["session_token"]
-        row = {"kind": "comment", "source": "ios_replaykit_ocr", "coverage": "ocr_visible_sample",
+        row = {"kind": "comment", "event_id": "first", "source": "ios_replaykit_ocr",
+               "availability": "available", "coverage": "ocr_visible_sample",
                "reliability": "known", "confidence": .9, "observed_at_ms": now,
-               "effective_at_ms": now, "received_at_ms": now, "content": {"text": "合成评论"}}
-        candidate = {"topic": COACHING_TOPICS[0][0], "priority": 25, "phenomenon": "公屏评论",
-                     "observations": [row], "prompt_type": "operation_notice", "training_trigger_at_ms": now}
+               "capture_batch_id": "batch", "line_index": 0, "capture_comment_count": 1,
+               "content": {"text": "阿青：这首歌很好听", "text_position":
+                           {"x": .1, "y": .5, "width": .4, "height": .04}}}
+        assert store.add_observation(sid, token, row, now)["_batch_ready"]
+        reply = store.fusion_candidate(sid, token, 0)
+        assert store.save_fusion_candidate(sid, token, reply, "谢谢喜欢。", 0)["reason"] == "generated"
+        store.finish_comment_attempt(sid, reply["reply_to"]["comment_id"], 0, True, True)
+        candidate = store.fusion_candidate(sid, token, 1)
+        assert candidate and candidate["prompt_type"] == "operation_notice"
         store.db.executescript("CREATE TRIGGER reject_training BEFORE INSERT ON live_events "
                                "BEGIN SELECT RAISE(FAIL, 'controlled failure'); END;")
         with pytest.raises(sqlite3.IntegrityError):
-            store.save_fusion_candidate(sid, token, candidate, COACHING_TOPICS[0][1])
-        assert store.events(sid, token)["events"] == []
+            store.save_fusion_candidate(sid, token, candidate, candidate["suggestion"], 1)
+        assert len(store.events(sid, token)["events"]) == 1
+        assert store.fusion_candidate(sid, token, 1) is None
         store.db.execute("DROP TRIGGER reject_training")
         clock[0] = now + 5000
-        result = store.save_fusion_candidate(sid, token, candidate, COACHING_TOPICS[0][1])
+        candidate = store.fusion_candidate(sid, token, 2)
+        result = store.save_fusion_candidate(sid, token, candidate, candidate["suggestion"], 2)
         assert result["reason"] == "generated"
-        event = store.events(sid, token)["events"][0]
+        event = store.events(sid, token)["events"][-1]
         assert event["expires_at_ms"] == now + 30_000
         clock[0] = now + 30_000
-        assert store.save_fusion_candidate(sid, token, candidate, COACHING_TOPICS[0][1])["reason"] == "candidate_expired"
-        assert len(store.events(sid, token)["events"]) == 1
+        assert store.save_fusion_candidate(sid, token, candidate, candidate["suggestion"], 2)["reason"] == "candidate_expired"
+        assert len(store.events(sid, token)["events"]) == 2
         store.stop(sid, token)
         assert store.fusion_candidate(sid, token) is None
     finally:

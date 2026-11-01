@@ -33,6 +33,7 @@ logger = logging.getLogger("screen_assistant.app")
 COACHING_GLOBAL_COOLDOWN_MS = 30_000
 COACHING_TOPIC_COOLDOWN_MS = 90_000
 COACHING_LIFETIME_MS = 30_000
+COACHING_MIN_REMAINING_MS = 3_000
 COACHING_TOPICS = (
     ("comment_coaching:continue", "如果想继续这个话题，可以接着聊一聊这条评论。"),
     ("comment_coaching:invite", "可以顺着这条评论，邀请大家分享各自的看法。"),
@@ -94,7 +95,8 @@ class LiveStore:
         self.comment_attempted: dict[str, set[str]] = {}
         self.comment_attempt_counts: dict[str, dict[str, int]] = {}
         self.comment_failed_epochs: dict[str, dict[str, int]] = {}
-        self.coaching_success_epoch: dict[str, int] = {}
+        self.coaching_opportunities: dict[str, dict] = {}
+        self.coaching_discarded_until: dict[str, int] = {}
         self.reply_context: dict[str, dict[str, tuple[int, dict]]] = {}
         self.db = sqlite3.connect(path, check_same_thread=False, timeout=0.5)
         self.db.row_factory = sqlite3.Row
@@ -179,6 +181,8 @@ class LiveStore:
 
     def close(self):
         self.reply_context.clear()
+        self.coaching_opportunities.clear()
+        self.coaching_discarded_until.clear()
         self.db.close()
 
     def _expire_reply_context(self, now: int) -> None:
@@ -191,6 +195,11 @@ class LiveStore:
                 del self.reply_context[sid]
 
     def _expire_comment_payloads(self, sid: str, now: int) -> None:
+        if now >= self.coaching_discarded_until.get(sid, 0):
+            self.coaching_discarded_until.pop(sid, None)
+        opportunity = self.coaching_opportunities.get(sid)
+        if opportunity is not None and now >= opportunity["deadline"]:
+            self.coaching_opportunities.pop(sid, None)
         previous = self.comment_batch_sweeps.get(sid)
         if previous is not None and now >= previous and now - previous < 1000:
             return
@@ -344,7 +353,8 @@ class LiveStore:
         self.comment_attempted.pop(sid, None)
         self.comment_attempt_counts.pop(sid, None)
         self.comment_failed_epochs.pop(sid, None)
-        self.coaching_success_epoch.pop(sid, None)
+        self.coaching_opportunities.pop(sid, None)
+        self.coaching_discarded_until.pop(sid, None)
         self.reply_context.pop(sid, None)
         if any(not batch["complete"] for batch in batches.values()):
             logger.info("live_comment_batch outcome=stopped_incomplete")
@@ -785,6 +795,70 @@ class LiveStore:
         return {"status": "accepted", "task_id": task["task_id"],
                 "result_status": payload["status"], "received_at_ms": received_at}
 
+    def _coaching_candidate(self, sid: str, now: int, trigger_epoch: int):
+        opportunity = self.coaching_opportunities.get(sid)
+        if opportunity is None:
+            return None
+        if now >= opportunity["deadline"]:
+            self.coaching_opportunities.pop(sid, None)
+            return None
+        if opportunity["deadline"] - now < COACHING_MIN_REMAINING_MS:
+            self.coaching_opportunities.pop(sid, None)
+            self.coaching_discarded_until[sid] = opportunity["deadline"]
+            logger.info("live_data stage=filter session=%s type=operation_notice reason=insufficient_reading_time", sid[:8])
+            return None
+        if trigger_epoch <= max(opportunity["epoch"], opportunity.get("attempt_epoch", -1)):
+            return None
+        hashes = [digest(topic) for topic, _ in COACHING_TOPICS]
+        recent = self.db.execute(
+            "SELECT topic_hash, MAX(generated_at_ms) AS last FROM live_events "
+            "WHERE session_id=? AND topic_hash IN (?,?,?) GROUP BY topic_hash", (sid, *hashes),
+        ).fetchall()
+        last_by_topic = {row["topic_hash"]: row["last"] for row in recent}
+        if last_by_topic and now - max(last_by_topic.values()) < COACHING_GLOBAL_COOLDOWN_MS:
+            return None
+        higher = self.db.execute(
+            "SELECT 1 FROM live_events WHERE session_id=? AND generated_at_ms>? "
+            "AND json_extract(payload, '$.priority')>25 LIMIT 1", (sid, now - COOLDOWN_MS),
+        ).fetchone()
+        if higher:
+            return None
+        available = [(last_by_topic.get(digest(topic), -1), topic, suggestion)
+                     for topic, suggestion in COACHING_TOPICS
+                     if digest(topic) not in last_by_topic
+                     or now - last_by_topic[digest(topic)] >= COACHING_TOPIC_COOLDOWN_MS]
+        if not available:
+            return None
+        source_event = self.db.execute(
+            "SELECT generated_at_ms, json_extract(payload, '$.sources') AS sources, "
+            "json_extract(payload, '$.prompt_type') AS prompt_type "
+            "FROM live_events WHERE session_id=? AND seq=?",
+            (sid, opportunity["seq"]),
+        ).fetchone()
+        if (source_event is None or source_event["prompt_type"] != "comment_reply"
+                or source_event["generated_at_ms"] != opportunity["trigger_at"]):
+            return None
+        sources = json.loads(source_event["sources"] or "[]")
+        selected = []
+        for source in sources:
+            if source.get("kind") != "comment":
+                return None
+            row = {key: source[key] for key in (
+                "kind", "source", "coverage", "reliability", "confidence", "observed_at_ms",
+                "started_at_ms", "ended_at_ms", "effective_at_ms", "received_at_ms"
+            ) if key in source}
+            row["content"] = {}
+            if source.get("text_position"):
+                row["content"]["text_position"] = dict(source["text_position"])
+            selected.append(row)
+        if not selected:
+            return None
+        _, topic, suggestion = min(available, key=lambda item: item[0])
+        return {"topic": topic, "priority": 25, "phenomenon": "基于可用评论的条件式话术训练",
+                "suggestion": suggestion, "training_trigger_at_ms": opportunity["trigger_at"],
+                "training_seq": opportunity["seq"], "model_text": None, "model_context": "",
+                "observations": selected, "prompt_type": "operation_notice"}
+
     def fusion_candidate(self, sid: str, token: str | None, trigger_epoch: int = 0):
         session = self.authorize(sid, token)
         if session["stopped_at_ms"] is not None:
@@ -804,6 +878,10 @@ class LiveStore:
         attempted = self.comment_attempted.setdefault(sid, set())
         counts = self.comment_attempt_counts.get(sid, {})
         failed_epochs = self.comment_failed_epochs.get(sid, {})
+        training_candidate = self._coaching_candidate(sid, now, trigger_epoch)
+        opportunity = self.coaching_opportunities.get(sid)
+        prefer_training = bool(training_candidate and opportunity["replies_after"] >= 1
+                               and (candidate is None or candidate["priority"] <= 25))
         comment_candidate = None
         records = [record for batch in self.comment_batches.get(sid, {}).values()
                    if batch["complete"] and now <= batch.get("reply_deadline", batch["deadline"])
@@ -858,7 +936,8 @@ class LiveStore:
             break
         if comment_candidate is not None and (candidate is None or candidate["priority"] <= 25):
             candidate = comment_candidate
-        elif comment_candidate is None and (candidate is None or candidate["priority"] < 25):
+        elif (not prefer_training and comment_candidate is None
+              and (candidate is None or candidate["priority"] < 25)):
             grouped: dict[str, list[dict]] = {}
             for batch in self.comment_batches.get(sid, {}).values():
                 if not batch["complete"] or now > batch["deadline"]:
@@ -895,63 +974,10 @@ class LiveStore:
                     "prompt_type": "operation_notice",
                 }
                 break
-        if (candidate is None and sid in self.coaching_success_epoch
-                and trigger_epoch > self.coaching_success_epoch[sid]):
-            # 使用已处理的可靠评论提供可选训练建议；不推断人数或直播状态。
-            topic_hashes = [digest(topic) for topic, _ in COACHING_TOPICS]
-            recent_training = self.db.execute(
-                "SELECT topic_hash, MAX(generated_at_ms) AS last FROM live_events "
-                "WHERE session_id=? AND topic_hash IN (?,?,?) GROUP BY topic_hash",
-                (sid, *topic_hashes),
-            ).fetchall()
-            last_by_topic = {row["topic_hash"]: row["last"] for row in recent_training}
-            if last_by_topic and now - max(last_by_topic.values()) < COACHING_GLOBAL_COOLDOWN_MS:
-                logger.info("live_data stage=filter session=%s type=operation_notice reason=coaching_cooldown", sid[:8])
-                return None
-            for record in records:
-                status, fields = record.get("field_status", {}), record.get("field_sources", {})
-                ids = record.get("source_event_ids") or []
-                text_sources = fields.get("text") or []
-                text, first = record.get("text"), record.get("first_observed_at_ms")
-                if (record.get("comment_id") not in attempted
-                        or status.get("text") != "usable"
-                        or record.get("boundary_status") != "locally_complete"
-                        or not isinstance(text, str) or type(first) is not int
-                        or not now - MAX_OBSERVATION_AGE_MS <= first <= now + FUSION_FUTURE_SKEW_MS
-                        or not ids or not text_sources
-                        or any(event_id not in ids for event_id in text_sources)
-                        or any(event_id not in by_event for event_id in ids)
-                        or any(by_event[event_id]["source"] != record.get("source") for event_id in ids)
-                        or not comment_is_candidate(text, consumption_level=None, fan_level=None)):
-                    continue
-                nickname_sources = fields.get("nickname") or []
-                nickname = record.get("nickname") if (
-                    status.get("nickname") == "usable" and nickname_sources
-                    and all(event_id in ids for event_id in nickname_sources)
-                    and isinstance(record.get("nickname"), str) and record["nickname"].strip()
-                ) else None
-                reply_topic = comment_reply_topic(record["source"], nickname, text)
-                last_reply = self.db.execute(
-                    "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash=?",
-                    (sid, digest(reply_topic)),
-                ).fetchone()[0]
-                if last_reply is None or last_reply < first or now - last_reply >= COACHING_LIFETIME_MS:
-                    continue
-                available = [(last_by_topic.get(digest(topic), -1), topic, suggestion)
-                             for topic, suggestion in COACHING_TOPICS
-                             if digest(topic) not in last_by_topic
-                             or now - last_by_topic[digest(topic)] >= COACHING_TOPIC_COOLDOWN_MS]
-                if not available:
-                    continue
-                _, topic, suggestion = min(available, key=lambda item: item[0])
-                selected = [by_event[event_id] for event_id in ids]
-                candidate = {
-                    "topic": topic, "priority": 25, "phenomenon": "基于可用评论的条件式话术训练",
-                    "suggestion": suggestion, "training_trigger_at_ms": last_reply,
-                    "model_text": None, "model_context": "",
-                    "observations": selected, "prompt_type": "operation_notice",
-                }
-                break
+        if prefer_training:
+            candidate = training_candidate
+        elif candidate is None:
+            candidate = training_candidate
         if candidate is None:
             logger.info("live_data stage=candidate session=%s reason=quiet", sid[:8])
             return None
@@ -979,6 +1005,8 @@ class LiveStore:
         candidate.setdefault("prompt_type", "operation_notice")
         if candidate.get("prompt_type") == "comment_reply":
             attempted.add(candidate["reply_to"]["comment_id"])
+        elif candidate.get("training_seq") is not None:
+            self.coaching_opportunities[sid]["attempt_epoch"] = trigger_epoch
         logger.info("live_data stage=candidate session=%s type=%s reason=selected", sid[:8], candidate["prompt_type"])
         return candidate
 
@@ -1008,8 +1036,17 @@ class LiveStore:
         is_coaching = candidate["topic"] in {topic for topic, _ in COACHING_TOPICS}
         if is_coaching:
             trigger_at = candidate.get("training_trigger_at_ms")
-            if type(trigger_at) is not int or not trigger_at <= now < trigger_at + COACHING_LIFETIME_MS:
+            opportunity = self.coaching_opportunities.get(sid)
+            if (opportunity is None or candidate.get("training_seq") != opportunity["seq"]
+                    or trigger_at != opportunity["trigger_at"]
+                    or trigger_epoch <= opportunity["epoch"]
+                    or not trigger_at <= now < opportunity["deadline"]):
                 return {"reason": "candidate_expired", "prompt_id": None}
+            if opportunity["deadline"] - now < COACHING_MIN_REMAINING_MS:
+                self.coaching_opportunities.pop(sid, None)
+                self.coaching_discarded_until[sid] = opportunity["deadline"]
+                logger.info("live_data stage=filter session=%s type=operation_notice reason=insufficient_reading_time", sid[:8])
+                return {"reason": "insufficient_reading_time", "prompt_id": None}
             hashes = [digest(topic) for topic, _ in COACHING_TOPICS]
             last_training = self.db.execute(
                 "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash IN (?,?,?)",
@@ -1020,7 +1057,7 @@ class LiveStore:
         rows = candidate["observations"]
         latest = max(row["effective_at_ms"] for row in rows)
         age_limit = COMMENT_REPLY_MAX_AGE_MS if candidate.get("prompt_type") == "comment_reply" else MAX_OBSERVATION_AGE_MS
-        if now - latest > age_limit:
+        if not is_coaching and now - latest > age_limit:
             return {"reason": "candidate_expired", "prompt_id": None}
         if (candidate.get("prompt_type") == "comment_reply"
                 and now - candidate["first_observed_at_ms"] > COMMENT_REPLY_MAX_AGE_MS):
@@ -1132,17 +1169,34 @@ class LiveStore:
         elif candidate.get("prompt_type") == "operation_notice":
             event["prompt_type"] = "operation_notice"
         with self.db:
-            self.db.execute(
+            cursor = self.db.execute(
                 "INSERT INTO live_events (session_id,topic_hash,generated_at_ms,expires_at_ms,payload) VALUES (?,?,?,?,?)",
                 (sid, topic_hash, now, trigger_at + COACHING_LIFETIME_MS if is_coaching else now + PROMPT_TTL_MS,
                  json.dumps(event, ensure_ascii=False)),
             )
         self._expire_reply_context(now)
         if candidate.get("prompt_type") == "comment_reply":
-            self.coaching_success_epoch[sid] = trigger_epoch
+            opportunity = self.coaching_opportunities.get(sid)
+            if opportunity is not None and opportunity["deadline"] - now < COACHING_MIN_REMAINING_MS:
+                self.coaching_opportunities.pop(sid, None)
+                if now < opportunity["deadline"]:
+                    self.coaching_discarded_until[sid] = opportunity["deadline"]
+                logger.info("live_data stage=filter session=%s type=operation_notice reason=insufficient_reading_time", sid[:8])
+                opportunity = None
+            if (opportunity is None and now >= self.coaching_discarded_until.get(sid, 0)):
+                self.coaching_discarded_until.pop(sid, None)
+                self.coaching_opportunities[sid] = {
+                    "seq": cursor.lastrowid, "trigger_at": now,
+                    "deadline": now + COACHING_LIFETIME_MS, "epoch": trigger_epoch,
+                    "replies_after": 0,
+                }
+            elif opportunity is not None and trigger_epoch > opportunity["epoch"]:
+                opportunity["replies_after"] = min(1, opportunity["replies_after"] + 1)
             self.reply_context.setdefault(sid, {})[event["prompt_id"]] = (
                 now + PROMPT_TTL_MS, dict(candidate["reply_to"])
             )
+        elif is_coaching:
+            self.coaching_opportunities.pop(sid, None)
         return {"reason": "generated", "prompt_id": event["prompt_id"]}
 
     @staticmethod
