@@ -9,6 +9,7 @@ import java.util.function.BiConsumer;
 final class OverlayMessageState {
     static final String WAITING_TEXT = "辅助中，等待内容";
     static final long MIN_READ_MS = 8000;
+    static final long MIN_START_REMAINING_MS = 3000;
     static final int CAPACITY = 16;
     private static final int SEEN_CAPACITY = 128;
 
@@ -63,6 +64,9 @@ final class OverlayMessageState {
             seen.put(key, sourceExpiry);
         }
         Message next = new Message(key, value, priority, sourceExpiry, maxVisibleMs);
+        if (insufficientReadingTime(next, nowMs)) {
+            trace.accept(key, "insufficient_reading_time"); return false;
+        }
         if (pending.size() >= CAPACITY) {
             overflowCount++;
             if (priority < 100) { trace.accept(key, "queue_full"); return false; }
@@ -79,6 +83,12 @@ final class OverlayMessageState {
         advance(nowMs);
         if (pending.contains(next)) trace.accept(key, "queued");
         return true;
+    }
+
+    private static boolean insufficientReadingTime(Message item, long nowMs) {
+        // 只约束普通项首次显示；源截止和本机上限均不能因阅读底线续期。
+        return item.priority < 100
+                && Math.min(item.sourceExpiry - nowMs, item.maxVisible) < MIN_START_REMAINING_MS;
     }
 
     private boolean containsId(String id) {
@@ -102,7 +112,13 @@ final class OverlayMessageState {
         if (urgent != null && (current == null || current.priority < 100)) {
             pending.remove(urgent); next = urgent;
         } else if (current == null || (current.priority < 100 && nowMs >= protectedUntilMs)) {
-            next = pending.pollFirst();
+            while (!pending.isEmpty()) {
+                Message candidate = pending.removeFirst();
+                if (insufficientReadingTime(candidate, nowMs)) {
+                    trace.accept(candidate.id, "insufficient_reading_time"); continue;
+                }
+                next = candidate; break;
+            }
         }
         if (next != null) {
             current = next;

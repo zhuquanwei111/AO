@@ -4,19 +4,120 @@ import org.junit.Test;
 import static org.junit.Assert.*;
 
 public class OverlayMessageStateTest {
+    @Test public void ordinaryStartRequiresThreeSecondsForTypedAndLegacyText() throws Exception {
+        for (String type : new String[]{"comment_reply", "operation_notice", "unknown"}) {
+            org.json.JSONObject prompt = new org.json.JSONObject().put("prompt_type", type)
+                    .put(DisplayText.TYPED_PROMPTS, !"unknown".equals(type));
+            String text = DisplayText.labeled(DisplayText.promptLabel(prompt), "测试正文");
+            for (int priority : new int[]{-1, 25, 99}) {
+                for (long remaining : new long[]{211, 2999, 3000}) {
+                    java.util.List<String> events = new java.util.ArrayList<>();
+                    OverlayMessageState state = new OverlayMessageState((id, reason) -> events.add(id + ":" + reason));
+                    state.start();
+                    String id = type + "-" + priority + "-" + remaining;
+                    assertEquals(id, remaining >= 3000, state.update(id, text, priority, 1000 + remaining, 1000, 12000));
+                    assertEquals(id, remaining >= 3000 ? text : "", state.textAt(1000));
+                    if (remaining < 3000) {
+                        assertTrue(events.contains(id + ":insufficient_reading_time"));
+                        assertEquals(0, state.pendingCount());
+                    } else {
+                        assertEquals(4000, state.sourceExpiryMs());
+                        assertEquals(4000, state.expiresAtMs());
+                        assertEquals(4000, state.protectedUntilMs());
+                        assertEquals(text, state.textAt(3999));
+                        assertEquals("", state.textAt(4000));
+                    }
+                }
+            }
+        }
+    }
+
+    @Test public void shortOrdinaryArrivalDoesNotInterruptCurrentOrRenewRejectedId() {
+        java.util.List<String> events = new java.util.ArrayList<>();
+        OverlayMessageState state = new OverlayMessageState((id, reason) -> events.add(id + ":" + reason));
+        state.start();
+        assertTrue(offer(state, "A", 25, 30000, 1000));
+        assertFalse(offer(state, "short", 99, 11999, 9000));
+        assertEquals("运营：A", state.textAt(9000));
+        assertEquals(13000, state.expiresAtMs());
+        assertEquals(0, state.pendingCount());
+        assertTrue(events.contains("short:insufficient_reading_time"));
+        assertFalse(offer(state, "short", 99, 30000, 9100));
+    }
+
+    @Test public void dequeueSkipsInsufficientTimeAndContinuesToNextLegalItem() {
+        for (long remaining : new long[]{211, 2999}) {
+            java.util.List<String> events = new java.util.ArrayList<>();
+            OverlayMessageState state = new OverlayMessageState((id, reason) -> events.add(id + ":" + reason));
+            state.start();
+            assertTrue(offer(state, "A", 25, 30000, 1000));
+            assertTrue(offer(state, "short", 25, 9000 + remaining, 1887));
+            assertTrue(offer(state, "next", 25, 20000, 2000));
+            assertEquals("运营：A", state.textAt(8999));
+            assertEquals("运营：next", state.textAt(9000));
+            assertEquals("next", state.currentId());
+            assertEquals(20000, state.sourceExpiryMs());
+            assertEquals(20000, state.expiresAtMs());
+            assertEquals(0, state.pendingCount());
+            assertEquals(0, state.expiredCount());
+            assertTrue(events.contains("short:insufficient_reading_time"));
+        }
+    }
+
+    @Test public void rejectedDequeuedItemDoesNotClearStillVisibleCurrent() {
+        java.util.List<String> events = new java.util.ArrayList<>();
+        OverlayMessageState state = new OverlayMessageState((id, reason) -> events.add(id + ":" + reason));
+        state.start();
+        assertTrue(offer(state, "A", 25, 30000, 1000));
+        assertTrue(offer(state, "short", 25, 9211, 1887));
+        assertEquals("运营：A", state.textAt(9000));
+        assertTrue(events.contains("short:insufficient_reading_time"));
+        assertEquals(0, state.pendingCount());
+        assertEquals(13000, state.nextChangeAtMs(9000));
+        assertEquals("", state.textAt(13000));
+    }
+
+    @Test public void urgentStillPreemptsWithShortSourceTimeWithoutExtension() {
+        for (int priority : new int[]{100, 101}) {
+            for (long remaining : new long[]{211, 2999}) {
+                OverlayMessageState state = started();
+                assertTrue(offer(state, "A", 25, 30000, 1000));
+                long expiry = 1100 + remaining;
+                assertTrue(offer(state, "urgent", priority, expiry, 1100));
+                assertEquals("运营：urgent", state.textAt(1100));
+                assertEquals(expiry, state.sourceExpiryMs());
+                assertEquals(expiry, state.expiresAtMs());
+                assertEquals(expiry, state.protectedUntilMs());
+                assertFalse(offer(state, "urgent", priority, 30000, 1101));
+                assertEquals("运营：urgent", state.textAt(expiry - 1));
+                assertEquals("", state.textAt(expiry));
+            }
+        }
+    }
+
+    @Test public void absentSourceDeadlineKeepsExistingLocalLimit() {
+        OverlayMessageState state = started();
+        assertTrue(state.update("本地正文", 0, 1000, 12000));
+        assertEquals(13000, state.sourceExpiryMs());
+        assertEquals(9000, state.protectedUntilMs());
+        assertEquals(13000, state.expiresAtMs());
+        assertEquals("本地正文", state.textAt(12999));
+        assertEquals("", state.textAt(13000));
+    }
+
     @Test public void reportsQueuedExpiryAndOverflowWithAffectedIds() {
         java.util.List<String> events = new java.util.ArrayList<>();
         OverlayMessageState state = new OverlayMessageState((id, reason) -> events.add(id + ":" + reason));
         state.start();
         assertTrue(state.update("A", "甲", 0, 30000, 1000, 12000));
-        assertTrue(state.update("B", "乙", 0, 3000, 1100, 12000));
+        assertTrue(state.update("B", "乙", 0, 5000, 1100, 12000));
         assertTrue(events.contains("B:queued"));
-        state.textAt(3000);
+        state.textAt(5000);
         assertTrue(events.contains("B:source_expired_queued"));
-        for (int i = 0; i < 16; i++) assertTrue(state.update("Q" + i, "等" + i, 0, 30000, 3100, 12000));
-        assertFalse(state.update("overflow", "满", 0, 30000, 3200, 12000));
+        for (int i = 0; i < 16; i++) assertTrue(state.update("Q" + i, "等" + i, 0, 30000, 5100, 12000));
+        assertFalse(state.update("overflow", "满", 0, 30000, 5200, 12000));
         assertTrue(events.contains("overflow:queue_full"));
-        assertTrue(state.update("urgent", "紧急", 100, 30000, 3300, 12000));
+        assertTrue(state.update("urgent", "紧急", 100, 30000, 5300, 12000));
         assertTrue(events.contains("Q15:queue_evicted"));
     }
     private OverlayMessageState started() {
@@ -63,12 +164,12 @@ public class OverlayMessageStateTest {
     @Test public void idleAndExpiredMessagesMustNotShowConnectionOrUploadStatus() {
         OverlayMessageState state = started();
         assertEquals("", state.textAt(1000));
-        state.update("运营：有效建议", 2000, 1000, 6000);
+        state.update("运营：有效建议", 4000, 1000, 6000);
         state.setStatus("已上传，复盘等待中", false);
-        assertEquals("运营：有效建议", state.textAt(1999));
-        assertEquals("", state.textAt(2000));
+        assertEquals("运营：有效建议", state.textAt(3999));
+        assertEquals("", state.textAt(4000));
         state.setStatus("实时已连接", false);
-        assertEquals("", state.textAt(2001));
+        assertEquals("", state.textAt(4001));
         assertTrue(state.shouldDisplay(true, false));
     }
 
@@ -82,41 +183,41 @@ public class OverlayMessageStateTest {
 
     @Test public void sourceExpiryWinsEvenDuringProtectionAndDuplicateDoesNotExtend() {
         OverlayMessageState state = started();
-        assertTrue(offer(state, "A", 25, 2200, 1000));
+        assertTrue(offer(state, "A", 25, 4000, 1000));
         assertFalse(offer(state, "A", 100, 99999, 1100));
         offer(state, "B", 38, 16000, 1887);
-        assertEquals("运营：A", state.textAt(2199));
-        assertEquals("运营：B", state.textAt(2200));
-        assertEquals(14200, state.expiresAtMs());
+        assertEquals("运营：A", state.textAt(3999));
+        assertEquals("运营：B", state.textAt(4000));
+        assertEquals(16000, state.expiresAtMs());
     }
 
     @Test public void expiredQueuedItemNeverAppearsAndDoesNotExtendCurrent() {
         OverlayMessageState state = started();
         offer(state, "A", 25, 16000, 1000);
-        offer(state, "B", 38, 4000, 1887);
-        assertEquals(4000, state.nextChangeAtMs(1887));
-        assertEquals("运营：A", state.textAt(4000));
+        offer(state, "B", 38, 5000, 1887);
+        assertEquals(5000, state.nextChangeAtMs(1887));
+        assertEquals("运营：A", state.textAt(5000));
         assertEquals(1, state.expiredCount());
         assertEquals(0, state.pendingCount());
-        assertEquals(13000, state.nextChangeAtMs(4000));
+        assertEquals(13000, state.nextChangeAtMs(5000));
         assertEquals("", state.textAt(13000));
     }
 
     @Test public void queuedShortLifeUsesRemainingSourceTimeWithoutEightSecondExtension() {
         OverlayMessageState state = started();
         offer(state, "A", 25, 16000, 1000);
-        offer(state, "B", 38, 9500, 1887);
+        offer(state, "B", 38, 12000, 1887);
         assertEquals("运营：B", state.textAt(9000));
-        assertEquals(9500, state.sourceExpiryMs());
-        assertEquals(9500, state.expiresAtMs());
-        assertEquals(9500, state.protectedUntilMs());
-        assertEquals("", state.textAt(9500));
+        assertEquals(12000, state.sourceExpiryMs());
+        assertEquals(12000, state.expiresAtMs());
+        assertEquals(12000, state.protectedUntilMs());
+        assertEquals("", state.textAt(12000));
     }
 
     @Test public void realUrgentPreemptsButPriority38AndTextDoNot() {
         OverlayMessageState state = started();
         offer(state, "A", 25, 16000, 1000);
-        state.update("B", "紧急！规则模板消费等级100", 38, 16000, 1887, 12000);
+        state.update("B", "紧急！规则模板消费等级100", 38, 19000, 1887, 12000);
         assertEquals("运营：A", state.textAt(1887));
         assertTrue(offer(state, "U", 100, 18000, 1900));
         assertEquals("运营：U", state.textAt(1900));

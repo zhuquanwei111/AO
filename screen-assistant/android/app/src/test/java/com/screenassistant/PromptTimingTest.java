@@ -5,6 +5,18 @@ import org.junit.Test;
 import static org.junit.Assert.*;
 
 public class PromptTimingTest {
+    @Test public void startThresholdUsesConservativeDeadlineIncludingOneMsMargin() throws Exception {
+        for (long remaining : new long[]{211, 2999, 3000}) {
+            PromptTiming timing = PromptTiming.from(page(1000, 0, 1_000_000_000L, 1_000_000_000L));
+            long deadline = timing.deadline(expiry(1000 + remaining + 1));
+            assertEquals(1000 + remaining, deadline);
+            OverlayMessageState state = new OverlayMessageState(); state.start();
+            assertEquals(remaining >= 3000, state.update("boundary", "正文", 25, deadline, 1000, 12000));
+            assertEquals(remaining >= 3000 ? "正文" : "", state.textAt(1000));
+            if (remaining >= 3000) assertEquals(deadline, state.expiresAtMs());
+        }
+    }
+
     private JSONObject page(long server, Object processing, long sentNs, long receivedNs) throws Exception {
         return new JSONObject().put("server_time_ms", server).put("server_processing_ms", processing)
                 .put(PromptTiming.SENT_NS, sentNs).put(PromptTiming.RECEIVED_NS, receivedNs);
@@ -81,14 +93,14 @@ public class PromptTimingTest {
         assertEquals("", state.textAt(4000));
     }
 
-    @Test public void shortSourceLifeCannotBeExtendedToEightSeconds() throws Exception {
+    @Test public void threeSecondSourceLifeCannotBeExtendedToEightSeconds() throws Exception {
         PromptTiming timing = PromptTiming.from(page(1000, 0, 1_000_000_000L, 1_000_000_000L));
         OverlayMessageState state = new OverlayMessageState(); state.start();
-        long deadline = timing.deadline(expiry(3000));
+        long deadline = timing.deadline(expiry(4001));
         assertTrue(state.update("short", "短源寿命", 25, deadline, 1000, 12000));
-        assertEquals(2999, state.expiresAtMs());
-        assertEquals(2999, state.protectedUntilMs());
-        assertEquals("", state.textAt(2999));
+        assertEquals(4000, state.expiresAtMs());
+        assertEquals(4000, state.protectedUntilMs());
+        assertEquals("", state.textAt(4000));
     }
 
     @Test public void continuousTimeIncludingSleepExpiresCurrentAndQueuedItems() throws Exception {
