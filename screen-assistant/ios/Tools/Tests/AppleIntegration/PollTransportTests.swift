@@ -233,6 +233,10 @@ final class PollTransportTests: XCTestCase {
         XCTAssertNil(LiveSessionState.isolatedStopIntent(fileURL: unknown))
         let safe = IsolatedStopIntent(credentials: credentials, serviceURL: try XCTUnwrap(URL(string: "https://poll-fixture.invalid:8443/isolated-stop")))
         XCTAssertFalse(LiveSessionState.saveIsolatedStop(safe, fileURL: unknown))
+        XCTAssertFalse(LiveSessionState.saveIsolatedStop(safe, fileURL: directory.appendingPathComponent("missing/pending.json")))
+        let otherService = IsolatedStopIntent(credentials: credentials, serviceURL: try XCTUnwrap(URL(string: "https://poll-fixture.invalid:9443/isolated-stop")))
+        XCTAssertFalse(LiveSessionState.saveIsolatedStop(otherService, fileURL: slot))
+        XCTAssertFalse(LiveSessionState.clearIsolatedStop(otherService, fileURL: slot))
         for text in ["https://u:p@poll-fixture.invalid/", "https://poll-fixture.invalid/?secret=x", "https://poll-fixture.invalid/#fragment"] {
             let invalid = IsolatedStopIntent(credentials: credentials, serviceURL: try XCTUnwrap(URL(string: text)))
             XCTAssertFalse(LiveSessionState.saveIsolatedStop(invalid, fileURL: directory.appendingPathComponent(UUID().uuidString)))
