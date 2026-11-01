@@ -636,7 +636,10 @@ def test_complete_batch_handles_two_comments_and_group_without_extra_model_calls
         events = client.get(f"/v1/live/sessions/{sid}/events", headers=headers).json()["events"]
         # 不同批次同昵称同正文只限制重复输出，不删除观察；群体提醒也保持独立冷却。
         assert len(calls) == 2
-        assert len([event for event in events if event["prompt_type"] == "operation_notice"]) == 1
+        notices = [event for event in events if event["prompt_type"] == "operation_notice"]
+        assert len(notices) == 2
+        assert sum("集中" in event["phenomenon"] for event in notices) == 1
+        assert sum(event["phenomenon"] == "基于可用评论的条件式话术训练" for event in notices) == 1
         assert app.state.live.store.db.execute(
             "SELECT COUNT(*) FROM live_observations WHERE session_id=?", (sid,)
         ).fetchone()[0] == 4
