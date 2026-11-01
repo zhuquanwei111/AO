@@ -28,7 +28,13 @@ final class AppModel: ObservableObject {
         didSet { SharedConfig.setROI(roi) }
     }
     @Published var onlineCountROI: CGRect? {
-        didSet { SharedConfig.setOnlineCountROI(onlineCountROI) }
+        didSet {
+            onlineCountSemanticsConfirmed = false
+            SharedConfig.setOnlineCountROI(onlineCountROI)
+        }
+    }
+    @Published var onlineCountSemanticsConfirmed: Bool {
+        didSet { SharedConfig.setOnlineCountSemanticsConfirmed(onlineCountSemanticsConfirmed) }
     }
     @Published var platformNoticeROI: CGRect? {
         didSet { SharedConfig.setPlatformNoticeROI(platformNoticeROI) }
@@ -65,6 +71,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var isolatedStopStatus = ""
     @Published var broadcastStatusText = "系统屏幕广播状态尚未确认"
     @Published var serviceStatusText = "服务连接尚未通过请求核验"
+    @Published var observationUploadStatus = "采样上传暂无诊断"
     @Published var overviewLoading = false
     @Published var audioSettings: AudioCaptureSettings {
         didSet { AudioCaptureSettings.save(audioSettings) }
@@ -81,6 +88,7 @@ final class AppModel: ObservableObject {
     private var liveCursor = ""
     private var liveDelivery = LivePromptDelivery()
     private var liveDisplayedUntilMS: Int64?
+    private var liveDisplayedItems: [LivePromptDelivery.Item] = []
     private var summaryRefreshInFlight = false
     private var overviewRequest = OverviewRequestTracker()
     private var lastServiceConnection = ControlState.serviceConnection()
@@ -91,7 +99,9 @@ final class AppModel: ObservableObject {
         intervalSeconds = SharedConfig.intervalSeconds()
         requestTimeout = SharedConfig.requestTimeoutSeconds()
         roi = SharedConfig.roi()
-        onlineCountROI = SharedConfig.onlineCountROI()
+        let initialOnlineCountROI = SharedConfig.onlineCountROI()
+        onlineCountROI = initialOnlineCountROI
+        onlineCountSemanticsConfirmed = SharedConfig.onlineCountSemanticsConfirmed() && initialOnlineCountROI != nil
         platformNoticeROI = SharedConfig.platformNoticeROI()
         let diagnosticRegion = InputDiagnosticsStore.configuration().region.clamped
         personROI = SharedConfig.personROI() ?? CGRect(x: CGFloat(diagnosticRegion.x),
@@ -127,10 +137,11 @@ final class AppModel: ObservableObject {
             $0.serviceURL.absoluteString == savedLiveCredentials?.boundServiceURL?.absoluteString
         } ?? false
         let savedConnectionPending = savedLiveCredentials?.liveConnectionPending == true
-        liveActive = !pendingOwnsSaved && !unknownStopRecord && LiveSessionState.isEnabled() && savedLiveCredentials != nil
+        liveActive = !pendingOwnsSaved && !unknownStopRecord && LiveSessionState.recoverActive(savedLiveCredentials,
+                                                   captureEnabled: LiveSessionState.isEnabled())
         liveConnectionPending = liveActive && savedConnectionPending
         let restoredService = savedLiveCredentials?.captureServiceURL(configured: SharedConfig.serverBaseURL())
-        if liveConnectionPending || pendingOwnsSaved || (liveActive && restoredService == nil) {
+        if pendingOwnsSaved || (liveActive && (LiveSessionState.holdCaptureOnRecovery(savedLiveCredentials) || restoredService == nil)) {
             captureWanted = false
             ControlState.setUserWantsCapture(false)
         }
@@ -158,6 +169,7 @@ final class AppModel: ObservableObject {
                     now: Date()
                 )
                 self.refreshServiceConnectionStatus()
+                self.observationUploadStatus = Self.observationUploadDescription()
                 self.deliverLivePrompts()
             }
 
@@ -166,11 +178,14 @@ final class AppModel: ObservableObject {
         } else if unknownStopRecord {
             liveStatus = "原场结束记录无法确认，未自动恢复场次"
         } else if liveActive, let credentials = Self.savedCredentials() {
+            PiPDisplayController.shared.setLiveSessionActive(true)
             liveCredentials = credentials
             liveClient = credentials.boundServiceURL.flatMap {
                 IsolatedStopIntent.safeServiceURL($0) ? LiveOperationsClient(baseURL: $0) : nil
             }
-            if restoredService == nil {
+            if credentials.stopPending == true {
+                liveStatus = "本机采集已停止；服务未确认结束场次，可重试结束"
+            } else if restoredService == nil {
                 liveStatus = "本场原服务信息不可确认或配置已变化，采集未开启"
             } else if liveConnectionPending {
                 liveStatus = "后台启动结果未确认；正在核验同一场实时连接"
@@ -179,7 +194,7 @@ final class AppModel: ObservableObject {
             } else {
                 liveStatus = "恢复当前场次收件"
             }
-            if liveClient != nil && restoredService != nil { pollLivePrompts() }
+            if liveClient != nil && restoredService != nil && credentials.stopPending != true { pollLivePrompts() }
         } else if LiveSessionState.isEnabled() && !LiveSessionState.isolatedStopRecordExists() {
             captureWanted = false
             ControlState.setUserWantsCapture(false)
@@ -253,7 +268,7 @@ final class AppModel: ObservableObject {
                     pendingCredentials.liveConnectionPending = true
                     self.captureWanted = false
                     guard LiveSessionState.save(pendingCredentials, enableCapture: true) else {
-                        client.stop(credentials) { _ in }
+                        client.stop(credentials) { _, _, _ in }
                         self.liveStarting = false
                         self.liveStatus = "无法安全保存本场授权，已请求取消场次"
                         return
@@ -306,6 +321,7 @@ final class AppModel: ObservableObject {
                                            client: LiveOperationsClient,
                                            status: String,
                                            captureImmediately: Bool = true) {
+        PiPDisplayController.shared.setLiveSessionActive(true)
         var activeCredentials = credentials
         if !captureImmediately { activeCredentials.liveConnectionPending = true }
         livePollGeneration &+= 1
@@ -324,6 +340,7 @@ final class AppModel: ObservableObject {
         overviewRequest.clear()
         liveDelivery.clear()
         liveDisplayedUntilMS = nil
+        liveDisplayedItems = []
         PiPDisplayController.shared.endLiveContent()
         liveSummary = nil
         liveCursor = ""
@@ -376,6 +393,7 @@ final class AppModel: ObservableObject {
             return
         }
         liveStartGeneration &+= 1
+        let stopGeneration = liveStartGeneration
         liveVerificationNeedsRetry = false
         liveStarting = false
         livePollGeneration &+= 1
@@ -383,29 +401,46 @@ final class AppModel: ObservableObject {
         livePollTask = nil
         liveDelivery.clear()
         liveDisplayedUntilMS = nil
+        liveDisplayedItems = []
         PiPDisplayController.shared.endLiveContent()
         captureWanted = false
         liveConnectionPending = false
         var stoppingCredentials = credentials
         stoppingCredentials.liveConnectionPending = false
-        _ = LiveSessionState.save(stoppingCredentials)
+        stoppingCredentials.stopPending = true
+        guard LiveSessionState.save(stoppingCredentials) else {
+            liveStatus = "本机采集已停止；结束状态无法保存，未发送结束请求，可重试"
+            return
+        }
         liveCredentials = stoppingCredentials
         liveStopping = true
-        liveStatus = "正在结束场次…"
-        client.stop(stoppingCredentials) { [weak self] ok in
+        liveStatus = "本机采集已停止；正在确认服务端结束…"
+        client.stop(stoppingCredentials, recordResponse: false) { [weak self] ok, response, error in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, self.liveClient?.baseURL.absoluteString == client.baseURL.absoluteString,
+                      SharedConfig.serverBaseURL()?.absoluteString == client.baseURL.absoluteString,
+                      let saved = Self.savedCredentials(),
+                      stoppingCredentials.hasSameBoundIdentity(as: saved), PollCallbackGate.commitIfCurrent(
+                    sessionID: stoppingCredentials.sessionID, generation: stopGeneration,
+                    currentSessionID: saved.sessionID,
+                    currentGeneration: self.liveStartGeneration, active: self.liveStopping,
+                    stopping: false, commit: {
+                        ControlState.recordServiceResponse(error: error, response: response)
+                    }) else { return }
                 self.liveStopping = false
                 guard ok else {
-                    self.liveStatus = "服务未确认结束场次；检查网络后可重试，当前场次授权仍保留"
+                    self.liveStatus = "本机采集已停止；服务未确认结束场次，检查网络后可重试"
                     return
                 }
                 self.audioSettings.appHostConfirmed = false
                 self.audioSettings.micHostConfirmed = false
                 self.liveActive = false
+                PiPDisplayController.shared.setLiveSessionActive(false)
                 self.liveStopped = true
                 self.liveCredentials = nil
-                LiveSessionState.disableCapturePreservingCredentials()
+                if !LiveSessionState.confirmStopped(stoppingCredentials) {
+                    LiveSessionState.disableCapturePreservingCredentials()
+                }
                 self.liveStatus = "已结束，正在读取本场记录"
                 self.loadStoppedOverview(credentials, client: client)
             }
@@ -490,9 +525,11 @@ final class AppModel: ObservableObject {
                     if page.stopped {
                         self.liveDelivery.clear()
                         self.liveDisplayedUntilMS = nil
+                        self.liveDisplayedItems = []
                         PiPDisplayController.shared.endLiveContent()
                         self.liveStatus = "服务端场次已停止"
                         self.liveActive = false
+                        PiPDisplayController.shared.setLiveSessionActive(false)
                         self.liveStopped = true
                         self.liveConnectionPending = false
                         LiveSessionState.disableCapturePreservingCredentials()
@@ -538,7 +575,8 @@ final class AppModel: ObservableObject {
            pending.credentials.token == credentials.token,
            pending.serviceURL.absoluteString == liveClient?.baseURL.absoluteString { return }
         let saved = Self.savedCredentials()
-        guard PollCallbackGate.matchesCredentials(sessionID: credentials.sessionID, token: credentials.token,
+        guard credentials.hasSameBoundIdentity(as: saved),
+            PollCallbackGate.matchesCredentials(sessionID: credentials.sessionID, token: credentials.token,
             currentSessionID: liveCredentials?.sessionID, currentToken: liveCredentials?.token,
             savedSessionID: saved?.sessionID, savedToken: saved?.token) else {
             liveStatus = "本场尚未核验，采集未开启；请检查本场授权后重试"
@@ -579,7 +617,7 @@ final class AppModel: ObservableObject {
             liveVerificationNeedsRetry = false
         }
         isolatedStopStatus = "正在确认原场结束"
-        client.stop(credentials, recordResponse: false) { [weak self] ok in
+        client.stop(credentials, recordResponse: false) { [weak self] ok, _, _ in
             DispatchQueue.main.async {
                 guard let self, self.isolatedStopGeneration == generation,
                       self.liveStartGeneration == startGeneration,
@@ -617,16 +655,25 @@ final class AppModel: ObservableObject {
     private func deliverLivePrompts() {
         let now = Int64(LiveOperationsClient.continuousNowNS() / 1_000_000)
         if let expiry = liveDisplayedUntilMS, expiry <= now {
-            PiPDisplayController.shared.endLiveContent()
-            liveDisplayedUntilMS = nil
+            liveDisplayedItems = LivePromptDelivery.unexpired(liveDisplayedItems, nowMS: now)
+            liveDisplayedUntilMS = liveDisplayedItems.map(\.expiresAtMS).min()
+            if liveDisplayedItems.isEmpty {
+                PiPDisplayController.shared.endLiveContent()
+            } else {
+                _ = PiPDisplayController.shared.showLiveFrame(liveDisplayedItems)
+            }
         }
         guard liveActive, !liveStopping, PiPDisplayController.shared.canShowLiveFrame else { return }
+        if !liveDisplayedItems.isEmpty, !PiPDisplayController.shared.hasLiveContent {
+            _ = PiPDisplayController.shared.showLiveFrame(liveDisplayedItems)
+        }
         let beforeExpired = liveDelivery.expiredCount
         let frame = liveDelivery.take(nowMS: now) { PiPDisplayController.shared.liveFrameFits($0) }
         if liveDelivery.expiredCount != beforeExpired {
             NSLog("Live prompt delivery: expired=%d", liveDelivery.expiredCount)
         }
         if !frame.isEmpty, PiPDisplayController.shared.showLiveFrame(frame) {
+            liveDisplayedItems = frame
             liveDisplayedUntilMS = frame.map(\.expiresAtMS).min()
             NSLog("Live prompt delivery: selected=%d", frame.count)
         }
@@ -730,6 +777,17 @@ final class AppModel: ObservableObject {
         if Self.isServiceFailure(current.phase) {
             PiPDisplayController.shared.showConnectionStatus(Self.pipServiceStatus(current))
         }
+    }
+
+    private static func observationUploadDescription() -> String {
+        guard let defaults = AppGroup.defaults else { return "采样上传诊断不可用" }
+        func value(_ key: String) -> Int { defaults.integer(forKey: "observation.upload.\(key)") }
+        let overLimit = ["limit_comment", "limit_count", "bytes_comment", "bytes_count",
+                         "oversize_comment", "oversize_count"]
+            .reduce(0) { $0 + value($1) }
+        let invalid = value("invalid_comment") + value("invalid_count")
+        let sending = defaults.bool(forKey: "observation.upload.sending") ? "发送中" : "未发送中"
+        return "采样上传（本机累计）：已接收 \(value("received"))，幂等重复 \(value("duplicate"))，服务端合并 \(value("merged"))；结果未知 \(value("unknown"))，服务端拒绝 \(value("rejected"))。未发送：队列满 \(value("overflow_batch")) 批（评论 \(value("overflow_comment"))、人数 \(value("overflow_count"))），超限 \(overLimit)，无效 \(invalid)，过期 \(value("expired"))，停止或断连余项 \(value("cancel_unsent"))；本机时钟回拨 \(value("clock_backward"))。最近报告：\(sending)，待发批次 \(value("waiting_batches"))。"
     }
 
     private static func isServiceFailure(_ phase: ControlState.ServicePhase) -> Bool {

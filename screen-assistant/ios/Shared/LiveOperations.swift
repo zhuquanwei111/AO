@@ -30,9 +30,10 @@ struct LiveSessionCredentials: Codable {
     let douyinAccount: String?
     var backstageTaskID: String?
     var backstageStatus: String?
-    /// Local-only markers; neither field is sent to the server.
+    /// 仅本地保存的状态标记，不发送给服务端。
     var backstageStartPending: Bool?
     var liveConnectionPending: Bool?
+    var stopPending: Bool? = nil
     /// 仅保存在本地，由创建场次时实际使用的 client 确定。
     var boundServiceURL: URL? = nil
     func captureServiceURL(configured: URL?) -> URL? {
@@ -51,6 +52,7 @@ struct LiveSessionCredentials: Codable {
         case backstageTaskID = "backstage_task_id", backstageStatus = "backstage_status"
         case backstageStartPending = "backstage_start_pending"
         case liveConnectionPending = "live_connection_pending"
+        case stopPending = "stop_pending"
         case boundServiceURL = "local_bound_service_url"
     }
 }
@@ -392,12 +394,12 @@ struct LiveOperationsClient {
     }
 
     func stop(_ credentials: LiveSessionCredentials, recordResponse: Bool = true,
-              completion: @escaping (Bool) -> Void) {
+              completion: @escaping (Bool, URLResponse?, Error?) -> Void) {
         var request = authorized(endpoint("v1", "live", "sessions", credentials.sessionID, "stop"), token: credentials.token)
         request.httpMethod = "POST"
         session.dataTask(with: request) { _, response, error in
             if recordResponse { ControlState.recordServiceResponse(error: error, response: response) }
-            completion(error == nil && (response as? HTTPURLResponse)?.statusCode == 200)
+            completion(error == nil && (response as? HTTPURLResponse)?.statusCode == 200, response, error)
         }.resume()
     }
 
@@ -693,9 +695,22 @@ enum LiveSessionState {
         catch { return false }
     }
 
+    static func recoverActive(_ value: LiveSessionCredentials?, captureEnabled: Bool) -> Bool {
+        value != nil && (captureEnabled || value?.stopPending == true)
+    }
+
+    static func holdCaptureOnRecovery(_ value: LiveSessionCredentials?) -> Bool {
+        value?.stopPending == true || value?.liveConnectionPending == true
+    }
+
     static func save(_ value: LiveSessionCredentials, enableCapture: Bool = true) -> Bool {
-        guard let fileURL, let defaults = AppGroup.defaults,
-              let data = try? JSONEncoder().encode(value) else { return false }
+        guard let fileURL, let defaults = AppGroup.defaults else { return false }
+        return save(value, fileURL: fileURL, defaults: defaults, enableCapture: enableCapture)
+    }
+
+    static func save(_ value: LiveSessionCredentials, fileURL: URL, defaults: UserDefaults,
+                     enableCapture: Bool = true) -> Bool {
+        guard let data = try? JSONEncoder().encode(value) else { return false }
         do {
             try data.write(to: fileURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
             defaults.set(enableCapture, forKey: enabledKey)
@@ -706,8 +721,21 @@ enum LiveSessionState {
     }
 
     static func credentials() -> LiveSessionCredentials? {
-        guard let fileURL, let data = try? Data(contentsOf: fileURL) else { return nil }
+        guard let fileURL else { return nil }
+        return credentials(fileURL: fileURL)
+    }
+    static func credentials(fileURL: URL) -> LiveSessionCredentials? {
+        guard let data = try? Data(contentsOf: fileURL) else { return nil }
         return try? JSONDecoder().decode(LiveSessionCredentials.self, from: data)
+    }
+    static func confirmStopped(_ value: LiveSessionCredentials) -> Bool {
+        guard let fileURL, let defaults = AppGroup.defaults else { return false }
+        return confirmStopped(value, fileURL: fileURL, defaults: defaults)
+    }
+    static func confirmStopped(_ value: LiveSessionCredentials, fileURL: URL, defaults: UserDefaults) -> Bool {
+        var confirmed = value
+        confirmed.stopPending = false
+        return save(confirmed, fileURL: fileURL, defaults: defaults, enableCapture: false)
     }
     static func isEnabled() -> Bool { AppGroup.defaults?.bool(forKey: enabledKey) ?? false }
     static func disableCapturePreservingCredentials() {

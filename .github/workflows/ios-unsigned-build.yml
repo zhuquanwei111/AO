@@ -10,6 +10,10 @@ on:
         options:
           - Debug
           - Release
+      run_poll_transport_tests:
+        description: 运行定向的场次网络与凭据测试
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -116,3 +120,40 @@ jobs:
           path: screen-assistant/ios/build/ScreenAssistant-unsigned.app.zip
           retention-days: 7
           if-no-files-found: error
+
+      - name: 运行定向 XCTest
+        if: ${{ inputs.run_poll_transport_tests }}
+        working-directory: screen-assistant/ios
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun simctl list devices available --json > build/available-simulators.json
+          SIMULATOR_UDID="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(next((x["udid"] for runtime,devices in d["devices"].items() if runtime.startswith("com.apple.CoreSimulator.SimRuntime.iOS-") for x in devices if x.get("isAvailable", False)), ""))' build/available-simulators.json)"
+          if [[ -z "$SIMULATOR_UDID" ]]; then
+            echo '没有可用的 iOS Simulator，无法运行定向 XCTest。' >&2
+            exit 1
+          fi
+          echo "使用可用的 iOS Simulator：$SIMULATOR_UDID"
+          xcodebuild \
+            -project ScreenAssistant.xcodeproj \
+            -scheme ScreenAssistant \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
+            -configuration Debug \
+            -derivedDataPath build/PollTransportDD \
+            -resultBundlePath build/PollTransport.xcresult \
+            -only-testing:ScreenAssistantTests/PollTransportTests \
+            CODE_SIGNING_ALLOWED=NO \
+            SWIFT_VERSION=5.0 \
+            test 2>&1 | tee build/poll-transport-test.log
+
+      - name: 保存定向 XCTest 结果
+        if: ${{ always() && inputs.run_poll_transport_tests }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: screen-assistant-poll-transport-test
+          path: |
+            screen-assistant/ios/build/available-simulators.json
+            screen-assistant/ios/build/poll-transport-test.log
+            screen-assistant/ios/build/PollTransport.xcresult
+          retention-days: 7
+          if-no-files-found: warn

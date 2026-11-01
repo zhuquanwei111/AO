@@ -1,5 +1,14 @@
 import Foundation
 
+var stopWrites = 0
+assert(!PollCallbackGate.commitIfCurrent(sessionID: "A", generation: 1,
+    currentSessionID: "B", currentGeneration: 2, active: true, stopping: false) { stopWrites += 1 })
+assert(!PollCallbackGate.commitIfCurrent(sessionID: "A", generation: 1,
+    currentSessionID: "A", currentGeneration: 1, active: false, stopping: false) { stopWrites += 1 })
+assert(PollCallbackGate.commitIfCurrent(sessionID: "A", generation: 1,
+    currentSessionID: "A", currentGeneration: 1, active: true, stopping: false) { stopWrites += 1 })
+assert(stopWrites == 1)
+
 var recorded: [String] = []
 func deliver(_ session: String, _ generation: Int, _ result: String,
              currentSession: String?, currentGeneration: Int,
