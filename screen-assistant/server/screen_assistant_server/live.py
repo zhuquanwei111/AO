@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import re
 import sqlite3
 import time
@@ -11,7 +12,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Literal
 
-from fastapi import APIRouter, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .live_rules import (
@@ -27,6 +28,7 @@ from .live_fusion import (
 from .person_observation import PersonObservation as PersonObservationValue, PersonPolicy
 
 router = APIRouter(prefix="/v1/live/sessions", tags=["live-test-fixture"])
+logger = logging.getLogger("screen_assistant.app")
 
 
 class CreateSession(BaseModel):
@@ -177,13 +179,107 @@ class PersonSessionState:
 
 
 class LiveService:
-    def __init__(self, path: str, clock):
+    def __init__(self, path: str, clock, *, concurrency: int = 2, queue_limit: int = 16):
         self.path, self.clock = path, clock
         self.store: LiveStore | None = None
         self.lock = asyncio.Lock()
-        self.fusion_lock = asyncio.Lock()
+        self.fusion_slots = asyncio.Semaphore(concurrency)
+        self.fusion_concurrency = concurrency
+        self.fusion_queue_limit = queue_limit
+        self.fusion_queue = deque()
+        self.fusion_queued = {}
+        self.fusion_active = {}
+        self.fusion_dirty = set()
+        self.fusion_audio_pending = {}
+        self.fusion_stopping = set()
+        self.fusion_closed = False
         self.waiters: dict[str, set[asyncio.Future]] = {}
         self.person_states: dict[str, PersonSessionState] = {}
+
+    def schedule_fusion(self, sid, token, request):
+        if self.fusion_closed or sid in self.fusion_stopping:
+            return False
+        active = self.fusion_active.get(sid)
+        if active is not None and active.done():
+            self._fusion_done(sid, active)
+            active = None
+        if active is not None:
+            self.fusion_dirty.add(sid)
+            logger.info("live_fusion outcome=coalesced")
+            return True
+        if sid in self.fusion_queued:
+            logger.info("live_fusion outcome=coalesced")
+            return True
+        if len(self.fusion_active) >= self.fusion_concurrency and len(self.fusion_queue) >= self.fusion_queue_limit:
+            logger.info("live_fusion outcome=busy")
+            return False
+        self.fusion_queued[sid] = (token, request)
+        self.fusion_queue.append(sid)
+        self._pump_fusion()
+        return True
+
+    def schedule_audio_fusion(self, sid, token, request):
+        scheduled = self.schedule_fusion(sid, token, request)
+        if scheduled:
+            # 每次有效音频触发使用新身份，旧执行不能清除随后到达的音频。
+            self.fusion_audio_pending[sid] = object()
+        return scheduled
+
+    def _pump_fusion(self):
+        while not self.fusion_closed and self.fusion_queue and len(self.fusion_active) < self.fusion_concurrency:
+            sid = self.fusion_queue.popleft()
+            token, request = self.fusion_queued.pop(sid)
+            task = asyncio.create_task(self._fusion_worker(sid, token, request))
+            self.fusion_active[sid] = task
+            task.add_done_callback(lambda task, sid=sid: self._fusion_done(sid, task))
+
+    def _fusion_done(self, sid, task):
+        if self.fusion_active.get(sid) is not task:
+            return
+        self.fusion_active.pop(sid, None)
+        self.fusion_dirty.discard(sid)
+        self.fusion_audio_pending.pop(sid, None)
+        self._pump_fusion()
+
+    async def _fusion_worker(self, sid, token, request):
+        try:
+            while True:
+                self.fusion_dirty.discard(sid)
+                if FUSION_SETTLE_MS:
+                    await asyncio.sleep(FUSION_SETTLE_MS / 1000)
+                audio_generation = self.fusion_audio_pending.get(sid)
+                try:
+                    await self.deliver_fusion(sid, token, request)
+                except Exception:
+                    logger.warning("live_fusion outcome=failed")
+                finally:
+                    if audio_generation is not None and self.fusion_audio_pending.get(sid) is audio_generation:
+                        self.fusion_audio_pending.pop(sid, None)
+                if sid not in self.fusion_dirty or sid in self.fusion_stopping:
+                    break
+        except asyncio.CancelledError:
+            logger.info("live_fusion outcome=cancelled")
+            raise
+
+    async def stop_fusion(self, sid):
+        self.fusion_dirty.discard(sid)
+        if sid in self.fusion_queued:
+            self.fusion_queued.pop(sid)
+            self.fusion_queue.remove(sid)
+        task = self.fusion_active.get(sid)
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def close_fusion(self):
+        self.fusion_closed = True
+        self.fusion_queue.clear()
+        self.fusion_queued.clear()
+        self.fusion_audio_pending.clear()
+        tasks = list(self.fusion_active.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     def dispatch(self, method: str, *args):
         # 延迟初始化，使新存储不可写时不影响旧问答/健康检查的生命周期。
@@ -335,7 +431,7 @@ class LiveService:
                     del self.waiters[sid]
 
     async def deliver_fusion(self, sid: str, token: str | None, request: Request,
-                             *, urgent: bool = False):
+                             *, urgent: bool = False, allow_stopping: bool = False):
         async def deliver():
             candidate = await self.run("fusion_candidate", sid, token)
             if candidate is None:
@@ -350,21 +446,35 @@ class LiveService:
                         row["source"] for row in candidate["observations"]
                     ))
                     observed_at = max(row["effective_at_ms"] for row in candidate["observations"])
-                    suggestion = await request.app.state.model.suggest_live(
-                        candidate["model_text"], candidate["description"], source,
-                        observed_at, context=candidate["model_context"],
+                    suggestion = await asyncio.wait_for(
+                        request.app.state.model.suggest_live(
+                            candidate["model_text"], candidate["description"], source,
+                            observed_at, context=candidate["model_context"],
+                        ), timeout=cfg.model_timeout_seconds,
                     )
-                except (ModelTimeoutError, ModelUnavailableError):
+                except (asyncio.TimeoutError, ModelTimeoutError):
+                    logger.info("live_fusion outcome=timeout")
+                    return {"reason": "model_unavailable", "prompt_id": None}
+                except ModelUnavailableError:
+                    logger.info("live_fusion outcome=model_unavailable")
                     return {"reason": "model_unavailable", "prompt_id": None}
                 if not valid_operation_suggestion(suggestion):
                     return {"reason": "model_output_invalid", "prompt_id": None}
             elif not suggestion or len(suggestion) > 100 or "\n" in suggestion or "\r" in suggestion:
                 return {"reason": "candidate_invalid", "prompt_id": None}
-            return await self.run("save_fusion_candidate", sid, token, candidate, suggestion)
+            async with self.lock:
+                if self.fusion_closed or (sid in self.fusion_stopping and not allow_stopping):
+                    return {"reason": "cancelled", "prompt_id": None}
+                result = await self.call("save_fusion_candidate", sid, token, candidate, suggestion)
+                if result.get("prompt_id"):
+                    for future in self.waiters.get(sid, ()):
+                        if not future.done():
+                            future.set_result(None)
+                return result
 
         if urgent:
             return await deliver()
-        async with self.fusion_lock:
+        async with self.fusion_slots:
             return await deliver()
 
 
@@ -410,17 +520,31 @@ async def stop_session(session_id: str, request: Request,
             raise HTTPException(409, "stop signal source does not match app session")
         stopped = row["stopped_at_ms"] is not None
     audio_result = None
+    if session_id in service.fusion_stopping:
+        raise HTTPException(409, "live session already stopping")
+    service.fusion_stopping.add(session_id)
+    pending_audio = service.fusion_audio_pending.pop(session_id, None) is not None
     if not stopped:
-        audio_result = await request.app.state.audio.finish_session(session_id, token)
-    request.app.state.audio.closing.add(session_id)
+        request.app.state.audio.begin_fusion_stop(session_id)
     try:
-        if audio_result and audio_result["transcript_count"]:
-            await service.deliver_fusion(session_id, token, request)
+        await service.stop_fusion(session_id)
+        if not stopped:
+            audio_result = await request.app.state.audio.finish_session(session_id, token)
+        request.app.state.audio.closing.add(session_id)
+        if not stopped and (pending_audio or request.app.state.audio.stop_transcripts.get(session_id)):
+            try:
+                await service.deliver_fusion(session_id, token, request, allow_stopping=True)
+            except HTTPException as error:
+                if error.status_code not in (429, 503):
+                    raise
+                logger.warning("live_fusion outcome=stop_candidate_failed status=%s", error.status_code)
         result = await service.run(
             "stop", session_id, token, payload.source if payload else None,
         )
     finally:
         request.app.state.audio.closing.discard(session_id)
+        request.app.state.audio.stop_transcripts.pop(session_id, None)
+        service.fusion_stopping.discard(session_id)
     if audio_result is not None and (audio_result["transcript_count"] or audio_result["incomplete"]):
         result["audio"] = audio_result
     return result
@@ -503,8 +627,10 @@ async def process_fusion_observation(service: LiveService, session_id: str,
                                      result: dict, body: dict, *, urgent: bool):
     if result.get("reason") != "windowed":
         return result
-    if not urgent and FUSION_SETTLE_MS:
-        await asyncio.sleep(FUSION_SETTLE_MS / 1000)
+    if not urgent:
+        scheduled = service.schedule_fusion(session_id, token, request)
+        result.update(reason="scheduled" if scheduled else "analysis_busy", prompt_id=None)
+        return result
     delivered = await service.deliver_fusion(session_id, token, request, urgent=urgent)
     if delivered.get("reason") == "generated":
         result.update(delivered)
@@ -563,8 +689,15 @@ async def add_signal(session_id: str, payload: PersonSignal, request: Request,
 
 
 @router.get("/{session_id}/prompts")
-async def poll_prompts(session_id: str, request: Request,
+async def poll_prompts(session_id: str, request: Request, response: Response,
                        after: str = Query("", max_length=128),
                        wait_ms: int = Query(0, ge=0, le=MAX_WAIT_MS),
                        token: str | None = Header(None, alias="X-Live-Session-Token")):
-    return await request.app.state.live.poll(session_id, token, after, wait_ms)
+    started_ns = time.monotonic_ns()
+    service = request.app.state.live
+    result = await service.poll(session_id, token, after, wait_ms)
+    finished_ns = time.monotonic_ns()
+    result["server_time_ms"] = service.clock()
+    result["server_processing_ms"] = (finished_ns - started_ns) // 1_000_000
+    response.headers["Cache-Control"] = "no-store"
+    return result

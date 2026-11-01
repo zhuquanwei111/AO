@@ -5,12 +5,20 @@ import org.json.JSONObject;
 
 /** 冻结v1共享summary的纯Java展示适配。缺值不补零，后台与OCR统计分开。 */
 final class RecapText {
+    static String stopStatus(boolean hasSession, boolean stopped, boolean pending, boolean inFlight) {
+        if (inFlight) return "本机采集已停止，正在确认场次结束。";
+        if (pending) return hasSession
+                ? "本机采集已停止，场次结束尚未确认。请返回设置重试结束本场。"
+                : "场次结束尚未确认，本机未保存场次凭证，请核对服务端状态。";
+        if (hasSession && stopped) return "本场已结束。";
+        return "";
+    }
     private static final String[] METRICS={"累计观众","新增粉丝","评论人数","送礼人数","获得音浪"};
     static boolean pending(JSONObject summary) {
         JSONObject recap=summary.optJSONObject("backstage_recap");
         if (recap==null) return false;
         String status=recap.optString("status");
-        return status.equals("waiting_for_stop") || status.equals("not_connected") || status.equals("capturing");
+        return status.equals("waiting_for_stop") || status.equals("capturing");
     }
     static boolean terminal(JSONObject summary) {
         JSONObject recap=summary.optJSONObject("backstage_recap");
@@ -42,7 +50,7 @@ final class RecapText {
         s.append("\n采集时间：").append(value(recap,"metrics_captured_at"));
         if (!recap.isNull("capture_method")) s.append("\n采集方式：").append(value(recap,"capture_method"));
         if (!recap.isNull("value_semantics")) s.append("\n口径：").append(value(recap,"value_semantics"));
-        s.append("\n这是停止信号后读到的页面汇总；音浪不换算金额，评论人数不是弹幕条数。");
+        s.append("\n后台五项按停止信号后的页面汇总口径；音浪不换算金额，评论人数不是弹幕条数。");
         return s.toString();
     }
     private static String value(JSONObject o,String key) { return !o.has(key)||o.isNull(key)?"未提供":o.optString(key); }
@@ -50,10 +58,10 @@ final class RecapText {
         switch (s) {
             case "not_configured": return "未配置抖音号";
             case "not_started": return "后台任务尚未启动";
-            case "waiting_for_stop": return "等待本场结束";
-            case "not_connected": return "已结束，后台取数执行器尚未连接";
-            case "capturing": return "后台正在取数";
-            case "captured_locally": return "已读取五项";
+            case "waiting_for_stop": return "任务已登记，取数状态待确认";
+            case "not_connected": return "本场复盘未取得，取数状态待确认；可手动刷新";
+            case "capturing": return "取数任务已领取，等待本场结果";
+            case "captured_locally": return "后台报告已采集，数据见下方";
             case "partial": return "部分数据缺失";
             case "needs_input": return "需要核对账号/后台状态";
             case "failed": return "取数失败，未补零";

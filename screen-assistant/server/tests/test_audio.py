@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from screen_assistant_server.app import create_app
 from screen_assistant_server.audio import AudioPacket, AudioService
 from screen_assistant_server.asr import FunASRConnection
-from test_live import Clock, create, settings
+from test_live import Clock, create, settings, wait_for_fusion
 
 
 def packet(seq=0, *, source="audioMic", start=0, frames=9600, final=False,
@@ -152,6 +152,7 @@ def test_final_revisions_enter_m4_once_then_short_prompt_and_record(tmp_path):
         windows = app.state.live.store.fusion_windows[session['session_id']]
         finals = [row for row in windows if row['kind'] == 'transcript' and row['content']['is_final']]
         assert len(finals) == 3
+        wait_for_fusion(client)
         events = client.get(url + "/events", headers=headers).json()["events"]
         assert len(events) == 1
         assert "稍快" in events[0]["suggestion"] and len(events[0]["suggestion"]) <= 80
@@ -287,6 +288,179 @@ def test_stop_flushes_tail_and_missing_engine_is_honest(tmp_path):
         assert not app.state.audio.tracks
 
 
+@pytest.mark.parametrize("pending_tail,before_finish,replace_job", [
+    (False, False, False), (True, False, False), (False, True, False), (False, True, True),
+])
+def test_stop_fuses_transcripts_from_inflight_job_without_flush_output(tmp_path, pending_tail, before_finish, replace_job):
+    import httpx
+
+    async def run():
+        clock = Clock()
+        app, _ = fixture_app(tmp_path, clock)
+        entered, release, stop_gate = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        class WindowVAD:
+            def speech(self, pcm):
+                if len(pcm) == 192000:
+                    return [(0, 16000), (16000, 32000), (32000, 96000)]
+                return [(0, len(pcm) // 2)]
+
+        class DelayedASR:
+            async def transcribe(self, pcm, segment_id, emit):
+                entered.set()
+                await release.wait()
+                await emit("欢迎大家一起聊聊今天的生活故事和自己的想法" * 3, True, "online")
+
+        async with app.router.lifespan_context(app):
+            app.state.audio.configure_for_test(WindowVAD, DelayedASR())
+            if before_finish:
+                original_stop_fusion = app.state.live.stop_fusion
+                async def wait_before_finish(sid):
+                    await original_stop_fusion(sid)
+                    await stop_gate.wait()
+                app.state.live.stop_fusion = wait_before_finish
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fixture") as client:
+                session = (await client.post("/v1/live/sessions", json={})).json()
+                sid = session["session_id"]
+                headers = {"X-Live-Session-Token": session["session_token"]}
+                url = f"/v1/live/sessions/{sid}"
+                clock.now += 10_000
+                for seq in range(10):
+                    response = await client.post(url + "/audio", headers=headers,
+                                                 json=packet(seq, start=seq * 600))
+                    assert response.status_code == 200, response.text
+                await asyncio.wait_for(entered.wait(), 2)
+                if pending_tail:
+                    tail = await client.post(url + "/audio", headers=headers, json=packet(10, start=6000))
+                    assert tail.status_code == 200, tail.text
+                stopping = asyncio.create_task(client.post(url + "/stop", headers=headers))
+                try:
+                    async with asyncio.timeout(2):
+                        while sid not in app.state.live.fusion_stopping:
+                            await asyncio.sleep(0)
+                    assert (await client.post(url + "/stop", headers=headers)).status_code == 409
+                    release.set()
+                    if before_finish:
+                        track = app.state.audio.tracks[(sid, "audioMic")]
+                        await asyncio.wait_for(track.job, 2)
+                        if replace_job:
+                            clock.now += 6_000
+                            for seq in range(10, 20):
+                                next_packet = await client.post(url + "/audio", headers=headers,
+                                    json=packet(seq, start=seq * 600))
+                                assert next_packet.status_code == 200, next_packet.text
+                            await asyncio.wait_for(track.job, 2)
+                        stop_gate.set()
+                    response = await asyncio.wait_for(stopping, 3)
+                    assert response.status_code == 200, response.text
+                    if pending_tail:
+                        assert response.json()["audio"]["transcript_count"] == 1
+                    else:
+                        assert "audio" not in response.json()
+                    assert app.state.live.store.db.execute(
+                        "SELECT COUNT(*) FROM live_observations WHERE session_id=?",
+                        (sid,),
+                    ).fetchone()[0] == (6 if replace_job else 4 if pending_tail else 3)
+                    events = (await client.get(url + "/events", headers=headers)).json()["events"]
+                    assert len(events) == 1
+                    assert events[0]["phenomenon"] == "近期连续主播转写的文字率偏快"
+                    repeated = await client.post(url + "/stop", headers=headers)
+                    assert repeated.status_code == 200
+                    assert repeated.json()["stopped_at_ms"] == response.json()["stopped_at_ms"]
+                finally:
+                    release.set()
+                    stop_gate.set()
+                    if not stopping.done():
+                        stopping.cancel()
+                    await asyncio.gather(stopping, return_exceptions=True)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode", ["direct_ingest", "failed", "partial_failure", "history", "cancel_after_store", "pre_gate"])
+def test_stop_only_fuses_new_inflight_audio(tmp_path, mode):
+    import httpx
+
+    async def run():
+        clock = Clock()
+        app, _ = fixture_app(tmp_path, clock)
+        entered, release, stored, finish_write = asyncio.Event(), asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        class ControlledASR:
+            async def transcribe(self, pcm, segment_id, emit):
+                entered.set()
+                if mode == "pre_gate":
+                    await emit("欢迎大家一起聊聊今天的生活故事", True, "online")
+                    stored.set()
+                    await release.wait()
+                    return
+                if mode not in ("history", "cancel_after_store"):
+                    await release.wait()
+                if mode == "failed":
+                    raise RuntimeError("controlled ASR failure")
+                await emit("欢迎大家一起聊聊今天的生活故事", True, "online")
+                if mode == "partial_failure":
+                    raise RuntimeError("controlled failure after persistence")
+
+        async with app.router.lifespan_context(app):
+            app.state.audio.configure_for_test(VadFixture, ControlledASR())
+            app.state.live.schedule_fusion = lambda *args: False
+            if mode == "cancel_after_store":
+                original_run = app.state.live.run
+                async def controlled_run(method, *args):
+                    result = await original_run(method, *args)
+                    if method == "add_observation" and args[2]["kind"] == "transcript":
+                        stored.set()
+                        await finish_write.wait()
+                    return result
+                app.state.live.run = controlled_run
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fixture") as client:
+                session = (await client.post("/v1/live/sessions", json={})).json()
+                sid = session["session_id"]
+                headers = {"X-Live-Session-Token": session["session_token"]}
+                url = f"/v1/live/sessions/{sid}"
+                clock.now += 10_000
+                assert (await client.post(url + "/audio", headers=headers, json=packet())).status_code == 200
+                end = asyncio.create_task(client.post(url + "/audio", headers=headers,
+                    json=packet(1, pcm_base64="", spans=[], final=True)))
+                await asyncio.wait_for(entered.wait(), 2)
+                if mode in ("cancel_after_store", "pre_gate"):
+                    await asyncio.wait_for(stored.wait(), 2)
+                if mode == "history":
+                    assert (await asyncio.wait_for(end, 2)).status_code == 200
+                for index in range(2):
+                    comment = {"event_id": f"question-{index}", "input_mode": "live_observation",
+                               "source": "ios_replaykit_ocr", "coverage": "ocr_visible_sample",
+                               "reliability": "known", "text": "主播你是哪里人？"}
+                    assert (await client.post(url + "/comments", headers=headers, json=comment)).status_code == 200
+                stopping = asyncio.create_task(client.post(url + "/stop", headers=headers))
+                try:
+                    if mode != "history":
+                        async with asyncio.timeout(2):
+                            while sid not in app.state.live.fusion_stopping:
+                                await asyncio.sleep(0)
+                    if mode == "cancel_after_store":
+                        end.cancel()
+                        finish_write.set()
+                    release.set()
+                    result = await asyncio.wait_for(stopping, 3)
+                    assert result.status_code == 200
+                    await asyncio.gather(end, return_exceptions=True)
+                    events = (await client.get(url + "/events", headers=headers)).json()["events"]
+                    if mode in ("direct_ingest", "partial_failure", "cancel_after_store", "pre_gate"):
+                        assert len(events) == 1
+                        assert "重复" in events[0]["phenomenon"]
+                    else:
+                        assert events == []
+                finally:
+                    release.set()
+                    finish_write.set()
+                    for task in (end, stopping):
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(end, stopping, return_exceptions=True)
+    asyncio.run(run())
+
+
 def test_real_websocket_transport_with_protocol_fixture():
     """真实loopback WebSocket传输；服务端是协议fixture，绝非真实ASR。"""
     from websockets.asyncio.server import serve
@@ -355,6 +529,81 @@ def test_empty_end_packet_flushes_existing_pcm_and_retired_capture_stays_out(tmp
         newer = packet(stream='capture-2', start=600)
         assert client.post(url, headers=headers, json=newer).status_code == 200
         assert client.post(url, headers=headers, json=end).status_code == 409
+
+
+@pytest.mark.parametrize("scheduled, expected", [(True, "scheduled"), (False, "analysis_busy")])
+def test_audio_reports_transcript_fusion_schedule(tmp_path, scheduled, expected):
+    clock = Clock()
+    app, configure = fixture_app(tmp_path, clock)
+    with TestClient(app) as client:
+        configure()
+        app.state.live.schedule_fusion = lambda sid, token, request: scheduled
+        session, headers = create(client)
+        clock.now += 20_000
+        url = f"/v1/live/sessions/{session['session_id']}/audio"
+        assert client.post(url, headers=headers, json=packet()).status_code == 200
+        response = client.post(url, headers=headers,
+                               json=packet(1, pcm_base64='', spans=[], final=True))
+        assert response.status_code == 200
+        result = response.json()
+        assert result['status'] == 'accepted' and len(result['transcripts']) == 2
+        assert result['fusion_schedule'] == expected
+        assert app.state.live.store.db.execute(
+            'SELECT COUNT(*) FROM live_observations WHERE session_id=?', (session['session_id'],)
+        ).fetchone()[0] == 2
+
+
+def test_background_audio_busy_is_durable_and_session_scoped(tmp_path):
+    clock = Clock()
+    app, configure = fixture_app(tmp_path, clock)
+    with TestClient(app) as client:
+        configure()
+        app.state.live.schedule_fusion = lambda sid, token, request: False
+        session, headers = create(client)
+        other, other_headers = create(client)
+        url = f"/v1/live/sessions/{session['session_id']}"
+        clock.now += 10_000
+        for seq in range(10):
+            response = client.post(url + "/audio", headers=headers, json=packet(seq, start=seq * 600))
+            assert response.status_code == 200
+        async def wait_job():
+            track = app.state.audio.tracks[(session['session_id'], 'audioMic')]
+            await asyncio.wait_for(track.job, 2)
+        client.portal.call(wait_job)
+        summary = client.get(url + "/summary", headers=headers).json()
+        assert summary['audio_fusion']['background_analysis_busy_count'] == 1
+        other_url = f"/v1/live/sessions/{other['session_id']}"
+        assert client.get(other_url + "/summary", headers=other_headers).json()['audio_fusion']['background_analysis_busy_count'] == 0
+        assert client.get(url + "/summary", headers=other_headers).status_code == 403
+        assert client.post(url + "/stop", headers=headers).status_code == 200
+    reopened = create_app(settings(tmp_path / "live.sqlite3"), live_clock=clock)
+    with TestClient(reopened) as client:
+        assert client.get(url + "/summary", headers=headers).json()['audio_fusion']['background_analysis_busy_count'] == 1
+
+
+def test_background_busy_record_survives_cancellation(tmp_path):
+    import httpx
+    async def run():
+        clock = Clock()
+        app = create_app(settings(tmp_path / "cancel.sqlite3"), live_clock=clock)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fixture") as client:
+                session = (await client.post("/v1/live/sessions", json={})).json()
+                sid, token = session['session_id'], session['session_token']
+                app.state.live.schedule_fusion = lambda *args: False
+                await app.state.live.lock.acquire()
+                try:
+                    task = asyncio.create_task(app.state.audio.deliver(sid, token, True))
+                    await asyncio.sleep(0)
+                    task.cancel()
+                finally:
+                    app.state.live.lock.release()
+                result = await asyncio.gather(task, return_exceptions=True)
+                assert isinstance(result[0], asyncio.CancelledError)
+                summary = await client.get(f"/v1/live/sessions/{sid}/summary",
+                                           headers={"X-Live-Session-Token": token})
+                assert summary.json()['audio_fusion']['background_analysis_busy_count'] == 1
+    asyncio.run(run())
 
 
 def test_abandoned_capture_pcm_expires_without_a_new_request(tmp_path):

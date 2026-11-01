@@ -37,7 +37,7 @@ public final class LiveContractProbe {
             JSONObject prompts=LiveClient.poll(s,"");
             assertFalse(prompts.getBoolean("stopped"));
             assertTrue(prompts.getJSONArray("prompts").length()>0);
-            JSONObject person=new JSONObject().put("source",LiveFrameAnalyzer.PERSON_SOURCE).put("coverage","sampled_person_roi")
+            JSONObject person=new JSONObject().put("source","android_vision_person").put("coverage","sampled_person_roi")
                     .put("segment_id","android-controlled").put("sequence",0).put("observed_at_ms",System.currentTimeMillis())
                     .put("uptime_ms",1000).put("quality","unknown");
             LiveClient.call(s,"person-observations",person);
