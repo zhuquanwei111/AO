@@ -1068,9 +1068,8 @@ class LiveStore:
     @staticmethod
     def event(row):
         payload = json.loads(row["payload"])
-        reply = payload.get("reply_to")
-        if isinstance(reply, dict) and "text" not in reply:
-            payload.pop("reply_to")
+        # 无论载荷来自新旧版本，持久化引用都不得直接进入响应。
+        payload.pop("reply_to", None)
         payload.update(generated_at_ms=row["generated_at_ms"],
                        expires_at_ms=row["expires_at_ms"],
                        returned_at_ms=row["returned_at_ms"],
