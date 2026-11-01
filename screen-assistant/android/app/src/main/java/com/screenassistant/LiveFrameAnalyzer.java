@@ -195,7 +195,16 @@ final class LiveFrameAnalyzer implements AutoCloseable {
         freezeObservationMetadata(outgoing, session.batchMetadata);
         ledger.register(outgoing);
         BatchDispatch.submit(upload,outgoing,active,() -> fresh(frame),
-                row -> LiveClient.call(session,"observations",row),status,hadLoss,
+                row -> {
+                    long sampleToSendMs=SystemClock.elapsedRealtime()-frame.uptime;
+                    try { LiveClient.call(session,"observations",row); }
+                    catch (LiveClient.HttpError error) {
+                        if ("HTTP 422 observations time_outside_session".equals(error.getMessage()))
+                            android.util.Log.i("CaptureService", "event=observation_time_422 route=observations status=422 "
+                                    + LiveClient.observationTimes(session,row,sampleToSendMs));
+                        throw error;
+                    }
+                },status,hadLoss,
                 (row,outcome) -> ledger.outcome(row.optString("event_id"),outcome));
     }
 

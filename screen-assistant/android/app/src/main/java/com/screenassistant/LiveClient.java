@@ -66,6 +66,22 @@ public final class LiveClient {
             "bool_type", "bool_parsing", "dict_type", "list_type", "model_type", "greater_than", "greater_than_equal",
             "less_than", "less_than_equal", "too_long", "too_short"));
 
+    static String observationTimes(Session session, JSONObject body, long sampleToSendMs) {
+        String id = session.id != null && session.id.matches("[0-9a-f]{32}") ? session.id : "invalid";
+        return "session=" + id + " observed_at_ms=" + integerField(body, "observed_at_ms")
+                + " started_at_ms=" + integerField(body, "started_at_ms")
+                + " ended_at_ms=" + integerField(body, "ended_at_ms")
+                + " sample_to_send_ms=" + sampleToSendMs;
+    }
+
+    private static String integerField(JSONObject body, String field) {
+        if (!body.has(field)) return "missing";
+        Object value = body.opt(field);
+        if (value == null || value == JSONObject.NULL) return "null";
+        if (value instanceof Integer || value instanceof Long) return value.toString();
+        return "invalid";
+    }
+
     private static String validationDetail(HttpURLConnection connection, String path) {
         if (!path.matches("/v1/live/sessions/[^/]+/observations")) return "";
         try (InputStream in = connection.getErrorStream(); ByteArrayOutputStream out = new ByteArrayOutputStream()) {

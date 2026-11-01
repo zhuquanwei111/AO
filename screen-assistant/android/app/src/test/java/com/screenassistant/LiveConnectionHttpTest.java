@@ -202,6 +202,31 @@ public class LiveConnectionHttpTest {
         }
     }
 
+    @Test public void timeDiagnosticIsBoundedAndLeavesActualRequestUntouched() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.observationHttp=422;
+            fixture.observationResponse="{\"detail\":\"observation time outside live session\"}";
+            String id="16530ac3c860438682d898ee4a468d53";
+            LiveClient.Session s=new LiveClient.Session(fixture.base(),id,"secret-token",10,false);
+            org.json.JSONObject body=new org.json.JSONObject().put("observed_at_ms",1234567890123L)
+                    .put("started_at_ms",org.json.JSONObject.NULL).put("ended_at_ms","private-text")
+                    .put("content",new org.json.JSONObject().put("text","secret-body"));
+            String original=body.toString();
+            try { LiveClient.call(s,"observations",body); fail(); }
+            catch (LiveClient.HttpError error) {
+                assertEquals("HTTP 422 observations time_outside_session", error.getMessage());
+                String diagnostic=LiveClient.observationTimes(s,body,42);
+                assertEquals("session="+id+" observed_at_ms=1234567890123 started_at_ms=null ended_at_ms=invalid sample_to_send_ms=42",diagnostic);
+                assertFalse(diagnostic.contains("secret")); assertFalse(diagnostic.contains("private"));
+            }
+            assertEquals(original,body.toString()); assertEquals(original,fixture.observationBodies.get(0));
+            body.remove("started_at_ms");
+            assertTrue(LiveClient.observationTimes(s,body,0).contains("started_at_ms=missing"));
+            LiveClient.Session invalid=new LiveClient.Session(fixture.base(),"secret-id","secret-token",10,false);
+            assertTrue(LiveClient.observationTimes(invalid,body,0).startsWith("session=invalid "));
+        }
+    }
+
     @Test public void createCapabilityControlsRealObservationBodies() throws Exception {
         try (Fixture fixture = new Fixture()) {
             fixture.createCapabilities = ",\"capabilities\":{\"observation_batch_metadata\":true}";
