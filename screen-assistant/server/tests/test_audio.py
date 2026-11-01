@@ -427,11 +427,11 @@ def test_stop_only_fuses_new_inflight_audio(tmp_path, mode):
                     await asyncio.wait_for(stored.wait(), 2)
                 if mode == "history":
                     assert (await asyncio.wait_for(end, 2)).status_code == 200
-                for index in range(2):
-                    comment = {"event_id": f"question-{index}", "input_mode": "live_observation",
-                               "source": "ios_replaykit_ocr", "coverage": "ocr_visible_sample",
-                               "reliability": "known", "text": "主播你是哪里人？"}
-                    assert (await client.post(url + "/comments", headers=headers, json=comment)).status_code == 200
+                quality = {"kind": "quality", "event_id": "quality-1", "source": "ios_replaykit_ocr",
+                           "observed_at_ms": clock.now, "availability": "available",
+                           "coverage": "ocr_visible_sample", "reliability": "known",
+                           "content": {"signal": "video_input_unclear"}}
+                assert (await client.post(url + "/observations", headers=headers, json=quality)).status_code == 200
                 stopping = asyncio.create_task(client.post(url + "/stop", headers=headers))
                 try:
                     if mode != "history":
@@ -448,7 +448,7 @@ def test_stop_only_fuses_new_inflight_audio(tmp_path, mode):
                     events = (await client.get(url + "/events", headers=headers)).json()["events"]
                     if mode in ("direct_ingest", "partial_failure", "cancel_after_store", "pre_gate"):
                         assert len(events) == 1
-                        assert "重复" in events[0]["phenomenon"]
+                        assert events[0]["phenomenon"] == "采集输入出现可检查的质量信号"
                     else:
                         assert events == []
                 finally:

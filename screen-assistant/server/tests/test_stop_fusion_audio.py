@@ -321,11 +321,11 @@ def test_tail_candidate_failure_first_stop_and_retry(tmp_path, status, monkeypat
                 headers = {'X-Live-Session-Token': session['session_token']}
                 url = f'/v1/live/sessions/{sid}'
                 clock.now += 10000
-                for index in range(2):
-                    comment = {'event_id': f'question-{index}', 'input_mode': 'live_observation',
-                               'source': 'ios_replaykit_ocr', 'coverage': 'ocr_visible_sample',
-                               'reliability': 'known', 'text': '主播你是哪里人？'}
-                    assert (await client.post(url + '/comments', headers=headers, json=comment)).status_code == 200
+                quality = {'kind': 'quality', 'event_id': 'quality-1', 'source': 'ios_replaykit_ocr',
+                           'observed_at_ms': clock.now, 'availability': 'available',
+                           'coverage': 'ocr_visible_sample', 'reliability': 'known',
+                           'content': {'signal': 'video_input_unclear'}}
+                assert (await client.post(url + '/observations', headers=headers, json=quality)).status_code == 200
                 assert (await client.post(url + '/audio', headers=headers, json=packet())).status_code == 200
                 first = await client.post(url + '/stop', headers=headers)
                 if status in (429, 503, 'stop_storage'):
