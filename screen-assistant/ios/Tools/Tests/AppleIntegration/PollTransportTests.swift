@@ -104,6 +104,40 @@ private final class PollFixtureProtocol: URLProtocol {
 }
 
 final class PollTransportTests: XCTestCase {
+    func testPromptMinimumReadingTimeAndUrgentDeadline() {
+        func item(_ id: String, expiry: Int64, priority: Int = 25, type: String? = nil) -> LivePromptDelivery.Item {
+            .init(id: id, text: id, expiresAtMS: expiry, priority: priority, promptType: type)
+        }
+        for type in ["comment_reply", "operation_notice", nil] as [String?] {
+            var delivery = LivePromptDelivery(intervalMS: 0)
+            var reasons: [String] = []
+            _ = delivery.receive([item("short", expiry: 2_999, type: type),
+                                  item("boundary", expiry: 3_000, type: type)], nowMS: 0) {
+                reasons.append("\($0.id):\($1)")
+            }
+            XCTAssertTrue(reasons.contains("short:insufficient_reading_time"))
+            XCTAssertEqual(delivery.take(nowMS: 0, fits: { _ in true }).map(\.id), ["boundary"])
+        }
+        var delivery = LivePromptDelivery(intervalMS: 0)
+        var reasons: [String] = []
+        _ = delivery.receive([item("late", expiry: 4_000), item("next", expiry: 8_000)], nowMS: 0)
+        XCTAssertEqual(delivery.take(nowMS: 1_001, onDecision: { reasons.append("\($0.id):\($1)") },
+                                     fits: { _ in true }).map(\.id), ["next"])
+        XCTAssertTrue(reasons.contains("late:insufficient_reading_time"))
+        delivery.clear()
+        _ = delivery.receive([item("urgent", expiry: 211, priority: 100)], nowMS: 0)
+        let urgent = delivery.take(nowMS: 0, fits: { _ in true })
+        XCTAssertEqual(urgent.map(\.id), ["urgent"])
+        XCTAssertEqual(urgent.first?.expiresAtMS, 211)
+        XCTAssertTrue(LivePromptDelivery.unexpired(urgent, nowMS: 211).isEmpty)
+        var protected = LivePromptDelivery()
+        _ = protected.receive([item("shown", expiry: 20_000)], nowMS: 0)
+        XCTAssertEqual(protected.take(nowMS: 0, fits: { _ in true }).map(\.id), ["shown"])
+        _ = protected.receive([item("next", expiry: 20_000)], nowMS: 887)
+        XCTAssertTrue(protected.take(nowMS: 7_999, fits: { _ in true }).isEmpty)
+        XCTAssertEqual(protected.take(nowMS: 8_000, fits: { _ in true }).map(\.id), ["next"])
+    }
+
     func testOnlineCountConfirmationPersistsOnlyForSameRegion() throws {
         let suite = "count-confirmation-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
