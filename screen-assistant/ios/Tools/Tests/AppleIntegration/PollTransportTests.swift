@@ -16,6 +16,21 @@ private final class PollFixtureProtocol: URLProtocol {
 
     override func startLoading() {
         let path = request.url!.path
+        if path.hasPrefix("/binding-a/") {
+            guard request.url?.port == 8443,
+                  request.value(forHTTPHeaderField: "X-Live-Session-Token") == "fixture-token" else {
+                client?.urlProtocol(self, didFailWithError: URLError(.userAuthenticationRequired))
+                return
+            }
+            let json = path.hasSuffix("/events")
+                ? "{\"session_id\":\"fixture-session\",\"started_at_ms\":1,\"events\":[],\"next_cursor\":\"\",\"has_more\":false}"
+                : "{\"session_id\":\"fixture-session\",\"started_at_ms\":1,\"online_count\":{\"status\":\"unknown\",\"coverage\":{}}}"
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: Data(json.utf8))
+            client?.urlProtocolDidFinishLoading(self)
+            return
+        }
         if path.hasSuffix("/stop"),
            (!path.contains("/sessions/fixture-session/stop") ||
             request.value(forHTTPHeaderField: "X-Live-Session-Token") != "fixture-token") {
@@ -253,6 +268,64 @@ final class PollTransportTests: XCTestCase {
         wait(for: [confirmed], timeout: 5)
         retrySession.invalidateAndCancel()
         XCTAssertEqual(LiveSessionState.credentials(fileURL: url)?.stopPending, false)
+    }
+
+    func testCaptureBindingRejectsChangedOrMissingService() {
+        var original = credentials
+        let serviceA = URL(string: "https://poll-fixture.invalid:8443/original")!
+        let serviceB = URL(string: "https://poll-fixture.invalid:8443/other")!
+        XCTAssertNil(original.captureServiceURL(configured: serviceA))
+        original.boundServiceURL = serviceA
+        XCTAssertEqual(original.captureServiceURL(configured: serviceA), serviceA)
+        var otherService = original
+        otherService.boundServiceURL = serviceB
+        XCTAssertTrue(original.hasSameBoundIdentity(as: original))
+        XCTAssertFalse(original.hasSameBoundIdentity(as: otherService))
+        XCTAssertFalse(original.hasSameBoundIdentity(as: nil))
+        XCTAssertNil(original.captureServiceURL(configured: serviceB))
+        XCTAssertNil(original.captureServiceURL(configured: nil))
+        original.boundServiceURL = URL(string: "https://user:secret@poll-fixture.invalid")!
+        XCTAssertNil(original.captureServiceURL(configured: original.boundServiceURL))
+    }
+
+    func testUnreadableStopRecordIsPreserved() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: url) }
+        XCTAssertFalse(LiveSessionState.isolatedStopRecordUnreadable(fileURL: url))
+        let invalid = Data("invalid stop record".utf8)
+        try invalid.write(to: url)
+        XCTAssertTrue(LiveSessionState.isolatedStopRecordUnreadable(fileURL: url))
+        let intent = IsolatedStopIntent(credentials: credentials,
+                                        serviceURL: URL(string: "https://poll-fixture.invalid/a")!)
+        XCTAssertFalse(LiveSessionState.saveIsolatedStop(intent, fileURL: url))
+        XCTAssertEqual(try Data(contentsOf: url), invalid)
+    }
+
+    func testOriginalServiceClientReadsEventsAndSummary() throws {
+        var original = credentials
+        original.boundServiceURL = URL(string: "https://poll-fixture.invalid:8443/binding-a")!
+        let stored = try JSONEncoder().encode(original)
+        let restored = try JSONDecoder().decode(LiveSessionCredentials.self, from: stored)
+        let configuredB = URL(string: "https://poll-fixture.invalid:8443/binding-b")!
+        XCTAssertNil(restored.captureServiceURL(configured: configuredB))
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PollFixtureProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let client = try XCTUnwrap(restored.boundServiceURL.flatMap { LiveOperationsClient(baseURL: $0, session: session) })
+        let events = expectation(description: "原服务事件")
+        let summary = expectation(description: "原服务汇总")
+        client.events(restored, onResponse: { _, _ in }) { result in
+            guard case .success(let page) = result else { XCTFail("事件请求未成功"); events.fulfill(); return }
+            XCTAssertEqual(page.sessionID, restored.sessionID)
+            events.fulfill()
+        }
+        client.summary(restored, onResponse: { _, _ in }) { result in
+            guard case .success(let page) = result else { XCTFail("汇总请求未成功"); summary.fulfill(); return }
+            XCTAssertEqual(page.sessionID, restored.sessionID)
+            summary.fulfill()
+        }
+        wait(for: [events, summary], timeout: 5)
     }
 
     private func makeClient(_ scenario: String) -> (LiveOperationsClient, URLSession) {
