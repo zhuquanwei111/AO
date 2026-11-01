@@ -564,7 +564,10 @@ public class LiveConnectionHttpTest {
 
     @Test public void realHttpBadPageAnchorStillRejectsAllButExpiredItemOnlySkipsItself() throws Exception {
         try (Fixture fixture = new Fixture()) {
-            ReceivedDisplay display = new ReceivedDisplay();
+            List<String> drops = new ArrayList<>();
+            ReceivedDisplay display = new ReceivedDisplay() {
+                @Override public void promptDropped(String id, String reason) { drops.add(id + ":" + reason); }
+            };
             LiveConnection connection = new LiveConnection(new LiveConnectionTest.Memory(),
                     LiveClient.remote(fixture.base(), "", "", () -> 10_000_000_000L), display);
             assertTrue(connection.connect());
@@ -572,9 +575,12 @@ public class LiveConnectionHttpTest {
                     + "," + item("C", "16000") + "]";
             for (String fields : new String[]{"", ",\"server_time_ms\":1000.0,\"server_processing_ms\":0",
                     ",\"server_time_ms\":1000,\"server_processing_ms\":1"}) {
+                drops.clear();
                 fixture.clockFields = fields;
                 assertTrue(connection.poll());
                 assertTrue(display.received.isEmpty());
+                assertEquals(java.util.Arrays.asList("A:invalid_page_time_anchor",
+                        "expired:invalid_page_time_anchor", "C:invalid_page_time_anchor"), drops);
                 assertTrue(display.diagnostic.contains(LiveConnection.TIME_UNKNOWN));
             }
             fixture.clockFields = ",\"server_time_ms\":1000,\"server_processing_ms\":0";

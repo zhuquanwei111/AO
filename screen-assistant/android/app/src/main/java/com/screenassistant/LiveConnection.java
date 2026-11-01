@@ -197,6 +197,9 @@ final class LiveConnection {
                             .put(DisplayText.TYPED_PROMPTS, session.typedPrompts);
                     ready.put(prompt);
                 }
+            } else for (int i = 0; i < prompts.length(); i++) {
+                JSONObject prompt = prompts.optJSONObject(i);
+                listener.promptDropped(prompt == null ? "" : prompt.optString("prompt_id"), "invalid_page_time_anchor");
             }
             if (uptime.getAsLong() >= refreshRecapAt) {
                 refreshRecapAt = uptime.getAsLong() + 30000;
