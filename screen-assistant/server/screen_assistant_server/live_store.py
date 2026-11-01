@@ -30,6 +30,15 @@ from .comment_reconstruction import reconstruct_comments
 
 logger = logging.getLogger("screen_assistant.app")
 
+COACHING_GLOBAL_COOLDOWN_MS = 30_000
+COACHING_TOPIC_COOLDOWN_MS = 90_000
+COACHING_LIFETIME_MS = 30_000
+COACHING_TOPICS = (
+    ("comment_coaching:continue", "如果想继续这个话题，可以接着聊一聊这条评论。"),
+    ("comment_coaching:invite", "可以顺着这条评论，邀请大家分享各自的看法。"),
+    ("comment_coaching:pace", "接住这条评论后，可以留一点时间等大家回应。"),
+)
+
 
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
@@ -39,12 +48,36 @@ def fusion_topic_cooldown(candidate: dict) -> int:
     if candidate.get("prompt_type") == "comment_reply":
         return COMMENT_REPLY_COOLDOWN_MS
     topic = candidate["topic"]
+    if topic in {item[0] for item in COACHING_TOPICS}:
+        return COACHING_TOPIC_COOLDOWN_MS
     if topic == "person:head_down":
         return 90_000
     if (candidate["priority"] >= 100 or topic.startswith(("person", "quality:"))
             or any(row["source"].startswith("fixture:") for row in candidate["observations"])):
         return COOLDOWN_MS
     return GROUP_NOTICE_COOLDOWN_MS
+
+
+def comment_reply_topic(source: str, nickname: str | None, text: str) -> str:
+    clean_text = "".join(unicodedata.normalize("NFKC", text).split()).casefold()
+    clean_name = ("".join(unicodedata.normalize("NFKC", nickname).split()).casefold()
+                  if nickname is not None else None)
+    return "comment_reply:" + digest(json.dumps([source, "comment_reply", clean_name, clean_text], ensure_ascii=True))
+
+
+def comment_record_priority(record: dict) -> bool:
+    """仅使用有本条来源证据的可用等级调整顺序。"""
+    statuses = record.get("field_status", {})
+    sources = record.get("field_sources", {})
+    ids = record.get("source_event_ids") or []
+
+    def level(name):
+        evidence = sources.get(name) or []
+        if statuses.get(name) != "usable" or not evidence or any(item not in ids for item in evidence):
+            return None
+        return record.get(name)
+
+    return comment_has_priority(level("consumption_level"), level("fan_level"))
 
 
 class LiveStore:
@@ -773,7 +806,8 @@ class LiveStore:
         records = [record for batch in self.comment_batches.get(sid, {}).values()
                    if batch["complete"] and now <= batch.get("reply_deadline", batch["deadline"])
                    for record in batch.get("records", [])]
-        for record in sorted(records, key=lambda item: counts.get(item.get("comment_id"), 0)):
+        for record in sorted(records, key=lambda item: (
+                counts.get(item.get("comment_id"), 0), not comment_record_priority(item))):
             status = record.get("field_status", {})
             text = record.get("text")
             comment_id = record.get("comment_id")
@@ -804,12 +838,7 @@ class LiveStore:
             nickname = record.get("nickname") if usable_field("nickname") else None
             if not isinstance(nickname, str) or not nickname.strip():
                 nickname = None
-            clean_text = "".join(unicodedata.normalize("NFKC", text).split()).casefold()
-            clean_name = ("".join(unicodedata.normalize("NFKC", nickname).split()).casefold()
-                          if nickname is not None else None)
-            topic = "comment_reply:" + digest(json.dumps(
-                [record["source"], "comment_reply", clean_name, clean_text], ensure_ascii=True
-            ))
+            topic = comment_reply_topic(record["source"], nickname, text)
             last_reply = self.db.execute(
                 "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash=?",
                 (sid, digest(topic)),
@@ -865,6 +894,62 @@ class LiveStore:
                 }
                 break
         if candidate is None:
+            # 使用已处理的可靠评论提供可选训练建议；不推断人数或直播状态。
+            topic_hashes = [digest(topic) for topic, _ in COACHING_TOPICS]
+            recent_training = self.db.execute(
+                "SELECT topic_hash, MAX(generated_at_ms) AS last FROM live_events "
+                "WHERE session_id=? AND topic_hash IN (?,?,?) GROUP BY topic_hash",
+                (sid, *topic_hashes),
+            ).fetchall()
+            last_by_topic = {row["topic_hash"]: row["last"] for row in recent_training}
+            if last_by_topic and now - max(last_by_topic.values()) < COACHING_GLOBAL_COOLDOWN_MS:
+                logger.info("live_data stage=filter session=%s type=operation_notice reason=coaching_cooldown", sid[:8])
+                return None
+            for record in records:
+                status, fields = record.get("field_status", {}), record.get("field_sources", {})
+                ids = record.get("source_event_ids") or []
+                text_sources = fields.get("text") or []
+                text, first = record.get("text"), record.get("first_observed_at_ms")
+                if (record.get("comment_id") not in attempted
+                        or status.get("text") != "usable"
+                        or record.get("boundary_status") != "locally_complete"
+                        or not isinstance(text, str) or type(first) is not int
+                        or not now - MAX_OBSERVATION_AGE_MS <= first <= now + FUSION_FUTURE_SKEW_MS
+                        or not ids or not text_sources
+                        or any(event_id not in ids for event_id in text_sources)
+                        or any(event_id not in by_event for event_id in ids)
+                        or any(by_event[event_id]["source"] != record.get("source") for event_id in ids)
+                        or not comment_is_candidate(text, consumption_level=None, fan_level=None)):
+                    continue
+                nickname_sources = fields.get("nickname") or []
+                nickname = record.get("nickname") if (
+                    status.get("nickname") == "usable" and nickname_sources
+                    and all(event_id in ids for event_id in nickname_sources)
+                    and isinstance(record.get("nickname"), str) and record["nickname"].strip()
+                ) else None
+                reply_topic = comment_reply_topic(record["source"], nickname, text)
+                last_reply = self.db.execute(
+                    "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash=?",
+                    (sid, digest(reply_topic)),
+                ).fetchone()[0]
+                if last_reply is None or last_reply < first or now - last_reply >= COACHING_LIFETIME_MS:
+                    continue
+                available = [(last_by_topic.get(digest(topic), -1), topic, suggestion)
+                             for topic, suggestion in COACHING_TOPICS
+                             if digest(topic) not in last_by_topic
+                             or now - last_by_topic[digest(topic)] >= COACHING_TOPIC_COOLDOWN_MS]
+                if not available:
+                    continue
+                _, topic, suggestion = min(available, key=lambda item: item[0])
+                selected = [by_event[event_id] for event_id in ids]
+                candidate = {
+                    "topic": topic, "priority": 25, "phenomenon": "基于可用评论的条件式话术训练",
+                    "suggestion": suggestion, "training_trigger_at_ms": last_reply,
+                    "model_text": None, "model_context": "",
+                    "observations": selected, "prompt_type": "operation_notice",
+                }
+                break
+        if candidate is None:
             logger.info("live_data stage=candidate session=%s reason=quiet", sid[:8])
             return None
         topic_hash = digest(candidate["topic"])
@@ -917,6 +1002,18 @@ class LiveStore:
         if session["stopped_at_ms"] is not None:
             raise HTTPException(409, "live session stopped")
         now = self.clock()
+        is_coaching = candidate["topic"] in {topic for topic, _ in COACHING_TOPICS}
+        if is_coaching:
+            trigger_at = candidate.get("training_trigger_at_ms")
+            if type(trigger_at) is not int or not trigger_at <= now < trigger_at + COACHING_LIFETIME_MS:
+                return {"reason": "candidate_expired", "prompt_id": None}
+            hashes = [digest(topic) for topic, _ in COACHING_TOPICS]
+            last_training = self.db.execute(
+                "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash IN (?,?,?)",
+                (sid, *hashes),
+            ).fetchone()[0]
+            if last_training is not None and now - last_training < COACHING_GLOBAL_COOLDOWN_MS:
+                return {"reason": "cooldown", "prompt_id": None}
         rows = candidate["observations"]
         latest = max(row["effective_at_ms"] for row in rows)
         age_limit = COMMENT_REPLY_MAX_AGE_MS if candidate.get("prompt_type") == "comment_reply" else MAX_OBSERVATION_AGE_MS
@@ -1034,7 +1131,7 @@ class LiveStore:
         with self.db:
             self.db.execute(
                 "INSERT INTO live_events (session_id,topic_hash,generated_at_ms,expires_at_ms,payload) VALUES (?,?,?,?,?)",
-                (sid, topic_hash, now, now + PROMPT_TTL_MS,
+                (sid, topic_hash, now, trigger_at + COACHING_LIFETIME_MS if is_coaching else now + PROMPT_TTL_MS,
                  json.dumps(event, ensure_ascii=False)),
             )
         self._expire_reply_context(now)
