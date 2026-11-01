@@ -493,7 +493,12 @@ final class AppModel: ObservableObject {
 
     func retryLiveVerification() {
         guard liveVerificationNeedsRetry, liveConnectionPending, liveActive, !liveStarting, !liveStopping,
+              !isolatedStopInFlight,
               let credentials = liveCredentials else { return }
+        if let pending = LiveSessionState.isolatedStopIntent(),
+           pending.credentials.sessionID == credentials.sessionID,
+           pending.credentials.token == credentials.token,
+           pending.serviceURL.absoluteString == liveClient?.baseURL.absoluteString { return }
         let saved = Self.savedCredentials()
         guard PollCallbackGate.matchesCredentials(sessionID: credentials.sessionID, token: credentials.token,
             currentSessionID: liveCredentials?.sessionID, currentToken: liveCredentials?.token,
@@ -533,6 +538,7 @@ final class AppModel: ObservableObject {
             livePollGeneration &+= 1
             livePollTask?.cancel()
             livePollTask = nil
+            liveVerificationNeedsRetry = false
         }
         isolatedStopStatus = "正在确认原场结束"
         client.stop(credentials, recordResponse: false) { [weak self] ok in

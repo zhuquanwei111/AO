@@ -59,7 +59,7 @@ struct ContentView: View {
                     }
                     if model.liveVerificationNeedsRetry {
                         Button("重试核验本场") { model.retryLiveVerification() }
-                            .disabled(model.liveStarting || model.liveStopping)
+                            .disabled(model.liveStarting || model.liveStopping || model.isolatedStopInFlight)
                     }
                     if model.liveTimingWarning {
                         Text("部分提示缺少可靠时效信息，未在画中画显示；实时采集仍可继续。时间锚异常 \(model.liveTimingAnchorFailures) 次，单条时效异常 \(model.liveTimingInvalidItems) 条。")
