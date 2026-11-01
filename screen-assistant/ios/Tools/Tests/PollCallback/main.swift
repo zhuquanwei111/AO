@@ -23,6 +23,19 @@ assert(PollCallbackGate.matchesCredentials(sessionID: "A", token: "old", current
 assert(!PollCallbackGate.matchesCredentials(sessionID: "A", token: "old", currentSessionID: "A", currentToken: "new", savedSessionID: "A", savedToken: "old"))
 assert(!PollCallbackGate.matchesCredentials(sessionID: "A", token: "old", currentSessionID: "A", currentToken: "old", savedSessionID: "A", savedToken: "new"))
 assert(!PollCallbackGate.matchesCredentials(sessionID: "A", token: "old", currentSessionID: "A", currentToken: "old", savedSessionID: nil, savedToken: nil))
+func disposition(currentToken: String?, savedToken: String?, generation: Int = 1,
+                 active: Bool = true, stopping: Bool = false) -> PollCallbackGate.Disposition {
+    PollCallbackGate.disposition(sessionID: "A", token: "old", generation: 1,
+        currentSessionID: "A", currentToken: currentToken, currentGeneration: generation,
+        savedSessionID: savedToken == nil ? nil : "A", savedToken: savedToken,
+        active: active, stopping: stopping)
+}
+assert(disposition(currentToken: "old", savedToken: "old") == .current)
+assert(disposition(currentToken: "old", savedToken: nil) == .savedCredentialsMismatch)
+assert(disposition(currentToken: "old", savedToken: "other") == .savedCredentialsMismatch)
+assert(disposition(currentToken: "other", savedToken: "old") == .stale)
+assert(disposition(currentToken: "old", savedToken: "old", generation: 2) == .stale)
+assert(disposition(currentToken: "old", savedToken: "old", stopping: true) == .stale)
 var overview = OverviewRequestTracker()
 let old = overview.begin()
 let newer = overview.begin()

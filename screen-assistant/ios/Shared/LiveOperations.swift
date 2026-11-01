@@ -323,7 +323,7 @@ struct LiveSessionSummary: Decodable {
 
 /// 薄适配 M2 的场次接口。所有路径都相对用户配置的服务基地址，保留其路径前缀。
 struct LiveOperationsClient {
-    private let baseURL: URL
+    let baseURL: URL
     private let session: URLSession
 
     static func continuousNowNS() -> UInt64 { clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) }
@@ -378,11 +378,12 @@ struct LiveOperationsClient {
         }.resume()
     }
 
-    func stop(_ credentials: LiveSessionCredentials, completion: @escaping (Bool) -> Void) {
+    func stop(_ credentials: LiveSessionCredentials, recordResponse: Bool = true,
+              completion: @escaping (Bool) -> Void) {
         var request = authorized(endpoint("v1", "live", "sessions", credentials.sessionID, "stop"), token: credentials.token)
         request.httpMethod = "POST"
         session.dataTask(with: request) { _, response, error in
-            ControlState.recordServiceResponse(error: error, response: response)
+            if recordResponse { ControlState.recordServiceResponse(error: error, response: response) }
             completion(error == nil && (response as? HTTPURLResponse)?.statusCode == 200)
         }.resume()
     }
@@ -604,10 +605,71 @@ struct LiveOperationsClient {
 }
 
 /// App Group 中只保存当前场次能力令牌；停止采集后为晚到summary暂留，任务终态后清除。
+struct IsolatedStopIntent: Codable {
+    let credentials: LiveSessionCredentials
+    let serviceURL: URL
+
+    static func safeServiceURL(_ url: URL) -> Bool {
+        guard let parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let scheme = parts.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              let host = parts.host, !host.isEmpty,
+              parts.user == nil, parts.password == nil,
+              parts.query == nil, parts.fragment == nil else { return false }
+        return true
+    }
+
+    func matches(_ other: IsolatedStopIntent) -> Bool {
+        serviceURL.absoluteString == other.serviceURL.absoluteString &&
+            credentials.sessionID == other.credentials.sessionID && credentials.token == other.credentials.token
+    }
+}
+
 enum LiveSessionState {
     private static let enabledKey = "live.enabled"
     private static var fileURL: URL? {
         AppGroup.containerURL?.appendingPathComponent("live-session.json", isDirectory: false)
+    }
+    private static var isolatedStopURL: URL? {
+        AppGroup.containerURL?.appendingPathComponent("live-stop-pending.json", isDirectory: false)
+    }
+    static func isolatedStopRecordExists() -> Bool {
+        guard let url = isolatedStopURL else { return false }
+        return FileManager.default.fileExists(atPath: url.path)
+    }
+
+    static func isolatedStopIntent() -> IsolatedStopIntent? {
+        guard let url = isolatedStopURL else { return nil }
+        return isolatedStopIntent(fileURL: url)
+    }
+    static func isolatedStopIntent(fileURL: URL) -> IsolatedStopIntent? {
+        guard let data = try? Data(contentsOf: fileURL) else { return nil }
+        guard let value = try? JSONDecoder().decode(IsolatedStopIntent.self, from: data),
+              IsolatedStopIntent.safeServiceURL(value.serviceURL) else { return nil }
+        return value
+    }
+    static func saveIsolatedStop(_ value: IsolatedStopIntent) -> Bool {
+        guard let url = isolatedStopURL else { return false }
+        return saveIsolatedStop(value, fileURL: url)
+    }
+    static func saveIsolatedStop(_ value: IsolatedStopIntent, fileURL: URL) -> Bool {
+        guard IsolatedStopIntent.safeServiceURL(value.serviceURL) else { return false }
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            guard let current = isolatedStopIntent(fileURL: fileURL), current.matches(value) else { return false }
+        }
+        guard let data = try? JSONEncoder().encode(value) else { return false }
+        do {
+            try data.write(to: fileURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            return true
+        } catch { return false }
+    }
+    static func clearIsolatedStop(_ value: IsolatedStopIntent) -> Bool {
+        guard let url = isolatedStopURL else { return false }
+        return clearIsolatedStop(value, fileURL: url)
+    }
+    static func clearIsolatedStop(_ value: IsolatedStopIntent, fileURL: URL) -> Bool {
+        guard let current = isolatedStopIntent(fileURL: fileURL), current.matches(value) else { return false }
+        do { try FileManager.default.removeItem(at: fileURL); return true }
+        catch { return false }
     }
 
     static func save(_ value: LiveSessionCredentials, enableCapture: Bool = true) -> Bool {
