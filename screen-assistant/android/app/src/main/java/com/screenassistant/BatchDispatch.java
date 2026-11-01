@@ -43,7 +43,7 @@ final class BatchDispatch {
                 } catch (Exception e) {
                     if (sent < batch.rows.size()) outcome.accept(batch.rows.get(sent).value,"unconfirmed");
                     remaining(batch,sent+1,outcome,"not_sent");
-                    String cause=e instanceof LiveClient.HttpError ? "HTTP " + ((LiveClient.HttpError)e).status
+                    String cause=e instanceof LiveClient.HttpError ? e.getMessage()
                             : e.getClass().getSimpleName();
                     if (active.getAsBoolean()) status.accept("采样上传未确认，剩余 " + (batch.rows.size()-sent)
                             + " 条未确认：" + cause);

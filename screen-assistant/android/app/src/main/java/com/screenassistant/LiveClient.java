@@ -12,6 +12,9 @@ import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.function.LongSupplier;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
 
 /** Android 薄客户端：所有场次请求绑定创建时的服务地址；令牌不写日志。 */
 public final class LiveClient {
@@ -47,6 +50,63 @@ public final class LiveClient {
     public static final class HttpError extends IOException {
         public final int status;
         HttpError(int status) { super("HTTP " + status); this.status = status; }
+        HttpError(int status, String detail) { super("HTTP " + status + (detail.isEmpty() ? "" : " " + detail)); this.status = status; }
+    }
+
+    private static final Set<String> VALIDATION_FIELDS = new HashSet<>(Arrays.asList(
+            "body", "comment", "online_count", "interaction", "transcript", "person_state", "platform_notice", "quality",
+            "kind", "event_id", "source", "observed_at_ms", "started_at_ms", "ended_at_ms", "availability", "coverage",
+            "reliability", "confidence", "content", "capture_batch_id", "line_index", "capture_comment_count",
+            "text", "text_position", "x", "y", "width", "height", "author_id", "platform_message_id", "raw_text",
+            "field_semantics_confirmed", "display_unit", "ocr_lines", "bbox", "count", "window_started_at_ms",
+            "window_ended_at_ms", "coverage_complete", "region_confirmed", "explicit_warning_confirmed", "signal"));
+    private static final Set<String> VALIDATION_TYPES = new HashSet<>(Arrays.asList(
+            "missing", "extra_forbidden", "literal_error", "union_tag_invalid", "union_tag_not_found", "value_error",
+            "string_type", "string_too_short", "string_too_long", "int_type", "int_parsing", "float_type", "float_parsing",
+            "bool_type", "bool_parsing", "dict_type", "list_type", "model_type", "greater_than", "greater_than_equal",
+            "less_than", "less_than_equal", "too_long", "too_short"));
+
+    private static String validationDetail(HttpURLConnection connection, String path) {
+        if (!path.matches("/v1/live/sessions/[^/]+/observations")) return "";
+        try (InputStream in = connection.getErrorStream(); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            if (in == null) return "";
+            byte[] buffer = new byte[2048]; int n;
+            while ((n = in.read(buffer)) != -1) {
+                if (out.size() + n > 16384) return "";
+                out.write(buffer, 0, n);
+            }
+            JSONObject payload = new JSONObject(out.toString(StandardCharsets.UTF_8.name()));
+            Object detail = payload.opt("detail");
+            if (detail instanceof String) {
+                if ("observation time outside live session".equals(detail)) return "observations time_outside_session";
+                if ("observation start follows observed time".equals(detail)) return "observations time_order_invalid";
+                if ("observation source does not match app session".equals(detail)) return "observations source_mismatch";
+                return "";
+            }
+            JSONArray errors = payload.optJSONArray("detail");
+            if (errors == null || errors.length() == 0 || errors.length() > 8) return "";
+            StringBuilder result = new StringBuilder();
+            for (int i = 0; i < errors.length(); i++) {
+                JSONObject item = errors.optJSONObject(i);
+                if (item == null) return "";
+                Object type = item.opt("type"); JSONArray loc = item.optJSONArray("loc");
+                if (!(type instanceof String) || !VALIDATION_TYPES.contains(type) || loc == null || loc.length() == 0 || loc.length() > 12) return "";
+                StringBuilder location = new StringBuilder();
+                for (int j = 0; j < loc.length(); j++) {
+                    Object part = loc.opt(j);
+                    if (part instanceof String && VALIDATION_FIELDS.contains(part)) {
+                        if (location.length() > 0) location.append('.');
+                        location.append(part);
+                    } else if ((part instanceof Integer || part instanceof Long) && ((Number) part).longValue() >= 0
+                            && ((Number) part).longValue() <= 65535) {
+                        location.append('[').append(part).append(']');
+                    } else return "";
+                }
+                if (result.length() > 0) result.append(';');
+                result.append(location).append(':').append(type);
+            }
+            return "observations " + result;
+        } catch (IOException | JSONException | RuntimeException ignored) { return ""; }
     }
 
     public static boolean validBaseUrl(String value) {
@@ -165,7 +225,8 @@ public final class LiveClient {
             // 停止仅以200确认；已受理或无内容响应仍保留原场待确认状态。
             if ("POST".equals(method) && path.endsWith("/stop") && status != HttpURLConnection.HTTP_OK)
                 throw new HttpError(status);
-            if (status < 200 || status >= 300) throw new HttpError(status);
+            if (status < 200 || status >= 300)
+                throw status == 422 ? new HttpError(status, validationDetail(c, path)) : new HttpError(status);
             if (status == 204) return new JSONObject();
             try (InputStream in = c.getInputStream(); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
                 byte[] buffer = new byte[4096]; int n;

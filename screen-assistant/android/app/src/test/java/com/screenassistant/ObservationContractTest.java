@@ -69,4 +69,23 @@ public class ObservationContractTest {
         assertEquals("提示", DisplayText.promptLabel(new JSONObject().put("source", "comment")));
         assertEquals("提示", DisplayText.promptLabel(new JSONObject().put("prompt_type", "future")));
     }
+
+    @Test public void unicodeWhitespaceCommentsAreExcludedBeforeBatchFreeze() throws Exception {
+        CollectedRows<JSONObject> rows = new CollectedRows<>(10);
+        JSONObject position = new JSONObject();
+        for (String blank : new String[]{"", " \t\n", "\u2003", "\u00a0\u202f", "\u0085", "\u3000"})
+            assertFalse(LiveFrameAnalyzer.collectComment(rows, 1, blank, 100, position, .8));
+        assertTrue(LiveFrameAnalyzer.collectComment(rows, 7, "\u2003真实文字\u2003", 100, position, .8));
+        LiveFrameAnalyzer.freezeObservationMetadata(rows, true);
+        assertEquals(1, rows.rows.size());
+        assertEquals(7, rows.rows.get(0).value.getInt("line_index"));
+        assertEquals(1, rows.rows.get(0).value.getInt("capture_comment_count"));
+        assertEquals("\u2003真实文字\u2003", rows.rows.get(0).value.getJSONObject("content").getString("text"));
+        assertTrue(LiveFrameAnalyzer.collectComment(rows, 8, "\u200b", 100, position, .8));
+        assertTrue(LiveFrameAnalyzer.collectComment(rows, 9, "\u001c", 100, position, .8));
+        CollectedRows<JSONObject> empty = new CollectedRows<>(10);
+        assertFalse(LiveFrameAnalyzer.collectComment(empty, 3, "\u2003", 100, position, .8));
+        LiveFrameAnalyzer.freezeObservationMetadata(empty, true);
+        assertTrue(empty.rows.isEmpty());
+    }
 }

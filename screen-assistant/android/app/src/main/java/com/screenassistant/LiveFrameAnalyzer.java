@@ -94,9 +94,22 @@ final class LiveFrameAnalyzer implements AutoCloseable {
 
     static boolean collectComment(CollectedRows<JSONObject> rows, int lineIndex, String value, long wall,
                                   JSONObject position, double confidence) throws Exception {
+        if (blankComment(value)) return false;
         if (value.codePointCount(0,value.length())>500) return false;
         rows.addAt(lineIndex,observation("comment",wall,new JSONObject().put("text",value)
                 .put("text_position",position),confidence));
+        return true;
+    }
+
+    private static boolean blankComment(String value) {
+        if (value == null || value.isEmpty()) return true;
+        for (int offset=0; offset<value.length();) {
+            int cp=value.codePointAt(offset);
+            boolean whitespace=(Character.isWhitespace(cp) && (cp<0x1c || cp>0x1f))
+                    || Character.isSpaceChar(cp) || cp==0x85;
+            if (!whitespace) return false;
+            offset+=Character.charCount(cp);
+        }
         return true;
     }
 
@@ -143,7 +156,8 @@ final class LiveFrameAnalyzer implements AutoCloseable {
                 int[] bounds=PaddleOcrGeometry.absoluteBounds(quad,roi.left,roi.top,roi.right,roi.bottom);
                 if (bounds==null) { if (kind.equals("comment")) invalidComments++; continue; }
                 int left=bounds[0],top=bounds[1],right=bounds[2],bottom=bounds[3];
-                String value=line.getText(); if (value==null || value.trim().isEmpty()) continue;
+                String value=line.getText();
+                if (value==null || (kind.equals("comment") ? blankComment(value) : value.trim().isEmpty())) continue;
                 double score=line.getConfidence(); if (!Double.isFinite(score)||score<0||score>1) score=0;
                 JSONObject position=Regions.position(left,top,right,bottom,frame.width,frame.height);
                 confidence=Math.min(confidence,score);

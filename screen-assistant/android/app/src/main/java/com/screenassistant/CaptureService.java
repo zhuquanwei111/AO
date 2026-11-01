@@ -689,6 +689,9 @@ public class CaptureService extends Service {
                                     () -> !tornDown && !uiVisible && phase == Phase.RUNNING && sessionEpoch == epoch,
                                     message -> main.post(() -> {
                                         if (!tornDown && epoch == sessionEpoch) {
+                                            int diagnostic = message.indexOf("HTTP 422 observations ");
+                                            if (diagnostic >= 0)
+                                                android.util.Log.i("CaptureService", "event=validation_422 " + message.substring(diagnostic));
                                             setState(message);
                                             overlayState.setStatus(connectionStatus + "\n" + message, false);
                                             renderOverlay(epoch);

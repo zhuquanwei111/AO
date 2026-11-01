@@ -35,6 +35,9 @@ public class LiveConnectionHttpTest {
         volatile String summaryStatus="failed";
         volatile int summaryHttp=200;
         volatile int stopHttp=200;
+        volatile int observationHttp=200;
+        volatile String observationResponse="{}";
+        volatile boolean truncateObservation;
         volatile boolean summaryStopped;
         volatile String clockFields = ",\"server_time_ms\":1000,\"server_processing_ms\":0";
         volatile String expiryJson = "16000";
@@ -109,7 +112,9 @@ public class LiveConnectionHttpTest {
                         + "\"next_cursor\":\"cursor-one\",\"stopped\":false}");
             } else if (path.endsWith("/observations")) {
                 observationBodies.add(body);
-                respond(e, 200, "{}");
+                if (truncateObservation) {
+                    e.getOutputStream().write("HTTP/1.1 422 Fixture\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{".getBytes(StandardCharsets.US_ASCII));
+                } else respond(e, observationHttp, observationResponse);
             } else if (path.endsWith("/stop")) {
                 stops.incrementAndGet();
                 respond(e, stopHttp, "{\"session_id\":\"one\",\"stopped_at_ms\":20}");
@@ -126,6 +131,75 @@ public class LiveConnectionHttpTest {
             e.getOutputStream().write(bytes);
         }
         public void close() throws IOException { releasePoll.countDown(); server.close(); executor.shutdownNow(); }
+    }
+
+    @Test public void validationErrorExposesOnlySafeFieldsAndPreservesStatus() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.observationHttp=422;
+            fixture.observationResponse="{\"detail\":[{\"loc\":[\"body\",\"comment\",\"content\",\"text\"],\"type\":\"string_type\",\"input\":\"secret-input\",\"ctx\":{\"key\":\"secret-context\"},\"msg\":\"secret-message\"}]}";
+            LiveClient.Session s=new LiveClient.Session(fixture.base(),"one","secret-token",10,false);
+            try { LiveClient.call(s,"observations",new org.json.JSONObject()); fail(); }
+            catch (LiveClient.HttpError error) {
+                assertEquals(422,error.status);
+                String message=error.getMessage();
+                assertTrue(message.contains("observations")); assertTrue(message.contains("content.text"));
+                assertTrue(message.contains("string_type"));
+                for (String secret:new String[]{"secret-input","secret-context","secret-message","secret-token",fixture.base(),"one"})
+                    assertFalse(message.contains(secret));
+            }
+        }
+    }
+
+    @Test public void unsafeOrIncompleteValidationBodiesFallBackToStatus() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.observationHttp=422;
+            LiveClient.Session s=new LiveClient.Session(fixture.base(),"one","secret-token",10,false);
+            for (String body:new String[]{"", "not json", "{\"detail\":\"secret-message\"}", "{\"detail\":[{\"loc\":[\"body\",\"secret-field\"],\"type\":\"secret-type\"}]}", "x".repeat(16385)}) {
+                fixture.observationResponse=body;
+                try { LiveClient.call(s,"observations",new org.json.JSONObject()); fail(); }
+                catch (LiveClient.HttpError error) { assertEquals(422,error.status); assertEquals("HTTP 422",error.getMessage()); }
+            }
+            fixture.truncateObservation=true;
+            try { LiveClient.call(s,"observations",new org.json.JSONObject()); fail(); }
+            catch (LiveClient.HttpError error) { assertEquals(422,error.status); assertEquals("HTTP 422",error.getMessage()); }
+        }
+    }
+
+    @Test public void validationDiagnosticKeepsOnlyApprovedIndexAndBatchOutcome() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.observationHttp=422;
+            fixture.observationResponse="{\"detail\":[{\"loc\":[\"body\",\"online_count\",\"content\",\"ocr_lines\",2,\"confidence\"],\"type\":\"float_type\"}]}";
+            LiveClient.Session s=new LiveClient.Session(fixture.base(),"one","secret-token",10,false);
+            CollectedRows<org.json.JSONObject> rows=new CollectedRows<>(4);
+            rows.add(new org.json.JSONObject().put("kind","online_count"));
+            rows.add(new org.json.JSONObject().put("kind","comment"));
+            List<String> outcomes=new ArrayList<>(), states=new ArrayList<>();
+            BatchDispatch.submit(Runnable::run,rows,()->true,()->true,
+                    row->LiveClient.call(s,"observations",row),states::add,false,
+                    (row,outcome)->outcomes.add(outcome));
+            assertEquals(java.util.Arrays.asList("unconfirmed","not_sent"),outcomes);
+            assertEquals(1,fixture.observationBodies.size());
+            assertTrue(states.get(0).contains("content.ocr_lines[2].confidence:float_type"));
+            assertFalse(states.get(0).contains("secret-token"));
+        }
+    }
+
+    @Test public void knownBusiness422DetailsMapToSafeCodesOnly() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.observationHttp=422;
+            LiveClient.Session s=new LiveClient.Session(fixture.base(),"one","secret-token",10,false);
+            String[][] cases={{"observation time outside live session","time_outside_session"},
+                    {"observation start follows observed time","time_order_invalid"},
+                    {"observation source does not match app session","source_mismatch"}};
+            for (String[] item:cases) {
+                fixture.observationResponse=new org.json.JSONObject().put("detail",item[0]).toString();
+                try { LiveClient.call(s,"observations",new org.json.JSONObject()); fail(); }
+                catch (LiveClient.HttpError error) {
+                    assertEquals("HTTP 422 observations " + item[1],error.getMessage());
+                    assertFalse(error.getMessage().contains(item[0]));
+                }
+            }
+        }
     }
 
     @Test public void createCapabilityControlsRealObservationBodies() throws Exception {
