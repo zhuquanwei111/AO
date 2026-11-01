@@ -198,8 +198,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
             // 运营会话使用独立收件契约；旧 OCR 问答不得抢先进入 PiP。
             if LiveSessionState.isEnabled() {
                 guard let credentials = sampledCredentials,
-                      let baseURL = SharedConfig.serverBaseURL(),
-                      baseURL.scheme == "http" || baseURL.scheme == "https" else {
+                      let baseURL = credentials.captureServiceURL(configured: SharedConfig.serverBaseURL()) else {
+                    self.recordObservationIssue("service_mismatch")
                     self.endRound(generation: generation)
                     return
                 }
@@ -309,7 +309,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         guard LiveSessionState.isEnabled(), ControlState.userWantsCapture(),
               let credentials = LiveSessionState.credentials(),
               credentials.sessionID == sessionID, credentials.token == token,
-              let baseURL = SharedConfig.serverBaseURL(),
+              let baseURL = credentials.captureServiceURL(configured: SharedConfig.serverBaseURL()),
               let body = try? JSONEncoder().encode(observation) else { return }
         let url = ["v1", "live", "sessions", sessionID, "person-observations"].reduce(baseURL) {
             $0.appendingPathComponent($1, isDirectory: false)
@@ -324,6 +324,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
             guard let self, self.personObservationRequest == nil,
                   let current = LiveSessionState.credentials(),
                   current.sessionID == sessionID, current.token == token,
+                  current.captureServiceURL(configured: SharedConfig.serverBaseURL())?.absoluteString == baseURL.absoluteString,
                   LiveSessionState.isEnabled(), ControlState.userWantsCapture() else { return }
             let task = self.personObservationSession.dataTask(with: request) { [weak self] _, _, _ in
                 guard let self else { return }
@@ -415,7 +416,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
             guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
                 stateQueue.sync {
                     if observationContextValid(generation: generation, captureGeneration: captureGeneration,
-                                               sessionID: credentials.sessionID, token: credentials.token) {
+                                               sessionID: credentials.sessionID, token: credentials.token, baseURL: baseURL) {
                         recordObservationIssue("encoding")
                     }
                 }
@@ -423,7 +424,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
             }
             stateQueue.sync {
                 guard observationContextValid(generation: generation, captureGeneration: captureGeneration,
-                                              sessionID: credentials.sessionID, token: credentials.token) else { return }
+                                              sessionID: credentials.sessionID, token: credentials.token, baseURL: baseURL) else { return }
                 if let active = observationBuffer.active,
                    (active.sessionID != credentials.sessionID || active.token != credentials.token ||
                     active.generation != captureGeneration) {
@@ -442,11 +443,13 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     private func observationContextValid(generation: Int, captureGeneration: Int,
-                                         sessionID: String, token: String) -> Bool {
+                                         sessionID: String, token: String, baseURL: URL? = nil) -> Bool {
         guard !isBroadcastPaused, roundGeneration == generation,
               ControlState.userWantsCapture(), ControlState.captureGeneration() == captureGeneration,
               LiveSessionState.isEnabled(), let current = LiveSessionState.credentials() else { return false }
-        return current.sessionID == sessionID && current.token == token
+        guard current.sessionID == sessionID && current.token == token,
+              let bound = current.captureServiceURL(configured: SharedConfig.serverBaseURL()) else { return false }
+        return baseURL == nil || bound.absoluteString == baseURL?.absoluteString
     }
 
     /// 必须在 stateQueue；仅一项在途。失败不重试，不把 200 当作生成提示。
@@ -454,7 +457,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         guard observationTask == nil, let item = observationBuffer.begin() else { return }
         let generation = roundGeneration
         guard observationContextValid(generation: generation, captureGeneration: item.generation,
-                                      sessionID: item.sessionID, token: item.token) else {
+                                      sessionID: item.sessionID, token: item.token, baseURL: item.baseURL) else {
             observationBuffer.clear()
             recordObservationIssue("stale")
             return
@@ -473,7 +476,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
             self.stateQueue.async {
                 guard self.observationBuffer.active?.id == item.id else { return }
                 guard self.observationContextValid(generation: generation, captureGeneration: item.generation,
-                                                   sessionID: item.sessionID, token: item.token) else {
+                                                   sessionID: item.sessionID, token: item.token, baseURL: item.baseURL) else {
                     self.cancelObservationTransport()
                     return
                 }
@@ -505,7 +508,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         let count = defaults.integer(forKey: key) + 1
         defaults.set(count, forKey: key)
         defaults.set(reason, forKey: "observation.upload.lastReason")
-        if ["encoding", "overflow", "oversize", "stale", "http_failed", "unconfirmed"].contains(reason) {
+        if ["encoding", "overflow", "oversize", "stale", "http_failed", "unconfirmed", "service_mismatch"].contains(reason) {
             NSLog("采样上传异常：原因=%@，累计=%d", reason, count)
         }
     }

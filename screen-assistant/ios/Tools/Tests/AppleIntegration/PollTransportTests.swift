@@ -81,6 +81,19 @@ private final class PollFixtureProtocol: URLProtocol {
 }
 
 final class PollTransportTests: XCTestCase {
+    func testCaptureBindingRejectsChangedOrMissingService() {
+        var original = credentials
+        let serviceA = URL(string: "https://poll-fixture.invalid:8443/original")!
+        let serviceB = URL(string: "https://poll-fixture.invalid:8443/other")!
+        XCTAssertNil(original.captureServiceURL(configured: serviceA))
+        original.boundServiceURL = serviceA
+        XCTAssertEqual(original.captureServiceURL(configured: serviceA), serviceA)
+        XCTAssertNil(original.captureServiceURL(configured: serviceB))
+        XCTAssertNil(original.captureServiceURL(configured: nil))
+        original.boundServiceURL = URL(string: "https://user:secret@poll-fixture.invalid")!
+        XCTAssertNil(original.captureServiceURL(configured: original.boundServiceURL))
+    }
+
     private func makeClient(_ scenario: String) -> (LiveOperationsClient, URLSession) {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [PollFixtureProtocol.self]

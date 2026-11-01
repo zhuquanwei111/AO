@@ -128,7 +128,11 @@ final class AppModel: ObservableObject {
         let savedConnectionPending = savedLiveCredentials?.liveConnectionPending == true
         liveActive = !pendingOwnsSaved && !unknownStopRecord && LiveSessionState.isEnabled() && savedLiveCredentials != nil
         liveConnectionPending = liveActive && savedConnectionPending
-        if liveConnectionPending || pendingOwnsSaved { captureWanted = false }
+        let restoredService = savedLiveCredentials?.captureServiceURL(configured: SharedConfig.serverBaseURL())
+        if liveConnectionPending || pendingOwnsSaved || (liveActive && restoredService == nil) {
+            captureWanted = false
+            ControlState.setUserWantsCapture(false)
+        }
         roundCounter = ControlState.roundCounter()
 
         // 轮询共享状态（扩展每完成一轮会 bump 计数器）。
@@ -162,20 +166,28 @@ final class AppModel: ObservableObject {
             liveStatus = "原场结束记录无法确认，未自动恢复场次"
         } else if liveActive, let credentials = Self.savedCredentials() {
             liveCredentials = credentials
-            liveClient = SharedConfig.serverBaseURL().flatMap { LiveOperationsClient(baseURL: $0) }
-            if liveConnectionPending {
+            liveClient = credentials.boundServiceURL.flatMap {
+                IsolatedStopIntent.safeServiceURL($0) ? LiveOperationsClient(baseURL: $0) : nil
+            }
+            if restoredService == nil {
+                liveStatus = "本场原服务信息不可确认或配置已变化，采集未开启"
+            } else if liveConnectionPending {
                 liveStatus = "后台启动结果未确认；正在核验同一场实时连接"
             } else if credentials.backstageStartPending == true {
                 liveStatus = "恢复同场实时收件；后台复盘任务状态仍未知"
             } else {
                 liveStatus = "恢复当前场次收件"
             }
-            if liveClient != nil { pollLivePrompts() }
+            if liveClient != nil && restoredService != nil { pollLivePrompts() }
         } else if LiveSessionState.isEnabled() && !LiveSessionState.isolatedStopRecordExists() {
-            LiveSessionState.clear()
+            captureWanted = false
+            ControlState.setUserWantsCapture(false)
+            liveStatus = "本场授权无法读取，采集未开启；结束状态尚未确认"
         } else if let credentials = savedLiveCredentials {
             liveStopped = true
-            liveClient = SharedConfig.serverBaseURL().flatMap { LiveOperationsClient(baseURL: $0) }
+            liveClient = credentials.boundServiceURL.flatMap {
+                IsolatedStopIntent.safeServiceURL($0) ? LiveOperationsClient(baseURL: $0) : nil
+            }
             liveStatus = "本场已结束，正在检查后台汇总"
             if let client = liveClient { loadStoppedOverview(credentials, client: client) }
         }
@@ -195,6 +207,10 @@ final class AppModel: ObservableObject {
     func startLiveSession() {
         guard !isolatedStopInFlight else { return }
         guard !liveStarting, !liveStopping else { return }
+        guard !LiveSessionState.isEnabled() || Self.savedCredentials() != nil else {
+            liveStatus = "已有场次授权无法读取，不能创建新场"
+            return
+        }
         let account = douyinAccount.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !account.isEmpty else {
             liveStatus = "请先填写本场抖音号"
@@ -204,7 +220,7 @@ final class AppModel: ObservableObject {
             liveStatus = "本场辅助已运行"
             return
         }
-        guard let base = SharedConfig.serverBaseURL(),
+        guard let base = SharedConfig.serverBaseURL(), IsolatedStopIntent.safeServiceURL(base),
               let client = LiveOperationsClient(baseURL: base) else {
             ControlState.setServiceConnection(.configurationInvalid)
             refreshServiceConnectionStatus()
@@ -223,6 +239,7 @@ final class AppModel: ObservableObject {
                 switch result {
                 case .success(let credentials):
                     var pendingCredentials = credentials
+                    pendingCredentials.boundServiceURL = client.baseURL
                     pendingCredentials.backstageStartPending = true
                     pendingCredentials.liveConnectionPending = true
                     self.captureWanted = false
@@ -327,13 +344,20 @@ final class AppModel: ObservableObject {
     func stopLiveSession() {
         guard !liveStopping, !isolatedStopInFlight else { return }
         guard let credentials = liveCredentials ?? Self.savedCredentials(),
-              let client = liveClient ?? SharedConfig.serverBaseURL().flatMap({ LiveOperationsClient(baseURL: $0) }) else {
-            liveStatus = "没有可停止的场次"
+              let client = liveClient ?? credentials.boundServiceURL.flatMap({
+                  IsolatedStopIntent.safeServiceURL($0) ? LiveOperationsClient(baseURL: $0) : nil
+              }) else {
+            liveStatus = "原场服务信息不足，结束尚未确认"
             return
         }
         let saved = Self.savedCredentials()
         if saved?.sessionID != credentials.sessionID || saved?.token != credentials.token ||
+            saved?.boundServiceURL?.absoluteString != client.baseURL.absoluteString ||
             (liveClient != nil && liveClient?.baseURL.absoluteString != SharedConfig.serverBaseURL()?.absoluteString) {
+            if saved?.sessionID == credentials.sessionID && saved?.token == credentials.token &&
+                saved?.boundServiceURL?.absoluteString == client.baseURL.absoluteString {
+                captureWanted = false
+            }
             guard let originalClient = liveClient else {
                 isolatedStopStatus = "原场服务信息不足，未发送结束请求"
                 return

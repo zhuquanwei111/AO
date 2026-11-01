@@ -33,12 +33,20 @@ struct LiveSessionCredentials: Codable {
     /// Local-only markers; neither field is sent to the server.
     var backstageStartPending: Bool?
     var liveConnectionPending: Bool?
+    /// 仅保存在本地，由创建场次时实际使用的 client 确定。
+    var boundServiceURL: URL? = nil
+    func captureServiceURL(configured: URL?) -> URL? {
+        guard let bound = boundServiceURL, IsolatedStopIntent.safeServiceURL(bound),
+              configured?.absoluteString == bound.absoluteString else { return nil }
+        return bound
+    }
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id", token = "session_token", startedAtMS = "started_at_ms"
         case douyinAccount = "douyin_account"
         case backstageTaskID = "backstage_task_id", backstageStatus = "backstage_status"
         case backstageStartPending = "backstage_start_pending"
         case liveConnectionPending = "live_connection_pending"
+        case boundServiceURL = "local_bound_service_url"
     }
 }
 
