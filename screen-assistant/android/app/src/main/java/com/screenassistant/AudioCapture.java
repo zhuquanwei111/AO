@@ -65,7 +65,7 @@ final class AudioCapture {
         if (recorder.getRecordingState()!=AudioRecord.RECORDSTATE_RECORDING) { recorder.release(); throw new IllegalStateException("音轨未进入录制状态"); }
         new Thread(this::capture,"live-audio-record").start();
         new Thread(this::upload,"live-audio-upload").start();
-        status.accept("音频：已请求"+(mode==2?"麦克风（同机并发可能被静音）":"抖音播放捕获（不等于主播上行声）")+"，等待有效数据");
+        status.accept("音频：正在尝试"+(mode==2?"麦克风（同机开播可能静音）":"获取抖音播放声音（不一定是主播声音）")+"。");
     }
 
     private void capture() {
@@ -73,7 +73,7 @@ final class AudioCapture {
         try {
             while (running) {
                 int n=recorder.read(packet,filled,packet.length-filled,AudioRecord.READ_BLOCKING);
-                if (n<=0 || n%2!=0) { if (running) status.accept("音频读取中断，继续其他取数"); gap=true; break; }
+                if (n<=0 || n%2!=0) { if (running) status.accept("音频读取中断，屏幕辅助继续。"); gap=true; break; }
                 filled+=n;
                 if (filled<packet.length) continue;
                 boolean nonzero=false;
@@ -85,8 +85,8 @@ final class AudioCapture {
                     gap=true;
                     if (silentSince==0) silentSince=SystemClock.elapsedRealtime();
                     if (silenced || SystemClock.elapsedRealtime()-silentSince>2000)
-                        status.accept(silenced?"音频：系统已屏蔽本App音轨；未上传静音冒充人声"
-                                :"音频：持续未取得非零样本；可能静音/不允许捕获，不能证明主播声可用");
+                        status.accept(silenced?"音频：系统暂不允许本应用录音，屏幕辅助继续。"
+                                :"音频：暂未听到声音，可能静音或不允许获取；请检查音频设置。");
                 } else {
                     silentSince=0;
                     AudioTimestamp timestamp=new AudioTimestamp(); long anchorFrame=-1,anchorWall=0;
@@ -99,7 +99,7 @@ final class AudioCapture {
                 }
                 filled=0;
             }
-        } catch (RuntimeException e) { status.accept("音频：采集不可用（"+e.getClass().getSimpleName()+"），屏幕链路继续"); gap=true; }
+        } catch (RuntimeException e) { android.util.Log.w("AudioCapture", "音频采集不可用", e); status.accept("音频暂不可用，屏幕辅助继续。"); gap=true; }
         finally {
             // 未满400ms尾段不伪造补零；标记断档，服务端stop收尾已收到数据。
             if (filled>0) gap=true;
@@ -120,9 +120,10 @@ final class AudioCapture {
                     JSONObject reply=LiveClient.call(session,"audio",AudioPackets.packet(stream,source,c.sequence,c.frame,c.pcm,
                             c.anchorFrame,c.anchorWall,host,discontinuity));
                     accepted=true; previous=c.sequence;
-                    status.accept("音频：PCM已送达；ASR/主播来源与抖音同机收音仍待实际核对");
+                    status.accept("音频已发送；请确认收录的是本场主播声音。");
                 } catch (Exception e) {
-                    gap=true; status.accept("音频上传未确认："+e.getMessage()+"；其他取数继续");
+                    android.util.Log.w("AudioCapture", "音频上传未确认", e);
+                    gap=true; status.accept("音频发送未确认，屏幕辅助继续；请检查连接。");
                     if (e instanceof LiveClient.HttpError) {
                         int code=((LiveClient.HttpError)e).status;
                         if (code==403 || code==409 || code==422 || code==503) { stop(); queue.clear(); break; }
@@ -134,7 +135,8 @@ final class AudioCapture {
             }
             completion.complete(null);
         } catch (Exception e) {
-            status.accept("音频收尾未确认："+e.getMessage()); completion.completeExceptionally(e);
+            android.util.Log.w("AudioCapture", "音频收尾未确认", e);
+            status.accept("音频结束状态尚未确认，请检查连接。"); completion.completeExceptionally(e);
         }
     }
 

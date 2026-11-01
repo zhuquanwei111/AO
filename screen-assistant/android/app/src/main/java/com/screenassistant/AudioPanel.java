@@ -12,7 +12,7 @@ final class AudioPanel {
     private final CheckBox host;
     AudioPanel(Activity activity,LinearLayout parent) {
         TextView note=new TextView(activity);
-        note.setText("音频只用于运营场次。普通App与抖音不能同时获得麦克风；播放捕获受抖音策略限制，也不等于主播上行声。默认关闭，权限失败仍继续屏幕取数。");
+        note.setText("音频默认关闭。同机开播时麦克风可能受限；抖音播放声音也不一定包含主播声音。音频不可用时，屏幕辅助仍会继续。");
         parent.addView(note);
         mode=new Spinner(activity);
         mode.setAdapter(new ArrayAdapter<>(activity,android.R.layout.simple_spinner_dropdown_item,

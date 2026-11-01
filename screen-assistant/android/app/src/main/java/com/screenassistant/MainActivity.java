@@ -253,8 +253,7 @@ public class MainActivity extends Activity {
         } catch (RuntimeException e) {
             pendingStart = false;
             logFlow("projection_consent_launch_failed", "error=" + e.getClass().getSimpleName());
-            showStartError("屏幕授权界面阶段失败（" + e.getClass().getSimpleName()
-                    + "）。请回到应用检查系统屏幕采集功能后重试。");
+            showStartError("无法打开屏幕共享授权。请检查系统设置后重试。");
         }
     }
 
@@ -291,8 +290,7 @@ public class MainActivity extends Activity {
                 refreshUi();
                 moveTaskToBack(true);
             } catch (RuntimeException e) {
-                showStartError("前台服务启动阶段失败（" + e.getClass().getSimpleName()
-                        + "）。请检查权限后重新开始；尚未确认屏幕采集运行。");
+                showStartError("辅助启动未确认。请检查权限后重新开始。");
                 logFlow("foreground_service_start_failed", "error=" + e.getClass().getSimpleName());
             }
         } else if (requestCode == REQ_OVERLAY) {

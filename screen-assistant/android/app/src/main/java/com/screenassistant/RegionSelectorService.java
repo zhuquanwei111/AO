@@ -91,7 +91,8 @@ public class RegionSelectorService extends Service {
         try {
             wm.addView(bubble, lp);
         } catch (Exception ex) {
-            Toast.makeText(this, "悬浮窗显示失败：" + ex.getMessage(), Toast.LENGTH_LONG).show();
+            android.util.Log.w("RegionSelector", "悬浮窗显示失败", ex);
+            Toast.makeText(this, "无法显示区域选择工具，请检查悬浮窗权限。", Toast.LENGTH_LONG).show();
             stopSelf();
         }
     }
@@ -146,7 +147,8 @@ public class RegionSelectorService extends Service {
         try {
             wm.addView(overlay, lp);
         } catch (Exception ex) {
-            Toast.makeText(this, "框选覆盖层显示失败：" + ex.getMessage(), Toast.LENGTH_LONG).show();
+            android.util.Log.w("RegionSelector", "区域选择显示失败", ex);
+            Toast.makeText(this, "无法显示区域选择，请检查悬浮窗权限。", Toast.LENGTH_LONG).show();
             stopSelf();
             return;
         }

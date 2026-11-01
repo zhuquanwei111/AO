@@ -230,7 +230,7 @@ public class CaptureService extends Service {
                     }
                 } catch (Throwable t) {
                     android.util.Log.e("CaptureService", "Paddle OCR failed; no alternate OCR is used", t);
-                    setState("Paddle OCR初始化或识别失败，本轮未识别");
+                    setState("本次画面识别失败，请检查识别区域后重试。");
                 } finally {
                     b.recycle();
                     busyEpoch.compareAndSet(epoch, -1);
@@ -339,8 +339,7 @@ public class CaptureService extends Service {
                 } catch (RuntimeException e) {
                     setupStage = "foreground_service_start";
                     logEvent("foreground_service_start_failed", "stage=" + setupStage + " error=" + e.getClass().getSimpleName());
-                    teardown("启动失败（前台服务阶段，" + e.getClass().getSimpleName()
-                            + "）。请检查屏幕采集权限与系统设置后重新开始。", "foreground_service_start_failed");
+                    teardown("辅助启动失败。请检查屏幕共享权限与系统设置后重新开始。", "foreground_service_start_failed");
                     break;
                 }
                 int code = intent.getIntExtra(EXTRA_RESULT_CODE, 0);
@@ -539,8 +538,7 @@ public class CaptureService extends Service {
         } catch (Exception e) {
             logEvent("projection_setup_failed", "stage=" + setupStage + " error=" + e.getClass().getSimpleName());
             android.util.Log.e("CaptureService", "projection setup failed at stage=" + setupStage, e);
-            teardown("启动失败（" + setupStage + "，" + e.getClass().getSimpleName()
-                    + "）。请确认权限后重新开始。", "setup_exception");
+            teardown("辅助启动失败，请确认屏幕共享权限后重新开始。", "setup_exception");
         }
     }
 
@@ -568,7 +566,7 @@ public class CaptureService extends Service {
             audioCapture = new AudioCapture(this, projection, liveSession, Prefs.getAudioMode(this), Prefs.hostConfirmed(this),
                     message -> { if (epoch == sessionEpoch) setAudioState(message); });
             audioCompletion = audioCapture.completion;
-        } catch (Exception e) { setAudioState("音频未启动：" + e.getMessage() + "；其他取数继续"); }
+        } catch (Exception e) { android.util.Log.w("CaptureService", "音频未启动", e); setAudioState("音频未启动，请检查音频权限和设置；屏幕辅助继续。"); }
     }
 
     private void setAudioState(String message) {
@@ -590,7 +588,7 @@ public class CaptureService extends Service {
                 long now = android.os.SystemClock.elapsedRealtime();
                 if (image.getTimestamp() <= lastFrameTimestamp) {
                     if (liveAnalyzer != null) liveAnalyzer.invalidateBefore(now);
-                    setState("屏幕源时间戳未前进，本轮不发送旧画面");
+                    setState("画面暂未更新，本次未处理旧画面。");
                     busyEpoch.compareAndSet(epoch, -1); scheduleNext(epoch); return;
                 }
                 lastFrameTimestamp = image.getTimestamp();
@@ -600,7 +598,7 @@ public class CaptureService extends Service {
                         currentSession == null ? null : currentSession.id);
                 if (ocr) lastLiveOcr = now;
             }
-        } catch (Exception e) { setState("屏幕取样失败：" + e.getClass().getSimpleName()); }
+        } catch (Exception e) { android.util.Log.w("CaptureService", "屏幕取样失败", e); setState("本次画面读取失败，请检查屏幕共享状态。"); }
         if (frame == null) { busyEpoch.compareAndSet(epoch, -1); scheduleNext(epoch); return; }
         LiveFrameAnalyzer.Frame sample = frame;
         LiveFrameAnalyzer analyzer = liveAnalyzer;
@@ -608,7 +606,7 @@ public class CaptureService extends Service {
             try {
                 if (!tornDown && !overlayBlocksCapture && phase == Phase.RUNNING && epoch == sessionEpoch) analyzer.analyze(sample);
             } catch (Exception e) {
-                if (!tornDown && epoch == sessionEpoch) setState("本轮观察未取得：" + e.getClass().getSimpleName());
+                if (!tornDown && epoch == sessionEpoch) { android.util.Log.w("CaptureService", "本轮观察未取得", e); setState("本次画面未能处理，请检查识别区域。"); }
             } finally { sample.close(); busyEpoch.compareAndSet(epoch, -1); scheduleNext(epoch); }
         });
     }
@@ -702,7 +700,7 @@ public class CaptureService extends Service {
                                             int diagnostic = message.indexOf("HTTP 422 observations ");
                                             if (diagnostic >= 0)
                                                 android.util.Log.i("CaptureService", "event=validation_422 " + message.substring(diagnostic));
-                                            setState(message);
+                                            setState(message.startsWith("采样上传未确认") ? "部分画面内容发送未确认，请检查连接。" : message);
                                             overlayState.setStatus(connectionStatus + "\n" + message, false);
                                             renderOverlay(epoch);
                                         }
@@ -920,8 +918,7 @@ public class CaptureService extends Service {
             logEvent("overlay_attach_failed", "error=" + e.getClass().getSimpleName());
             android.util.Log.w("CaptureService", "overlay attach failed: " + e.getClass().getSimpleName());
             removeReplyOverlay();
-            setState("辅助正在运行，但悬浮提示未显示（" + e.getClass().getSimpleName()
-                    + "）。请回到应用检查悬浮窗权限后重新开始。");
+            setState("辅助正在运行，但悬浮提示未显示。请回到应用检查悬浮窗权限后重新开始。");
             notifManager.notify(NOTIF_ID, buildNotification("悬浮提示未显示，点此检查"));
         }
     }

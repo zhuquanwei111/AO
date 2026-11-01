@@ -100,8 +100,8 @@ final class LivePanel {
                     onComplete.run();
                 });
             } catch (Exception e) {
-                String message = "本机采集已停止，但场次结束未确认：" + e.getMessage()
-                        + "。请在设置中重试结束场次；复盘保留服务端实际状态。";
+                android.util.Log.w("LivePanel", "场次结束未确认", e);
+                String message = "屏幕辅助已停止，但本场结束尚未确认。请检查连接后在设置中重试结束本场。";
                 activity.runOnUiThread(() -> {
                     working = false;
                     lastError = message;
@@ -131,8 +131,8 @@ final class LivePanel {
         if (session == null) return Prefs.hasCachedRecap(activity) ? "最近场次已结束，可查看已保存复盘。" : "尚未开始";
         if (session.stopped) return "上一场已结束，可查看复盘或开始新辅助";
         return CaptureService.phase == CaptureService.Phase.IDLE
-                ? "保留了原场次凭证，当前未确认在线。可继续连接或重试结束本场。"
-                : "已保留本场凭证；实时连接与采集状态见首页。";
+                ? "当前场次的连接尚未确认。可继续辅助或重试结束本场。"
+                : "本场连接与辅助状态见首页。";
     }
 
     private void showError(String message) {
