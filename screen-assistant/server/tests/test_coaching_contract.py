@@ -1,6 +1,7 @@
 """隔离验证现有适配器及产品链的契约；替身输出不证明话术质量。"""
 import asyncio
 import json
+import socket
 
 import httpx
 import pytest
@@ -11,6 +12,49 @@ from screen_assistant_server.config import Settings
 from screen_assistant_server.model_client import (
     COMMENT_REPLY_SYSTEM_PROMPT, LIVE_SYSTEM_PROMPT, TianyiChatClient,
 )
+
+
+@pytest.fixture(autouse=True)
+def block_external_network(monkeypatch):
+    connect = socket.socket.connect
+    connect_ex = socket.socket.connect_ex
+    getaddrinfo = socket.getaddrinfo
+
+    def checked_address(address):
+        if isinstance(address, tuple) and address[0] not in {"127.0.0.1", "::1", "localhost"}:
+            raise PermissionError("测试禁止连接外部网络")
+
+    def guarded_connect(sock, address):
+        checked_address(address)
+        return connect(sock, address)
+
+    def guarded_connect_ex(sock, address):
+        checked_address(address)
+        return connect_ex(sock, address)
+
+    def guarded_getaddrinfo(host, *args, **kwargs):
+        if host not in {"127.0.0.1", "::1", "localhost"}:
+            raise PermissionError("测试禁止解析外部主机")
+        return getaddrinfo(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
+    monkeypatch.setattr(socket, "getaddrinfo", guarded_getaddrinfo)
+    with socket.socket() as sock, pytest.raises(PermissionError):
+        sock.connect(("203.0.113.1", 443))
+
+
+def make_client(handler) -> TianyiChatClient:
+    model = object.__new__(TianyiChatClient)
+    model._model = "fake"
+    model._client = httpx.AsyncClient(
+        base_url="http://model.invalid",
+        transport=httpx.MockTransport(handler),
+        headers={"Authorization": "Bearer synthetic"},
+        timeout=httpx.Timeout(2, connect=1),
+        trust_env=False,
+    )
+    return model
 
 
 @pytest.mark.parametrize("text", ["这首歌很动听", "今天特别累", "你先把自己逗笑了吧", "我喜欢听民谣"])
@@ -29,11 +73,7 @@ def test_comment_adapter_is_used_by_real_reconstruction_and_prompt_endpoint(tmp_
     app = create_app(cfg, live_clock=lambda: now)
     with TestClient(app) as client:
         client.portal.call(app.state.model.aclose)
-        model = TianyiChatClient("http://model.invalid", "synthetic", "fake", 2, 1)
-        model._client._transport = httpx.MockTransport(handler)
-        model._client._mounts.clear()
-        assert model._client._transport_for_url(httpx.URL("http://model.invalid/chat/completions")) is model._client._transport
-        app.state.model = model
+        app.state.model = make_client(handler)
         session = client.post("/v1/live/sessions", json={}).json()
         sid = session["session_id"]
         headers = {"X-Live-Session-Token": session["session_token"]}
@@ -74,11 +114,7 @@ def test_existing_operation_model_path_keeps_its_http_contract(tmp_path):
     app = create_app(cfg, live_clock=lambda: now)
     with TestClient(app) as client:
         client.portal.call(app.state.model.aclose)
-        model = TianyiChatClient("http://model.invalid", "synthetic", "fake", 2, 1)
-        model._client._transport = httpx.MockTransport(handler)
-        model._client._mounts.clear()
-        assert model._client._transport_for_url(httpx.URL("http://model.invalid/chat/completions")) is model._client._transport
-        app.state.model = model
+        app.state.model = make_client(handler)
         session = client.post("/v1/live/sessions", json={}).json()
         sid = session["session_id"]
         headers = {"X-Live-Session-Token": session["session_token"]}
