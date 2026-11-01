@@ -113,10 +113,11 @@ final class AppModel: ObservableObject {
         }
         let savedLiveCredentials = LiveSessionState.credentials()
         let pendingIsolatedStop = LiveSessionState.isolatedStopIntent()
+        let unknownStopRecord = pendingIsolatedStop == nil && LiveSessionState.isolatedStopRecordExists()
         if pendingIsolatedStop != nil {
             isolatedStopAvailable = true
             isolatedStopStatus = "有原场结束尚未确认，可手动重试"
-        } else if LiveSessionState.isolatedStopRecordExists() {
+        } else if unknownStopRecord {
             isolatedStopStatus = "原场结束尚未确认，原服务信息不足或记录不可读取"
         }
         let pendingOwnsSaved = pendingIsolatedStop.map {
@@ -125,7 +126,7 @@ final class AppModel: ObservableObject {
             $0.serviceURL.absoluteString == SharedConfig.serverBaseURL()?.absoluteString
         } ?? false
         let savedConnectionPending = savedLiveCredentials?.liveConnectionPending == true
-        liveActive = !pendingOwnsSaved && LiveSessionState.isEnabled() && savedLiveCredentials != nil
+        liveActive = !pendingOwnsSaved && !unknownStopRecord && LiveSessionState.isEnabled() && savedLiveCredentials != nil
         liveConnectionPending = liveActive && savedConnectionPending
         if liveConnectionPending || pendingOwnsSaved { captureWanted = false }
         roundCounter = ControlState.roundCounter()
@@ -157,6 +158,8 @@ final class AppModel: ObservableObject {
 
         if pendingOwnsSaved {
             liveStatus = "原场结束尚未确认，采集未恢复"
+        } else if unknownStopRecord {
+            liveStatus = "原场结束记录无法确认，未自动恢复场次"
         } else if liveActive, let credentials = Self.savedCredentials() {
             liveCredentials = credentials
             liveClient = SharedConfig.serverBaseURL().flatMap { LiveOperationsClient(baseURL: $0) }
