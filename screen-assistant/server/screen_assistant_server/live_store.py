@@ -313,7 +313,6 @@ class LiveStore:
 
     def add_observation(self, sid: str, token: str | None, body: dict, received_at_ms: int):
         session = self.authorize(sid, token)
-        self._expire_comment_payloads(sid, received_at_ms)
         if session["stopped_at_ms"] is not None:
             raise HTTPException(409, "live session stopped")
         if not observation_source_allowed(body["kind"], body["source"],
@@ -405,23 +404,17 @@ class LiveStore:
         batch_count = body.get("capture_comment_count")
         if body["kind"] == "comment" and batch_count is not None:
             key = (body["source"], body["capture_batch_id"])
-            batches = self.comment_batches.setdefault(sid, {})
-            batch = batches.get(key)
+            batch = self.comment_batches.get(sid, {}).get(key)
             if batch is None:
                 batch = {"count": batch_count, "indices": {}, "rows": [], "quality_gaps": [],
                          "deadline": min(effective, received_at_ms) + MAX_OBSERVATION_AGE_MS,
                          "complete": False}
-                batches[key] = batch
             if batch["count"] != batch_count:
                 raise HTTPException(409, "capture batch count mismatch")
             if body["line_index"] in batch["indices"] or batch["complete"]:
                 raise HTTPException(409, "capture batch index already used")
-            batch["deadline"] = min(batch["deadline"], effective + MAX_OBSERVATION_AGE_MS)
-            if received_at_ms > batch["deadline"]:
-                batch["rows"].clear()
-                if not batch.get("expired"):
-                    logger.info("live_comment_batch outcome=expired")
-                    batch["expired"] = True
+            batch_deadline = min(batch["deadline"], effective + MAX_OBSERVATION_AGE_MS)
+            if received_at_ms > batch_deadline:
                 usable, reason = False, "batch_expired"
         if not usable:
             result["reason"] = reason or "unavailable"
@@ -454,7 +447,15 @@ class LiveStore:
                     json.dumps(content["text_position"], ensure_ascii=False) if content.get("text_position") else None,
                     json.dumps(content.get("ocr_lines", []), ensure_ascii=False), result["reason"],
                 ))
+        self._expire_comment_payloads(sid, received_at_ms)
         if batch is not None:
+            self.comment_batches.setdefault(sid, {})[key] = batch
+            batch["deadline"] = batch_deadline
+            if received_at_ms > batch_deadline:
+                batch["rows"].clear()
+                if not batch.get("expired"):
+                    logger.info("live_comment_batch outcome=expired")
+                    batch["expired"] = True
             batch["indices"][body["line_index"]] = event_hash
             if (not usable or observed is None) and received_at_ms <= batch["deadline"]:
                 box = (body.get("content") or {}).get("text_position")

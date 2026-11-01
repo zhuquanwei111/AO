@@ -162,6 +162,52 @@ def test_batch_waits_for_distinct_indices_and_counts_unreliable_arrivals(tmp_pat
         store.close()
 
 
+def test_batch_memory_state_unchanged_when_observation_insert_fails(tmp_path):
+    import sqlite3
+    now = 1_790_000_000_000
+    clock = [now]
+    store = LiveStore(str(tmp_path / "batch-insert-failure.sqlite3"), lambda: clock[0])
+    try:
+        session = store.create("")
+        sid, token = session["session_id"], session["session_token"]
+        clock[0] += 1000
+        first = {"kind": "comment", "event_id": "first", "source": "ios_replaykit_ocr",
+                 "observed_at_ms": now + 1000, "availability": "available", "coverage": "ocr_visible_sample",
+                 "reliability": "known", "content": {"text": "观察"},
+                 "capture_batch_id": "existing", "line_index": 0, "capture_comment_count": 2}
+        assert store.add_observation(sid, token, first, now + 1000)["reason"] == "batch_incomplete"
+        batch = store.comment_batches[sid][("ios_replaykit_ocr", "existing")]
+        old_deadline, old_rows = batch["deadline"], list(batch["rows"])
+        store.db.execute("CREATE TRIGGER fail_observation BEFORE INSERT ON live_observations "
+                         "BEGIN SELECT RAISE(FAIL, 'controlled'); END")
+        store.db.commit()
+        for index in range(3):
+            new = {**first, "event_id": f"failed-{index}", "capture_batch_id": f"new-{index}"}
+            with pytest.raises(sqlite3.IntegrityError):
+                store.add_observation(sid, token, new, now + 1000)
+        assert len(store.comment_batches[sid]) == 1
+        second = {**first, "event_id": "second", "line_index": 1, "observed_at_ms": now}
+        with pytest.raises(sqlite3.IntegrityError):
+            store.add_observation(sid, token, second, now + 1000)
+        assert batch["deadline"] == old_deadline
+        assert batch["rows"] == old_rows
+        assert len(batch["indices"]) == 1
+        assert store.db.execute("SELECT COUNT(*) FROM live_observations WHERE session_id=?", (sid,)).fetchone()[0] == 1
+        assert not store.comment_attempted.get(sid)
+        store.db.execute("DROP TRIGGER fail_observation")
+        store.db.commit()
+        result = store.add_observation(sid, token, second, now + 1000)
+        assert result.get("_batch_ready") is True
+        assert store.add_observation(sid, token, second, now + 1000)["reason"] == "duplicate_event"
+        conflicting = {**second, "event_id": "conflict"}
+        with pytest.raises(HTTPException) as exc:
+            store.add_observation(sid, token, conflicting, now + 1000)
+        assert exc.value.status_code == 409
+        assert len(batch["indices"]) == 2
+    finally:
+        store.close()
+
+
 def test_batch_expiry_and_session_isolation(tmp_path):
     now = 1_790_000_000_000
     clock = [now]
