@@ -138,9 +138,47 @@ def test_training_below_minimum_after_selection_is_not_saved_or_retried(tmp_path
         assert sid not in store.coaching_opportunities
         add_comment(store, sid, token, clock[0], "new", "小林：晚上好")
         reply(store, sid, token, 3)
-        later = store.fusion_candidate(sid, token, 4)
+        assert sid not in store.coaching_opportunities
+        clock[0] = start + 30_000
+        add_comment(store, sid, token, clock[0], "after-deadline", "小明：今天心情不错")
+        reply(store, sid, token, 4)
+        later = store.fusion_candidate(sid, token, 5)
         assert later and later["prompt_type"] == "operation_notice"
         assert later["training_trigger_at_ms"] == clock[0]
+    finally:
+        store.close()
+
+
+def test_unreadable_opportunity_is_not_renewed_by_same_observation_epoch(tmp_path):
+    start = 1_790_000_000_000
+    clock = [start]
+    store = LiveStore(str(tmp_path / "no-renew.sqlite3"), lambda: clock[0])
+    try:
+        data = store.create("")
+        sid, token = data["session_id"], data["session_token"]
+        add_comment(store, sid, token, start, "first", "阿青：这首歌很好听")
+        reply(store, sid, token, 1)
+        original = dict(store.coaching_opportunities[sid])
+        assert original["deadline"] == start + 30_000
+        clock[0] += 27_001
+        add_comment(store, sid, token, clock[0], "next", "小林：晚上好")
+        reply(store, sid, token, 2)
+        assert sid not in store.coaching_opportunities
+        add_comment(store, sid, token, clock[0], "same-epoch", "小明：今天心情不错")
+        reply(store, sid, token, 2)
+        assert sid not in store.coaching_opportunities
+        clock[0] += 1_000
+        add_comment(store, sid, token, clock[0], "later-epoch", "小红：我也喜欢音乐")
+        reply(store, sid, token, 3)
+        assert sid not in store.coaching_opportunities
+        clock[0] = start + 30_000
+        add_comment(store, sid, token, clock[0], "after-deadline", "小花：这首歌很不错")
+        reply(store, sid, token, 4)
+        later = store.coaching_opportunities[sid]
+        assert later["trigger_at"] == clock[0] and later["deadline"] == clock[0] + 30_000
+        assert store.fusion_candidate(sid, token, 4) is None
+        candidate = store.fusion_candidate(sid, token, 5)
+        assert candidate and candidate["prompt_type"] == "operation_notice"
     finally:
         store.close()
 

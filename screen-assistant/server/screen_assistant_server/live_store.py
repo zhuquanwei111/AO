@@ -96,6 +96,7 @@ class LiveStore:
         self.comment_attempt_counts: dict[str, dict[str, int]] = {}
         self.comment_failed_epochs: dict[str, dict[str, int]] = {}
         self.coaching_opportunities: dict[str, dict] = {}
+        self.coaching_discarded_until: dict[str, int] = {}
         self.reply_context: dict[str, dict[str, tuple[int, dict]]] = {}
         self.db = sqlite3.connect(path, check_same_thread=False, timeout=0.5)
         self.db.row_factory = sqlite3.Row
@@ -181,6 +182,7 @@ class LiveStore:
     def close(self):
         self.reply_context.clear()
         self.coaching_opportunities.clear()
+        self.coaching_discarded_until.clear()
         self.db.close()
 
     def _expire_reply_context(self, now: int) -> None:
@@ -193,6 +195,8 @@ class LiveStore:
                 del self.reply_context[sid]
 
     def _expire_comment_payloads(self, sid: str, now: int) -> None:
+        if now >= self.coaching_discarded_until.get(sid, 0):
+            self.coaching_discarded_until.pop(sid, None)
         opportunity = self.coaching_opportunities.get(sid)
         if opportunity is not None and now >= opportunity["deadline"]:
             self.coaching_opportunities.pop(sid, None)
@@ -350,6 +354,7 @@ class LiveStore:
         self.comment_attempt_counts.pop(sid, None)
         self.comment_failed_epochs.pop(sid, None)
         self.coaching_opportunities.pop(sid, None)
+        self.coaching_discarded_until.pop(sid, None)
         self.reply_context.pop(sid, None)
         if any(not batch["complete"] for batch in batches.values()):
             logger.info("live_comment_batch outcome=stopped_incomplete")
@@ -799,6 +804,7 @@ class LiveStore:
             return None
         if opportunity["deadline"] - now < COACHING_MIN_REMAINING_MS:
             self.coaching_opportunities.pop(sid, None)
+            self.coaching_discarded_until[sid] = opportunity["deadline"]
             logger.info("live_data stage=filter session=%s type=operation_notice reason=insufficient_reading_time", sid[:8])
             return None
         if trigger_epoch <= max(opportunity["epoch"], opportunity.get("attempt_epoch", -1)):
@@ -1038,6 +1044,7 @@ class LiveStore:
                 return {"reason": "candidate_expired", "prompt_id": None}
             if opportunity["deadline"] - now < COACHING_MIN_REMAINING_MS:
                 self.coaching_opportunities.pop(sid, None)
+                self.coaching_discarded_until[sid] = opportunity["deadline"]
                 logger.info("live_data stage=filter session=%s type=operation_notice reason=insufficient_reading_time", sid[:8])
                 return {"reason": "insufficient_reading_time", "prompt_id": None}
             hashes = [digest(topic) for topic, _ in COACHING_TOPICS]
@@ -1172,15 +1179,18 @@ class LiveStore:
             opportunity = self.coaching_opportunities.get(sid)
             if opportunity is not None and opportunity["deadline"] - now < COACHING_MIN_REMAINING_MS:
                 self.coaching_opportunities.pop(sid, None)
+                if now < opportunity["deadline"]:
+                    self.coaching_discarded_until[sid] = opportunity["deadline"]
                 logger.info("live_data stage=filter session=%s type=operation_notice reason=insufficient_reading_time", sid[:8])
                 opportunity = None
-            if opportunity is None:
+            if (opportunity is None and now >= self.coaching_discarded_until.get(sid, 0)):
+                self.coaching_discarded_until.pop(sid, None)
                 self.coaching_opportunities[sid] = {
                     "seq": cursor.lastrowid, "trigger_at": now,
                     "deadline": now + COACHING_LIFETIME_MS, "epoch": trigger_epoch,
                     "replies_after": 0,
                 }
-            elif trigger_epoch > opportunity["epoch"]:
+            elif opportunity is not None and trigger_epoch > opportunity["epoch"]:
                 opportunity["replies_after"] = min(1, opportunity["replies_after"] + 1)
             self.reply_context.setdefault(sid, {})[event["prompt_id"]] = (
                 now + PROMPT_TTL_MS, dict(candidate["reply_to"])
