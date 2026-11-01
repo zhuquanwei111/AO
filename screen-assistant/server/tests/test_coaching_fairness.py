@@ -51,7 +51,7 @@ def test_expired_comment_can_support_fixed_lifetime_coaching(tmp_path):
         store.close()
 
 
-def test_dense_comment_stream_yields_training_after_two_replies(tmp_path):
+def test_dense_comment_stream_yields_training_after_one_reply(tmp_path):
     now = 1_790_000_000_000
     store = LiveStore(str(tmp_path / "fair.sqlite3"), lambda: now)
     try:
@@ -59,16 +59,16 @@ def test_dense_comment_stream_yields_training_after_two_replies(tmp_path):
         sid, token = s["session_id"], s["session_token"]
         add_comment(store, sid, token, now, "first", "阿青：这首歌很好听")
         reply(store, sid, token, 1)
-        for epoch, text in [(2, "小林：晚上好"), (3, "小明：今天心情不错")]:
+        for epoch, text in [(2, "小林：晚上好")]:
             add_comment(store, sid, token, now, f"e{epoch}", text)
             reply(store, sid, token, epoch)
-        add_comment(store, sid, token, now, "e4", "小红：我也喜欢音乐")
-        candidate = store.fusion_candidate(sid, token, 4)
+        add_comment(store, sid, token, now, "e3", "小明：今天心情不错")
+        candidate = store.fusion_candidate(sid, token, 3)
         assert candidate and candidate["prompt_type"] == "operation_notice"
-        assert store.save_fusion_candidate(sid, token, candidate, candidate["suggestion"], 4)["reason"] == "generated"
-        following = store.fusion_candidate(sid, token, 4)
+        assert store.save_fusion_candidate(sid, token, candidate, candidate["suggestion"], 3)["reason"] == "generated"
+        following = store.fusion_candidate(sid, token, 3)
         assert following and following["prompt_type"] == "comment_reply"
-        assert following["model_text"] == "我也喜欢音乐"
+        assert following["model_text"] == "今天心情不错"
     finally:
         store.close()
 
@@ -151,7 +151,7 @@ def test_confirmed_quality_candidate_precedes_due_training(tmp_path):
     try:
         s = store.create("")
         sid, token = s["session_id"], s["session_token"]
-        for epoch, text in [(1, "阿青：这首歌很好听"), (2, "小林：晚上好"), (3, "小明：今天心情不错")]:
+        for epoch, text in [(1, "阿青：这首歌很好听"), (2, "小林：晚上好")]:
             add_comment(store, sid, token, now, f"e{epoch}", text)
             reply(store, sid, token, epoch)
         signal = {"kind": "quality", "event_id": "quality", "source": "ios_replaykit_ocr",
@@ -171,7 +171,7 @@ def test_higher_priority_history_does_not_block_ordinary_reply(tmp_path):
     try:
         s = store.create("")
         sid, token = s["session_id"], s["session_token"]
-        for epoch, text in [(1, "阿青：这首歌很好听"), (2, "小林：晚上好"), (3, "小明：今天心情不错")]:
+        for epoch, text in [(1, "阿青：这首歌很好听"), (2, "小林：晚上好")]:
             add_comment(store, sid, token, start, f"e{epoch}", text)
             reply(store, sid, token, epoch)
         signal = {"kind": "quality", "event_id": "quality", "source": "ios_replaykit_ocr",
@@ -280,5 +280,5 @@ def test_http_dense_batch_resumes_comments_after_training(tmp_path, monkeypatch)
         client.portal.call(idle)
         events = client.get(url + "/events", headers=headers).json()["events"]
         assert [event["prompt_type"] for event in events] == [
-            "comment_reply", "comment_reply", "comment_reply", "operation_notice", "comment_reply"]
+            "comment_reply", "comment_reply", "operation_notice", "comment_reply", "comment_reply"]
         assert calls == ["这首歌很好听", "晚上好", "今天心情不错", "我也喜欢音乐"]

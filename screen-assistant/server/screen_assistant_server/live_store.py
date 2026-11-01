@@ -874,7 +874,7 @@ class LiveStore:
         failed_epochs = self.comment_failed_epochs.get(sid, {})
         training_candidate = self._coaching_candidate(sid, now, trigger_epoch)
         opportunity = self.coaching_opportunities.get(sid)
-        prefer_training = bool(training_candidate and opportunity["replies_after"] >= 2
+        prefer_training = bool(training_candidate and opportunity["replies_after"] >= 1
                                and (candidate is None or candidate["priority"] <= 25))
         comment_candidate = None
         records = [record for batch in self.comment_batches.get(sid, {}).values()
@@ -1181,7 +1181,7 @@ class LiveStore:
                     "replies_after": 0,
                 }
             elif trigger_epoch > opportunity["epoch"]:
-                opportunity["replies_after"] = min(2, opportunity["replies_after"] + 1)
+                opportunity["replies_after"] = min(1, opportunity["replies_after"] + 1)
             self.reply_context.setdefault(sid, {})[event["prompt_id"]] = (
                 now + PROMPT_TTL_MS, dict(candidate["reply_to"])
             )
