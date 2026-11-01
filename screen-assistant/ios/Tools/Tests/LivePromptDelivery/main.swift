@@ -1,0 +1,63 @@
+import Foundation
+
+var malformedPriority = LivePromptDelivery(intervalMS: 0)
+let unsafePriority = LivePromptDelivery.Item(id: "bad", text: "bad", expiresAtMS: 100,
+                                             priority: nil, priorityInvalid: true)
+let validPriority = LivePromptDelivery.Item(id: "valid", text: "valid", expiresAtMS: 100, priority: 100)
+assert(malformedPriority.receive([unsafePriority, validPriority], nowMS: 1).map(\.id) == ["bad", "valid"])
+assert(malformedPriority.take(nowMS: 1) { _ in true }.map(\.id) == ["valid"])
+
+func item(_ id: String, expires: Int64 = 20_000, priority: Int = 0) -> LivePromptDelivery.Item {
+    .init(id: id, text: id, expiresAtMS: expires, priority: priority)
+}
+let fitsTwo: ([LivePromptDelivery.Item]) -> Bool = { $0.count <= 2 }
+var delivery = LivePromptDelivery(capacity: 3, intervalMS: 3_000)
+assert(delivery.receive([item("a"), item("b"), item("a")], nowMS: 0).map(\.id) == ["a", "b"])
+assert(delivery.take(nowMS: 0, fits: fitsTwo).map(\.id) == ["a", "b"])
+assert(delivery.receive([item("c"), item("d"), item("e"), item("f")], nowMS: 1).count == 4)
+assert(delivery.overflowCount == 1 && delivery.pending.map(\.id) == ["c", "d", "e"])
+assert(delivery.take(nowMS: 2_999, fits: fitsTwo).isEmpty)
+assert(delivery.take(nowMS: 3_000, fits: fitsTwo).map(\.id) == ["c", "d"])
+assert(delivery.take(nowMS: 20_000, fits: fitsTwo).isEmpty && delivery.expiredCount == 1)
+delivery.clear()
+_ = delivery.receive([item("a"), item("urgent", priority: 100)], nowMS: 1)
+assert(delivery.take(nowMS: 1, fits: { $0.count == 1 }).map(\.id) == ["urgent"])
+delivery.clear()
+assert(delivery.pending.isEmpty)
+assert(delivery.receive([item("a")], nowMS: 1).count == 1)
+delivery.clear()
+assert(LivePromptDelivery.displayExpiry(nil, serverTimeMS: 1_000, processingMS: 0, startNS: 0, endNS: 0) == nil)
+assert(LivePromptDelivery.displayExpiry(16_000, serverTimeMS: nil, processingMS: 0, startNS: 0, endNS: 0) == nil)
+assert(LivePromptDelivery.displayExpiry(16_000, serverTimeMS: 1_000, processingMS: 15_001, startNS: 0, endNS: 15_000_000_000) == nil)
+assert(LivePromptDelivery.displayExpiry(16_000, serverTimeMS: 1_000, processingMS: -1, startNS: 0, endNS: 1) == nil)
+assert(LivePromptDelivery.displayExpiry(16_000, serverTimeMS: 1_000, processingMS: 0, startNS: 2, endNS: 1) == nil)
+let expiry = LivePromptDelivery.displayExpiry(16_000, serverTimeMS: 1_000, processingMS: 15_000, startNS: 0, endNS: 15_010_000_000)!
+assert(expiry == 29_999)
+assert(LivePromptDelivery.displayExpiry(16_000, serverTimeMS: 1_000, processingMS: 15_000, startNS: 0, endNS: 15_200_000_000) == 29_999)
+assert(LivePromptDelivery.displayExpiry(16_000, serverTimeMS: 1_000, processingMS: 15_000, startNS: 0, endNS: 31_000_000_000) == 31_000)
+for wallClock in [-86_400_000, 0, 86_400_000] {
+    _ = wallClock // 截止点计算不读取设备墙钟。
+    assert(LivePromptDelivery.displayExpiry(16_000, serverTimeMS: 1_000, processingMS: 15_000, startNS: 0, endNS: 15_010_000_000) == expiry)
+}
+assert(LivePromptDelivery.displayExpiry(16_000, serverTimeMS: 1_000, processingMS: 0, startNS: 0, endNS: 1) == 14_998)
+assert(LivePromptDelivery.displayExpiry(16_000, serverTimeMS: 1_000, processingMS: 15_000, startNS: 0, endNS: 16_000_000_000) == 29_999)
+assert(LivePromptDelivery.displayExpiry(1_002, serverTimeMS: 1_000, processingMS: 0, startNS: 0, endNS: 1_000_000) == 1)
+_ = delivery.receive([item("timed", expires: expiry)], nowMS: 15_010)
+assert(delivery.take(nowMS: 29_998, fits: fitsTwo).map(\.id) == ["timed"])
+delivery.clear()
+_ = delivery.receive([item("slept", expires: expiry)], nowMS: 15_010)
+assert(delivery.take(nowMS: 30_000, fits: fitsTwo).isEmpty)
+delivery.clear()
+_ = delivery.receive([item("1"), item("2"), item("3"), item("urgent", priority: 100)], nowMS: 0)
+assert(delivery.pending.map(\.id) == ["1", "2", "urgent"])
+assert(delivery.take(nowMS: 0, fits: { $0.count == 1 }).map(\.id) == ["urgent"])
+assert(delivery.take(nowMS: 2_999, fits: fitsTwo).isEmpty)
+assert(delivery.take(nowMS: 3_000, fits: fitsTwo).map(\.id) == ["1", "2"])
+assert(delivery.take(nowMS: 20_000, fits: fitsTwo).isEmpty)
+delivery.clear()
+_ = delivery.receive([item("long-urgent", expires: 100_000, priority: 100)], nowMS: 100)
+assert(delivery.take(nowMS: 100, fits: fitsTwo).map(\.id) == ["long-urgent"])
+_ = delivery.receive([item("ordinary", expires: 5_000)], nowMS: 101)
+assert(delivery.take(nowMS: 3_099, fits: fitsTwo).isEmpty)
+assert(delivery.take(nowMS: 3_100, fits: fitsTwo).map(\.id) == ["ordinary"])
+print("OK: live prompt deduplication, capacity, interval, expiry, priority and reset")

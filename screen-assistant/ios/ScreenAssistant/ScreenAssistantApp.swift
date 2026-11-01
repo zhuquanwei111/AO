@@ -47,12 +47,22 @@ final class AppModel: ObservableObject {
     @Published var liveDescription = ""
     @Published var liveStatus = "未开始"
     @Published var liveEvents: [LivePrompt] = []
+    @Published var liveTimingWarning = false
+    @Published private(set) var liveTimingAnchorFailures = 0
+    @Published private(set) var liveTimingInvalidItems = 0
+    @Published private(set) var livePriorityInvalidItems = 0
+    @Published private(set) var liveSourcesInvalidItems = 0
+    @Published private(set) var liveEntryInvalidItems = 0
     @Published var liveSummary: LiveSessionSummary?
     @Published var liveActive = false
     @Published var liveStopped = false
     @Published var liveStarting = false
     @Published var liveStopping = false
     @Published var liveConnectionPending = false
+    @Published private(set) var liveVerificationNeedsRetry = false
+    @Published private(set) var isolatedStopAvailable = false
+    @Published private(set) var isolatedStopInFlight = false
+    @Published private(set) var isolatedStopStatus = ""
     @Published var broadcastStatusText = "系统屏幕广播状态尚未确认"
     @Published var serviceStatusText = "服务连接尚未通过请求核验"
     @Published var overviewLoading = false
@@ -65,8 +75,14 @@ final class AppModel: ObservableObject {
     private var liveCredentials: LiveSessionCredentials?
     private var liveClient: LiveOperationsClient?
     private var livePollTask: URLSessionDataTask?
+    private var livePollGeneration = 0
+    private var liveStartGeneration = 0
+    private var isolatedStopGeneration = 0
     private var liveCursor = ""
+    private var liveDelivery = LivePromptDelivery()
+    private var liveDisplayedUntilMS: Int64?
     private var summaryRefreshInFlight = false
+    private var overviewRequest = OverviewRequestTracker()
     private var lastServiceConnection = ControlState.serviceConnection()
 
     init() {
@@ -83,23 +99,41 @@ final class AppModel: ObservableObject {
                                                        width: CGFloat(diagnosticRegion.width),
                                                        height: CGFloat(diagnosticRegion.height))
         captureWanted = ControlState.userWantsCapture()
+        audioSettings = AudioCaptureSettings.load()
         broadcastStatusText = Self.broadcastStatusDescription(
             activity: ControlState.broadcastActivity(),
             captureWanted: captureWanted,
             now: Date()
         )
         serviceStatusText = Self.serviceStatusDescription(ControlState.serviceConnection(), now: Date())
-        audioSettings = AudioCaptureSettings.load()
-        if LiveSessionState.credentials() == nil {
+        if LiveSessionState.credentials() == nil && !LiveSessionState.isolatedStopRecordExists() {
             audioSettings.appHostConfirmed = false
             audioSettings.micHostConfirmed = false
             AudioCaptureSettings.save(audioSettings)
         }
         let savedLiveCredentials = LiveSessionState.credentials()
+        let pendingIsolatedStop = LiveSessionState.isolatedStopIntent()
+        let unknownStopRecord = pendingIsolatedStop == nil && LiveSessionState.isolatedStopRecordExists()
+        if pendingIsolatedStop != nil {
+            isolatedStopAvailable = true
+            isolatedStopStatus = "有原场结束尚未确认，可手动重试"
+        } else if unknownStopRecord {
+            isolatedStopAvailable = true
+            isolatedStopStatus = "原场结束尚未确认，原服务信息不足或记录不可读取"
+        }
+        let pendingOwnsSaved = pendingIsolatedStop.map {
+            $0.credentials.sessionID == savedLiveCredentials?.sessionID &&
+            $0.credentials.token == savedLiveCredentials?.token &&
+            $0.serviceURL.absoluteString == savedLiveCredentials?.boundServiceURL?.absoluteString
+        } ?? false
         let savedConnectionPending = savedLiveCredentials?.liveConnectionPending == true
-        liveActive = LiveSessionState.isEnabled() && savedLiveCredentials != nil
+        liveActive = !pendingOwnsSaved && !unknownStopRecord && LiveSessionState.isEnabled() && savedLiveCredentials != nil
         liveConnectionPending = liveActive && savedConnectionPending
-        if liveConnectionPending { captureWanted = false }
+        let restoredService = savedLiveCredentials?.captureServiceURL(configured: SharedConfig.serverBaseURL())
+        if liveConnectionPending || pendingOwnsSaved || (liveActive && restoredService == nil) {
+            captureWanted = false
+            ControlState.setUserWantsCapture(false)
+        }
         roundCounter = ControlState.roundCounter()
 
         // 轮询共享状态（扩展每完成一轮会 bump 计数器）。
@@ -124,26 +158,43 @@ final class AppModel: ObservableObject {
                     now: Date()
                 )
                 self.refreshServiceConnectionStatus()
+                self.deliverLivePrompts()
             }
 
-        if liveActive, let credentials = Self.savedCredentials() {
+        if pendingOwnsSaved {
+            liveStatus = "原场结束尚未确认，采集未恢复"
+        } else if unknownStopRecord {
+            liveStatus = "原场结束记录无法确认，未自动恢复场次"
+        } else if liveActive, let credentials = Self.savedCredentials() {
             liveCredentials = credentials
-            liveClient = SharedConfig.serverBaseURL().flatMap { LiveOperationsClient(baseURL: $0) }
-            if liveConnectionPending {
+            liveClient = credentials.boundServiceURL.flatMap {
+                IsolatedStopIntent.safeServiceURL($0) ? LiveOperationsClient(baseURL: $0) : nil
+            }
+            if restoredService == nil {
+                liveStatus = "本场原服务信息不可确认或配置已变化，采集未开启"
+            } else if liveConnectionPending {
                 liveStatus = "后台启动结果未确认；正在核验同一场实时连接"
             } else if credentials.backstageStartPending == true {
                 liveStatus = "恢复同场实时收件；后台复盘任务状态仍未知"
             } else {
                 liveStatus = "恢复当前场次收件"
             }
-            if liveClient != nil { pollLivePrompts() }
-        } else if LiveSessionState.isEnabled() {
-            LiveSessionState.clear()
+            if liveClient != nil && restoredService != nil { pollLivePrompts() }
+        } else if LiveSessionState.isEnabled() && !LiveSessionState.isolatedStopRecordExists() {
+            captureWanted = false
+            ControlState.setUserWantsCapture(false)
+            liveStatus = "本场授权无法读取，采集未开启；结束状态尚未确认"
         } else if let credentials = savedLiveCredentials {
             liveStopped = true
-            liveClient = SharedConfig.serverBaseURL().flatMap { LiveOperationsClient(baseURL: $0) }
-            liveStatus = "本场已结束，正在检查后台汇总"
-            if let client = liveClient { loadStoppedOverview(credentials, client: client) }
+            liveClient = credentials.boundServiceURL.flatMap {
+                IsolatedStopIntent.safeServiceURL($0) ? LiveOperationsClient(baseURL: $0) : nil
+            }
+            if let client = liveClient {
+                liveStatus = "本场已结束，正在检查后台汇总"
+                loadStoppedOverview(credentials, client: client)
+            } else {
+                liveStatus = "本场原服务地址未确认，暂不能读取后台汇总"
+            }
         }
     }
 
@@ -159,7 +210,16 @@ final class AppModel: ObservableObject {
     }
 
     func startLiveSession() {
+        guard !isolatedStopInFlight else { return }
         guard !liveStarting, !liveStopping else { return }
+        guard !LiveSessionState.isolatedStopRecordUnreadable() else {
+            liveStatus = "原场结束记录无法读取，未创建新场；可重试读取"
+            return
+        }
+        guard !LiveSessionState.isEnabled() || Self.savedCredentials() != nil else {
+            liveStatus = "已有场次授权无法读取，不能创建新场"
+            return
+        }
         let account = douyinAccount.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !account.isEmpty else {
             liveStatus = "请先填写本场抖音号"
@@ -169,7 +229,7 @@ final class AppModel: ObservableObject {
             liveStatus = "本场辅助已运行"
             return
         }
-        guard let base = SharedConfig.serverBaseURL(),
+        guard let base = SharedConfig.serverBaseURL(), IsolatedStopIntent.safeServiceURL(base),
               let client = LiveOperationsClient(baseURL: base) else {
             ControlState.setServiceConnection(.configurationInvalid)
             refreshServiceConnectionStatus()
@@ -177,13 +237,18 @@ final class AppModel: ObservableObject {
             return
         }
         liveStarting = true
+        liveStartGeneration &+= 1
+        let generation = liveStartGeneration
         liveStatus = "正在创建场次…"
         client.create(description: liveDescription, douyinAccount: account) { [weak self] result in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, BackstageStatusPresentation.acceptsStartCallback(
+                    generation: generation, currentGeneration: self.liveStartGeneration,
+                    starting: self.liveStarting, stopping: self.liveStopping) else { return }
                 switch result {
                 case .success(let credentials):
                     var pendingCredentials = credentials
+                    pendingCredentials.boundServiceURL = client.baseURL
                     pendingCredentials.backstageStartPending = true
                     pendingCredentials.liveConnectionPending = true
                     self.captureWanted = false
@@ -195,7 +260,10 @@ final class AppModel: ObservableObject {
                     }
                     client.start(pendingCredentials) { [weak self] startResult in
                         DispatchQueue.main.async {
-                            guard let self else { return }
+                            guard let self, BackstageStatusPresentation.acceptsStartCallback(
+                                    generation: generation, currentGeneration: self.liveStartGeneration,
+                                    starting: self.liveStarting, stopping: self.liveStopping),
+                                  Self.savedCredentials()?.sessionID == pendingCredentials.sessionID else { return }
                             self.liveStarting = false
                             switch startResult {
                             case .success(let activeCredentials):
@@ -214,26 +282,15 @@ final class AppModel: ObservableObject {
                                 self.activateLivePromptSession(
                                     activeCredentials,
                                     client: client,
-                                    status: "后台场次已就绪；请按下方步骤启动本机提示与屏幕广播"
+                                    status: BackstageStatusPresentation.active(status: activeCredentials.backstageStatus)
                                 )
                             case .failure(let error):
-                                if (error as? LiveOperationsHTTPError)?.isBackstageTaskBusy == true {
-                                    var recapBusy = pendingCredentials
-                                    recapBusy.backstageStartPending = false
-                                    recapBusy.liveConnectionPending = false
-                                    self.activateLivePromptSession(
-                                        recapBusy,
-                                        client: client,
-                                        status: "后台复盘任务繁忙；本场实时提示仍可继续，五项汇总可能缺失"
-                                    )
-                                } else {
-                                    self.activateLivePromptSession(
-                                        pendingCredentials,
-                                        client: client,
-                                        status: Self.startOutcomePendingMessage(error),
-                                        captureImmediately: false
-                                    )
-                                }
+                                self.activateLivePromptSession(
+                                    pendingCredentials,
+                                    client: client,
+                                    status: Self.startOutcomePendingMessage(error),
+                                    captureImmediately: false
+                                )
                             }
                         }
                     }
@@ -251,6 +308,25 @@ final class AppModel: ObservableObject {
                                            captureImmediately: Bool = true) {
         var activeCredentials = credentials
         if !captureImmediately { activeCredentials.liveConnectionPending = true }
+        livePollGeneration &+= 1
+        livePollTask?.cancel()
+        livePollTask = nil
+        liveVerificationNeedsRetry = false
+        liveEvents = []
+        liveTimingWarning = false
+        liveTimingAnchorFailures = 0
+        liveTimingInvalidItems = 0
+        livePriorityInvalidItems = 0
+        liveSourcesInvalidItems = 0
+        liveEntryInvalidItems = 0
+        overviewLoading = false
+        summaryRefreshInFlight = false
+        overviewRequest.clear()
+        liveDelivery.clear()
+        liveDisplayedUntilMS = nil
+        PiPDisplayController.shared.endLiveContent()
+        liveSummary = nil
+        liveCursor = ""
         guard LiveSessionState.save(activeCredentials) else {
             activeCredentials.backstageStartPending = true
             activeCredentials.liveConnectionPending = true
@@ -270,22 +346,44 @@ final class AppModel: ObservableObject {
         liveStopped = false
         liveStatus = status
         liveConnectionPending = activeCredentials.liveConnectionPending == true
-        liveEvents = []
-        liveSummary = nil
-        liveCursor = ""
         captureWanted = captureImmediately && !liveConnectionPending
         pollLivePrompts()
     }
 
     func stopLiveSession() {
-        guard !liveStopping else { return }
+        guard !liveStopping, !isolatedStopInFlight else { return }
         guard let credentials = liveCredentials ?? Self.savedCredentials(),
-              let client = liveClient ?? SharedConfig.serverBaseURL().flatMap({ LiveOperationsClient(baseURL: $0) }) else {
-            liveStatus = "没有可停止的场次"
+              let client = liveClient ?? credentials.boundServiceURL.flatMap({
+                  IsolatedStopIntent.safeServiceURL($0) ? LiveOperationsClient(baseURL: $0) : nil
+              }) else {
+            liveStatus = "原场服务信息不足，结束尚未确认"
             return
         }
+        let saved = Self.savedCredentials()
+        if saved?.sessionID != credentials.sessionID || saved?.token != credentials.token ||
+            saved?.boundServiceURL?.absoluteString != client.baseURL.absoluteString ||
+            (liveClient != nil && liveClient?.baseURL.absoluteString != SharedConfig.serverBaseURL()?.absoluteString) {
+            if saved?.sessionID == credentials.sessionID && saved?.token == credentials.token &&
+                saved?.boundServiceURL?.absoluteString == client.baseURL.absoluteString {
+                captureWanted = false
+            }
+            guard let originalClient = liveClient else {
+                isolatedStopStatus = "原场服务信息不足，未发送结束请求"
+                return
+            }
+            let intent = IsolatedStopIntent(credentials: credentials, serviceURL: originalClient.baseURL)
+            beginIsolatedStop(intent, client: originalClient)
+            return
+        }
+        liveStartGeneration &+= 1
+        liveVerificationNeedsRetry = false
+        liveStarting = false
+        livePollGeneration &+= 1
         livePollTask?.cancel()
         livePollTask = nil
+        liveDelivery.clear()
+        liveDisplayedUntilMS = nil
+        PiPDisplayController.shared.endLiveContent()
         captureWanted = false
         liveConnectionPending = false
         var stoppingCredentials = credentials
@@ -315,22 +413,84 @@ final class AppModel: ObservableObject {
     }
 
     private func pollLivePrompts() {
-        guard liveActive, let credentials = liveCredentials, let client = liveClient else { return }
-        livePollTask = client.poll(credentials, after: liveCursor) { [weak self] result in
+        guard !LiveSessionState.isolatedStopRecordUnreadable(), liveActive,
+              let credentials = liveCredentials, let bound = credentials.boundServiceURL,
+              IsolatedStopIntent.safeServiceURL(bound), let client = liveClient,
+              client.baseURL.absoluteString == bound.absoluteString else { return }
+        livePollGeneration &+= 1
+        let generation = livePollGeneration
+        let waitMS = liveConnectionPending ? 0 : 15_000
+        livePollTask = client.poll(credentials, after: liveCursor, waitMS: waitMS) { [weak self] result, response, transportError in
             DispatchQueue.main.async {
-                guard let self, self.liveActive, !self.liveStopping,
-                      self.liveCredentials?.sessionID == credentials.sessionID else { return }
+                guard let self else { return }
+                let saved = Self.savedCredentials()
+                guard !LiveSessionState.isolatedStopRecordUnreadable(),
+                      self.liveCredentials?.boundServiceURL?.absoluteString == bound.absoluteString else { return }
+                let disposition = PollCallbackGate.disposition(
+                    sessionID: credentials.sessionID, token: credentials.token, generation: generation,
+                    currentSessionID: self.liveCredentials?.sessionID, currentToken: self.liveCredentials?.token,
+                    currentGeneration: self.livePollGeneration,
+                    savedSessionID: saved?.sessionID, savedToken: saved?.token,
+                    active: self.liveActive, stopping: self.liveStopping)
+                guard disposition != .stale else { return }
+                if disposition == .savedCredentialsMismatch || saved?.boundServiceURL?.absoluteString != bound.absoluteString {
+                    if self.liveConnectionPending {
+                        self.livePollTask = nil
+                        self.liveVerificationNeedsRetry = true
+                        self.liveStatus = "本场尚未核验，采集未开启；请检查本场授权后重试"
+                    }
+                    return
+                }
+                self.liveVerificationNeedsRetry = false
+                guard PollCallbackGate.commitIfCurrent(
+                    sessionID: credentials.sessionID, generation: generation,
+                    currentSessionID: self.liveCredentials?.sessionID,
+                    currentGeneration: self.livePollGeneration,
+                    active: self.liveActive, stopping: self.liveStopping,
+                    commit: { ControlState.recordServiceResponse(error: transportError, response: response) }
+                ) else { return }
                 switch result {
                 case .success(let page):
+                    self.liveEntryInvalidItems += page.invalidEntryCount
                     self.liveCursor = page.nextCursor
-                    let known = Set(self.liveEvents.map(\.promptID))
-                    let fresh = page.prompts.filter { !known.contains($0.promptID) }
+                    let now = Int64(LiveOperationsClient.continuousNowNS() / 1_000_000)
+                    let deadlines = page.prompts.map { prompt in
+                        LivePromptDelivery.displayExpiry(prompt.expiresAtMS, serverTimeMS: page.serverTimeMS,
+                            processingMS: page.serverProcessingMS, startNS: page.requestStartNS, endNS: page.responseEndNS)
+                    }
+                    let anchorValid = LivePromptDelivery.displayExpiry(page.serverTimeMS, serverTimeMS: page.serverTimeMS,
+                        processingMS: page.serverProcessingMS, startNS: page.requestStartNS, endNS: page.responseEndNS) != nil
+                    let items = zip(page.prompts, deadlines).map { prompt, deadline in
+                        let label = prompt.sources?.contains(where: { $0.kind == "comment" }) == true ? "问答" : "运营"
+                        return LivePromptDelivery.Item(id: prompt.promptID,
+                            text: "【\(label)】" + prompt.displayText,
+                            expiresAtMS: deadline ?? 0,
+                            priority: prompt.priority, timingInvalid: deadline == nil,
+                            priorityInvalid: prompt.priorityInvalid)
+                    }
+                    let beforeOverflow = self.liveDelivery.overflowCount
+                    let beforeExpired = self.liveDelivery.expiredCount
+                    let freshItems = self.liveDelivery.receive(items, nowMS: now)
+                    if !freshItems.isEmpty {
+                        if !anchorValid { self.liveTimingAnchorFailures += 1 }
+                        else { self.liveTimingInvalidItems += freshItems.filter(\.timingInvalid).count }
+                        if !anchorValid || freshItems.contains(where: \.timingInvalid) { self.liveTimingWarning = true }
+                    }
+                    var acceptedIDs = Set(freshItems.map(\.id))
+                    let fresh = page.prompts.filter { acceptedIDs.remove($0.promptID) != nil }
+                    self.livePriorityInvalidItems += fresh.filter(\.priorityInvalid).count
+                    self.liveSourcesInvalidItems += fresh.filter(\.sourcesInvalid).count
                     self.liveEvents.insert(contentsOf: fresh, at: 0)
                     self.liveEvents = Array(self.liveEvents.prefix(100))
-                    if let prompt = fresh.last {
-                        PiPDisplayController.shared.showLivePrompt(prompt.displayText)
+                    if !fresh.isEmpty { NSLog("Live prompt delivery: received=%d", fresh.count) }
+                    if self.liveDelivery.overflowCount != beforeOverflow || self.liveDelivery.expiredCount != beforeExpired {
+                        NSLog("Live prompt delivery: overflow=%d expired=%d", self.liveDelivery.overflowCount, self.liveDelivery.expiredCount)
                     }
+                    if !page.stopped { self.deliverLivePrompts() }
                     if page.stopped {
+                        self.liveDelivery.clear()
+                        self.liveDisplayedUntilMS = nil
+                        PiPDisplayController.shared.endLiveContent()
                         self.liveStatus = "服务端场次已停止"
                         self.liveActive = false
                         self.liveStopped = true
@@ -345,7 +505,7 @@ final class AppModel: ObservableObject {
                             confirmedCredentials.liveConnectionPending = false
                             guard LiveSessionState.save(confirmedCredentials) else {
                                 self.liveStatus = "同场实时收件已响应，但授权状态无法保存；暂未启用采集"
-                                self.scheduleLivePromptRetry()
+                                self.scheduleLivePromptRetry(sessionID: credentials.sessionID, generation: generation)
                                 return
                             }
                             self.liveCredentials = confirmedCredentials
@@ -355,7 +515,7 @@ final class AppModel: ObservableObject {
                                 ? "同场实时收件已响应；后台复盘任务状态未知，未重复启动"
                                 : "同场实时收件已响应；已恢复本机采集"
                         } else if self.liveStatus == "运营收件暂不可用，正在重试" {
-                            self.liveStatus = "后台场次已就绪；运营收件已恢复"
+                            self.liveStatus = BackstageStatusPresentation.recovered(status: credentials.backstageStatus)
                         }
                         self.pollLivePrompts()
                     }
@@ -363,15 +523,120 @@ final class AppModel: ObservableObject {
                     self.liveStatus = self.liveConnectionPending
                         ? Self.liveVerificationFailureMessage(error)
                         : "运营收件暂不可用，正在重试"
-                    self.scheduleLivePromptRetry()
+                    self.scheduleLivePromptRetry(sessionID: credentials.sessionID, generation: generation)
                 }
             }
         }
     }
 
-    private func scheduleLivePromptRetry() {
+    func retryLiveVerification() {
+        guard liveVerificationNeedsRetry, liveConnectionPending, liveActive, !liveStarting, !liveStopping,
+              !isolatedStopInFlight,
+              let credentials = liveCredentials else { return }
+        if let pending = LiveSessionState.isolatedStopIntent(),
+           pending.credentials.sessionID == credentials.sessionID,
+           pending.credentials.token == credentials.token,
+           pending.serviceURL.absoluteString == liveClient?.baseURL.absoluteString { return }
+        let saved = Self.savedCredentials()
+        guard PollCallbackGate.matchesCredentials(sessionID: credentials.sessionID, token: credentials.token,
+            currentSessionID: liveCredentials?.sessionID, currentToken: liveCredentials?.token,
+            savedSessionID: saved?.sessionID, savedToken: saved?.token) else {
+            liveStatus = "本场尚未核验，采集未开启；请检查本场授权后重试"
+            return
+        }
+        liveVerificationNeedsRetry = false
+        liveStatus = "正在重新核验本场实时连接"
+        pollLivePrompts()
+    }
+
+    func retryIsolatedStop() {
+        guard !isolatedStopInFlight, let intent = LiveSessionState.isolatedStopIntent(),
+              let client = LiveOperationsClient(baseURL: intent.serviceURL) else {
+            isolatedStopStatus = "原场结束记录或服务地址不可用，未发送请求，可重试"
+            return
+        }
+        beginIsolatedStop(intent, client: client)
+    }
+
+    private func beginIsolatedStop(_ intent: IsolatedStopIntent, client: LiveOperationsClient) {
+        guard !isolatedStopInFlight else { return }
+        guard client.baseURL.absoluteString == intent.serviceURL.absoluteString,
+              LiveSessionState.saveIsolatedStop(intent) else {
+            isolatedStopStatus = "原场结束意图未能安全保存，未发送请求，可重试"
+            return
+        }
+        let credentials = intent.credentials
+        isolatedStopAvailable = true
+        isolatedStopInFlight = true
+        isolatedStopGeneration &+= 1
+        let generation = isolatedStopGeneration
+        let startGeneration = liveStartGeneration
+        if liveCredentials?.sessionID == credentials.sessionID && liveCredentials?.token == credentials.token &&
+            liveClient?.baseURL.absoluteString == intent.serviceURL.absoluteString {
+            livePollGeneration &+= 1
+            livePollTask?.cancel()
+            livePollTask = nil
+            liveVerificationNeedsRetry = false
+        }
+        isolatedStopStatus = "正在确认原场结束"
+        client.stop(credentials, recordResponse: false) { [weak self] ok in
+            DispatchQueue.main.async {
+                guard let self, self.isolatedStopGeneration == generation,
+                      self.liveStartGeneration == startGeneration,
+                      let pending = LiveSessionState.isolatedStopIntent(), pending.matches(intent) else { return }
+                self.isolatedStopInFlight = false
+                guard ok else {
+                    self.isolatedStopStatus = "原场结束尚未确认，可重试"
+                    return
+                }
+                guard LiveSessionState.clearIsolatedStop(intent) else {
+                    self.isolatedStopStatus = "原场结束已确认，但待结束记录未清除，可重试核销"
+                    return
+                }
+                self.isolatedStopAvailable = false
+                self.isolatedStopStatus = "原场结束已确认"
+                if self.liveCredentials?.sessionID == credentials.sessionID,
+                   self.liveCredentials?.token == credentials.token,
+                   self.liveClient?.baseURL.absoluteString == intent.serviceURL.absoluteString {
+                    if let saved = Self.savedCredentials(), saved.sessionID == credentials.sessionID,
+                       saved.token == credentials.token,
+                       saved.boundServiceURL?.absoluteString == intent.serviceURL.absoluteString {
+                        LiveSessionState.disableCapturePreservingCredentials()
+                    }
+                    self.liveActive = false
+                    self.liveStopped = true
+                    self.liveConnectionPending = false
+                    self.liveVerificationNeedsRetry = false
+                    self.liveCredentials = nil
+                    self.liveStatus = "原场结束已确认"
+                }
+            }
+        }
+    }
+
+    private func deliverLivePrompts() {
+        let now = Int64(LiveOperationsClient.continuousNowNS() / 1_000_000)
+        if let expiry = liveDisplayedUntilMS, expiry <= now {
+            PiPDisplayController.shared.endLiveContent()
+            liveDisplayedUntilMS = nil
+        }
+        guard liveActive, !liveStopping, PiPDisplayController.shared.canShowLiveFrame else { return }
+        let beforeExpired = liveDelivery.expiredCount
+        let frame = liveDelivery.take(nowMS: now) { PiPDisplayController.shared.liveFrameFits($0) }
+        if liveDelivery.expiredCount != beforeExpired {
+            NSLog("Live prompt delivery: expired=%d", liveDelivery.expiredCount)
+        }
+        if !frame.isEmpty, PiPDisplayController.shared.showLiveFrame(frame) {
+            liveDisplayedUntilMS = frame.map(\.expiresAtMS).min()
+            NSLog("Live prompt delivery: selected=%d", frame.count)
+        }
+    }
+
+    private func scheduleLivePromptRetry(sessionID: String, generation: Int) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            guard let self, self.liveActive, !self.liveStopping else { return }
+            guard let self, self.liveActive, !self.liveStopping,
+                  self.liveCredentials?.sessionID == sessionID,
+                  self.livePollGeneration == generation else { return }
             self.pollLivePrompts()
         }
     }
@@ -503,31 +768,64 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func overviewResponseHandler(_ credentials: LiveSessionCredentials, generation: Int)
+        -> (URLResponse?, Error?) -> Void {
+        { [weak self] response, error in
+            DispatchQueue.main.async {
+                guard let self, !LiveSessionState.isolatedStopRecordUnreadable(),
+                      credentials.hasSameBoundIdentity(as: Self.savedCredentials()) else { return }
+                _ = PollCallbackGate.commitIfCurrent(
+                    sessionID: credentials.sessionID, generation: generation,
+                    currentSessionID: Self.savedCredentials()?.sessionID,
+                    currentGeneration: self.liveStartGeneration,
+                    active: !self.liveActive && !self.liveStarting, stopping: self.liveStopping,
+                    commit: { ControlState.recordServiceResponse(error: error, response: response) }
+                )
+            }
+        }
+    }
+
     private func loadStoppedOverview(_ credentials: LiveSessionCredentials, client: LiveOperationsClient) {
+        guard !LiveSessionState.isolatedStopRecordUnreadable(),
+              let bound = credentials.boundServiceURL, IsolatedStopIntent.safeServiceURL(bound),
+              client.baseURL.absoluteString == bound.absoluteString else { return }
+        let generation = liveStartGeneration
+        let onResponse = overviewResponseHandler(credentials, generation: generation)
         let group = DispatchGroup()
         var fetchedEvents: LiveEventPage?
         var fetchedSummary: LiveSessionSummary?
+        let requestID = overviewRequest.begin()
         overviewLoading = true
         summaryRefreshInFlight = true
         group.enter()
-        client.events(credentials) { result in
+        client.events(credentials, onResponse: onResponse) { result in
             DispatchQueue.main.async {
                 if case .success(let page) = result { fetchedEvents = page }
                 group.leave()
             }
         }
         group.enter()
-        client.summary(credentials) { result in
+        client.summary(credentials, onResponse: onResponse) { result in
             DispatchQueue.main.async {
                 if case .success(let summary) = result { fetchedSummary = summary }
                 group.leave()
             }
         }
         group.notify(queue: .main) { [weak self] in
-            guard let self else { return }
+            guard let self, self.overviewRequest.finish(requestID) else { return }
             self.overviewLoading = false
             self.summaryRefreshInFlight = false
-            self.liveEvents = fetchedEvents?.events ?? []
+            guard !self.liveActive, !self.liveStarting, generation == self.liveStartGeneration,
+                  !LiveSessionState.isolatedStopRecordUnreadable(),
+                  credentials.hasSameBoundIdentity(as: Self.savedCredentials()) else { return }
+            if let page = fetchedEvents {
+                let knownIDs = Set(self.liveEvents.map(\.promptID))
+                let newlyRead = page.events.filter { !knownIDs.contains($0.promptID) }
+                self.livePriorityInvalidItems += newlyRead.filter(\.priorityInvalid).count
+                self.liveSourcesInvalidItems += newlyRead.filter(\.sourcesInvalid).count
+                self.liveEntryInvalidItems += page.invalidEntryCount
+                self.liveEvents = page.events
+            }
             self.liveSummary = fetchedSummary
             self.finishCredentialRetentionIfTerminal(fetchedSummary?.backstageRecap?.status)
             switch (fetchedEvents, fetchedSummary) {
@@ -541,7 +839,7 @@ final class AppModel: ObservableObject {
                 self.liveStatus = "本场已结束；概览和记录暂不可读取"
             }
             if let recap = fetchedSummary?.backstageRecap {
-                self.liveStatus = self.backstageStatusText(recap.status)
+                self.liveStatus = Self.backstageStatusText(recap)
             } else if fetchedSummary != nil {
                 self.liveStatus = "本场事件记录已读取；服务未返回后台五项任务记录，结果保持未知"
             }
@@ -549,18 +847,26 @@ final class AppModel: ObservableObject {
     }
 
     func refreshStoppedOverview() {
-        guard !liveActive, !summaryRefreshInFlight,
+        guard !LiveSessionState.isolatedStopRecordUnreadable(),
+              !liveActive, !liveStarting, !summaryRefreshInFlight,
               let credentials = Self.savedCredentials(),
-              let client = liveClient ?? SharedConfig.serverBaseURL().flatMap({ LiveOperationsClient(baseURL: $0) }) else {
+              let bound = credentials.boundServiceURL, IsolatedStopIntent.safeServiceURL(bound),
+              let client = liveClient ?? LiveOperationsClient(baseURL: bound),
+              client.baseURL.absoluteString == bound.absoluteString else {
             return
         }
         summaryRefreshInFlight = true
         overviewLoading = true
-        client.summary(credentials) { [weak self] result in
+        let requestID = overviewRequest.begin()
+        let generation = liveStartGeneration
+        client.summary(credentials, onResponse: overviewResponseHandler(credentials, generation: generation)) { [weak self] result in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, self.overviewRequest.finish(requestID) else { return }
                 self.summaryRefreshInFlight = false
                 self.overviewLoading = false
+                guard !self.liveActive, !self.liveStarting, generation == self.liveStartGeneration,
+                      !LiveSessionState.isolatedStopRecordUnreadable(),
+                      credentials.hasSameBoundIdentity(as: Self.savedCredentials()) else { return }
                 guard case .success(let summary) = result else {
                     if self.liveSummary == nil {
                         self.liveStatus = "本场后台汇总暂不可读，可重试；事件记录独立保留"
@@ -569,7 +875,7 @@ final class AppModel: ObservableObject {
                 }
                 self.liveSummary = summary
                 if let recap = summary.backstageRecap {
-                    self.liveStatus = self.backstageStatusText(recap.status)
+                    self.liveStatus = Self.backstageStatusText(recap)
                     self.finishCredentialRetentionIfTerminal(recap.status)
                 } else {
                     self.liveStatus = "服务未返回后台五项任务记录，结果保持未知"
@@ -585,17 +891,13 @@ final class AppModel: ObservableObject {
         LiveSessionState.clear()
     }
 
-    private func backstageStatusText(_ status: String) -> String {
-        switch status {
-        case "waiting_for_stop": return "后台任务已绑定，等待结束信号"
-        case "capturing": return "已结束，后台汇总处理中"
-        case "not_connected": return "已结束；后台执行器未连接，结果待处理"
-        case "captured_locally": return "后台五项汇总已收到"
-        case "partial": return "后台汇总部分缺失，请核对缺项"
-        case "needs_input": return "后台任务需要处理后重试"
-        case "failed": return "后台汇总失败，请检查任务状态"
-        default: return "本场后台汇总状态：\(status)"
+    private static func backstageStatusText(_ recap: LiveBackstageRecap) -> String {
+        let count = recap.metrics.map { metrics in
+            [metrics.cumulativeAudience, metrics.newFollowers, metrics.commentCount,
+             metrics.giftGivers, metrics.soundEnergy].compactMap { $0 }.count
         }
+        return BackstageStatusPresentation.summary(status: recap.status, claimedAtMS: recap.claimedAtMS,
+                                                   receivedMetricCount: count)
     }
 
     private static func savedCredentials() -> LiveSessionCredentials? {

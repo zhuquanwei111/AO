@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import Darwin
 
 enum LiveCommentFilter {
     static func isWorthwhileQuestion(_ text: String) -> Bool {
@@ -32,12 +33,25 @@ struct LiveSessionCredentials: Codable {
     /// Local-only markers; neither field is sent to the server.
     var backstageStartPending: Bool?
     var liveConnectionPending: Bool?
+    /// 仅保存在本地，由创建场次时实际使用的 client 确定。
+    var boundServiceURL: URL? = nil
+    func captureServiceURL(configured: URL?) -> URL? {
+        guard let bound = boundServiceURL, IsolatedStopIntent.safeServiceURL(bound),
+              configured?.absoluteString == bound.absoluteString else { return nil }
+        return bound
+    }
+    func hasSameBoundIdentity(as other: LiveSessionCredentials?) -> Bool {
+        guard let bound = boundServiceURL, IsolatedStopIntent.safeServiceURL(bound), let other else { return false }
+        return sessionID == other.sessionID && token == other.token &&
+            bound.absoluteString == other.boundServiceURL?.absoluteString
+    }
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id", token = "session_token", startedAtMS = "started_at_ms"
         case douyinAccount = "douyin_account"
         case backstageTaskID = "backstage_task_id", backstageStatus = "backstage_status"
         case backstageStartPending = "backstage_start_pending"
         case liveConnectionPending = "live_connection_pending"
+        case boundServiceURL = "local_bound_service_url"
     }
 }
 
@@ -75,22 +89,106 @@ struct LivePrompt: Codable, Identifiable {
     let suggestion: String
     let displayText: String
     let observationCount: Int
+    var expiresAtMS: Int64?
+    var priority: Int?
+    let sources: [LivePromptSource]?
+    var priorityInvalid: Bool
+    let sourcesInvalid: Bool
     var id: String { promptID }
     enum CodingKeys: String, CodingKey {
         case promptID = "prompt_id", inputMode = "input_mode"
         case startAtMS = "start_at_ms", endAtMS = "end_at_ms"
         case phenomenon, suggestion, displayText = "display_text"
         case observationCount = "observation_count"
+        case expiresAtMS = "expires_at_ms", priority, sources
+    }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        promptID = try values.decode(String.self, forKey: .promptID)
+        inputMode = try values.decode(String.self, forKey: .inputMode)
+        startAtMS = try values.decode(Int64.self, forKey: .startAtMS)
+        endAtMS = try values.decode(Int64.self, forKey: .endAtMS)
+        phenomenon = try values.decode(String.self, forKey: .phenomenon)
+        suggestion = try values.decode(String.self, forKey: .suggestion)
+        displayText = try values.decode(String.self, forKey: .displayText)
+        observationCount = try values.decode(Int.self, forKey: .observationCount)
+        expiresAtMS = try? values.decode(Int64.self, forKey: .expiresAtMS)
+        priority = try? values.decode(Int.self, forKey: .priority)
+        priorityInvalid = priority == nil
+        if !values.contains(.sources) || (try? values.decodeNil(forKey: .sources)) == true {
+            sources = nil
+            sourcesInvalid = false
+        } else if var entries = try? values.nestedUnkeyedContainer(forKey: .sources) {
+            var valid: [LivePromptSource] = []
+            var invalid = false
+            while !entries.isAtEnd {
+                let decoder = try entries.superDecoder()
+                if let source = try? LivePromptSource(from: decoder) { valid.append(source) }
+                else { invalid = true }
+            }
+            sources = valid
+            sourcesInvalid = invalid
+        } else {
+            sources = nil
+            sourcesInvalid = true
+        }
+    }
+}
+
+struct LivePromptSource: Codable {
+    let kind: String?
+}
+
+/// 只隔离无法解码的单条提示，保留有效项在原始页面中的位置。
+private struct LivePromptItems: Decodable {
+    let items: [LivePrompt]
+    let indices: [Int]
+    let invalidCount: Int
+    init(from decoder: Decoder) throws {
+        var entries = try decoder.unkeyedContainer()
+        var valid: [LivePrompt] = []
+        var positions: [Int] = []
+        var invalid = 0
+        while !entries.isAtEnd {
+            let index = entries.currentIndex
+            let itemDecoder = try entries.superDecoder()
+            if let item = try? LivePrompt(from: itemDecoder) {
+                valid.append(item)
+                positions.append(index)
+            } else { invalid += 1 }
+        }
+        items = valid
+        indices = positions
+        invalidCount = invalid
     }
 }
 
 struct LivePromptPage: Decodable {
     let sessionID: String
-    let prompts: [LivePrompt]
+    var prompts: [LivePrompt]
+    let rawPromptIndices: [Int]
+    let invalidEntryCount: Int
     let stopped: Bool
     let nextCursor: String
+    var serverTimeMS: Int64?
+    var serverProcessingMS: Int64?
+    var requestStartNS: UInt64?
+    var responseEndNS: UInt64?
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id", prompts, stopped, nextCursor = "next_cursor"
+        case serverTimeMS = "server_time_ms", serverProcessingMS = "server_processing_ms"
+    }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try values.decode(String.self, forKey: .sessionID)
+        let decoded = try values.decode(LivePromptItems.self, forKey: .prompts)
+        prompts = decoded.items
+        rawPromptIndices = decoded.indices
+        invalidEntryCount = decoded.invalidCount
+        stopped = try values.decode(Bool.self, forKey: .stopped)
+        nextCursor = try values.decode(String.self, forKey: .nextCursor)
+        serverTimeMS = try? values.decode(Int64.self, forKey: .serverTimeMS)
+        serverProcessingMS = try? values.decode(Int64.self, forKey: .serverProcessingMS)
     }
 }
 
@@ -101,9 +199,23 @@ struct LiveEventPage: Decodable {
     var events: [LivePrompt]
     let nextCursor: String
     let hasMore: Bool
+    let rawEventIndices: [Int]
+    var invalidEntryCount: Int
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id", startedAtMS = "started_at_ms"
         case stoppedAtMS = "stopped_at_ms", events, nextCursor = "next_cursor", hasMore = "has_more"
+    }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try values.decode(String.self, forKey: .sessionID)
+        startedAtMS = try values.decode(Int64.self, forKey: .startedAtMS)
+        stoppedAtMS = try values.decodeIfPresent(Int64.self, forKey: .stoppedAtMS)
+        let decoded = try values.decode(LivePromptItems.self, forKey: .events)
+        events = decoded.items
+        rawEventIndices = decoded.indices
+        invalidEntryCount = decoded.invalidCount
+        nextCursor = try values.decode(String.self, forKey: .nextCursor)
+        hasMore = try values.decode(Bool.self, forKey: .hasMore)
     }
 }
 
@@ -224,16 +336,18 @@ struct LiveSessionSummary: Decodable {
 
 /// 薄适配 M2 的场次接口。所有路径都相对用户配置的服务基地址，保留其路径前缀。
 struct LiveOperationsClient {
-    private let baseURL: URL
+    let baseURL: URL
     private let session: URLSession
 
-    init?(baseURL: URL) {
+    static func continuousNowNS() -> UInt64 { clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) }
+
+    init?(baseURL: URL, session: URLSession? = nil) {
         guard baseURL.scheme == "http" || baseURL.scheme == "https" else { return nil }
         self.baseURL = baseURL
         let config = URLSessionConfiguration.ephemeral
         config.waitsForConnectivity = false
         config.timeoutIntervalForRequest = 35
-        self.session = URLSession(configuration: config)
+        self.session = session ?? URLSession(configuration: config)
     }
 
     func create(description: String, douyinAccount: String,
@@ -277,68 +391,120 @@ struct LiveOperationsClient {
         }.resume()
     }
 
-    func stop(_ credentials: LiveSessionCredentials, completion: @escaping (Bool) -> Void) {
+    func stop(_ credentials: LiveSessionCredentials, recordResponse: Bool = true,
+              completion: @escaping (Bool) -> Void) {
         var request = authorized(endpoint("v1", "live", "sessions", credentials.sessionID, "stop"), token: credentials.token)
         request.httpMethod = "POST"
         session.dataTask(with: request) { _, response, error in
-            ControlState.recordServiceResponse(error: error, response: response)
+            if recordResponse { ControlState.recordServiceResponse(error: error, response: response) }
             completion(error == nil && (response as? HTTPURLResponse)?.statusCode == 200)
         }.resume()
     }
 
-    func poll(_ credentials: LiveSessionCredentials, after: String,
-              completion: @escaping (Result<LivePromptPage, Error>) -> Void) -> URLSessionDataTask {
+    func poll(_ credentials: LiveSessionCredentials, after: String, waitMS: Int = 15_000,
+              completion: @escaping (Result<LivePromptPage, Error>, URLResponse?, Error?) -> Void) -> URLSessionDataTask {
         var components = URLComponents(url: endpoint("v1", "live", "sessions", credentials.sessionID, "prompts"), resolvingAgainstBaseURL: false)!
-        components.queryItems = [URLQueryItem(name: "after", value: after), URLQueryItem(name: "wait_ms", value: "15000")]
+        components.queryItems = [URLQueryItem(name: "after", value: after), URLQueryItem(name: "wait_ms", value: String(waitMS))]
         let request = authorized(components.url!, token: credentials.token)
+        let requestStartNS = Self.continuousNowNS()
         let task = session.dataTask(with: request) { data, response, error in
-            switch Self.decode(LivePromptPage.self, data: data, response: response, error: error) {
-            case .failure(let error): completion(.failure(error))
-            case .success(let page):
+            let responseEndNS = Self.continuousNowNS()
+            switch Self.decode(LivePromptPage.self, data: data, response: response, error: error,
+                               recordResponse: false) {
+            case .failure(let failure): completion(.failure(failure), response, error)
+            case .success(var page):
                 guard page.sessionID == credentials.sessionID else {
-                    completion(.failure(NSError(domain: "LiveOperations", code: -3)))
+                    completion(.failure(NSError(domain: "LiveOperations", code: -3)), response, error)
                     return
                 }
-                completion(.success(page))
+                if let timing = PromptTimingJSON.inspect(data),
+                   page.rawPromptIndices.allSatisfy({ $0 < timing.expiries.count && $0 < timing.priorities.count }) {
+                    page.serverTimeMS = timing.serverTimeMS
+                    page.serverProcessingMS = timing.processingMS
+                    for index in page.prompts.indices {
+                        page.prompts[index].expiresAtMS = timing.expiries[page.rawPromptIndices[index]]
+                    }
+                    Self.applyStrictPriorities(&page.prompts, rawIndices: page.rawPromptIndices,
+                                               priorities: timing.priorities)
+                } else {
+                    page.serverTimeMS = nil
+                    page.serverProcessingMS = nil
+                    for index in page.prompts.indices {
+                        page.prompts[index].priority = nil
+                        page.prompts[index].priorityInvalid = true
+                    }
+                }
+                page.requestStartNS = requestStartNS
+                page.responseEndNS = responseEndNS
+                completion(.success(page), response, error)
             }
         }
         task.resume()
         return task
     }
 
-    func events(_ credentials: LiveSessionCredentials, completion: @escaping (Result<LiveEventPage, Error>) -> Void) {
-        loadEvents(credentials, after: "", accumulated: [], completion: completion)
+    func events(_ credentials: LiveSessionCredentials,
+                onResponse: @escaping (URLResponse?, Error?) -> Void,
+                completion: @escaping (Result<LiveEventPage, Error>) -> Void) {
+        loadEvents(credentials, after: "", accumulated: [], invalidCount: 0,
+                   onResponse: onResponse, completion: completion)
     }
 
     func summary(_ credentials: LiveSessionCredentials,
+                 onResponse: @escaping (URLResponse?, Error?) -> Void,
                  completion: @escaping (Result<LiveSessionSummary, Error>) -> Void) {
         let request = authorized(endpoint("v1", "live", "sessions", credentials.sessionID, "summary"),
                                  token: credentials.token)
         session.dataTask(with: request) { data, response, error in
-            completion(Self.decode(LiveSessionSummary.self, data: data, response: response, error: error))
+            onResponse(response, error)
+            completion(Self.decode(LiveSessionSummary.self, data: data, response: response, error: error,
+                                   recordResponse: false))
         }.resume()
     }
 
     private func loadEvents(_ credentials: LiveSessionCredentials, after: String,
-                            accumulated: [LivePrompt],
+                            accumulated: [LivePrompt], invalidCount: Int,
+                            onResponse: @escaping (URLResponse?, Error?) -> Void,
                             completion: @escaping (Result<LiveEventPage, Error>) -> Void) {
         var components = URLComponents(url: endpoint("v1", "live", "sessions", credentials.sessionID, "events"), resolvingAgainstBaseURL: false)!
         components.queryItems = [URLQueryItem(name: "after", value: after), URLQueryItem(name: "limit", value: "100")]
         let request = authorized(components.url!, token: credentials.token)
         session.dataTask(with: request) { data, response, error in
-            switch Self.decode(LiveEventPage.self, data: data, response: response, error: error) {
+            onResponse(response, error)
+            switch Self.decode(LiveEventPage.self, data: data, response: response, error: error,
+                               recordResponse: false) {
             case .failure(let error): completion(.failure(error))
-            case .success(let page):
+            case .success(var page):
+                let timing = PromptTimingJSON.inspect(data, collectionKey: "events")
+                Self.applyStrictPriorities(&page.events, rawIndices: page.rawEventIndices,
+                                           priorities: timing?.priorities ?? [])
                 let all = accumulated + page.events
                 if page.hasMore {
-                    self.loadEvents(credentials, after: page.nextCursor, accumulated: all, completion: completion)
+                    self.loadEvents(credentials, after: page.nextCursor, accumulated: all,
+                                    invalidCount: invalidCount + page.invalidEntryCount,
+                                    onResponse: onResponse, completion: completion)
                 } else {
                     var completePage = page
                     completePage.events = all
+                    completePage.invalidEntryCount += invalidCount
                     completion(.success(completePage))
                 }
             }
         }.resume()
+    }
+
+    private static func applyStrictPriorities(_ prompts: inout [LivePrompt], rawIndices: [Int],
+                                              priorities: [Int64?]) {
+        for index in prompts.indices {
+            guard index < rawIndices.count, rawIndices[index] < priorities.count,
+                  let raw = priorities[rawIndices[index]], let priority = Int(exactly: raw) else {
+                prompts[index].priority = nil
+                prompts[index].priorityInvalid = true
+                continue
+            }
+            prompts[index].priority = priority
+            prompts[index].priorityInvalid = false
+        }
     }
 
     func submitObservation(_ text: String, textPosition: [String: Double], observedAtMS: Int64,
@@ -433,28 +599,98 @@ struct LiveOperationsClient {
     }
 
     private static func decode<T: Decodable>(_ type: T.Type, data: Data?, response: URLResponse?, error: Error?,
-                                             acceptedStatusCodes: Set<Int> = [200]) -> Result<T, Error> {
+                                             acceptedStatusCodes: Set<Int> = [200],
+                                             recordResponse: Bool = true) -> Result<T, Error> {
         if let error {
-            ControlState.recordServiceResponse(error: error, response: response)
+            if recordResponse { ControlState.recordServiceResponse(error: error, response: response) }
             return .failure(error)
         }
         let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard acceptedStatusCodes.contains(statusCode), let data else {
-            ControlState.recordServiceResponse(error: nil, response: response)
+            if recordResponse { ControlState.recordServiceResponse(error: nil, response: response) }
             let detail = data.flatMap { try? JSONDecoder().decode(LiveOperationsErrorPayload.self, from: $0).detail }
             return .failure(LiveOperationsHTTPError(statusCode: statusCode, detail: detail))
         }
-        ControlState.recordServiceResponse(error: nil, response: response)
+        if recordResponse { ControlState.recordServiceResponse(error: nil, response: response) }
         do { return .success(try JSONDecoder().decode(type, from: data)) }
         catch { return .failure(error) }
     }
 }
 
 /// App Group 中只保存当前场次能力令牌；停止采集后为晚到summary暂留，任务终态后清除。
+struct IsolatedStopIntent: Codable {
+    let credentials: LiveSessionCredentials
+    let serviceURL: URL
+
+    static func safeServiceURL(_ url: URL) -> Bool {
+        guard let parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let scheme = parts.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              let host = parts.host, !host.isEmpty,
+              parts.user == nil, parts.password == nil,
+              parts.query == nil, parts.fragment == nil else { return false }
+        return true
+    }
+
+    func matches(_ other: IsolatedStopIntent) -> Bool {
+        serviceURL.absoluteString == other.serviceURL.absoluteString &&
+            credentials.sessionID == other.credentials.sessionID && credentials.token == other.credentials.token
+    }
+}
+
 enum LiveSessionState {
     private static let enabledKey = "live.enabled"
     private static var fileURL: URL? {
         AppGroup.containerURL?.appendingPathComponent("live-session.json", isDirectory: false)
+    }
+    private static var isolatedStopURL: URL? {
+        AppGroup.containerURL?.appendingPathComponent("live-stop-pending.json", isDirectory: false)
+    }
+    static func isolatedStopRecordExists() -> Bool {
+        guard let url = isolatedStopURL else { return false }
+        return FileManager.default.fileExists(atPath: url.path)
+    }
+
+    static func isolatedStopRecordUnreadable() -> Bool {
+        guard let url = isolatedStopURL else { return true }
+        return isolatedStopRecordUnreadable(fileURL: url)
+    }
+    static func isolatedStopRecordUnreadable(fileURL: URL) -> Bool {
+        FileManager.default.fileExists(atPath: fileURL.path) && isolatedStopIntent(fileURL: fileURL) == nil
+    }
+
+    static func isolatedStopIntent() -> IsolatedStopIntent? {
+        guard let url = isolatedStopURL else { return nil }
+        return isolatedStopIntent(fileURL: url)
+    }
+    static func isolatedStopIntent(fileURL: URL) -> IsolatedStopIntent? {
+        guard let data = try? Data(contentsOf: fileURL) else { return nil }
+        guard let value = try? JSONDecoder().decode(IsolatedStopIntent.self, from: data),
+              IsolatedStopIntent.safeServiceURL(value.serviceURL) else { return nil }
+        return value
+    }
+    static func saveIsolatedStop(_ value: IsolatedStopIntent) -> Bool {
+        guard let url = isolatedStopURL else { return false }
+        return saveIsolatedStop(value, fileURL: url)
+    }
+    static func saveIsolatedStop(_ value: IsolatedStopIntent, fileURL: URL) -> Bool {
+        guard IsolatedStopIntent.safeServiceURL(value.serviceURL) else { return false }
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            guard let current = isolatedStopIntent(fileURL: fileURL), current.matches(value) else { return false }
+        }
+        guard let data = try? JSONEncoder().encode(value) else { return false }
+        do {
+            try data.write(to: fileURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            return true
+        } catch { return false }
+    }
+    static func clearIsolatedStop(_ value: IsolatedStopIntent) -> Bool {
+        guard let url = isolatedStopURL else { return false }
+        return clearIsolatedStop(value, fileURL: url)
+    }
+    static func clearIsolatedStop(_ value: IsolatedStopIntent, fileURL: URL) -> Bool {
+        guard let current = isolatedStopIntent(fileURL: fileURL), current.matches(value) else { return false }
+        do { try FileManager.default.removeItem(at: fileURL); return true }
+        catch { return false }
     }
 
     static func save(_ value: LiveSessionCredentials, enableCapture: Bool = true) -> Bool {

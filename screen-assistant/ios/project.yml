@@ -49,6 +49,18 @@ targets:
         INFOPLIST_FILE: Config/Broadcast-Info.plist
         CODE_SIGN_ENTITLEMENTS: Config/Broadcast.entitlements
 
+  ScreenAssistantTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tools/Tests/AppleIntegration
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.screenassistant.ios.tests
+        GENERATE_INFOPLIST_FILE: YES
+    dependencies:
+      - target: ScreenAssistant
+
 schemes:
   ScreenAssistant:
     build:
@@ -57,5 +69,9 @@ schemes:
         ScreenAssistantBroadcast: all
     run:
       config: Debug
+    test:
+      config: Debug
+      targets:
+        - ScreenAssistantTests
     archive:
       config: Release
