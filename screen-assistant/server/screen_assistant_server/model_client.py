@@ -31,7 +31,9 @@ COMMENT_REPLY_SYSTEM_PROMPT = (
     "仅根据提供的可靠评论和昵称判断是否值得回应；不要猜测身份、背景或事实。"
     "priority_eligible 为 true 时，短句或表情也可回应，不要推断徽章或身份。"
     "值得回应时给出主播可以直接说出的一句简短友善的话，不要写运营建议；"
-    "信息不足无法回应时不要编造。只输出 JSON 对象，恰有 respond 和 reply 两个字段："
+    "信息不足无法回应时不要编造。"
+    "缺少可核事实时自然表达目前无法确认或询问对象，不要假定已有预告、安排或承诺会做某事。"
+    "只输出 JSON 对象，恰有 respond 和 reply 两个字段："
     "respond 为布尔值；为 true 时 reply 是不超过80字的单行回复，为 false 时 reply 为 null。"
 )
 
@@ -240,7 +242,7 @@ class TianyiChatClient:
                 )},
             ],
             "temperature": 0.2,
-            "max_tokens": 96,
+            "max_tokens": MAX_OUTPUT_TOKENS,
             "reasoning_effort": REASONING_EFFORT,
             "stream": False,
         }
@@ -255,12 +257,14 @@ class TianyiChatClient:
         try:
             data = resp.json()
             choice = data["choices"][0]
+            if choice.get("finish_reason") == "length":
+                raise ModelUnavailableError("model_output_truncated", finish_reason="length")
             message = choice["message"]
             content = message["content"]
         except (ValueError, KeyError, IndexError, TypeError):
             raise ModelUnavailableError("model_response_malformed") from None
         reply = content.strip() if isinstance(content, str) else ""
-        if choice.get("finish_reason") == "length" or not reply or len(reply) > 80:
+        if not reply or len(reply) > 80:
             raise ModelUnavailableError("model_output_invalid")
         return reply
 

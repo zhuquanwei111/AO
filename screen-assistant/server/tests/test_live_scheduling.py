@@ -214,6 +214,50 @@ def test_incomplete_batch_does_not_block_legacy_observation(tmp_path, monkeypatc
     asyncio.run(run())
 
 
+def test_legacy_truncated_suggestion_waits_for_new_observation(tmp_path, monkeypatch):
+    import screen_assistant_server.live as live
+    from screen_assistant_server.model_client import ModelUnavailableError
+    monkeypatch.setattr(live, "FUSION_SETTLE_MS", 0)
+    now = 1_790_000_000_000
+
+    async def run():
+        cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="fake",
+                       tianyi_base_url="http://model.invalid", tianyi_model="fake",
+                       dedup_ttl_seconds=60, max_sentence_chars=2000,
+                       model_timeout_seconds=2, model_connect_timeout_seconds=1,
+                       live_db_path=str(tmp_path / "legacy-truncated.sqlite3"))
+        app = create_app(cfg, live_clock=lambda: now)
+        calls = []
+        class Model:
+            async def suggest_live(self, text, *args, **kwargs):
+                calls.append(text)
+                if len(calls) == 1:
+                    raise ModelUnavailableError("model_output_truncated", finish_reason="length")
+                return "可以顺着这个问题聊两句。"
+            async def aclose(self):
+                pass
+        async with app.router.lifespan_context(app):
+            app.state.model = Model()
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                session = (await client.post("/v1/live/sessions", json={})).json()
+                sid, token = session["session_id"], session["session_token"]
+                headers = {"X-Live-Session-Token": token}
+                url = f"/v1/live/sessions/{sid}/comments"
+                body = {"event_id": "first", "input_mode": "live_observation", "source": "ios_replaykit_ocr",
+                        "coverage": "ocr_visible_sample", "reliability": "known", "text": "主播你是哪里人？"}
+                assert (await client.post(url, headers=headers, json=body)).json()["reason"] == "scheduled"
+                await asyncio.wait_for(app.state.live.fusion_active[sid], 2)
+                assert len(calls) == 1
+                assert (await client.get(f"/v1/live/sessions/{sid}/prompts", headers=headers)).json()["prompts"] == []
+                assert (await client.post(url, headers=headers, json={**body, "event_id": "second", "text": "你今天在聊什么？"})).json()["reason"] == "scheduled"
+                await asyncio.wait_for(app.state.live.fusion_active[sid], 2)
+                assert len(calls) == 2
+                prompts = (await client.get(f"/v1/live/sessions/{sid}/prompts", headers=headers)).json()["prompts"]
+                assert len(prompts) == 1
+                assert prompts[0]["display_text"] == "可以顺着这个问题聊两句。"
+    asyncio.run(run())
+
+
 def test_reconstructed_reply_cannot_write_after_stop(tmp_path, monkeypatch):
     import screen_assistant_server.live as live
     monkeypatch.setattr(live, "FUSION_SETTLE_MS", 0)
