@@ -20,6 +20,6 @@ public class RecapRequestTest {
     @Test public void forbiddenIsReportedWithoutClaimingRecovery() {
         String message=RecapRequest.failure(new LiveClient.HttpError(403));
         assertTrue(message.contains("读取未确认")); assertTrue(message.contains("权限可能已失效"));
-        assertTrue(message.contains("403"));
+        assertFalse(message.contains("403"));
     }
 }

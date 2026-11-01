@@ -12,8 +12,8 @@ final class RecapRequest {
     static String failure(Exception e) {
         if (e instanceof LiveClient.HttpError) {
             int code = ((LiveClient.HttpError)e).status;
-            if (code == 401 || code == 403) return "本场复盘读取未确认，权限可能已失效（HTTP " + code + "）";
+            if (code == 401 || code == 403) return "本场复盘读取未确认，访问权限可能已失效。";
         }
-        return "本场复盘读取未确认：" + e.getClass().getSimpleName();
+        return "本场复盘读取未确认，请检查连接后刷新。";
     }
 }
