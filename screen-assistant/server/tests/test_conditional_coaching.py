@@ -135,6 +135,44 @@ def test_incomplete_or_quality_gap_does_not_create_coaching(tmp_path):
         assert client.get(url + "/events", headers=headers).json()["events"] == []
 
 
+@pytest.mark.parametrize("sources", [
+    ("ios_replaykit_ocr", "fixture:ocr_comment"),
+    ("fixture:ocr_comment", "ios_replaykit_ocr"),
+])
+def test_training_considers_replied_comment_from_each_source(tmp_path, sources):
+    now = 1_790_000_000_000
+    store = LiveStore(str(tmp_path / "sources.sqlite3"), lambda: now)
+    try:
+        session = store.create("")
+        sid, token = session["session_id"], session["session_token"]
+
+        def add(source, event, text):
+            row = {"kind": "comment", "event_id": event, "source": source,
+                   "observed_at_ms": now, "availability": "available",
+                   "coverage": "ocr_visible_sample", "reliability": "known", "confidence": .98,
+                   "capture_batch_id": event, "line_index": 0, "capture_comment_count": 1,
+                   "content": {"text": text, "text_position":
+                               {"x": .1, "y": .5, "width": .4, "height": .04}}}
+            assert store.add_observation(sid, token, row, now)["_batch_ready"]
+
+        add(sources[0], "first", "阿青：这首歌很好听")
+        first = store.fusion_candidate(sid, token)
+        assert first["prompt_type"] == "comment_reply"
+        assert store.save_fusion_candidate(sid, token, first, "谢谢喜欢。 ")["reason"] == "generated"
+        store.finish_comment_attempt(sid, first["reply_to"]["comment_id"], 0, True, True)
+
+        add(sources[1], "second", "小林：晚上好")
+        second = store.fusion_candidate(sid, token)
+        assert second["prompt_type"] == "comment_reply"
+        store.finish_comment_attempt(sid, second["reply_to"]["comment_id"], 0, True, True)
+
+        training = store.fusion_candidate(sid, token)
+        assert training is not None and training["prompt_type"] == "operation_notice"
+        assert training["observations"][0]["source"] == sources[0]
+    finally:
+        store.close()
+
+
 def test_failed_training_save_does_not_consume_cooldown_or_extend_deadline(tmp_path):
     now = 1_790_000_000_000
     clock = [now]

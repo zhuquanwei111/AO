@@ -872,8 +872,8 @@ class LiveStore:
                             or any(by_event[event_id]["source"] != record.get("source") for event_id in ids)):
                         continue
                     grouped.setdefault(record["source"], []).append(record)
-            for records in grouped.values():
-                group = group_feedback(records, now)
+            for group_records in grouped.values():
+                group = group_feedback(group_records, now)
                 if not group:
                     continue
                 normalized = "".join(unicodedata.normalize("NFKC", group[0]["text"]).split()).casefold()
