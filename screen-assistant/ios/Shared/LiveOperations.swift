@@ -40,6 +40,11 @@ struct LiveSessionCredentials: Codable {
               configured?.absoluteString == bound.absoluteString else { return nil }
         return bound
     }
+    func hasSameBoundIdentity(as other: LiveSessionCredentials?) -> Bool {
+        guard let bound = boundServiceURL, IsolatedStopIntent.safeServiceURL(bound), let other else { return false }
+        return sessionID == other.sessionID && token == other.token &&
+            bound.absoluteString == other.boundServiceURL?.absoluteString
+    }
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id", token = "session_token", startedAtMS = "started_at_ms"
         case douyinAccount = "douyin_account"

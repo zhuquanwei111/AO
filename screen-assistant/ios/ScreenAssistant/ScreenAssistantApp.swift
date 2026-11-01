@@ -772,7 +772,8 @@ final class AppModel: ObservableObject {
         -> (URLResponse?, Error?) -> Void {
         { [weak self] response, error in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, !LiveSessionState.isolatedStopRecordUnreadable(),
+                      credentials.hasSameBoundIdentity(as: Self.savedCredentials()) else { return }
                 _ = PollCallbackGate.commitIfCurrent(
                     sessionID: credentials.sessionID, generation: generation,
                     currentSessionID: Self.savedCredentials()?.sessionID,
@@ -815,7 +816,8 @@ final class AppModel: ObservableObject {
             self.overviewLoading = false
             self.summaryRefreshInFlight = false
             guard !self.liveActive, !self.liveStarting, generation == self.liveStartGeneration,
-                  Self.savedCredentials()?.sessionID == credentials.sessionID else { return }
+                  !LiveSessionState.isolatedStopRecordUnreadable(),
+                  credentials.hasSameBoundIdentity(as: Self.savedCredentials()) else { return }
             if let page = fetchedEvents {
                 let knownIDs = Set(self.liveEvents.map(\.promptID))
                 let newlyRead = page.events.filter { !knownIDs.contains($0.promptID) }
@@ -863,7 +865,8 @@ final class AppModel: ObservableObject {
                 self.summaryRefreshInFlight = false
                 self.overviewLoading = false
                 guard !self.liveActive, !self.liveStarting, generation == self.liveStartGeneration,
-                      Self.savedCredentials()?.sessionID == credentials.sessionID else { return }
+                      !LiveSessionState.isolatedStopRecordUnreadable(),
+                      credentials.hasSameBoundIdentity(as: Self.savedCredentials()) else { return }
                 guard case .success(let summary) = result else {
                     if self.liveSummary == nil {
                         self.liveStatus = "本场后台汇总暂不可读，可重试；事件记录独立保留"

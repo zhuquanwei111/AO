@@ -103,6 +103,11 @@ final class PollTransportTests: XCTestCase {
         XCTAssertNil(original.captureServiceURL(configured: serviceA))
         original.boundServiceURL = serviceA
         XCTAssertEqual(original.captureServiceURL(configured: serviceA), serviceA)
+        var otherService = original
+        otherService.boundServiceURL = serviceB
+        XCTAssertTrue(original.hasSameBoundIdentity(as: original))
+        XCTAssertFalse(original.hasSameBoundIdentity(as: otherService))
+        XCTAssertFalse(original.hasSameBoundIdentity(as: nil))
         XCTAssertNil(original.captureServiceURL(configured: serviceB))
         XCTAssertNil(original.captureServiceURL(configured: nil))
         original.boundServiceURL = URL(string: "https://user:secret@poll-fixture.invalid")!
