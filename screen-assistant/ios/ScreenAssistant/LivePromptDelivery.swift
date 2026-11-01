@@ -54,6 +54,13 @@ struct LivePromptDelivery {
     private var urgentUntilMS: Int64?
     let capacity: Int
     let intervalMS: Int64
+    private static let minimumReadingMS: Int64 = 3_000
+
+    private static func insufficientReadingTime(_ item: Item, nowMS: Int64) -> Bool {
+        guard let priority = item.priority, priority < 100 else { return false }
+        let (threshold, overflow) = nowMS.addingReportingOverflow(minimumReadingMS)
+        return overflow || item.expiresAtMS < threshold
+    }
 
     init(capacity: Int = 16, intervalMS: Int64 = 8_000) {
         self.capacity = capacity
@@ -76,6 +83,8 @@ struct LivePromptDelivery {
             if item.expiresAtMS <= nowMS {
                 expiredCount += 1
                 onDecision?(item, "expired_before_queue")
+            } else if Self.insufficientReadingTime(item, nowMS: nowMS) {
+                onDecision?(item, "insufficient_reading_time")
             } else if pending.count >= capacity {
                 overflowCount += 1
                 if let priority = item.priority, priority >= 100,
@@ -96,6 +105,11 @@ struct LivePromptDelivery {
     mutating func take(nowMS: Int64, onDecision: ((Item, String) -> Void)? = nil,
                        fits: ([Item]) -> Bool) -> [Item] {
         expire(nowMS: nowMS, onDecision: onDecision)
+        pending.removeAll { item in
+            guard Self.insufficientReadingTime(item, nowMS: nowMS) else { return false }
+            onDecision?(item, "insufficient_reading_time")
+            return true
+        }
         guard !pending.isEmpty else { return [] }
         let urgent = pending.firstIndex(where: { ($0.priority ?? Int.min) >= 100 })
         if urgent == nil, let until = urgentUntilMS, nowMS < until { return [] }
