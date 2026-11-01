@@ -5,24 +5,12 @@ import android.graphics.Bitmap;
 import android.graphics.Rect;
 import android.media.Image;
 import android.os.SystemClock;
-import com.google.android.gms.tasks.Tasks;
 import com.paddle.ocr.model.OCRBox;
 import com.paddle.ocr.model.OCRResult;
 import com.paddle.ocr.model.OCRRunResult;
-import com.google.mlkit.vision.common.InputImage;
-import com.google.mlkit.vision.pose.Pose;
-import com.google.mlkit.vision.pose.PoseDetection;
-import com.google.mlkit.vision.pose.PoseDetector;
-import com.google.mlkit.vision.pose.PoseLandmark;
-import com.google.mlkit.vision.pose.defaults.PoseDetectorOptions;
-import com.google.mlkit.vision.face.FaceDetection;
-import com.google.mlkit.vision.face.FaceDetector;
-import com.google.mlkit.vision.face.FaceDetectorOptions;
 import org.json.JSONArray;
 import org.json.JSONObject;
-import java.util.ArrayList;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -31,7 +19,6 @@ import java.util.function.Consumer;
 
 /** 仅SDK及现有HTTP协议的薄适配；同帧时间、单在途推理、最多一个待发批次。 */
 final class LiveFrameAnalyzer implements AutoCloseable {
-    static final String PERSON_SOURCE="android_vision_person";
     static final class Frame implements AutoCloseable {
         final Map<String,Bitmap> images=new LinkedHashMap<>();
         final Map<String,Rect> rects=new LinkedHashMap<>();
@@ -44,7 +31,7 @@ final class LiveFrameAnalyzer implements AutoCloseable {
         }
         @Override public void close() { for (Bitmap b:images.values()) b.recycle(); }
     }
-    static Frame snapshot(Context context, Image image, boolean ocr, boolean person,
+    static Frame snapshot(Context context, Image image, boolean ocr,
                           ObservationClock clock, String sessionId) {
         Frame f=new Frame(image.getWidth(),image.getHeight(),clock,sessionId);
         try {
@@ -53,11 +40,6 @@ final class LiveFrameAnalyzer implements AutoCloseable {
                 float[] region=Prefs.getRegion(context,key); if (region==null) continue;
                 int[] r=Regions.crop(region,f.width,f.height); Rect rect=new Rect(r[0],r[1],r[2],r[3]);
                 Bitmap crop=CaptureService.cropImage(image,rect);
-                if (key.equals("person") && Math.max(crop.getWidth(),crop.getHeight())>512) {
-                    float scale=512f/Math.max(crop.getWidth(),crop.getHeight());
-                    Bitmap small=Bitmap.createScaledBitmap(crop,Math.max(1,Math.round(crop.getWidth()*scale)),
-                            Math.max(1,Math.round(crop.getHeight()*scale)),true); crop.recycle(); crop=small;
-                }
                 f.images.put(key,crop); f.rects.put(key,rect);
             }
             return f;
@@ -65,24 +47,15 @@ final class LiveFrameAnalyzer implements AutoCloseable {
     }
 
     private final PaddleOcrBridge text;
-    private PoseDetector poses;
-    private FaceDetector faces;
     private final LiveClient.Session session;
     private final BooleanSupplier active;
     private final Consumer<String> status;
     private final Context context;
     private final ThreadPoolExecutor upload=BatchDispatch.executor();
     private final CaptureLedger ledger=new CaptureLedger(10);
-    private String previousNotice="";
-    private String segment=UUID.randomUUID().toString();
-    private HeadWindow head=new HeadWindow();
-    private long sequence;
-    private double[] previousGray;
-    private String personRegion="";
     private volatile long earliestUptime;
-    private volatile boolean reset;
 
-    void invalidateBefore(long uptime) { earliestUptime=uptime; reset=true; }
+    void invalidateBefore(long uptime) { earliestUptime=uptime; }
 
     LiveFrameAnalyzer(Context context, PaddleOcrBridge text, LiveClient.Session session,
                       BooleanSupplier active, Consumer<String> status) {
@@ -136,16 +109,12 @@ final class LiveFrameAnalyzer implements AutoCloseable {
         if (frame.wall==null) { status.accept("采样时间未核实，本轮未上传"); return; }
         long frameStartMs=SystemClock.elapsedRealtime();
         long coldLoadMs=text.initializeBlocking();
-        if (reset) {
-            reset=false; segment=UUID.randomUUID().toString(); sequence=0; head=new HeadWindow(); previousGray=null;
-            previousNotice="";
-        }
         CollectedRows<JSONObject> outgoing=new CollectedRows<>(128);
         int invalidComments=0, skippedOnlineLines=0;
         long inferenceWallMs=0;
         for (Map.Entry<String,Bitmap> entry:frame.images.entrySet()) {
             if (!active.getAsBoolean()) return;
-            String kind=entry.getKey(); if (kind.equals("person")) continue;
+            String kind=entry.getKey();
             OCRRunResult result=text.recognizeBlocking(entry.getValue());
             inferenceWallMs+=result.getTotalTimeMs();
             JSONArray lines=new JSONArray(); double confidence=1; StringBuilder raw=new StringBuilder();
@@ -179,18 +148,15 @@ final class LiveFrameAnalyzer implements AutoCloseable {
             String value=raw.toString();
             if (kind.equals("comment")) continue;
             if (value.codePointCount(0,value.length())>120) { skippedOnlineLines += lines.length(); continue; }
-            if (kind.equals("platform_notice") && value.equals(previousNotice)) continue;
             Rect roi=frame.rects.get(kind);
             JSONObject content=null;
             if (!value.isEmpty()) {
                 content=new JSONObject().put("ocr_lines",lines).put("text_position",Regions.position(
                         roi.left,roi.top,roi.right,roi.bottom,frame.width,frame.height));
-                if (kind.equals("online_count")) content.put("raw_text",limit(value,120))
+                content.put("raw_text",limit(value,120))
                         .put("field_semantics_confirmed",Prefs.onlineConfirmed(context));
-                else content.put("text",limit(value,500)).put("region_confirmed",true).put("explicit_warning_confirmed",false);
             }
             outgoing.add(observation(kind,frame.wall,content,lines.length()==0?-1:confidence));
-            if (kind.equals("platform_notice")) previousNotice=value;
         }
         android.util.Log.d("LiveFrameAnalyzer", "Paddle OCR coldLoadMs="+coldLoadMs+
                 " inferenceMs="+inferenceWallMs+" frameMs="+(SystemClock.elapsedRealtime()-frameStartMs)+
@@ -217,52 +183,6 @@ final class LiveFrameAnalyzer implements AutoCloseable {
     private boolean fresh(Frame f) {
         return FrameFreshness.valid(active.getAsBoolean(),f.uptime,earliestUptime,SystemClock.elapsedRealtime());
     }
-    private JSONObject inspectPerson(Bitmap image,Frame f) throws Exception {
-        JSONObject p=new JSONObject().put("source",PERSON_SOURCE).put("coverage","sampled_person_roi")
-                .put("segment_id",segment).put("sequence",sequence++).put("observed_at_ms",f.wall)
-                .put("uptime_ms",f.uptime).put("quality","unknown");
-        // 复用iOS的16x16灰度门禁及阈值，不从静止/黑屏推断人物不存在。
-        double[] gray=new double[256]; double sum=0,change=0,edge=0; int dark=0;
-        for (int i=0;i<256;i++) {
-            int pixel=image.getPixel(Math.min(image.getWidth()-1,(i%16)*image.getWidth()/16),
-                    Math.min(image.getHeight()-1,(i/16)*image.getHeight()/16));
-            gray[i]=(.299*((pixel>>16)&255)+.587*((pixel>>8)&255)+.114*(pixel&255))/255;
-            sum+=gray[i]; if (gray[i]<.04) dark++;
-            if (previousGray!=null) change+=Math.abs(gray[i]-previousGray[i]);
-            if (i>0) edge+=Math.abs(gray[i]-gray[i-1]);
-        }
-        boolean first=previousGray==null; previousGray=gray;
-        if (image.getWidth()<96 || image.getHeight()<96) return p.put("quality","small_roi");
-        double variance=0;
-        for (double value:gray) variance+=(value-sum/256)*(value-sum/256);
-        if (sum/256<.04 && dark/256.0>.98) return p.put("quality","near_black");
-        if (Math.sqrt(variance/256)<.035 || edge/255<.008) return p.put("quality","low_detail");
-        if (first) return p;
-        if (change/256<.0008) return p.put("quality","frozen_or_still");
-        if (change/256>.25) return p.put("quality","scene_change");
-        InputImage input=InputImage.fromBitmap(image,0);
-        if (poses==null) poses=PoseDetection.getClient(new PoseDetectorOptions.Builder()
-                .setDetectorMode(PoseDetectorOptions.SINGLE_IMAGE_MODE).build());
-        if (faces==null) faces=FaceDetection.getClient(new FaceDetectorOptions.Builder()
-                .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST).build());
-        Pose pose=Tasks.await(poses.process(input));
-        int faceCount=Tasks.await(faces.process(input)).size();
-        if (faceCount>1) return p.put("quality","multiple_people").put("person_count",Math.min(10,faceCount));
-        PoseLandmark nose=pose.getPoseLandmark(PoseLandmark.NOSE),left=pose.getPoseLandmark(PoseLandmark.LEFT_SHOULDER),
-                right=pose.getPoseLandmark(PoseLandmark.RIGHT_SHOULDER);
-        if (nose==null || left==null || right==null) return p.put("quality","not_detected_unconfirmed");
-        double confidence=Math.min(nose.getInFrameLikelihood(),Math.min(left.getInFrameLikelihood(),right.getInFrameLikelihood()));
-        if (confidence<.65 || faceCount!=1) return p.put("quality","low_confidence");
-        double[] points={nose.getPosition().x,nose.getPosition().y,left.getPosition().x,left.getPosition().y,
-                right.getPosition().x,right.getPosition().y};
-        double[] body=PersonGeometry.body(points,image.getWidth(),image.getHeight());
-        if (body==null) return p.put("quality","invalid_or_small_pose");
-        JSONArray vector=new JSONArray();
-        for (double value:body) vector.put(value);
-        status.accept("人物：采样中可见一个可靠姿态；不代表身份认证/情绪判断");
-        return p.put("quality","valid").put("person_count",1).put("confidence",confidence)
-                .put("body_vector",vector).put("head_ratio",vector.getDouble(1)).put("head_confidence",confidence);
-    }
     private static String limit(String s,int n) { return s.substring(0,Math.min(n,s.length())); }
-    @Override public void close() { upload.shutdownNow(); ledger.clear(); if (poses!=null) poses.close(); if (faces!=null) faces.close(); }
+    @Override public void close() { upload.shutdownNow(); ledger.clear(); }
 }

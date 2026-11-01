@@ -5,8 +5,6 @@ import org.json.JSONObject;
 
 /** 全屏左上原点、ltrb归一化；不依据文字/人物自动移动。 */
 public final class Regions {
-    public static final String[] KEYS = {"legacy", "comment", "online_count", "platform_notice", "person"};
-    public static final String[] LABELS = {"旧问答区域", "公屏评论", "在线人数", "平台通知", "独立人物画面"};
     public static final String[] ACTIVE_KEYS = {"comment", "online_count"};
     public static final String[] ACTIVE_LABELS = {"公屏评论：读取可见评论", "当前在线人数：读取实时人数"};
     private Regions() {}

@@ -101,7 +101,7 @@ public class CaptureService extends Service {
     private volatile LiveFrameAnalyzer liveAnalyzer;
     private volatile ObservationClock observationClock;
     private long lastLiveOcr;
-    private long lastLivePerson, lastFrameTimestamp;
+    private long lastFrameTimestamp;
     private AudioCapture audioCapture;
     private boolean microphoneForeground;
     public static volatile java.util.concurrent.CompletableFuture<Void> audioCompletion = java.util.concurrent.CompletableFuture.completedFuture(null);
@@ -523,7 +523,7 @@ public class CaptureService extends Service {
             if (virtualDisplay == null) throw new IllegalStateException("VirtualDisplay unavailable");
             setupStage = "paddle_ocr";
             lastLiveOcr = 0;
-            lastLivePerson = 0; lastFrameTimestamp = 0;
+            lastFrameTimestamp = 0;
             connectionStatus = operationMode ? LiveConnection.CONNECTING : OverlayMessageState.WAITING_TEXT;
             overlayState.start(connectionStatus);
             phase = Phase.RUNNING;
@@ -594,12 +594,10 @@ public class CaptureService extends Service {
                 }
                 lastFrameTimestamp = image.getTimestamp();
                 boolean ocr = now - lastLiveOcr >= intervalMs;
-                boolean person = false;
                 LiveClient.Session currentSession=liveSession;
-                frame = LiveFrameAnalyzer.snapshot(this, image, ocr, person, observationClock,
+                frame = LiveFrameAnalyzer.snapshot(this, image, ocr, observationClock,
                         currentSession == null ? null : currentSession.id);
                 if (ocr) lastLiveOcr = now;
-                if (person) lastLivePerson = now;
             }
         } catch (Exception e) { setState("屏幕取样失败：" + e.getClass().getSimpleName()); }
         if (frame == null) { busyEpoch.compareAndSet(epoch, -1); scheduleNext(epoch); return; }
