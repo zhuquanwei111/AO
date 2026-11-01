@@ -104,6 +104,19 @@ private final class PollFixtureProtocol: URLProtocol {
 }
 
 final class PollTransportTests: XCTestCase {
+    func testOperatorPresentationDistinguishesMissingAndUsesLocalTimezone() {
+        let locale = Locale(identifier: "en_US_POSIX")
+        let start: Int64 = 1_704_151_800_000
+        let utc = TimeZone(secondsFromGMT: 0)!
+        let east = TimeZone(secondsFromGMT: 8 * 3600)!
+        XCTAssertTrue(OperatorPresentation.date(start, locale: locale, timeZone: utc).contains("1/1/24"))
+        XCTAssertTrue(OperatorPresentation.date(start, locale: locale, timeZone: east).contains("1/2/24"))
+        XCTAssertEqual(OperatorPresentation.duration(start: start, end: start + 7_200_000), "2小时0分")
+        XCTAssertEqual(OperatorPresentation.duration(start: start, end: start - 1), "时长待确认")
+        XCTAssertNil(OperatorPresentation.people(nil, approximate: false, locale: locale))
+        XCTAssertEqual(OperatorPresentation.people(0, approximate: false, locale: locale), "0 人")
+    }
+
     func testPromptMinimumReadingTimeAndUrgentDeadline() {
         func item(_ id: String, expiry: Int64, priority: Int = 25, type: String? = nil) -> LivePromptDelivery.Item {
             .init(id: id, text: id, expiresAtMS: expiry, priority: priority, promptType: type)
