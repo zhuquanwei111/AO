@@ -169,13 +169,14 @@ final class LiveConnection {
 
     boolean poll() {
         if (closed || blocked || session == null) return false;
+        boolean serverStoppedObserved = false;
         try {
             JSONObject page = remote.poll(session, cursor);
             if (closed) return false;
             JSONArray prompts = page.getJSONArray("prompts");
             String next = page.getString("next_cursor");
             // 先处理终止，不能先显示同页中的过期场次内容。
-            if (page.optBoolean("stopped")) { serverStopped(); return false; }
+            if (page.optBoolean("stopped")) { serverStoppedObserved = true; serverStopped(); return false; }
             PromptTiming timing = PromptTiming.from(page);
             boolean timingProblem = timing == null;
             boolean priorityProblem = false;
@@ -203,13 +204,13 @@ final class LiveConnection {
                     JSONObject summary = remote.summary(session);
                     if (closed) return false;
                     if (summary.has("stopped_at_ms") && !summary.isNull("stopped_at_ms")) {
-                        serverStopped(); return false;
+                        serverStoppedObserved = true; serverStopped(); return false;
                     }
                     JSONObject backstage = summary.optJSONObject("backstage_recap");
                     String value = backstage == null ? "" : backstage.optString("status");
                     recap = recapLabel(value);
                     if (recapStartUnconfirmed || "not_started".equals(value)) registerRecap();
-                } catch (Exception e) { recap = "复盘状态未取得"; }
+                } catch (Exception e) { if (serverStoppedObserved) throw e; recap = "复盘状态未取得"; }
             }
             synchronized (this) {
                 if (closed) return false;
@@ -221,7 +222,7 @@ final class LiveConnection {
                 cursor = next;
             }
             return true;
-        } catch (Exception e) { if (!closed) listener.observationClock(session, null); status(OFFLINE, true); return false; }
+        } catch (Exception e) { if (!closed) listener.observationClock(session, null); status(OFFLINE, serverStoppedObserved); return false; }
     }
 
     private void registerRecap() {

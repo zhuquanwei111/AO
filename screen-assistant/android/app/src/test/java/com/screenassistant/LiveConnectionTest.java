@@ -218,6 +218,64 @@ public class LiveConnectionTest {
         assertEquals(0, remote.stops); assertEquals(0, display.ended);
     }
 
+    @Test public void transientPollFailuresKeepCurrentAndQueuedUntilOriginalDeadlines() throws Exception {
+        Memory store = new Memory(); store.session = SESSION;
+        Remote remote = new Remote();
+        Display display = new Display() {
+            @Override public void status(String text, boolean discard) {
+                diagnostic = text; overlay.setStatus(text, discard);
+            }
+        };
+        LiveConnection connection = new LiveConnection(store, remote, display);
+        assertTrue(connection.connect()); assertTrue(connection.poll());
+        assertTrue(display.overlay.update("a", "第一条", 25, 20000, 1000, 12000));
+        assertTrue(display.overlay.update("b", "第二条", 25, 15000, 2000, 12000));
+        remote.pollError = new SocketTimeoutException("timeout");
+        assertFalse(connection.poll());
+        assertEquals("第一条", display.overlay.textAt(2000));
+        assertEquals(1, display.overlay.pendingCount());
+        assertEquals(13000, display.overlay.expiresAtMs());
+        remote.pollError = new LiveClient.HttpError(503);
+        assertFalse(connection.poll());
+        assertEquals("第一条", display.overlay.textAt(3000));
+        remote.pollError = null;
+        assertTrue(connection.poll());
+        assertEquals("c1", remote.lastCursor);
+        assertEquals("第二条", display.overlay.textAt(9000));
+        assertEquals(15000, display.overlay.expiresAtMs());
+        assertEquals("", display.overlay.textAt(15000));
+        assertFalse(display.overlay.update("b", "第二条", 25, 30000, 15000, 12000));
+    }
+
+    @Test public void confirmedServerStopDiscardsEvenWhenSavingStoppedStateFails() throws Exception {
+        for (boolean fromSummary : new boolean[]{false, true}) {
+            Memory store = new Memory(); store.session = SESSION;
+            final boolean[] stopped = {false};
+            Remote remote = new Remote() {
+                @Override public JSONObject summary(LiveClient.Session session) throws Exception {
+                    JSONObject result = super.summary(session);
+                    if (stopped[0]) result.put("stopped_at_ms", 12000);
+                    return result;
+                }
+            };
+            java.util.concurrent.atomic.AtomicLong clock = new java.util.concurrent.atomic.AtomicLong();
+            Display display = new Display() {
+                @Override public void status(String text, boolean discard) {
+                    diagnostic = text; overlay.setStatus(text, discard);
+                }
+            };
+            LiveConnection connection = new LiveConnection(store, remote, display, clock::get);
+            assertTrue(connection.connect()); assertTrue(connection.poll());
+            assertTrue(display.overlay.update("a", "第一条", 25, 20000, 1000, 12000));
+            store.failSaves = 1;
+            if (fromSummary) { stopped[0] = true; clock.set(30001); }
+            else remote.page.put("stopped", true);
+            assertFalse(connection.poll());
+            assertEquals("", display.overlay.textAt(2000));
+            assertFalse(store.session.stopped);
+        }
+    }
+
     @Test public void pollingRecoversSameCredentialsAndCursorWithoutCreatingAgain() throws Exception {
         Memory store = new Memory(); store.session = SESSION;
         Remote remote = new Remote(); Display display = new Display();
