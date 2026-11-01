@@ -121,6 +121,7 @@ public class CaptureService extends Service {
             logEvent("prompt_outcome", "id=" + safeId(id) + " reason=" + reason));
 
     private View replyOverlayView;
+    private View replyBodyView;
     private TextView replyTextView;
     private volatile boolean overlayBlocksCapture;
     private boolean draggingOverlay;
@@ -820,65 +821,64 @@ public class CaptureService extends Service {
         if (!overlayState.shouldDisplay(true, uiVisible)) { removeReplyOverlay(); return; }
         try {
             if (replyOverlayView == null) {
-                replyOverlayView = LayoutInflater.from(this).inflate(R.layout.overlay_reply, null);
-                replyTextView = replyOverlayView.findViewById(R.id.tv_reply);
-                replyOverlayView.getViewTreeObserver().addOnDrawListener(() -> {
+                replyOverlayView = LayoutInflater.from(this).inflate(R.layout.overlay_reply_handle, null);
+                replyBodyView = LayoutInflater.from(this).inflate(R.layout.overlay_reply, null);
+                replyTextView = (TextView) replyBodyView;
+                replyBodyView.setVisibility(View.GONE);
+                replyBodyView.getViewTreeObserver().addOnDrawListener(() -> {
                     String id = overlayState.currentId();
-                    if (replyOverlayView != null && !id.equals(drawnPromptId)) {
+                    if (replyBodyView != null && replyTextView != null && !id.equals(drawnPromptId)) {
                         logEvent("prompt_drawn", "id=" + safeId(id) + " previous=" + safeId(drawnPromptId)
                                 + " at=" + System.currentTimeMillis() + " body_visible=" + replyTextView.isShown()
-                                + " width=" + replyOverlayView.getWidth() + " height=" + replyOverlayView.getHeight()
+                                + " width=" + replyBodyView.getWidth() + " height=" + replyBodyView.getHeight()
                                 + " epoch=" + sessionEpoch);
                         drawnPromptId = id;
                     }
                 });
                 overlayBlocksCapture = true;
-                replyOverlayView.addOnLayoutChangeListener((view,left,top,right,bottom,oldLeft,oldTop,oldRight,oldBottom) -> {
+                replyBodyView.addOnLayoutChangeListener((view,left,top,right,bottom,oldLeft,oldTop,oldRight,oldBottom) -> {
                     if (!draggingOverlay && (right-left != oldRight-oldLeft || bottom-top != oldBottom-oldTop)) {
                         overlayBlocksCapture = true;
                         view.post(this::placeReplyOverlay);
                     }
                 });
-                replyOverlayView.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
-                    @Override
-                    public void onViewAttachedToWindow(View view) {
-                        logEvent("overlay_attached", "shown=" + view.isShown());
-                    }
-
-                    @Override
-                    public void onViewDetachedFromWindow(View view) {
-                        logEvent("overlay_detached", "phase=" + phase);
-                    }
-                });
+                float maximum = android.os.Build.VERSION.SDK_INT >= 31
+                        ? getSystemService(android.hardware.input.InputManager.class).getMaximumObscuringOpacityForTouch() : .8f;
+                int handleWidth = Math.round(48 * getResources().getDisplayMetrics().density);
                 WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                        WindowManager.LayoutParams.WRAP_CONTENT,
-                        WindowManager.LayoutParams.WRAP_CONTENT,
-                        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                                | WindowManager.LayoutParams.FLAG_SECURE
-                                | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-                        PixelFormat.TRANSLUCENT);
+                        handleWidth, handleWidth, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_SECURE
+                                | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL, PixelFormat.TRANSLUCENT);
                 lp.gravity = Gravity.TOP | Gravity.START;
-                // Android12+不可信覆盖层的触摸穿透必须满足系统最大遮挡透明度。
-                lp.alpha = android.os.Build.VERSION.SDK_INT >= 31
-                        ? Math.min(.8f, getSystemService(android.hardware.input.InputManager.class).getMaximumObscuringOpacityForTouch()) : .8f;
+                lp.alpha = OverlayWindowGeometry.handleAlpha(maximum);
                 lp.y = (int) (64 * getResources().getDisplayMetrics().density);
                 lp.x = (int) (16 * getResources().getDisplayMetrics().density);
-                lp.width = Math.max(200, (int) (screenSize[0] * .72f));
-                View handle = replyOverlayView.findViewById(R.id.drag_handle);
-                handle.setOnTouchListener(new View.OnTouchListener() {
+                WindowManager.LayoutParams body = new WindowManager.LayoutParams(
+                        Math.max(1, Math.min(screenSize[0], Math.max(200, (int) (screenSize[0] * .72f))) - handleWidth),
+                        WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_SECURE
+                                | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                        PixelFormat.TRANSLUCENT);
+                body.gravity = Gravity.TOP | Gravity.START;
+                body.alpha = OverlayWindowGeometry.bodyAlpha(maximum);
+                body.x = lp.x + handleWidth; body.y = lp.y;
+                replyOverlayView.setOnTouchListener(new View.OnTouchListener() {
                     float downX, downY; int startX, startY;
                     @Override public boolean onTouch(View view, MotionEvent event) {
-                        if (replyOverlayView == null) return false;
+                        if (replyOverlayView == null || replyBodyView == null) return false;
                         switch (event.getActionMasked()) {
                             case MotionEvent.ACTION_DOWN:
                                 draggingOverlay = true; overlayBlocksCapture = true;
                                 downX = event.getRawX(); downY = event.getRawY();
                                 startX = lp.x; startY = lp.y; return true;
                             case MotionEvent.ACTION_MOVE:
-                                lp.x = startX + Math.round(event.getRawX() - downX);
-                                lp.y = startY + Math.round(event.getRawY() - downY);
-                                wm.updateViewLayout(replyOverlayView, lp); return true;
+                                int bodyWidth = replyBodyView.getVisibility() == View.VISIBLE ? body.width : 0;
+                                int height = Math.max(handleWidth, replyBodyView.getVisibility() == View.VISIBLE ? replyBodyView.getHeight() : 0);
+                                int[] bounded = OverlayWindowGeometry.clamp(startX + Math.round(event.getRawX() - downX),
+                                        startY + Math.round(event.getRawY() - downY), screenSize[0], screenSize[1],
+                                        handleWidth, bodyWidth, height);
+                                lp.x = bounded[0]; lp.y = bounded[1];
+                                wm.updateViewLayout(replyOverlayView, lp); syncReplyBodyPosition(); return true;
                             case MotionEvent.ACTION_UP:
                                 view.performClick();
                             case MotionEvent.ACTION_CANCEL:
@@ -888,21 +888,19 @@ public class CaptureService extends Service {
                     }
                 });
                 wm.addView(replyOverlayView, lp);
+                wm.addView(replyBodyView, body);
+                logEvent("overlay_attached", "shown=" + replyOverlayView.isShown());
             }
             long now = SystemClock.elapsedRealtime();
             String text = overlayState.textAt(now);
             boolean expanded = !text.isEmpty();
             if (overlayConflictNotified && expanded) text = OVERLAY_CONFLICT + "\n" + text;
             replyTextView.setVisibility(expanded ? View.VISIBLE : View.GONE);
-            WindowManager.LayoutParams layout = (WindowManager.LayoutParams) replyOverlayView.getLayoutParams();
-            int width = expanded ? Math.max(200, (int) (screenSize[0] * .72f))
-                    : Math.round(48 * getResources().getDisplayMetrics().density);
-            if (layout.width != width) { layout.width = width; wm.updateViewLayout(replyOverlayView, layout); }
             if (!text.contentEquals(replyTextView.getText())) replyTextView.setText(text);
             replyOverlayView.setVisibility(View.VISIBLE);
             if (!draggingOverlay) {
                 overlayBlocksCapture = true;
-                replyOverlayView.post(this::placeReplyOverlay);
+                replyBodyView.post(this::placeReplyOverlay);
             }
             String id = overlayState.currentId();
             if (!id.equals(displayedPromptId)) {
@@ -930,14 +928,20 @@ public class CaptureService extends Service {
 
     private void placeReplyOverlay() {
         View view = replyOverlayView;
-        if (view == null || draggingOverlay || !view.isAttachedToWindow()) return;
+        if (view == null || replyBodyView == null || draggingOverlay || !view.isAttachedToWindow()
+                || !replyBodyView.isAttachedToWindow()) return;
         int[] loc = new int[2]; view.getLocationOnScreen(loc);
+        boolean bodyVisible = replyBodyView.getVisibility() == View.VISIBLE;
+        if (bodyVisible && replyBodyView.getHeight() == 0) { overlayBlocksCapture = true; return; }
+        int bodyWidth = bodyVisible ? ((WindowManager.LayoutParams) replyBodyView.getLayoutParams()).width : 0;
+        int combinedWidth = view.getWidth() + bodyWidth;
+        int combinedHeight = Math.max(view.getHeight(), replyBodyView.getVisibility() == View.VISIBLE ? replyBodyView.getHeight() : 0);
         java.util.List<int[]> areas = new java.util.ArrayList<>();
         for (String key : Regions.ACTIVE_KEYS) {
             float[] region = Prefs.getRegion(this, key);
             if (Regions.valid(region)) areas.add(Regions.crop(region, screenSize[0], screenSize[1]));
         }
-        int[] target = Regions.placeOverlay(screenSize[0], screenSize[1], view.getWidth(), view.getHeight(),
+        int[] target = Regions.placeOverlay(screenSize[0], screenSize[1], combinedWidth, combinedHeight,
                 loc[0], loc[1], areas.toArray(new int[0][]));
         if (target == null) {
             overlayBlocksCapture = true;
@@ -953,18 +957,36 @@ public class CaptureService extends Service {
         if (target[0] != loc[0] || target[1] != loc[1]) {
             lp.x += target[0] - loc[0]; lp.y += target[1] - loc[1];
             wm.updateViewLayout(view, lp);
+            syncReplyBodyPosition();
             view.post(this::verifyReplyPlacement);
-        } else verifyReplyPlacement();
+        } else { syncReplyBodyPosition(); verifyReplyPlacement(); }
+    }
+
+    private void syncReplyBodyPosition() {
+        if (replyOverlayView == null || replyBodyView == null || !replyOverlayView.isAttachedToWindow()
+                || !replyBodyView.isAttachedToWindow()) return;
+        WindowManager.LayoutParams handle = (WindowManager.LayoutParams) replyOverlayView.getLayoutParams();
+        WindowManager.LayoutParams body = (WindowManager.LayoutParams) replyBodyView.getLayoutParams();
+        int x = handle.x + handle.width;
+        if (body.x != x || body.y != handle.y) {
+            body.x = x; body.y = handle.y; wm.updateViewLayout(replyBodyView, body);
+        }
     }
 
     private void verifyReplyPlacement() {
         View view = replyOverlayView;
-        if (view == null || draggingOverlay) return;
+        if (view == null || replyBodyView == null || draggingOverlay || !view.isAttachedToWindow()
+                || !replyBodyView.isAttachedToWindow()) return;
         int[] loc = new int[2]; view.getLocationOnScreen(loc);
+        boolean bodyVisible = replyBodyView.getVisibility() == View.VISIBLE;
+        if (bodyVisible && replyBodyView.getHeight() == 0) { overlayBlocksCapture = true; return; }
+        int bodyWidth = bodyVisible ? ((WindowManager.LayoutParams) replyBodyView.getLayoutParams()).width : 0;
+        int combinedWidth = view.getWidth() + bodyWidth;
+        int combinedHeight = Math.max(view.getHeight(), replyBodyView.getVisibility() == View.VISIBLE ? replyBodyView.getHeight() : 0);
         boolean blocked = false;
         for (String key : Regions.ACTIVE_KEYS) {
             float[] r = Prefs.getRegion(this, key);
-            if (Regions.valid(r) && Regions.overlaps(loc[0], loc[1], view.getWidth(), view.getHeight(),
+            if (Regions.valid(r) && Regions.overlaps(loc[0], loc[1], combinedWidth, combinedHeight,
                     Regions.crop(r, screenSize[0], screenSize[1]))) blocked = true;
         }
         overlayBlocksCapture = blocked;
@@ -995,6 +1017,11 @@ public class CaptureService extends Service {
     }
 
     private void removeReplyOverlay() {
+        if (replyBodyView != null) {
+            try { wm.removeView(replyBodyView); } catch (Exception ignored) { }
+            replyBodyView = null;
+            replyTextView = null;
+        }
         if (replyOverlayView != null) {
             try {
                 wm.removeView(replyOverlayView);
