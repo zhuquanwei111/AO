@@ -825,7 +825,9 @@ final class AppModel: ObservableObject {
     func refreshStoppedOverview() {
         guard !liveActive, !liveStarting, !summaryRefreshInFlight,
               let credentials = Self.savedCredentials(),
-              let client = liveClient ?? SharedConfig.serverBaseURL().flatMap({ LiveOperationsClient(baseURL: $0) }) else {
+              let bound = credentials.boundServiceURL, IsolatedStopIntent.safeServiceURL(bound),
+              let client = liveClient ?? LiveOperationsClient(baseURL: bound),
+              client.baseURL.absoluteString == bound.absoluteString else {
             return
         }
         summaryRefreshInFlight = true
