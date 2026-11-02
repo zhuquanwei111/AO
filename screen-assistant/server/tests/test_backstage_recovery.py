@@ -105,6 +105,8 @@ def test_claim_and_recovery_compete_atomically(tmp_path):
 @pytest.mark.parametrize("mutation", [
     "claimed_at_ms=1", "stopped_at_ms=1", "received_at_ms=1",
     "result_hash='existing'", "result_json='{}'", "status='capturing'",
+    "stop_signal_source='android_app'",
+    "start_signal_source='unknown'",
 ])
 def test_recovery_rejects_changed_task_without_writing(tmp_path, mutation):
     clock = Clock()
@@ -139,3 +141,34 @@ def test_old_task_schema_is_migrated_without_changing_existing_rows(tmp_path):
         row = store.db.execute("SELECT * FROM live_backstage_tasks WHERE task_id='old-task'").fetchone()
         assert row["status"] == "waiting_for_stop" and row["created_at_ms"] == 12
         assert row["recovered_at_ms"] is None and row["recovery_reason"] is None
+
+
+def test_recovery_rejects_mismatched_session_source_without_writing(tmp_path):
+    clock = Clock()
+    with LiveStoreForTest(str(tmp_path / 'source.sqlite3'), clock) as store:
+        session = store.create('', 'fixture')
+        task = store.start_backstage(session['session_id'], session['session_token'], 'android_app')
+        created = clock.now
+        clock.now += DAY
+        with store.db:
+            store.db.execute("UPDATE live_sessions SET app_source='ios_app' WHERE session_id=?", (session['session_id'],))
+        with pytest.raises(HTTPException) as error:
+            store.recover_backstage_task(task['task_id'], created)
+        assert error.value.status_code == 409
+        row = store.db.execute('SELECT * FROM live_backstage_tasks WHERE task_id=?', (task['task_id'],)).fetchone()
+        assert row['status'] == 'waiting_for_stop' and row['recovered_at_ms'] is None
+
+
+def test_recovery_duplicate_rejects_unexpected_post_recovery_state(tmp_path):
+    clock=Clock()
+    with LiveStoreForTest(str(tmp_path / 'duplicate.sqlite3'),clock) as store:
+        session=store.create('', 'fixture')
+        task=store.start_backstage(session['session_id'],session['session_token'],'android_app')
+        created=clock.now
+        clock.now+=DAY
+        store.recover_backstage_task(task['task_id'],created)
+        with store.db:
+            store.db.execute("UPDATE live_backstage_tasks SET status='capturing' WHERE task_id=?",(task['task_id'],))
+        with pytest.raises(HTTPException) as error:
+            store.recover_backstage_task(task['task_id'],created)
+        assert error.value.status_code==409
