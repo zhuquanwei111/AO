@@ -98,7 +98,7 @@ def main():
         binding=record.get('binding_evidence') or {}
         runtime=GLMRuntime(args.scratch/task/args.command,{'phase':args.command,
             'douyin_account':record['douyin_account'],
-            'bound_room_id':binding.get('room_id'),'bound_at':binding.get('observed_at')})
+            'bound_room_id':binding.get('room_id'),'bound_at':binding.get('observed_at')}, gate=args.gate_a)
         mcp=MCP(os.environ.get('BACKSTAGE_MCP_CLIENT_PYTHON',''),
                 ROOT/'windows-mcp/mcp_stdio_client.py',
                 args.scratch/task/'mcp-events.jsonl',

@@ -1,6 +1,11 @@
-"""保留旧配置兼容；当前复盘路径不发送图片或调用视觉模型。"""
+"""保留旧配置，并为经校验的局部图片提供内存模型传输。"""
 import json
 import os
+import base64
+import hashlib
+import hmac
+import secrets
+import subprocess
 from pathlib import Path
 import time
 
@@ -37,9 +42,61 @@ def require_sdk_runtime():
 
 
 class GLMRuntime:
-    def __init__(self,scratch,context=None):
+    def __init__(self,scratch,context=None,gate=None):
         self.scratch=Path(scratch).resolve(); self.scratch.mkdir(parents=True,exist_ok=True)
-        self.calls=0; self.http_requests=0; self.context=context or {}; self.deadline=time.monotonic()+240
+        self.calls=0; self.http_requests=0; self.context=context or {}; self.gate=gate; self.deadline=time.monotonic()+240
 
     def run(self,image,prompt,schema=None,challenge=None):
         raise RuntimeError('image_visual_disabled')
+
+    def run_crop(self, crop, prompt):
+        """仅将本轮核验的小裁区经子进程标准输入传给既有模型。"""
+        from glm_vision import LocalCrop, _CROP_ISSUER
+        if not isinstance(crop, LocalCrop) or crop._issuer is not _CROP_ISSUER:
+            raise RuntimeError('visual_crop_source_invalid')
+        crop.ensure_current()
+        if not isinstance(prompt, str) or not prompt or len(prompt) > 2048:
+            raise RuntimeError('visual_prompt_invalid')
+        if not os.environ.get('TIANYI_API_KEY'):
+            raise RuntimeError('missing_current_process_tianyi_key')
+        if self.gate is None:
+            raise RuntimeError('gate_a_not_verified')
+        require_gate_a(self.gate)
+        sdk_python = require_sdk_runtime()
+        if self.calls >= 24 or time.monotonic() >= self.deadline:
+            raise RuntimeError('model_phase_budget_exhausted')
+        job = {'image_base64': base64.b64encode(crop.image).decode('ascii'),
+               'prompt': prompt, 'purpose': crop.purpose}
+        canonical = json.dumps(job, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        capability = secrets.token_hex(32)
+        job['attestation'] = hmac.new(capability.encode('ascii'), canonical, hashlib.sha256).hexdigest()
+        data = json.dumps(job, ensure_ascii=False).encode('utf-8')
+        if len(data) > 4 * 1024 * 1024:
+            raise RuntimeError('visual_crop_too_large')
+        allowed = {'SYSTEMROOT', 'WINDIR', 'PATH', 'PATHEXT', 'TEMP', 'TMP', 'LOCALAPPDATA',
+                   'APPDATA', 'USERPROFILE', 'COMSPEC', 'PROGRAMFILES', 'PROGRAMFILES(X86)',
+                   'OS', 'HOME', 'LANG', 'LC_ALL', 'TIANYI_API_KEY'}
+        env = {key: value for key, value in os.environ.items() if key.upper() in allowed}
+        env.update(PYTHONUTF8='1', PYTHONDONTWRITEBYTECODE='1', RECAP_VISUAL_CAPABILITY=capability)
+        self.calls += 1
+        try:
+            result = subprocess.run([sdk_python, '-B', str(Path(__file__).with_name('agent_worker.py'))],
+                input=data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env,
+                timeout=min(110, max(.1, self.deadline-time.monotonic())),
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        except (OSError, subprocess.TimeoutExpired):
+            self.http_requests = None
+            raise RuntimeError('visual_worker_failed') from None
+        if result.returncode != 0 or len(result.stdout) > 16384:
+            raise RuntimeError('visual_worker_failed')
+        try:
+            reply = json.loads(result.stdout)
+        except (ValueError, UnicodeError):
+            raise RuntimeError('visual_worker_invalid_reply') from None
+        if not isinstance(reply, dict) or reply.get('status') != 'OK' or not isinstance(reply.get('result'), dict):
+            raise RuntimeError('visual_worker_invalid_reply')
+        requests = reply.get('http_requests')
+        if type(requests) is not int or not 1 <= requests <= 3:
+            raise RuntimeError('visual_worker_invalid_reply')
+        self.http_requests = None if self.http_requests is None else self.http_requests + requests
+        return reply['result']
