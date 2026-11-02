@@ -599,6 +599,19 @@ def test_bridge_preserves_unknown_capture_time_for_empty_result():
     assert payload["missing_fields"]["累计观众"] == "未读取"
 
 
+@pytest.mark.parametrize("outcome", ["not_live", "account_not_found"])
+def test_bridge_preserves_confirmed_business_outcome_after_stop(outcome):
+    task = {"task_id": "t", "session_id": "s", "douyin_account": "a",
+            "stop_signal_received": True, "start_signal_source": "android_app",
+            "stop_signal_source": "android_app"}
+    record = {"status": "failed", "reason": outcome, "session_id": "s",
+              "douyin_account": "a", "metrics": None, "room_id": None,
+              "start_signal_source": "android_app", "stop_signal_source": "android_app"}
+    payload = BackstageBridge.result_payload(task, record)
+    assert set(payload["missing_fields"].values()) == {outcome}
+    assert all(value is None for value in payload["metrics"].values())
+
+
 def test_bridge_forwards_android_app_signal_source_without_ios_relabeling():
     task = {"task_id": "t", "session_id": "s", "douyin_account": "a",
             "start_signal_source": "android_app", "stop_signal_source": "android_app",
