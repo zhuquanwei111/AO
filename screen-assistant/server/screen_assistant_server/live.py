@@ -525,7 +525,8 @@ class LiveService:
                     return result
             finally:
                 if is_comment:
-                    await self.run("finish_comment_attempt", sid, comment_id, epoch, model_called, terminal)
+                    await self.run("finish_comment_attempt", sid, comment_id, epoch, model_called, terminal,
+                                   self.fusion_trigger_epoch.get(sid, epoch))
                     if terminal:
                         if sid in self.fusion_active and sid not in self.fusion_stopping:
                             # 同一有界执行槽继续处理已完成候选之后的其它评论。

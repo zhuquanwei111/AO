@@ -7,6 +7,124 @@ from fastapi.testclient import TestClient
 from screen_assistant_server.app import create_app
 from screen_assistant_server.config import Settings
 from screen_assistant_server.live_store import LiveStore
+from screen_assistant_server.model_client import ModelTimeoutError
+
+
+@pytest.mark.parametrize("second_succeeds", [False, True])
+def test_unlocked_attempt_inflight_observation_does_not_unlock_again(tmp_path, second_succeeds):
+    now = 1_790_000_000_000
+    cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="controlled",
+                   tianyi_base_url="http://model.invalid", tianyi_model="fake", dedup_ttl_seconds=60,
+                   max_sentence_chars=2000, model_timeout_seconds=5, model_connect_timeout_seconds=1,
+                   live_db_path=str(tmp_path / "inflight-after-unlock.sqlite3"))
+    class Model:
+        def __init__(self):
+            self.calls = 0
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+        async def reply_to_comment(self, text, *, nickname, priority_eligible):
+            self.calls += 1
+            if self.calls == 2:
+                self.started.set()
+                await self.release.wait()
+                if second_succeeds:
+                    return "谢谢分享。"
+            raise ModelTimeoutError()
+        async def aclose(self):
+            pass
+    app = create_app(cfg, live_clock=lambda: now)
+    with TestClient(app) as client:
+        client.portal.call(app.state.model.aclose)
+        model = Model()
+        app.state.model = model
+        session = client.post("/v1/live/sessions", json={}).json()
+        url = "/v1/live/sessions/" + session["session_id"]
+        headers = {"X-Live-Session-Token": session["session_token"]}
+        async def idle():
+            async with asyncio.timeout(5):
+                while app.state.live.fusion_active or app.state.live.fusion_queue:
+                    await asyncio.sleep(.005)
+        def send(event, text):
+            body = {"kind": "comment", "event_id": event, "source": "ios_replaykit_ocr",
+                    "observed_at_ms": now, "availability": "available", "coverage": "ocr_visible_sample",
+                    "reliability": "known", "confidence": .98, "capture_batch_id": event,
+                    "line_index": 0, "capture_comment_count": 1, "content": {"text": text,
+                    "text_position": {"x": .1, "y": .5, "width": .4, "height": .04}}}
+            assert client.post(url + "/observations", headers=headers, json=body).status_code == 200
+        send("first", "阿青：这首歌很好听")
+        client.portal.call(idle)
+        send("second", "小林：晚上好")
+        client.portal.call(model.started.wait)
+        send("during", "小明：今天心情不错")
+        client.portal.call(model.release.set)
+        client.portal.call(idle)
+        expected = ["comment_reply"] if second_succeeds else []
+        assert [e["prompt_type"] for e in client.get(url + "/events", headers=headers).json()["events"]] == expected
+        send("after", "小红：我也喜欢音乐")
+        client.portal.call(idle)
+        assert [e["prompt_type"] for e in client.get(url + "/events", headers=headers).json()["events"]] == expected + ["operation_notice"]
+
+
+def test_http_reliable_activity_can_coach_when_comment_model_fails(tmp_path, monkeypatch):
+    def blocked(*args, **kwargs):
+        raise AssertionError("隔离测试禁止外连")
+    monkeypatch.setattr(socket, "create_connection", blocked)
+    monkeypatch.setattr(socket, "getaddrinfo", blocked)
+    start = 1_790_000_000_000
+    clock = [start]
+    cfg = Settings(redis_url="redis://127.0.0.1:1/0", tianyi_api_key="controlled",
+                   tianyi_base_url="http://model.invalid", tianyi_model="fake", dedup_ttl_seconds=60,
+                   max_sentence_chars=2000, model_timeout_seconds=1, model_connect_timeout_seconds=1,
+                   live_db_path=str(tmp_path / "failed-model.sqlite3"))
+    calls = []
+    class Model:
+        async def reply_to_comment(self, text, *, nickname, priority_eligible):
+            calls.append(text)
+            raise ModelTimeoutError()
+        async def aclose(self):
+            pass
+    app = create_app(cfg, live_clock=lambda: clock[0])
+    with TestClient(app) as client:
+        client.portal.call(app.state.model.aclose)
+        app.state.model = Model()
+        session = client.post("/v1/live/sessions", json={}).json()
+        url = "/v1/live/sessions/" + session["session_id"]
+        headers = {"X-Live-Session-Token": session["session_token"]}
+        async def idle():
+            async with asyncio.timeout(5):
+                while app.state.live.fusion_active or app.state.live.fusion_queue:
+                    await asyncio.sleep(.005)
+        def send(event, text):
+            body = {"kind": "comment", "event_id": event, "source": "ios_replaykit_ocr",
+                    "observed_at_ms": clock[0], "availability": "available", "coverage": "ocr_visible_sample",
+                    "reliability": "known", "confidence": .98, "capture_batch_id": event,
+                    "line_index": 0, "capture_comment_count": 1, "content": {"text": text,
+                    "text_position": {"x": .1, "y": .5, "width": .4, "height": .04}}}
+            assert client.post(url + "/observations", headers=headers, json=body).status_code == 200
+            client.portal.call(idle)
+        send("first", "阿青：这首歌很好听")
+        assert not client.get(url + "/events", headers=headers).json()["events"]
+        send("first", "阿青：这首歌很好听")
+        assert len(calls) == 1
+        assert not client.get(url + "/events", headers=headers).json()["events"]
+        clock[0] += 1000
+        unreliable = {"kind": "comment", "event_id": "bad", "source": "ios_replaykit_ocr",
+                      "observed_at_ms": clock[0], "availability": "available", "coverage": "ocr_visible_sample",
+                      "reliability": "unknown", "confidence": .1, "capture_batch_id": "bad",
+                      "line_index": 0, "capture_comment_count": 1, "content": {"text": "无效内容",
+                      "text_position": {"x": .1, "y": .5, "width": .4, "height": .04}}}
+        assert client.post(url + "/observations", headers=headers, json=unreliable).status_code == 200
+        client.portal.call(idle)
+        assert not client.get(url + "/events", headers=headers).json()["events"]
+        clock[0] += 1000
+        send("second", "小林：晚上好")
+        clock[0] += 1000
+        send("third", "小明：今天心情不错")
+        events = client.get(url + "/events", headers=headers).json()["events"]
+        assert [event["prompt_type"] for event in events] == ["operation_notice"]
+        assert events[0]["expires_at_ms"] == start + 30_000
+        assert "阿青" not in str(events[0]) and "这首歌很好听" not in str(events[0])
+        assert client.get(url + "/prompts", headers=headers).json()["prompts"][0]["prompt_id"] == events[0]["prompt_id"]
 
 
 def add_comment(store, sid, token, now, event, text):
