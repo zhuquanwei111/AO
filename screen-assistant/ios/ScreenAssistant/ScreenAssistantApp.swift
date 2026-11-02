@@ -899,7 +899,7 @@ final class AppModel: ObservableObject {
                 self.liveEntryInvalidItems += page.invalidEntryCount
                 self.liveEvents = page.events
             }
-            self.liveSummary = fetchedSummary
+            self.applyStoppedSummary(fetchedSummary)
             self.finishCredentialRetentionIfTerminal(fetchedSummary?.backstageRecap?.status)
             switch (fetchedEvents, fetchedSummary) {
             case let (.some(page), .some(_)):
@@ -946,7 +946,7 @@ final class AppModel: ObservableObject {
                     }
                     return
                 }
-                self.liveSummary = summary
+                self.applyStoppedSummary(summary)
                 if let recap = summary.backstageRecap {
                     self.liveStatus = Self.backstageStatusText(recap)
                     self.finishCredentialRetentionIfTerminal(recap.status)
@@ -965,12 +965,17 @@ final class AppModel: ObservableObject {
     }
 
     private static func backstageStatusText(_ recap: LiveBackstageRecap) -> String {
-        let count = recap.metrics.map { metrics in
-            [metrics.cumulativeAudience, metrics.newFollowers, metrics.commentCount,
-             metrics.giftGivers, metrics.soundEnergy].compactMap { $0 }.count
-        }
+        let count = recap.metrics.map { _ in recap.availableMetricCount }
         return BackstageStatusPresentation.summary(status: recap.status, claimedAtMS: recap.claimedAtMS,
                                                    receivedMetricCount: count)
+    }
+
+    private func applyStoppedSummary(_ summary: LiveSessionSummary?) {
+        if summary?.backstageRecap?.hasMissingFieldConflict == true &&
+            liveSummary?.backstageRecap?.hasMissingFieldConflict != true {
+            NSLog("后台复盘存在字段冲突，按缺失处理")
+        }
+        liveSummary = summary
     }
 
     private static func savedCredentials() -> LiveSessionCredentials? {

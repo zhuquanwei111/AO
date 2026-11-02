@@ -104,6 +104,36 @@ private final class PollFixtureProtocol: URLProtocol {
 }
 
 final class PollTransportTests: XCTestCase {
+    func testBackstageMetricPreservesZeroAndHonorsExplicitMissing() {
+        XCTAssertEqual(OperatorPresentation.recapMetric(value: 0, approximate: false, missing: false), "0")
+        XCTAssertEqual(OperatorPresentation.recapMetric(value: 12_000, approximate: true, missing: false), "约12000")
+        XCTAssertEqual(OperatorPresentation.recapMetric(value: nil, approximate: false, missing: false), "暂无数据")
+        XCTAssertEqual(OperatorPresentation.recapMetric(value: 0, approximate: false, missing: true), "暂无数据")
+        XCTAssertEqual(OperatorPresentation.recapMetric(value: -1, approximate: false, missing: false), "暂无数据")
+    }
+    func testBackstageRecapDoesNotCountConflictsOrRawOnly() throws {
+        func recap(metrics: String, raw: String, missing: String) throws -> LiveBackstageRecap {
+            let json = """
+            {"task_id":"fixture","status":"captured_locally","douyin_account":"fixture",
+             "stop_signal_received":true,"started_at_ms":1,"metrics":\(metrics),
+             "raw_displays":\(raw),"approximate_metrics":[],"missing_fields":\(missing),
+             "start_signal_source":"ios_app"}
+            """
+            return try JSONDecoder().decode(LiveBackstageRecap.self, from: Data(json.utf8))
+        }
+        let conflict = try recap(metrics: "{\"累计观众\":0}", raw: "{\"累计观众\":\"0\"}",
+                                 missing: "{\"累计观众\":\"未读取\"}")
+        XCTAssertTrue(conflict.hasMissingFieldConflict)
+        XCTAssertEqual(conflict.availableMetricCount, 0)
+        XCTAssertEqual(OperatorPresentation.recapMetric(value: conflict.metrics?.cumulativeAudience,
+            approximate: false, missing: conflict.missingFields["累计观众"] != nil), "暂无数据")
+        let zero = try recap(metrics: "{\"累计观众\":0}", raw: "{}", missing: "{}")
+        XCTAssertFalse(zero.hasMissingFieldConflict)
+        XCTAssertEqual(zero.availableMetricCount, 1)
+        let rawOnly = try recap(metrics: "null", raw: "{\"累计观众\":\"约1.2万\"}", missing: "{}")
+        XCTAssertEqual(rawOnly.availableMetricCount, 0)
+        XCTAssertNil(rawOnly.metrics)
+    }
     func testOperatorHistoricalUploadAndPersonAreaPresentation() {
         func upload(_ counts: [String: Int]) -> String {
             OperatorPresentation.observationUploadDescription { counts[$0, default: 0] }
