@@ -32,7 +32,7 @@ struct ContentView: View {
         NavigationView {
             Form {
                 Section(header: Text("本场直播辅助"),
-                        footer: Text("先开始本场后台任务；随后按步骤启动本机提示和系统屏幕广播。屏幕采集必须由你在系统弹窗确认。")) {
+                        footer: Text("先开始本场辅助，再按步骤启动悬浮窗和系统屏幕广播。屏幕广播需要你在系统弹窗中确认。")) {
                     TextField("抖音号（本场汇总绑定）", text: $model.douyinAccount)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
@@ -62,12 +62,12 @@ struct ContentView: View {
                             .disabled(model.liveStarting || model.liveStopping || model.isolatedStopInFlight)
                     }
                     if model.liveTimingWarning {
-                        Text("部分提示缺少可靠时效信息，未在画中画显示；实时采集仍可继续。时间锚异常 \(model.liveTimingAnchorFailures) 次，单条时效异常 \(model.liveTimingInvalidItems) 条。")
+                    Text("部分提示未能及时显示，实时辅助仍可继续。")
                             .font(.footnote)
                             .foregroundColor(.orange)
                     }
                     if model.livePriorityInvalidItems > 0 || model.liveSourcesInvalidItems > 0 || model.liveEntryInvalidItems > 0 {
-                        Text("部分提示字段异常：必需字段异常 \(model.liveEntryInvalidItems) 次；优先级异常 \(model.livePriorityInvalidItems) 条，仅保留记录；来源异常 \(model.liveSourcesInvalidItems) 条，无法解读的来源保持未知。")
+                    Text("部分提示信息不完整，可能无法在悬浮窗显示。")
                             .font(.footnote)
                             .foregroundColor(.orange)
                     }
@@ -75,12 +75,13 @@ struct ContentView: View {
                         .font(.footnote)
                         .foregroundColor(model.serviceStatusText.contains("未收到") ||
                                          model.serviceStatusText.contains("失败") ||
+                                         model.serviceStatusText.contains("未成功") ||
                                          model.serviceStatusText.contains("无效") ? .orange : .secondary)
                 }
 
                 if model.liveActive {
                     Section(header: Text("本机提示与屏幕广播"),
-                            footer: Text("系统控制广播授权与开始/停止；屏识不能静默开启广播。PiP 和广播是否在同机正常运行仍需真机确认。")) {
+                            footer: Text("屏幕广播需要在系统弹窗中由你确认。")) {
                         if model.liveConnectionPending {
                             Text("同一场实时服务尚未确认，本机采集暂缓；不会自动重发后台启动或创建新场次。")
                                 .font(.footnote)
@@ -110,24 +111,10 @@ struct ContentView: View {
                         Text(model.observationUploadStatus)
                             .font(.footnote)
                             .foregroundColor(.secondary)
-                        Text("仅统计已识别的采样；忙碌时跳过的帧及画面漏识不在统计内。")
-                            .font(.footnote)
-                            .foregroundColor(.secondary)
-                        HStack {
-                            Text("已完成 OCR 轮次")
-                            Spacer()
-                            Text("\(model.roundCounter)")
-                                .foregroundColor(.secondary)
-                        }
-                        if let t = model.lastUpdated {
-                            Text("最近完成：\(t, style: .time)")
-                                .font(.footnote)
-                                .foregroundColor(.secondary)
-                        }
                     }
 
                     Section {
-                        NavigationLink("当前收到的运营事件记录") {
+                        NavigationLink("本场建议记录") {
                             LiveEventListView(events: model.liveEvents)
                         }
                     }
@@ -136,7 +123,7 @@ struct ContentView: View {
                 if model.liveStopped {
                     Section(header: Text("本场复盘"),
                             footer: Text("结束辅助不会替你关闭 iOS 系统广播；如果系统仍显示正在广播，请从系统广播状态栏停止。")) {
-                        NavigationLink("场次概览与事件记录") {
+                        NavigationLink("本场复盘") {
                             LiveSessionOverviewView(model: model)
                         }
                     }
@@ -222,7 +209,7 @@ private struct AdvancedSettingsView: View {
                     }
                 }
 
-                Section(header: Text("识别区域（归一化）"),
+                Section(header: Text("识别区域"),
                         footer: Text(roiLimitationNote)) {
                     NavigationLink("编辑识别区域") {
                         ROIEditorView(roi: $model.roi)
@@ -248,7 +235,7 @@ private struct AdvancedSettingsView: View {
                     }
                     .disabled(model.liveActive)
 
-                    Text("当前人物区域：\(roiSummary(for: model.personROI))")
+                    Text("人物区域：\(OperatorPresentation.personROISummary(configured: SharedConfig.personROI() != nil))")
                         .font(.footnote)
                         .foregroundColor(.secondary)
 
@@ -355,21 +342,11 @@ private struct AdvancedSettingsView: View {
                             .font(.footnote)
                             .foregroundColor(.secondary)
                     } else {
-                        Toggle("识别开关（扩展按此决定是否处理）", isOn: $model.captureWanted)
+                        Toggle("识别开关", isOn: $model.captureWanted)
                         BroadcastPickerSection(showsMicrophoneButton: model.audioSettings.enabled &&
                             model.audioSettings.includes("audioMic"))
                             .frame(width: BroadcastPickerSection.buttonSize,
                                    height: BroadcastPickerSection.buttonSize)
-                    }
-                    HStack {
-                        Text("已处理轮次")
-                        Spacer()
-                        Text("\(model.roundCounter)")
-                            .foregroundColor(.secondary)
-                        if let t = model.lastUpdated {
-                            Text("（\(t, style: .time)）")
-                                .foregroundColor(.secondary)
-                        }
                     }
                 }
 
@@ -390,11 +367,11 @@ private struct AdvancedSettingsView: View {
                         }
                         Text("未确认时转写仅作参考，不生成语速或停顿结论。")
                             .font(.footnote).foregroundColor(.secondary)
-                        Text(model.audioStatus.phase).font(.footnote)
-                        Text("应用块 \(model.audioStatus.copiedApp) · 麦克风块 \(model.audioStatus.copiedMic) · 已送包 \(model.audioStatus.uploaded) · 丢弃 \(model.audioStatus.dropped)")
-                            .font(.caption).foregroundColor(.secondary)
-                        if let issue = model.audioStatus.issue {
-                            Text(issue).font(.footnote).foregroundColor(.orange)
+                        Text(model.audioStatus.phase == AudioCaptureStatus.receivingPCMPhase
+                             ? "正在接收音频，请确认声音来源" : model.audioStatus.phase).font(.footnote)
+                        if model.audioStatus.issue != nil {
+                            Text("音频处理暂不可用，请检查广播与音频设置。")
+                                .font(.footnote).foregroundColor(.orange)
                         }
                     }
                 }
@@ -418,7 +395,7 @@ private struct AdvancedSettingsView: View {
                 }
                 Button("取消", role: .cancel) { }
             } message: {
-                Text("将设置评论 x=0.03 y=0.69 w=0.82 h=0.25、人数 x=0.80 y=0.055 w=0.10 h=0.045、人物 x=0 y=0.14 w=1 h=0.80。已有这三类自定义框会被替换；平台提醒区域保持原样（默认未配置）。请在主播界面核对后再开始采集。")
+                Text("将替换已设置的评论、人数和人物区域，平台提醒区域保持不变。请在主播界面核对后再开始采集。")
             }
     }
 
@@ -426,21 +403,21 @@ private struct AdvancedSettingsView: View {
         roiSummary(for: model.roi)
     }
 
-    private func roiSummary(for r: CGRect) -> String {
-        return String(format: "x=%.2f  y=%.2f  宽=%.2f  高=%.2f", r.minX, r.minY, r.width, r.height)
+    private func roiSummary(for _: CGRect) -> String {
+        "已设置，请按示意图核对"
     }
 
     private let roiLimitationNote =
-        "iOS 公开 API 无法在其他 App 上叠加任意可拖矩形选择。识别区域在此编辑：以竖屏满屏为参照的归一化矩形，广播期间扩展按同一比例裁剪当前屏幕内容。"
+        "以竖屏画面为参照选择需要识别的区域，开始广播后请核对画面位置。"
 
     private let pipFooter =
-        "主展示路径：在前台启动 PiP，再开广播并切到目标应用；主 App listener 随 PiP 启停，回复通过 App Group UDS 短通道到 PiP。PiP 启动时使用系统要求的 playback 音频会话并混音，不播放静音内容；后台实际存活仍需真机验证，系统仍可能挂起进程或暂时暂停 PiP。关闭 PiP 后扩展无法连接时会有限重试并丢弃回复，不写文件或转通知。广播停止则停止识别。广播采集整个屏幕（含 PiP），请把 PiP 拖离识别区域以降低回声风险；公开 API 无法读取 PiP 位置或保证覆盖区域触摸穿透。"
+        "先启动悬浮窗，再开启系统广播并切到直播界面。请将悬浮窗移出识别区域；关闭悬浮窗后提示可能无法显示。系统可能暂停悬浮窗。"
 
     private let startGuide =
-        "旧快问快答：打开识别开关，在前台启动 PiP，再点系统广播按钮并确认，最后切到目标应用。直播辅助：先在首页开始本场，再按首页步骤启动 PiP 和系统广播。暂停可关闭识别开关；停止系统广播由系统状态栏操作。关闭 PiP 会停止回复 listener，通道不可达时短回复会丢弃。采集授权、状态栏提示与受保护画面限制均由系统承载；广播不能由 App 静默启动。"
+        "先打开识别开关并启动悬浮窗，再点击系统广播按钮确认。直播辅助请先在首页开始本场。暂停可关闭识别开关，停止广播请使用系统状态栏。"
 
     private let guideText =
-        "本 App 与“屏识AI广播”扩展通过 App Group 共享配置与控制开关，并通过 UDS 传递短回复；句子和回复正文仅在进程内存及 socket 内核缓冲短暂存在，不写文件或偏好设置。识别与请求在广播扩展进程内完成，画面仅内存处理。"
+        "请先设置识别区域，开始本场后按首页提示开启悬浮窗和系统广播。完成后结束本场，并在系统状态栏停止广播。"
 }
 
 private struct LiveSessionOverviewView: View {
@@ -449,54 +426,13 @@ private struct LiveSessionOverviewView: View {
     var body: some View {
         List {
             if let summary = model.liveSummary {
-            Section(header: Text("辅助场次")) {
-                dateRow("开始", milliseconds: summary.startedAtMS)
-                if let stopped = summary.stoppedAtMS {
-                    dateRow("结束", milliseconds: stopped)
-                    row("辅助时长", duration(stopped - summary.startedAtMS))
+                Section(header: Text("本场时间")) {
+                    dateRow("开始", milliseconds: summary.startedAtMS)
+                    if let stopped = summary.stoppedAtMS {
+                        dateRow("结束", milliseconds: stopped)
+                        row("辅助时长", OperatorPresentation.duration(start: summary.startedAtMS, end: stopped))
+                    }
                 }
-            }
-            Section(header: Text("采样在线人数"), footer: Text("仅表示本辅助场次采样到的屏幕读数，不代表抖音完整统计。")) {
-                if let peak = summary.onlineCount.peak {
-                    row("采样峰值", "\(peak.approximate ? "约" : "")\(number(peak.nominalValue, maximumFractionDigits: 0)) 人")
-                    row("峰值屏幕原文", peak.rawText)
-                    row("显示单位", peak.displayUnit)
-                } else {
-                    row("采样峰值", "未知（没有有效读数）")
-                }
-                if let average = summary.onlineCount.timeWeightedAverage {
-                    row("有效时段平均", "\(average.approximate ? "约" : "")\(number(average.nominalValue, maximumFractionDigits: 1)) 人")
-                } else {
-                    row("有效时段平均", "未知（没有有效连续采样时段）")
-                }
-                if let recorded = summary.onlineCount.coverage.recordedSamples {
-                    let valid = summary.onlineCount.coverage.validValueSamples ?? 0
-                    row("有效采样覆盖", "\(valid) / \(recorded) 条；加权时段 \(duration(summary.onlineCount.coverage.coveredDurationMS ?? 0))")
-                }
-                let coverage = summary.onlineCount.coverage
-                if let gaps = coverage.uncoveredIntervals, gaps > 0 {
-                    row("采样断档", "\(gaps) 段；最长 \(duration(coverage.longestUncoveredIntervalMS ?? 0))")
-                }
-                if let before = coverage.uncoveredBeforeFirstValidMS, before > 0 {
-                    row("首个有效读数前", "未覆盖 \(duration(before))")
-                }
-                if let after = coverage.uncoveredAfterLastValidMS, after > 0 {
-                    row("末个有效读数后", "未覆盖 \(duration(after))")
-                }
-                if let issues = coverage.sampleIssues, !issues.isEmpty {
-                    let labels = issues.sorted { $0.key < $1.key }.map { "\(issueName($0.key)) \($0.value)" }
-                    row("缺失／无效样本", labels.joined(separator: "、"))
-                }
-            }
-            if let recap = summary.backstageRecap {
-                backstageSection(recap)
-            } else {
-                Section(header: Text("后台五项汇总"),
-                        footer: Text("服务未返回本场后台任务记录，五项结果保持未知；运营事件记录单独保留。")) {
-                    row("任务状态", "未返回后台任务记录")
-                    Text(model.liveStatus).font(.footnote).foregroundColor(.secondary)
-                }
-            }
             } else {
                 Section(header: Text("本场概览")) {
                     if model.overviewLoading {
@@ -509,37 +445,34 @@ private struct LiveSessionOverviewView: View {
                     }
                 }
             }
-            Section(header: Text("事件记录（\(model.liveEvents.count)条）")) {
+            Section(header: Text("建议记录（\(model.liveEvents.count)条）")) {
                 if model.liveEvents.isEmpty {
-                    Text("当前没有可显示的运营事件")
-                        .foregroundColor(.secondary)
+                    Text("暂无建议记录").foregroundColor(.secondary)
                 } else {
                     ForEach(model.liveEvents) { event in
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack(spacing: 4) {
-                                Text(Date(timeIntervalSince1970: Double(event.startAtMS) / 1000), style: .time)
-                                if event.endAtMS > event.startAtMS {
-                                    Text("–")
-                                    Text(Date(timeIntervalSince1970: Double(event.endAtMS) / 1000), style: .time)
-                                }
-                            }
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            Text(LivePromptDelivery.promptLabel(event.promptType)).font(.caption)
-                            Text(event.phenomenon).font(.subheadline)
-                            Text(event.displayText).font(.body)
-                            if event.promptType == "comment_reply", let reply = event.replyTo {
-                                Text("原评论：\(reply.nickname.flatMap { $0.isEmpty ? nil : "\($0)：" } ?? "")\(reply.text)")
-                                    .font(.footnote).foregroundColor(.secondary)
-                            }
-                            if event.priorityInvalid {
-                                Text("优先级异常，无法用于画中画调度")
-                                    .font(.footnote).foregroundColor(.orange)
-                            }
-                        }
-                        .padding(.vertical, 4)
+                        LiveEventRow(event: event)
                     }
                 }
+            }
+            if let summary = model.liveSummary {
+            Section(header: Text("在线人数")) {
+                if let peak = summary.onlineCount.peak,
+                   let value = OperatorPresentation.people(peak.nominalValue, approximate: peak.approximate) {
+                    row("画面参考峰值", value)
+                    Text("仅供参考，画面读数可能不完整，不代表平台全场统计。")
+                        .font(.footnote).foregroundColor(.secondary)
+                } else {
+                    Text("暂无可用的在线人数数据").foregroundColor(.secondary)
+                }
+            }
+            if let recap = summary.backstageRecap {
+                backstageSection(recap)
+            } else {
+                Section(header: Text("后台复盘")) {
+                    Text("暂无本场后台复盘数据").foregroundColor(.secondary)
+                    Text(model.liveStatus).font(.footnote).foregroundColor(.secondary)
+                }
+            }
             }
         }
         .navigationTitle("本场概览")
@@ -560,39 +493,27 @@ private struct LiveSessionOverviewView: View {
 
     @ViewBuilder
     private func backstageSection(_ recap: LiveBackstageRecap) -> some View {
-        Section(header: Text("后台五项汇总"),
-                footer: Text("按App结束信号读取的主播后台页面快照，不代表平台最终结算；近似原文按原精度展示。")) {
+        Section(header: Text("后台复盘"),
+                footer: Text("后台页面读数仅供参考，不代表平台最终结算。")) {
             row("任务状态", statusText(recap))
-            row("抖音号快照", recap.douyinAccount)
-            if let roomID = recap.roomID, !roomID.isEmpty { row("场次线索", roomID) }
             if let metrics = recap.metrics {
-                metricRow("累计观众", value: metrics.cumulativeAudience, raw: recap.rawDisplays?["累计观众"], approximate: recap.approximateMetrics.contains("累计观众"), missing: recap.missingFields["累计观众"])
-                metricRow("新增粉丝", value: metrics.newFollowers, raw: recap.rawDisplays?["新增粉丝"], approximate: recap.approximateMetrics.contains("新增粉丝"), missing: recap.missingFields["新增粉丝"])
-                metricRow("评论人数", value: metrics.commentCount, raw: recap.rawDisplays?["评论人数"], approximate: recap.approximateMetrics.contains("评论人数"), missing: recap.missingFields["评论人数"])
-                metricRow("送礼人数", value: metrics.giftGivers, raw: recap.rawDisplays?["送礼人数"], approximate: recap.approximateMetrics.contains("送礼人数"), missing: recap.missingFields["送礼人数"])
-                metricRow("获得音浪", value: metrics.soundEnergy, raw: recap.rawDisplays?["获得音浪"], approximate: recap.approximateMetrics.contains("获得音浪"), missing: recap.missingFields["获得音浪"])
+                metricRow("累计观众", value: metrics.cumulativeAudience, approximate: recap.approximateMetrics.contains("累计观众"))
+                metricRow("新增粉丝", value: metrics.newFollowers, approximate: recap.approximateMetrics.contains("新增粉丝"))
+                metricRow("评论人数", value: metrics.commentCount, approximate: recap.approximateMetrics.contains("评论人数"))
+                metricRow("送礼人数", value: metrics.giftGivers, approximate: recap.approximateMetrics.contains("送礼人数"))
+                metricRow("获得音浪", value: metrics.soundEnergy, approximate: recap.approximateMetrics.contains("获得音浪"))
             } else {
-                row("五项读数", "尚未取得；缺失项保持未知")
+                Text("暂无本场后台复盘数据").foregroundColor(.secondary)
             }
-            if let captured = recap.metricsCapturedAt { row("实际采集时间", captured) }
-            if let received = recap.receivedAtMS { dateRow("服务端收到", milliseconds: received) }
-            if let method = recap.captureMethod { row("读取方式", method) }
-            if !recap.missingFields.isEmpty {
-                let missing = recap.missingFields.sorted { $0.key < $1.key }
-                    .map { "\($0.key)：\($0.value)" }.joined(separator: "；")
-                row("缺失说明", missing)
-            }
-            Text(model.liveStatus).font(.footnote).foregroundColor(.secondary)
         }
     }
 
     @ViewBuilder
-    private func metricRow(_ name: String, value: Int?, raw: String?, approximate: Bool, missing: String?) -> some View {
+    private func metricRow(_ name: String, value: Int?, approximate: Bool) -> some View {
         if let value {
-            let original = raw.map { "原文：\($0)；" } ?? ""
-            row(name, "\(approximate ? "约" : "")\(value)（\(original)\(approximate ? "按屏幕缩写折算" : "已读数值")）")
+            row(name, "\(approximate ? "约" : "")\(value)")
         } else {
-            row(name, "未知\(missing.map { "（\($0)）" } ?? "（未取得）")")
+            row(name, "暂无数据")
         }
     }
 
@@ -621,7 +542,7 @@ private struct LiveSessionOverviewView: View {
     }
 
     private func dateRow(_ title: String, milliseconds: Int64) -> some View {
-        row(title, Date(timeIntervalSince1970: Double(milliseconds) / 1000).formatted(date: .abbreviated, time: .shortened))
+        row(title, OperatorPresentation.date(milliseconds))
     }
 
     private func row(_ title: String, _ value: String) -> some View {
@@ -632,35 +553,6 @@ private struct LiveSessionOverviewView: View {
         }
     }
 
-    private func number(_ value: Double, maximumFractionDigits: Int) -> String {
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        formatter.locale = Locale(identifier: "zh_CN")
-        formatter.maximumFractionDigits = maximumFractionDigits
-        formatter.minimumFractionDigits = 0
-        return formatter.string(from: NSNumber(value: value)) ?? String(value)
-    }
-
-    private func duration(_ milliseconds: Int64) -> String {
-        let seconds = max(0, milliseconds / 1000)
-        let hours = seconds / 3600
-        let minutes = (seconds % 3600) / 60
-        let remaining = seconds % 60
-        if hours > 0 { return "\(hours)小时\(minutes)分" }
-        if minutes > 0 { return "\(minutes)分\(remaining)秒" }
-        return "\(remaining)秒"
-    }
-
-    private func issueName(_ reason: String) -> String {
-        switch reason {
-        case "source_missing": return "未读到"
-        case "count_unreadable": return "数字无法解析"
-        case "field_semantics_unconfirmed": return "字段未确认"
-        case "late": return "过期"
-        case "unreliable", "source_unreliable": return "不可靠"
-        default: return reason
-        }
-    }
 }
 
 private struct LiveEventListView: View {
@@ -668,30 +560,25 @@ private struct LiveEventListView: View {
 
     var body: some View {
         List(events) { event in
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 4) {
-                    Text(Date(timeIntervalSince1970: Double(event.startAtMS) / 1000), style: .time)
-                    if event.endAtMS > event.startAtMS {
-                        Text("–")
-                        Text(Date(timeIntervalSince1970: Double(event.endAtMS) / 1000), style: .time)
-                    }
-                }
-                .font(.caption)
-                .foregroundColor(.secondary)
-                Text(LivePromptDelivery.promptLabel(event.promptType)).font(.caption)
-                Text(event.phenomenon).font(.subheadline)
-                Text(event.displayText).font(.body)
-                if event.promptType == "comment_reply", let reply = event.replyTo {
-                    Text("原评论：\(reply.nickname.flatMap { $0.isEmpty ? nil : "\($0)：" } ?? "")\(reply.text)")
-                        .font(.footnote).foregroundColor(.secondary)
-                }
-                if event.priorityInvalid {
-                    Text("优先级异常，无法用于画中画调度")
-                        .font(.footnote).foregroundColor(.orange)
-                }
-            }
-            .padding(.vertical, 4)
+            LiveEventRow(event: event)
         }
-        .navigationTitle("本场事件记录")
+        .navigationTitle("本场建议记录")
+    }
+}
+
+private struct LiveEventRow: View {
+    let event: LivePrompt
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(OperatorPresentation.date(event.startAtMS)).font(.caption).foregroundColor(.secondary)
+            Text(LivePromptDelivery.promptLabel(event.promptType)).font(.caption)
+            Text(event.displayText).font(.body)
+            if event.promptType == "comment_reply", let reply = event.replyTo {
+                Text("原评论：\(reply.nickname.flatMap { $0.isEmpty ? nil : "\($0)：" } ?? "")\(reply.text)")
+                    .font(.footnote).foregroundColor(.secondary)
+            }
+        }
+        .padding(.vertical, 4)
     }
 }

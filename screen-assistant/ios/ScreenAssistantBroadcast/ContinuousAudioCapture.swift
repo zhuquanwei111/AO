@@ -176,7 +176,7 @@ final class ContinuousAudioCapture {
             if old?.credentials.sessionID != current?.credentials.sessionID { status = AudioCaptureStatus() }
         }
         status.dropped += dropped
-        status.phase = current == nil ? (settings.enabled ? "等待广播和本场辅助" : "未启用") : "接收系统PCM；来源需核对"
+        status.phase = current == nil ? (settings.enabled ? "等待广播和本场辅助" : "未启用") : AudioCaptureStatus.receivingPCMPhase
         status.save()
     }
 

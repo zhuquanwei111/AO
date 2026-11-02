@@ -165,10 +165,10 @@ struct SharedConfig {
     }
 
     /// 直播人物采样区域；未设置时人物观察器继续沿用既有输入诊断区域。
-    static func personROI() -> CGRect? {
+    static func personROI(defaults: UserDefaults? = AppGroup.defaults) -> CGRect? {
         configuredROI(enabledKey: Keys.personROIEnabled, xKey: Keys.personROIX,
                       yKey: Keys.personROIY, widthKey: Keys.personROIWidth,
-                      heightKey: Keys.personROIHeight)
+                      heightKey: Keys.personROIHeight, defaults: defaults)
     }
 
     static func setPersonROI(_ roi: CGRect?) {
@@ -178,8 +178,9 @@ struct SharedConfig {
     }
 
     private static func configuredROI(enabledKey: String, xKey: String, yKey: String,
-                                      widthKey: String, heightKey: String) -> CGRect? {
-        guard let defaults = AppGroup.defaults, defaults.bool(forKey: enabledKey) else { return nil }
+                                      widthKey: String, heightKey: String,
+                                      defaults: UserDefaults? = AppGroup.defaults) -> CGRect? {
+        guard let defaults, defaults.bool(forKey: enabledKey) else { return nil }
         let x = defaults.double(forKey: xKey)
         let y = defaults.double(forKey: yKey)
         let width = defaults.double(forKey: widthKey)

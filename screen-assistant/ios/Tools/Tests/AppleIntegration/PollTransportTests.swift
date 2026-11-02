@@ -104,6 +104,54 @@ private final class PollFixtureProtocol: URLProtocol {
 }
 
 final class PollTransportTests: XCTestCase {
+    func testOperatorHistoricalUploadAndPersonAreaPresentation() {
+        func upload(_ counts: [String: Int]) -> String {
+            OperatorPresentation.observationUploadDescription { counts[$0, default: 0] }
+        }
+        let unsent = "本机历史：部分识别内容未发送。"
+        XCTAssertEqual(upload(["expired": 1]), unsent)
+        XCTAssertEqual(upload(["cancel_unsent": 1, "received": 1]), unsent)
+        XCTAssertEqual(upload(["expired": 1, "cancel_unsent": 1]), unsent)
+        XCTAssertEqual(upload(["waiting_batches": 1]), "暂未收到画面信息。")
+        XCTAssertEqual(upload(["overflow_batch": 1, "overflow_comment": 1]), "本机历史：曾有画面信息未送达。")
+        XCTAssertEqual(upload(["unknown": 1, "expired": 1]), "本机历史：曾有发送结果未确认；部分识别内容未发送。")
+        XCTAssertEqual(OperatorPresentation.personROISummary(configured: true), "已设置")
+        XCTAssertEqual(OperatorPresentation.personROISummary(configured: false), "未单独设置")
+    }
+
+    func testPersonAreaPresentationUsesValidSavedConfiguration() throws {
+        let suite = "operator.person-roi.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        func summary() -> String {
+            OperatorPresentation.personROISummary(configured: SharedConfig.personROI(defaults: defaults) != nil)
+        }
+        XCTAssertEqual(summary(), "未单独设置")
+        defaults.set(true, forKey: "config.personROI.enabled")
+        defaults.set(0.1, forKey: "config.personROI.x")
+        defaults.set(0.2, forKey: "config.personROI.y")
+        defaults.set(0.0, forKey: "config.personROI.width")
+        defaults.set(0.4, forKey: "config.personROI.height")
+        XCTAssertEqual(summary(), "未单独设置")
+        defaults.set(0.3, forKey: "config.personROI.width")
+        XCTAssertEqual(summary(), "已设置")
+        defaults.set(1.0, forKey: "config.personROI.width")
+        XCTAssertEqual(summary(), "未单独设置")
+    }
+
+    func testOperatorPresentationDistinguishesMissingAndUsesLocalTimezone() {
+        let locale = Locale(identifier: "en_US_POSIX")
+        let start: Int64 = 1_704_151_800_000
+        let utc = TimeZone(secondsFromGMT: 0)!
+        let east = TimeZone(secondsFromGMT: 8 * 3600)!
+        XCTAssertTrue(OperatorPresentation.date(start, locale: locale, timeZone: utc).contains("1/1/24"))
+        XCTAssertTrue(OperatorPresentation.date(start, locale: locale, timeZone: east).contains("1/2/24"))
+        XCTAssertEqual(OperatorPresentation.duration(start: start, end: start + 7_200_000), "2小时0分")
+        XCTAssertEqual(OperatorPresentation.duration(start: start, end: start - 1), "时长待确认")
+        XCTAssertNil(OperatorPresentation.people(nil, approximate: false, locale: locale))
+        XCTAssertEqual(OperatorPresentation.people(0, approximate: false, locale: locale), "0 人")
+    }
+
     func testPromptMinimumReadingTimeAndUrgentDeadline() {
         func item(_ id: String, expiry: Int64, priority: Int = 25, type: String? = nil) -> LivePromptDelivery.Item {
             .init(id: id, text: id, expiresAtMS: expiry, priority: priority, promptType: type)

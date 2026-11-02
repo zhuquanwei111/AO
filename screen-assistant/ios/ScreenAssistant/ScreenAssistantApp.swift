@@ -801,14 +801,9 @@ final class AppModel: ObservableObject {
     }
 
     private static func observationUploadDescription() -> String {
-        guard let defaults = AppGroup.defaults else { return "采样上传诊断不可用" }
+        guard let defaults = AppGroup.defaults else { return "画面信息状态暂不可用" }
         func value(_ key: String) -> Int { defaults.integer(forKey: "observation.upload.\(key)") }
-        let overLimit = ["limit_comment", "limit_count", "bytes_comment", "bytes_count",
-                         "oversize_comment", "oversize_count"]
-            .reduce(0) { $0 + value($1) }
-        let invalid = value("invalid_comment") + value("invalid_count")
-        let sending = defaults.bool(forKey: "observation.upload.sending") ? "发送中" : "未发送中"
-        return "采样上传（本机累计）：已接收 \(value("received"))，幂等重复 \(value("duplicate"))，服务端合并 \(value("merged"))；结果未知 \(value("unknown"))，服务端拒绝 \(value("rejected"))。未发送：队列满 \(value("overflow_batch")) 批（评论 \(value("overflow_comment"))、人数 \(value("overflow_count"))），超限 \(overLimit)，无效 \(invalid)，过期 \(value("expired"))，停止或断连余项 \(value("cancel_unsent"))；本机时钟回拨 \(value("clock_backward"))。最近报告：\(sending)，待发批次 \(value("waiting_batches"))。"
+        return OperatorPresentation.observationUploadDescription(value: value)
     }
 
     private static func isServiceFailure(_ phase: ControlState.ServicePhase) -> Bool {
@@ -827,8 +822,7 @@ final class AppModel: ObservableObject {
         case .unreachable:
             return stale ? "最近请求未收到服务响应；尚未通过新请求确认恢复" : "最近请求未收到服务响应；新请求会重试"
         case .respondedWithError:
-            let code = status.httpStatusCode > 0 ? "（HTTP \(status.httpStatusCode)）" : ""
-            return stale ? "服务曾响应但请求失败\(code)；等待新请求确认" : "服务已响应但请求失败\(code)"
+            return stale ? "上次服务请求失败，当前连接状态待确认" : "服务请求未成功，请检查服务设置"
         case .configurationInvalid:
             return "服务地址无效；请到采集与服务设置检查"
         }
