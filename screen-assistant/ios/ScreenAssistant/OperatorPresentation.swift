@@ -21,7 +21,7 @@ enum OperatorPresentation {
     }
 
     static func personROISummary(configured: Bool) -> String {
-        configured ? "已设置，请按示意图核对" : "未单独设置"
+        configured ? "已设置" : "未单独设置"
     }
 
     static func date(_ milliseconds: Int64, locale: Locale = .autoupdatingCurrent,

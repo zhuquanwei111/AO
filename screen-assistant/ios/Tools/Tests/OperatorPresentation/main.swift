@@ -28,6 +28,6 @@ assert(upload(["oversize_comment": 1]) == "本机历史：曾有画面信息未�
 assert(upload(["unknown": 1]) == "本机历史：曾有发送结果未确认。")
 assert(upload(["rejected": 1]) == "本机历史：曾有画面信息未送达。")
 assert(upload(["received": 1]) == "本机历史：曾收到过画面信息。")
-assert(OperatorPresentation.personROISummary(configured: true) == "已设置，请按示意图核对")
+assert(OperatorPresentation.personROISummary(configured: true) == "已设置")
 assert(OperatorPresentation.personROISummary(configured: false) == "未单独设置")
 print("OK: locale, timezone, cross-day duration and missing versus zero")
