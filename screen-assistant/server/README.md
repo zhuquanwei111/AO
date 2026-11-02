@@ -315,6 +315,8 @@ loopback Redis，核对目录身份后为旧测试提供 `TEST_REDIS_URL`，结�
 
 `not_connected` 既可能来自后台忙，也可能来自场次停止时未领取；现有字段不区分原因，也不能反向推断执行器在线状态。旧客户端可能将它显示成待处理或已绑定，需要客户端按上述状态更新；服务端改动本身不改变已安装 App 的文案。
 
+对于确认遗留的未领取任务，受控 worker 可调用 `POST /v1/live/sessions/backstage/tasks/{task_id}/recover`，使用既有 worker 鉴权并提交 `expected_status=waiting_for_stop` 和准确的整数 `expected_created_at_ms`。服务端仅接受至少 24 小时、未领取、未停止、无结果且场次未停止的精确任务；领取与恢复通过 SQLite 写事务互斥。恢复保留场次及任务原记录，任务转为 `not_connected`，新增 `recovered_at_ms` 与固定 `recovery_reason=stale_unclaimed` 审计字段，不生成 stop 或复盘结果。重复相同身份请求返回原恢复时间；其他状态或创建时间变化返回 409。恢复并不停止原场，也不使已有 `not_connected` 任务重新领取。新字段由启动时的增量迁移加入；部署前须备份数据库，回退时保留新增列和原数据。
+
 M3 在 M2 fixture 契约上增加 `input_mode=live_observation`，不改变旧 `/v1/answer`。
 ReplayKit OCR 保留逐行文本框：iOS 将裁剪ROI内的 Vision 框映射为全屏左上原点归一化
 `text_position`，并提交 `source=ios_replaykit_ocr` 与 `observed_at_ms`。运营分支只挑
