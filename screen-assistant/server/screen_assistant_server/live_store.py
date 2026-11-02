@@ -1041,10 +1041,10 @@ class LiveStore:
             counts[comment_id] = counts.get(comment_id, 0) + 1
             opportunity = self.coaching_opportunities.get(sid)
             if opportunity is not None:
-                if trigger_epoch == opportunity["epoch"] and latest_epoch is not None:
-                    opportunity["epoch"] = max(opportunity["epoch"], latest_epoch)
-                elif trigger_epoch > opportunity["epoch"]:
+                if trigger_epoch > opportunity["epoch"]:
                     opportunity["replies_after"] = 1
+                if latest_epoch is not None and latest_epoch > trigger_epoch:
+                    opportunity["epoch"] = max(opportunity["epoch"], latest_epoch)
         if terminal:
             return
         if counts.get(comment_id, 0) >= 2:
