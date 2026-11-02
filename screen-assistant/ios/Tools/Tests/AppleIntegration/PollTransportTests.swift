@@ -104,6 +104,40 @@ private final class PollFixtureProtocol: URLProtocol {
 }
 
 final class PollTransportTests: XCTestCase {
+    func testConfirmedBackstageBusinessOutcomeUsesStrictEvidence() throws {
+        let keys = ["累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪"]
+        func decode(code: String = "not_live", status: String = "failed", stop: Bool = true,
+                    room: Any? = NSNull(), metrics: [String: Any]? = nil,
+                    reasons: [String: String]? = nil, raw: [String: String]? = nil) throws -> LiveBackstageRecap {
+            var obj: [String: Any] = ["task_id": "test", "status": status, "douyin_account": "test",
+                "stop_signal_received": stop, "started_at_ms": 1,
+                "metrics": metrics ?? Dictionary(uniqueKeysWithValues: keys.map { ($0, NSNull()) }),
+                "approximate_metrics": [], "missing_fields": reasons ?? Dictionary(uniqueKeysWithValues: keys.map { ($0, code) }),
+                "start_signal_source": "ios_app"]
+            if let room { obj["room_id"] = room }
+            if let raw { obj["raw_displays"] = raw }
+            return try JSONDecoder().decode(LiveBackstageRecap.self, from: JSONSerialization.data(withJSONObject: obj))
+        }
+        XCTAssertEqual(BackstageStatusPresentation.confirmedBusinessOutcome(try decode()), "主播当前未开播")
+        XCTAssertEqual(BackstageStatusPresentation.confirmedBusinessOutcome(try decode(code: "account_not_found")), "未找到该抖音号")
+        XCTAssertNil(BackstageStatusPresentation.confirmedBusinessOutcome(try decode(code: "unknown")))
+        XCTAssertNil(BackstageStatusPresentation.confirmedBusinessOutcome(try decode(status: "needs_input")))
+        XCTAssertNil(BackstageStatusPresentation.confirmedBusinessOutcome(try decode(stop: false)))
+        XCTAssertNil(BackstageStatusPresentation.confirmedBusinessOutcome(try decode(room: "room")))
+        XCTAssertNil(BackstageStatusPresentation.confirmedBusinessOutcome(try decode(room: nil)))
+        var reasons = Dictionary(uniqueKeysWithValues: keys.map { ($0, "not_live") })
+        reasons.removeValue(forKey: keys[0])
+        XCTAssertNil(BackstageStatusPresentation.confirmedBusinessOutcome(try decode(reasons: reasons)))
+        reasons[keys[0]] = "account_not_found"
+        XCTAssertNil(BackstageStatusPresentation.confirmedBusinessOutcome(try decode(reasons: reasons)))
+        var metrics: [String: Any] = Dictionary(uniqueKeysWithValues: keys.map { ($0, NSNull()) })
+        metrics[keys[0]] = 0
+        XCTAssertNil(BackstageStatusPresentation.confirmedBusinessOutcome(try decode(metrics: metrics)))
+        metrics.removeValue(forKey: keys[0])
+        XCTAssertNil(BackstageStatusPresentation.confirmedBusinessOutcome(try decode(metrics: metrics)))
+        XCTAssertNil(BackstageStatusPresentation.confirmedBusinessOutcome(try decode(raw: [keys[0]: "1"])))
+        XCTAssertNil(BackstageStatusPresentation.confirmedBusinessOutcome(try decode(code: "account_not_found", raw: [keys[4]: "--"])))
+    }
     func testBackstageMetricPreservesZeroAndHonorsExplicitMissing() {
         XCTAssertEqual(OperatorPresentation.recapMetric(value: 0, approximate: false, missing: false), "0")
         XCTAssertEqual(OperatorPresentation.recapMetric(value: 12_000, approximate: true, missing: false), "约12000")

@@ -511,6 +511,7 @@ private struct LiveSessionOverviewView: View {
     }
 
     private func statusText(_ recap: LiveBackstageRecap) -> String {
+        if let outcome = BackstageStatusPresentation.confirmedBusinessOutcome(recap) { return outcome }
         switch recap.status {
         case "waiting_for_stop":
             if recap.claimedAtMS != nil { return "取数任务已领取，等待本场结果" }

@@ -344,12 +344,26 @@ struct LiveBackstageMetrics: Decodable {
     let commentCount: Int?
     let giftGivers: Int?
     let soundEnergy: Int?
+    let allExplicitlyNull: Bool
     enum CodingKeys: String, CodingKey {
         case cumulativeAudience = "累计观众"
         case newFollowers = "新增粉丝"
         case commentCount = "评论人数"
         case giftGivers = "送礼人数"
         case soundEnergy = "获得音浪"
+    }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        cumulativeAudience = try values.decodeIfPresent(Int.self, forKey: .cumulativeAudience)
+        newFollowers = try values.decodeIfPresent(Int.self, forKey: .newFollowers)
+        commentCount = try values.decodeIfPresent(Int.self, forKey: .commentCount)
+        giftGivers = try values.decodeIfPresent(Int.self, forKey: .giftGivers)
+        soundEnergy = try values.decodeIfPresent(Int.self, forKey: .soundEnergy)
+        let keys: [CodingKeys] = [.cumulativeAudience, .newFollowers, .commentCount, .giftGivers, .soundEnergy]
+        allExplicitlyNull = try keys.allSatisfy {
+            guard values.contains($0) else { return false }
+            return try values.decodeNil(forKey: $0)
+        }
     }
 }
 
@@ -358,6 +372,7 @@ struct LiveBackstageRecap: Decodable {
     let status: String
     let douyinAccount: String
     let roomID: String?
+    let roomIDExplicitlyNull: Bool
     let stopSignalReceived: Bool
     let startedAtMS: Int64
     let stoppedAtMS: Int64?
@@ -394,6 +409,28 @@ struct LiveBackstageRecap: Decodable {
         case metricsCapturedAt = "metrics_captured_at", captureMethod = "capture_method"
         case valueSemantics = "value_semantics", missingFields = "missing_fields"
         case startSignalSource = "start_signal_source", stopSignalSource = "stop_signal_source"
+    }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        taskID = try values.decode(String.self, forKey: .taskID)
+        status = try values.decode(String.self, forKey: .status)
+        douyinAccount = try values.decode(String.self, forKey: .douyinAccount)
+        roomID = try values.decodeIfPresent(String.self, forKey: .roomID)
+        roomIDExplicitlyNull = values.contains(.roomID) ? try values.decodeNil(forKey: .roomID) : false
+        stopSignalReceived = try values.decode(Bool.self, forKey: .stopSignalReceived)
+        startedAtMS = try values.decode(Int64.self, forKey: .startedAtMS)
+        stoppedAtMS = try values.decodeIfPresent(Int64.self, forKey: .stoppedAtMS)
+        claimedAtMS = try values.decodeIfPresent(Int64.self, forKey: .claimedAtMS)
+        receivedAtMS = try values.decodeIfPresent(Int64.self, forKey: .receivedAtMS)
+        metrics = try values.decodeIfPresent(LiveBackstageMetrics.self, forKey: .metrics)
+        rawDisplays = try values.decodeIfPresent([String: String].self, forKey: .rawDisplays)
+        approximateMetrics = try values.decode([String].self, forKey: .approximateMetrics)
+        metricsCapturedAt = try values.decodeIfPresent(String.self, forKey: .metricsCapturedAt)
+        captureMethod = try values.decodeIfPresent(String.self, forKey: .captureMethod)
+        valueSemantics = try values.decodeIfPresent(String.self, forKey: .valueSemantics)
+        missingFields = try values.decode([String: String].self, forKey: .missingFields)
+        startSignalSource = try values.decode(String.self, forKey: .startSignalSource)
+        stopSignalSource = try values.decodeIfPresent(String.self, forKey: .stopSignalSource)
     }
 }
 

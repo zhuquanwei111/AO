@@ -2,6 +2,19 @@ import Foundation
 
 /// 仅描述服务端已返回的状态；任务登记、领取与结果是不同事实。
 enum BackstageStatusPresentation {
+    static func confirmedBusinessOutcome(_ recap: LiveBackstageRecap) -> String? {
+        let keys = ["累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪"]
+        guard recap.status == "failed", recap.stopSignalReceived, recap.roomIDExplicitlyNull,
+              recap.metrics?.allExplicitlyNull == true, !recap.hasMissingFieldConflict,
+              recap.missingFields.count == keys.count,
+              let code = recap.missingFields[keys[0]],
+              keys.allSatisfy({ recap.missingFields[$0] == code }) else { return nil }
+        switch code {
+        case "not_live": return "主播当前未开播"
+        case "account_not_found": return "未找到该抖音号"
+        default: return nil
+        }
+    }
     static func acceptsStartCallback(generation: Int, currentGeneration: Int,
                                      starting: Bool, stopping: Bool) -> Bool {
         starting && !stopping && generation == currentGeneration
