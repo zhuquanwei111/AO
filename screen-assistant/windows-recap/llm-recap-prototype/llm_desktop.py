@@ -1,9 +1,7 @@
 """单主播单场固定步骤。视觉选择经原Desktop.guard/click/type校验后才执行。"""
 from pathlib import Path
-from PIL import Image
 import sys
 import time
-import re
 
 LEGACY=Path(__file__).resolve().parent.parent/'fixed-recap-prototype'
 if str(LEGACY) not in sys.path: sys.path.insert(0,str(LEGACY))
@@ -40,14 +38,7 @@ class LLMDesktop(Desktop):
         return view
 
     def target(self,window,goal,toolbar=False):
-        # 有界加载恢复：只对missing多观察一次；歧义、保护、身份问题立即退出。
-        for attempt in range(2):
-            view=self.observe(window,False)
-            try: return view,self.vision.locate(view,goal,toolbar)
-            except RecapError as error:
-                if error.reason!='visual_missing' or attempt: raise
-                self.mcp.note('loading_wait',reason='visual_missing',observations=attempt+1)
-                time.sleep(1)
+        raise RecapError('navigation_visual_not_authorized')
 
     def navigate_entry(self,window):
         # Esc关闭地址建议，模型不接收浏览器历史。Ctrl+L/输入/Enter仍是程序既定动作。
@@ -64,52 +55,16 @@ class LLMDesktop(Desktop):
         self.key(window,'esc')
         return self.confirm_portal(window)
 
-    def type_account(self,view,token,account):
-        # 搜索候选由键入触发，不按Enter预先选择；每段短于现成Type剪贴板分支阈值。
-        for index,start in enumerate(range(0,len(account),19)):
-            live=self.guard(view.window)
-            if live['rect']!=view.window['rect']: raise RecapError('window_moved_before_action')
-            point=view.point(token); x,y,r,b=live['rect']
-            if not (x<point[0]<r and y<point[1]<b): raise RecapError('locator_outside_window')
-            self.mcp.call('Type',loc=point,text=account[start:start+19],clear=index==0,
-                          caret_position='end',press_enter=False)
-
     def confirm_portal(self,window):
         view=self.observe(window,False)
         if not all(portal_page_evidence(view.tokens).values()):
-            data=self.vision.read(view.image,('origin','brand','navigation'),
-                '逐字读取浏览器地址中的机构主机路径origin、机构产品名brand、主播管理或工作台navigation。')
-            origin=compact(data['origin'] or '')
-            if not re.match(r'^(?:https?://)?union\.bytedance\.com/open/portal(?:[/?#]|$)',origin,re.I):
-                raise RecapError('portal_origin_unconfirmed')
-            if '直播服务平台' not in (data['brand'] or '') or not any(q in (data['navigation'] or '') for q in ('主播','工作台')):
-                raise RecapError('portal_page_unconfirmed')
+            raise RecapError('portal_page_unconfirmed')
         return view
 
     def identity(self,view,account,live=False):
-        try:
-            require_account(view.tokens,account)
-            if not live or any('已开播' in compact(q.text) for q in view.tokens): return
-        except RecapError: pass
-        try: image=self.save_minimal(view,'identity-check.png')
-        except RecapError as error:
-            if error.reason!='evidence_region_missing': raise
-            # 列表资料行可能用抖音图标标识账号；裸账号只作裁图锚点，仍须视觉核对身份。
-            matches=[q for q in view.tokens if compact(q.text)==account and q.score>=.85]
-            if not matches: raise
-            height=max(q.h for q in matches)
-            left=min(q.box[0] for q in matches); right=max(q.box[2] for q in matches)
-            top=min(q.box[1] for q in matches); bottom=max(q.box[3] for q in matches)
-            if bottom-top>height*8 or right-left>max(q.w for q in matches)*2:
-                raise RecapError('identity_region_ambiguous')
-            image=self.evidence/'identity-check.png'
-            with Image.open(view.image) as img:
-                img.crop((max(0,int(left-height*4)),max(0,int(top-height*4)),
-                          min(img.width,int(right+height*4)),min(img.height,int(bottom+height*4)))).save(image)
-        data=self.vision.read(image,('account','live_status'),
-            '逐字读取主播资料或列表资料行的抖音号account，可能以抖音图标标识而没有“抖音号”文字。不能把搜索框输入当身份；不是主播资料或无法确认则account=null。读取“已开播”及可见时长为live_status。')
-        if data['account']!=account: raise RecapError('wrong_identity')
-        if live and '已开播' not in (data['live_status'] or ''): raise RecapError('live_status_unconfirmed')
+        require_account(view.tokens,account)
+        if live and not any('已开播' in compact(q.text) for q in view.tokens):
+            raise RecapError('live_status_unconfirmed')
 
     def launch_edge(self):
         began=time.monotonic()

@@ -47,6 +47,8 @@ Gate A需对应现有模型名`glm-5.3-flash`和天翼业务入口`https://ai.ct
 
 真实调用需Windows交互桌面、用户现有Edge登录态、安装好的四个隔离环境、外部OCR权重目录、有效Gate A及进程凭据。当前PR只交源码/配置模板，不启动桌面、模型或后台任务；不能将离线fixture测试当作抖音实播验证。
 
+截图经现有 Windows-MCP 返回后只通过进程管道驻留内存，RapidOCR 直接读取字节；整窗图不写入 observations 或 screens。导航只使用当前窗口的本地 OCR/UIA 和既有受保护动作，整页视觉导航及宽裁图回退不启用。只有当前场次及账号经校验后，才把互不重叠的目标身份、开播状态和指标文字框分别裁出并拼接为本地证据；识别到登录/验证码、重叠、歧义或边界不明时停止。视觉读取仅接受经生成的指标证据及哈希校验，子进程发出前再次校验，不以原图兜底。OCR 漏识别、文字框背景及遮挡的真实页面风险尚未排除，现有合成测试不证明裁区不含其他内容；未经验证不得启动真实桌面取数。本地证据、界面识别和模型通道仍须按实际授权和真实环境独立验收。
+
 ## 许可与来源
 
 保留源清单提供的RapidOCR及模型许可材料。RapidOCR代码为Apache-2.0，随附模型许可另见`fixed-recap-prototype/rapidocr-MODEL_LICENSES.md`及`ocr-model-manifest.json`。锁定的Agents SDK与Python MCP SDK为MIT，Windows-MCP 0.8.8为MIT，分别见[OpenAI Agents SDK许可](https://github.com/openai/openai-agents-python/blob/main/LICENSE)、[Python MCP SDK许可](https://github.com/modelcontextprotocol/python-sdk/blob/main/LICENSE)和[Windows-MCP 0.8.8发行说明](https://pypi.org/project/windows-mcp/0.8.8/)。本目录不内嵌这些依赖包；两份直接依赖列表没有完整锁定全部传递依赖，安装方仍须随实际分发检查其许可。本目录仅包含客户端适配源码，不包含Windows-MCP二进制包、模型权重、API密钥、桌面截图或本地结果。

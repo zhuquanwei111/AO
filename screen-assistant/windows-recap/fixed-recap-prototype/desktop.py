@@ -1,20 +1,25 @@
 """本后台有限步骤适配。只用现有Windows-MCP输入，UIA可见控件／当前截图OCR。"""
 from dataclasses import dataclass
+import base64
+import binascii
+import io
+import hashlib
 from pathlib import Path
 import re
 import time
 from urllib.parse import urlparse
 from PIL import Image
 
-from core import Token, RecapError, compact, unique_label, require_account, metrics_from_tokens
+from core import Token, RecapError, compact, unique_label, require_account, metrics_from_tokens, METRICS, parse_count
 from flow import now
 from transport import check_reply
+from safe_evidence import SafeEvidence
 
 
 @dataclass
 class View:
     tokens: list
-    image: Path
+    image: bytes
     window: dict
     size: tuple
     captured_at: str
@@ -62,10 +67,10 @@ def room_from_tokens(tokens):
 
 def _blank_entry_boxes(image,anchor):
     """仅当前入口工具栏行的浅色宽框，复用OpenCV；不识别任意应用控件。"""
-    if image is None or not Path(image).is_file(): return []
+    if not isinstance(image, bytes) or not image: return []
     import cv2
     import numpy as np
-    with Image.open(image) as img: pixels=np.asarray(img.convert('RGB'))
+    with Image.open(io.BytesIO(image)) as img: pixels=np.asarray(img.convert('RGB'))
     height,width=pixels.shape[:2]
     y0=max(0,round(anchor.y-anchor.h*.3)); y1=min(height,round(anchor.y+anchor.h*.3))
     right=min(width,round(anchor.box[0]))
@@ -99,7 +104,7 @@ def entry_address_candidates(tokens,image=None):
         candidates=[q for q in raw if q.box[2]<anchor.box[0] and
                     q.box[1]>tabs[0].box[3] and abs(q.y-anchor.y)<=max(q.h,anchor.h)*.75]
     ocr_count=len(candidates); visual=[]
-    visual_examined=len(toolbar)==1 and not raw and image is not None and Path(image).is_file()
+    visual_examined=len(toolbar)==1 and not raw and isinstance(image, bytes) and bool(image)
     if visual_examined:
         visual=_blank_entry_boxes(image,toolbar[0]); candidates=visual
     return candidates,{'source':'current_window_screenshot_toolbar_box' if visual_examined else 'current_window_screenshot_ocr',
@@ -178,17 +183,18 @@ class Desktop:
         captured_at=now()  # 工具返回截图时，不把后续OCR结束时间冒作截图时间。
         self.guard(live)  # 在耗时OCR前记录本次截图正常取得的租约，并复核前台。
         text=check_reply(reply)
-        paths=[Path(q['image_path']) for q in reply.get('content',[]) if 'image_path' in q]
-        if len(paths)!=1 or not paths[0].is_file(): raise RecapError('screenshot_missing')
-        image=paths[0]
-        with Image.open(image) as img: size=img.size
+        images=[q['image_data'] for q in reply.get('content',[]) if 'image_data' in q]
+        if len(images)!=1 or not isinstance(images[0],str): raise RecapError('screenshot_missing')
+        try: image=base64.b64decode(images[0],validate=True)
+        except (ValueError,binascii.Error): raise RecapError('invalid_screenshot') from None
+        with Image.open(io.BytesIO(image)) as img: size=img.size
         uia=uia_tokens(text,live['title']) if use_uia else []
         tokens=self.ocr.read(image)
         if hasattr(self.mcp,'note'):
             self.mcp.note('snapshot_diagnostics',window_handle=live['handle'],window_pid=live['pid'],
-                          screenshot=image.name,**snapshot_diagnostics(text,live['title'],use_uia,tokens))
+                          **snapshot_diagnostics(text,live['title'],use_uia,tokens))
         for q in tokens:
-            if compact(q.text) in ('扫码登录','请登录','安全验证','滑块验证','短信登录'):
+            if any(marker in compact(q.text) for marker in ('扫码登录','请登录','安全验证','滑块验证','短信登录','验证码')):
                 raise RecapError('needs_login_or_verification')
         return View(tokens,image,live,size,captured_at,uia)
 
@@ -248,6 +254,16 @@ class Desktop:
             self.mcp.call('Type',loc=point,text=chunk,clear=index==0,
                           caret_position='end',press_enter=index==len(chunks)-1)
 
+    def type_account(self,view,token,account):
+        # 不提交搜索；短分段沿用现有输入保护，避免长文本剪贴板分支。
+        for index,start in enumerate(range(0,len(account),19)):
+            live=self.guard(view.window)
+            if live['rect']!=view.window['rect']: raise RecapError('window_moved_before_action')
+            point=view.point(token); x,y,r,b=live['rect']
+            if not (x<point[0]<r and y<point[1]<b): raise RecapError('locator_outside_window')
+            self.mcp.call('Type',loc=point,text=account[start:start+19],clear=index==0,
+                          caret_position='end',press_enter=False)
+
     def wait_entry(self,window,timeout=20):
         def confirmed(view):
             evidence=portal_page_evidence(view.tokens)
@@ -272,13 +288,15 @@ class Desktop:
         if hasattr(self.mcp,'note'):
             self.mcp.note('entry_address_candidates',window_handle=view.window['handle'],
                           window_pid=view.window['pid'],window_title=view.window['title'],
-                          screenshot=view.image.name,**diagnostic)
+                          **diagnostic)
         if not candidates: raise RecapError('address_bar_missing')
         if len(candidates)>1: raise RecapError('address_bar_ambiguous')
         self.type_replacement(view,candidates[0],self.portal_url)
         return self.wait_entry(live)
 
     def bind(self,account):
+        self.expected_account=account
+        self._verified_room_id=None
         self.guard()
         # 先建立只读快照；不截取无关应用图像或提取其UI树。
         self.mcp.call('Snapshot',use_vision=False,use_dom=False,use_ui_tree=False,use_annotation=False)
@@ -312,8 +330,7 @@ class Desktop:
                 return unique_label(items,'主播列表')
             view,button=self.wait(window,sidebar); self.click(view,button)
         view,search=self.wait(window,lambda v:self.label(v,'请输入主播',True))
-        self.click(view,search); self.guard(window)
-        self.mcp.call('Type',loc=view.point(search),text=account,clear=True,press_enter=False)
+        self.type_account(view,search,account)
         def candidate(v):
             # 只选当前输入框下方、显示完全相同抖音号的候选，不碰原列表同名项。
             sx,sy=view.point(search)
@@ -326,7 +343,10 @@ class Desktop:
             if len(nearby)!=1: raise RecapError('locator_ambiguous' if nearby else 'locator_missing')
             return nearby[0]
         view,button=self.wait(window,candidate); self.click(view,button)
-        view,button=self.wait(window,lambda v:self.label(v,'主播详情'))
+        def filtered_detail(v):
+            require_account(v.uia+v.tokens,account)
+            return self.label(v,'主播详情')
+        view,button=self.wait(window,filtered_detail)
         self.click(view,button)
         def detail(v):
             require_account(v.uia+v.tokens,account)
@@ -348,7 +368,17 @@ class Desktop:
             if not any('已开播' in compact(q.text) for q in v.tokens+v.uia): raise RecapError('locator_missing')
             return True
         view,_=self.wait(room,room_ready)
-        room_id=self.room_identity(view)
+        try:
+            room_id=room_from_tokens(view.uia+view.tokens)
+        except RecapError:
+            room_id=self.room_identity(view)
+            view=self.observe(room,True)
+            require_account(view.uia+view.tokens,account)
+            if room_from_tokens(view.uia+view.tokens)!=room_id:
+                raise RecapError('room_changed')
+            if not any('已开播' in compact(q.text) for q in view.tokens+view.uia):
+                raise RecapError('live_status_unconfirmed')
+        self._verified_room_id=room_id
         evidence=self.save_minimal(view,'binding.png')
         return {'douyin_account':account,'room_id':room_id,'window':room,
                 'screenshot':str(evidence.relative_to(self.evidence.parent)),'account_verified_on_page':True,
@@ -368,19 +398,83 @@ class Desktop:
         return room_from_tokens(address.uia+address.tokens)
 
     def save_minimal(self,view,name):
-        anchors=[q for q in view.tokens if any(label in compact(q.text)
-                 for label in ('抖音号','累计观众','新增粉丝','评论人数','送礼人数','获得音浪','跟播列表'))]
-        if not anchors: raise RecapError('evidence_region_missing')
-        top=min(q.box[1] for q in anchors); bottom=max(q.box[3] for q in anchors)
-        left=min(q.box[0] for q in anchors); right=max(q.box[2] for q in anchors)
-        margin=max(q.h for q in anchors)*4
-        path=self.evidence/name
-        with Image.open(view.image) as img:
-            img.crop((max(0,int(left-margin)),max(0,int(top-margin)),
-                      min(img.width,int(right+margin)),min(img.height,int(bottom+margin)))).save(path)
-        return path
+        current=self.guard(view.window)
+        if current['rect']!=view.window['rect']: raise RecapError('window_moved_before_evidence')
+        account=getattr(self,'expected_account',None)
+        if not account or not getattr(self,'_verified_room_id',None):
+            raise RecapError('safe_evidence_identity_unconfirmed')
+        if any(any(marker in compact(q.text) for marker in ('请登录','扫码登录','安全验证','滑块验证','短信登录','验证码'))
+               for q in view.tokens):
+            raise RecapError('needs_login_or_verification')
+        require_account(view.tokens,account)
+        good=[q for q in view.tokens if q.score>=.85]
+        identities=[q for q in good if compact(q.text) in
+                    ('抖音号:'+account,'抖音号：'+account,account,'抖音号','抖音号:')]
+        # 身份要么一条完整字段，要么标签与账号各一条；不能附带其他内容。
+        combined=[q for q in identities if compact(q.text)=='抖音号:'+account]
+        if len(combined)==1:
+            chosen=combined
+        else:
+            labels=[q for q in identities if compact(q.text) in ('抖音号','抖音号:')]
+            values=[q for q in identities if compact(q.text)==account]
+            if len(labels)!=1 or len(values)!=1: raise RecapError('safe_evidence_identity_ambiguous')
+            chosen=labels+values
+        if name=='binding.png':
+            live=[q for q in good if re.fullmatch(r'已开播[\d:：]*',compact(q.text))]
+            if len(live)!=1: raise RecapError('safe_evidence_live_unconfirmed')
+            chosen+=live
+        elif name=='metrics.png':
+            parsed=metrics_from_tokens(view.tokens)
+            for metric in METRICS:
+                labels=[q for q in good if compact(q.text)==metric or
+                        (compact(q.text).startswith(metric) and
+                         parse_count(compact(q.text)[len(metric):].strip(':'))[0] is not None)]
+                if len(labels)>1: raise RecapError('safe_evidence_metric_ambiguous')
+                if not labels: continue
+                label=labels[0]; chosen.append(label)
+                raw=parsed['raw_displays'].get(metric)
+                if raw is None or compact(label.text)!=metric: continue
+                peers=[q for q in good if compact(q.text) in METRICS and abs(q.y-label.y)<=label.h]
+                left=max([q.x for q in peers if q.x<label.x],default=label.x-label.w*2)
+                right=min([q.x for q in peers if q.x>label.x],default=label.x+label.w*2)
+                candidates=[q for q in good if compact(q.text)==compact(raw) and
+                            (left+label.x)/2<q.x<(right+label.x)/2 and
+                            0<label.y-q.y<label.h*5 and abs(q.x-label.x)<=max(label.w*.8,label.h*2)]
+                if len(candidates)!=1: raise RecapError('safe_evidence_metric_ambiguous')
+                chosen+=candidates
+        else:
+            raise RecapError('safe_evidence_kind_invalid')
+        if not isinstance(view.image,bytes): raise RecapError('safe_evidence_image_invalid')
+        boxes=[]
+        with Image.open(io.BytesIO(view.image)) as image:
+            width,height=image.size
+            if (width,height)!=view.size: raise RecapError('safe_evidence_size_mismatch')
+            for token in chosen:
+                left,top,right,bottom=token.box
+                box=(int(left),int(top),int(right),int(bottom))
+                x,y,r,b=box
+                if not (0<=x<r<=width and 0<=y<b<=height): raise RecapError('safe_evidence_box_invalid')
+                if r-x>width*.6 or b-y>height*.1: raise RecapError('safe_evidence_box_too_large')
+                for other in view.tokens:
+                    if other is token: continue
+                    a,c,d,e=other.box
+                    if x<d and a<r and y<e and c<b: raise RecapError('safe_evidence_overlap')
+                boxes.append(box)
+            if not boxes: raise RecapError('safe_evidence_region_missing')
+            if sum((r-x)*(b-y) for x,y,r,b in boxes)>width*height*.2:
+                raise RecapError('safe_evidence_region_too_large')
+            output=Image.new('RGB',(max(r-x for x,y,r,b in boxes),sum(b-y for x,y,r,b in boxes)), 'white')
+            y_offset=0
+            for box in boxes:
+                piece=image.crop(box).convert('RGB')
+                output.paste(piece,(0,y_offset)); y_offset+=piece.height
+            path=self.evidence/name
+            output.save(path,format='PNG')
+        return SafeEvidence(path,hashlib.sha256(path.read_bytes()).hexdigest(),name)
 
     def capture(self,binding):
+        self.expected_account=binding['douyin_account']
+        self._verified_room_id=None
         room=self.focus(binding['window'])
         view=self.observe(room,True)
         require_account(view.uia+view.tokens,binding['douyin_account'])
@@ -390,13 +484,13 @@ class Desktop:
             room_id=self.room_identity(view)
             # 只有地址栏动作改变页面焦点时才再取一次清晰指标截图。
             view=self.observe(room,True)
+            if room_from_tokens(view.uia+view.tokens)!=room_id: raise RecapError('room_changed')
         if room_id!=binding['room_id']: raise RecapError('room_changed')
+        self._verified_room_id=room_id
         require_account(view.uia+view.tokens,binding['douyin_account'])
-        result=metrics_from_tokens(view.uia)
-        method='Windows-MCP visible UIA'
-        if result['missing_fields']:
-            result=metrics_from_tokens(view.tokens)
-            method='Windows-MCP screenshot + local RapidOCR 3.10.0'
+        # 指标与证据使用同一次本地OCR，避免UIA数值无法关联到对应裁区。
+        result=metrics_from_tokens(view.tokens)
+        method='Windows-MCP screenshot + local RapidOCR 3.10.0'
         evidence=self.save_minimal(view,'metrics.png')
         return {**result,'metrics_captured_at':view.captured_at,'capture_method':method,
                 'capture_evidence':{'metrics_screenshot':str(evidence.relative_to(self.evidence.parent)),'account_verified_on_page':True,

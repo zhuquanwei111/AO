@@ -6,6 +6,9 @@ import secrets
 import subprocess
 import time
 import uuid
+import sys
+sys.path.insert(0,str(Path(__file__).resolve().parent.parent/'fixed-recap-prototype'))
+from safe_evidence import SafeEvidence
 
 MODEL='glm-5.3-flash'
 BASE_URL='https://ai.ctaigw.cn/v1'
@@ -50,12 +53,14 @@ class GLMRuntime:
         if self.calls>=24: raise RuntimeError('model_call_budget_exhausted')
         remaining=self.deadline-time.monotonic()
         if remaining<=0: raise RuntimeError('model_phase_budget_exhausted')
-        image=Path(image).resolve()
+        if not isinstance(image,SafeEvidence): raise ValueError('safe_visual_region_unconfirmed')
+        expected_sha256=image.sha256
+        image=image.path.resolve()
         if not image.is_file(): raise ValueError('image_missing')
         folder=self.scratch/uuid.uuid4().hex; folder.mkdir()
         job=folder/'job.json'; result=folder/'result.json'
         job.write_text(json.dumps({'image':str(image),'prompt':prompt,'schema':schema,
-            'context':self.context,'receipt':secrets.token_hex(12),'challenge':challenge,
+            'context':self.context,'receipt':secrets.token_hex(12),'challenge':challenge,'image_sha256':expected_sha256,
             'result_path':str(result),'audit':str(folder/'mcp-audit.jsonl')},ensure_ascii=False),encoding='utf-8')
         env={k:v for k,v in os.environ.items() if not k.startswith('AO_')}
         env.update(PYTHONUTF8='1',PYTHONDONTWRITEBYTECODE='1')

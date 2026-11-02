@@ -68,7 +68,7 @@ class GLMTests(unittest.TestCase):
             image=Path(folder)/'image.png'; Image.new('RGB',(100,100)).save(image)
             runtime=Mock(); runtime.run.return_value=({'status':'ambiguous','box':None},{})
             with self.assertRaises(RecapError): GLMVision(runtime).locate(Mock(image=image),'target')
-            self.assertEqual(runtime.run.call_count,1)
+            runtime.run.assert_not_called()
 
     def test_read_only_status_without_model_or_desktop(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -109,13 +109,13 @@ class GLMTests(unittest.TestCase):
                 def observe(self,window,use_uia=False):
                     tokens=scenario.tokens()
                     if scenario.stage=='filtered': tokens.append(Token('抖音号:demo',(100,60,200,72)))
-                    return View(tokens,scenario.image,scenario.get(window),(600,400),'fake',[])
+                    return View(tokens,scenario.image.read_bytes(),scenario.get(window),(600,400),'fake',[])
             driver=Driver(scenario,scenario,None,Path(folder)/'data/evidence',
                 'https://union.bytedance.com/open/portal/',vision=Vision())
             runner=Runner(Store(Path(folder)/'data'),driver)
             record=runner.start('glm-fake','demo',None,'test_simulated')
             self.assertEqual(record['status'],'waiting_for_stop',record)
-            self.assertIn(MODEL,record['binding_evidence']['locator'])
+            self.assertIn('OCR',record['binding_evidence']['locator'])
             actions=list(scenario.inputs)
             self.assertEqual(runner.start('glm-fake','demo',None,'test_simulated'),record)
             self.assertEqual(scenario.inputs,actions)

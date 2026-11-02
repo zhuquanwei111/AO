@@ -21,16 +21,13 @@ class IdentityCropTests(unittest.TestCase):
             image,{'rect':[0,0,500,400]},(500,400),'offline',[])
         return d,view
 
-    def test_bare_account_only_crops_and_requires_visual_confirmation(self):
+    def test_bare_account_does_not_trigger_visual_or_save(self):
         with tempfile.TemporaryDirectory() as folder:
             d,view=self.driver(folder)
-            d.identity(view,'demo')
-            d.vision.read.assert_called_once()
-            with Image.open(d.evidence/'identity-check.png') as image:
-                self.assertLess(image.width,500); self.assertLess(image.height,400)
-            d.vision.read.return_value={'account':None,'live_status':None}
             with self.assertRaises(RecapError) as error: d.identity(view,'demo')
             self.assertEqual(error.exception.reason,'wrong_identity')
+            d.vision.read.assert_not_called()
+            self.assertFalse((d.evidence/'identity-check.png').exists())
 
     def test_disjoint_or_missing_account_regions_do_not_call_model(self):
         with tempfile.TemporaryDirectory() as folder:

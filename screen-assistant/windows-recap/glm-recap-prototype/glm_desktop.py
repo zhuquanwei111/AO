@@ -6,7 +6,7 @@ import json
 
 sys.path.insert(0,str(Path(__file__).resolve().parent.parent/'llm-recap-prototype'))
 from llm_desktop import LLMDesktop
-from glm_runtime import MODEL
+from desktop import Desktop
 from core import RecapError
 from transport import check_reply
 
@@ -113,12 +113,11 @@ class GLMDesktop(LLMDesktop):
         raise RecapError('foreground_changed')
 
     def bind(self,account):
-        result=super().bind(account)
-        result['locator']=MODEL+' visual decisions + guarded Windows-MCP fixed steps'
-        return result
+        # 导航复用当前窗口的本地OCR/UIA步骤，不发送页面图片。
+        return Desktop.bind(self,account)
+
+    def navigate_entry(self,window):
+        return Desktop.navigate_entry(self,window)
 
     def capture(self,binding):
-        result=super().capture(binding)
-        if '; missing-only visual review' in result['capture_method']:
-            result['capture_method']=result['capture_method'].split(';',1)[0]+'; missing-only visual review '+MODEL
-        return result
+        return Desktop.capture(self,binding)

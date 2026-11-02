@@ -38,7 +38,7 @@ class Scenario:
         if self.stage=='management': return [q('主播管理',10,60),q('主播列表',10,85)]
         if self.stage=='list': return [q('请输入主播昵称或抖音号',350,30,160)]
         if self.stage=='candidate': return [q('抖音号:demo',350,65,110)]
-        if self.stage=='filtered': return [q('主播详情',450,120)]
+        if self.stage=='filtered': return [q('抖音号:demo',100,60,100),q('主播详情',450,120)]
         if self.stage=='detail': return [q('抖音号:demo',100,60,100),q('进入直播间',450,100)]
         return [q('抖音号:demo',100,60,100),q('跟播列表',10,35),q('已开播00:40:16',230,60,100),
                 q('https://union.bytedance.com/open/portal/live_flow/followRoomDetail?roomID=1234567890123456789',0,8,595),
@@ -53,7 +53,7 @@ class FixedPathTests(unittest.TestCase):
             scenario=Scenario(folder)
             class Driver(Desktop):
                 def observe(self,window,use_uia=False):
-                    return View(scenario.tokens(),scenario.image,scenario.get(window),(600,400),'fake-time',[])
+                    return View(scenario.tokens(),scenario.image.read_bytes(),scenario.get(window),(600,400),'fake-time',[])
             driver=Driver(scenario,scenario,None,Path(folder)/'state/evidence','https://union.bytedance.com/open/portal/')
             runner=Runner(Store(Path(folder)/'state'),driver)
             result=runner.start('test-one','demo',None,'test_simulated')

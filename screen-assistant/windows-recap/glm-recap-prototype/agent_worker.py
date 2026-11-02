@@ -14,6 +14,7 @@ from agents.model_settings import ModelSettings
 from openai.types.shared import Reasoning
 import httpx2
 from glm_runtime import MODEL,BASE_URL,parse_final
+from safe_evidence import read_verified_image
 
 
 async def run(job_path):
@@ -57,7 +58,8 @@ async def run(job_path):
                 reasoning=Reasoning(effort='low'),max_tokens=1024))
         prompt=json.dumps({'phase_and_target':job.get('context',{}),'goal':job['prompt'],
             'result_fields':job.get('schema')},ensure_ascii=False)
-        picture='data:image/png;base64,'+base64.b64encode(Path(job['image']).read_bytes()).decode('ascii')
+        image_bytes=read_verified_image(job['image'],job.get('image_sha256'))
+        picture='data:image/png;base64,'+base64.b64encode(image_bytes).decode('ascii')
         async with server:
             response=await asyncio.wait_for(Runner.run(agent,input=[{'role':'user','content':[
                 {'type':'input_text','text':prompt},{'type':'input_image','image_url':picture}]}],max_turns=3),timeout=95)
