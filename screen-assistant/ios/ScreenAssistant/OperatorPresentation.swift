@@ -8,11 +8,11 @@ enum OperatorPresentation {
                       "overflow_comment", "overflow_count"]
             .reduce(0) { $0 + value($1) }
         var messages: [String] = []
-        if unsent > 0 || value("rejected") > 0 { messages.append("部分画面信息未送达") }
-        if value("unknown") > 0 { messages.append("部分发送结果未确认") }
+        if unsent > 0 || value("rejected") > 0 { messages.append("曾有画面信息未送达") }
+        if value("unknown") > 0 { messages.append("曾有发送结果未确认") }
         if !messages.isEmpty { return messages.joined(separator: "；") + "。" }
         if value("received") > 0 || value("duplicate") > 0 || value("merged") > 0 {
-            return "已收到部分画面信息；提示以实际收到的建议为准。"
+            return "曾收到过画面信息；本场建议以实际收到为准。"
         }
         return "暂未收到画面信息。"
     }

@@ -17,9 +17,9 @@ assert(OperatorPresentation.people(.nan, approximate: false, locale: locale) == 
 func upload(_ counts: [String: Int]) -> String {
     OperatorPresentation.observationUploadDescription { counts[$0, default: 0] }
 }
-assert(upload(["cancel_unsent": 1, "received": 1]) == "已收到部分画面信息；提示以实际收到的建议为准。")
+assert(upload(["cancel_unsent": 1, "received": 1]) == "曾收到过画面信息；本场建议以实际收到为准。")
 assert(upload(["expired": 1]) == "暂未收到画面信息。")
-assert(upload(["oversize_comment": 1]) == "部分画面信息未送达。")
-assert(upload(["unknown": 1]) == "部分发送结果未确认。")
-assert(upload(["rejected": 1]) == "部分画面信息未送达。")
+assert(upload(["oversize_comment": 1]) == "曾有画面信息未送达。")
+assert(upload(["unknown": 1]) == "曾有发送结果未确认。")
+assert(upload(["rejected": 1]) == "曾有画面信息未送达。")
 print("OK: locale, timezone, cross-day duration and missing versus zero")
