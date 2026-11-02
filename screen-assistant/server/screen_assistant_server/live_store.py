@@ -798,7 +798,7 @@ class LiveStore:
     def _coaching_candidate(self, sid: str, now: int, trigger_epoch: int):
         opportunity = self.coaching_opportunities.get(sid)
         if opportunity is None:
-            logger.info("live_data stage=coaching session=%s reason=source_unavailable", sid[:8])
+            logger.debug("live_data stage=coaching session=%s reason=source_unavailable", sid[:8])
             return None
         if now >= opportunity["deadline"]:
             self.coaching_opportunities.pop(sid, None)
