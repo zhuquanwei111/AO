@@ -130,7 +130,8 @@ class Runner:
                     return self._capture(task)
                 return self.store.get(task)
         except RecapError as error:
-            return self._fail(task,error.reason)
+            # 仅明确业务判断用旧协议终态承载；其余异常仍需处理。
+            return self._fail(task,error.reason,failed=error.reason in ('not_live','account_not_found'))
         except Exception:
             return self._fail(task,'unexpected_error',failed=True)
 

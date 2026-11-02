@@ -92,6 +92,23 @@ class FakeDesktop:
 
 
 class FlowTests(unittest.TestCase):
+    def test_confirmed_business_outcome_keeps_reason_through_app_stop(self):
+        for outcome in ('not_live', 'account_not_found'):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as folder:
+                class Confirmed:
+                    def bind(self, account):
+                        raise RecapError(outcome)
+                store = Store(folder)
+                runner = Runner(store, Confirmed())
+                started = runner.start('task', 'fixture', 'session', 'android_app')
+                self.assertEqual(started['status'], 'failed')
+                self.assertEqual(started['reason'], outcome)
+                self.assertIsNone(started['metrics'])
+                stopped = runner.stop('task', 'android_app')
+                self.assertTrue(stopped['stop_signal_received'])
+                self.assertEqual(stopped['reason'], outcome)
+                self.assertIsNone(stopped['binding_evidence'])
+
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
