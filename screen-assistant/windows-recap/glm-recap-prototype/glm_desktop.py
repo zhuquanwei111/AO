@@ -7,7 +7,8 @@ import json
 sys.path.insert(0,str(Path(__file__).resolve().parent.parent/'llm-recap-prototype'))
 from llm_desktop import LLMDesktop
 from desktop import Desktop
-from core import RecapError
+from core import RecapError, unique_label
+from vision import fill_missing
 from transport import check_reply
 
 ENTRY_URL='https://union.bytedance.com/open/portal/index'
@@ -117,7 +118,34 @@ class GLMDesktop(LLMDesktop):
         return Desktop.bind(self,account)
 
     def navigate_entry(self,window):
-        return Desktop.navigate_entry(self,window)
+        live=self.guard(window)
+        matches=[item for item in self.probe.windows() if item['title']==live['title']]
+        if len(matches)!=1 or matches[0]['handle']!=live['handle']:
+            raise RecapError('edge_window_ambiguous')
+        self.key(live,'ctrl+l')
+        view=self.observe(live,True)
+        if len(view.address_seeds)!=1:
+            raise RecapError(view.address_seed_error or 'address_seed_missing_or_ambiguous')
+        target=self.vision.locate(view,'地址栏',seed=view.address_seeds[0],guard=self.guard)
+        self.type_replacement(view,target,self.portal_url)
+        return self.wait_entry(live)
 
     def capture(self,binding):
         return Desktop.capture(self,binding)
+
+    def refine_metrics(self,view,result):
+        self._used_visual_metric=False
+        for name in list(result.get('missing_fields', [])):
+            try:
+                anchor=unique_label(view.tokens,name)
+                values=self.vision.read(view,(name,),'读取单项',anchor=anchor,guard=self.guard,
+                                        account=self.expected_account)
+                updated=fill_missing(result,values)
+                self._used_visual_metric |= updated['metrics'] != result['metrics']
+                result=updated
+            except RecapError as error:
+                if error.reason not in ('locator_missing','locator_ambiguous','visual_crop_anchor_invalid',
+                        'visual_crop_anchor_ambiguous','visual_crop_content_ambiguous','visual_crop_too_large',
+                        'visual_metric_unconfirmed'):
+                    raise
+        return result

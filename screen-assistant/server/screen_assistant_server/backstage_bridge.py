@@ -293,12 +293,13 @@ class BackstageBridge:
 
     def _cli(self, command: str, task: dict) -> CliInvocation:
         entry = Path(self.config.cli_entry)
-        # 本地识别不需要模型或worker凭据；仅传运行所需系统变量及明确路径。
+        # 仅传明确运行配置及视觉模型凭据，worker凭据不得传给CLI。
         allowed = {"SYSTEMROOT", "WINDIR", "PATH", "PATHEXT", "TEMP", "TMP",
                    "LOCALAPPDATA", "APPDATA", "USERPROFILE", "COMSPEC", "PROGRAMFILES",
                    "PROGRAMFILES(X86)", "OS", "HOME", "LANG", "LC_ALL", "BACKSTAGE_CLI_DATA", "BACKSTAGE_CLI_MODELS",
                    "BACKSTAGE_CLI_SCRATCH", "BACKSTAGE_MCP_CLIENT_PYTHON",
-                   "BACKSTAGE_WINDOWS_MCP_PYTHON"}
+                   "BACKSTAGE_WINDOWS_MCP_PYTHON", "BACKSTAGE_SDK_PYTHON",
+                   "BACKSTAGE_CLI_GATE_A", "TIANYI_API_KEY"}
         child_env = {key: value for key, value in os.environ.items() if key.upper() in allowed}
         child_env.update(PYTHONUTF8="1", PYTHONDONTWRITEBYTECODE="1")
         try:

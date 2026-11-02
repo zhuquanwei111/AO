@@ -22,11 +22,54 @@ class View:
     size: tuple
     captured_at: str
     uia: list
+    address_seeds: tuple = ()
+    address_seed_error: str | None = None
 
     def point(self, token):
         if token.source=='uia': return [round(token.x),round(token.y)]
         x,y,r,b=self.window['rect']
         return [round(x+token.x*(r-x)/self.size[0]),round(y+token.y*(b-y)/self.size[1])]
+
+
+_SEED_ISSUER = object()
+
+
+@dataclass(frozen=True)
+class AddressSeed:
+    x: int
+    y: int
+    title: str
+    _issuer: object
+
+
+def address_seed_candidates(snapshot, title, rect):
+    """仅将本轮唯一窗口内的具名 Edit 中心作为裁图区种子。"""
+    if not isinstance(snapshot, str) or 'UI Tree:' not in snapshot or '[truncated:' in snapshot:
+        raise RecapError('address_seed_unavailable')
+    tree = snapshot.split('UI Tree:', 1)[1]
+    headers = re.findall(r'window "([^"\n]*)"', tree)
+    if headers.count(title) != 1:
+        raise RecapError('address_seed_window_ambiguous')
+    selected = False
+    seeds = []
+    labels = {'地址和搜索栏', '地址和搜索', 'address and search bar'}
+    for line in tree.splitlines():
+        header = re.search(r'window "([^"\n]*)"', line)
+        if header:
+            selected = header[1] == title
+            continue
+        if not selected:
+            continue
+        item = re.search(r'\((-?\d+),\s*(-?\d+)\)\s+([^\s]+)\s+"([^"\n]*)"', line)
+        if not item or item[3].casefold() not in ('edit', '编辑', '编辑框') or item[4].casefold() not in labels:
+            continue
+        x, y = int(item[1]), int(item[2])
+        if not (rect[0] < x < rect[2] and rect[1] < y < rect[3]):
+            raise RecapError('address_seed_outside_window')
+        seeds.append(AddressSeed(x, y, title, _SEED_ISSUER))
+    if len(seeds) != 1:
+        raise RecapError('address_seed_missing_or_ambiguous')
+    return seeds
 
 
 def uia_tokens(text,title):
@@ -194,7 +237,11 @@ class Desktop:
         for q in tokens:
             if any(marker in compact(q.text) for marker in ('扫码登录','请登录','安全验证','滑块验证','短信登录','验证码')):
                 raise RecapError('needs_login_or_verification')
-        return View(tokens,image,live,size,captured_at,uia)
+        seeds=(); seed_error=None
+        if use_uia:
+            try: seeds=tuple(address_seed_candidates(text,live['title'],live['rect']))
+            except RecapError as error: seed_error=error.reason
+        return View(tokens,image,live,size,captured_at,uia,seeds,seed_error)
 
     def wait(self,window,select,timeout=20,use_uia=True):
         began=time.monotonic(); deadline=began+timeout
@@ -398,6 +445,9 @@ class Desktop:
     def save_minimal(self,view,name):
         raise RecapError('image_evidence_disabled')
 
+    def refine_metrics(self,view,result):
+        return result
+
     def capture(self,binding):
         self.expected_account=binding['douyin_account']
         self._verified_room_id=None
@@ -416,6 +466,9 @@ class Desktop:
         require_account(view.uia+view.tokens,binding['douyin_account'])
         # 指标与证据使用同一次本地OCR，避免UIA数值无法关联到对应裁区。
         result=summary_metrics(view.tokens)
+        result=self.refine_metrics(view,result)
         method='Windows-MCP screenshot + local RapidOCR 3.10.0'
+        if getattr(self,'_used_visual_metric',False):
+            method+=' + local-crop GLM review'
         return {**result,'metrics_captured_at':view.captured_at,'capture_method':method,
                 'capture_evidence':{'account_verified_on_page':True,'room_id_reverified':binding['room_id']}}

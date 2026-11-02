@@ -275,13 +275,19 @@ def test_secure_launcher_injects_only_single_field_into_child(tmp_path, monkeypa
     monkeypatch.setattr(launcher.subprocess,'Popen',popen)
     monkeypatch.setattr(launcher,'verify_ssh_tunnel',Mock())
     env={'SYSTEMROOT':'C:\\Windows','PATH':'fixture-path','API_KEY':'unrelated-secret',
-         'BACKSTAGE_CLI_PYTHON':'fixture-python','BACKSTAGE_CLI_ENTRY':'fixture-entry'}
+         'BACKSTAGE_CLI_PYTHON':'fixture-python','BACKSTAGE_CLI_ENTRY':'fixture-entry',
+         'TIANYI_API_KEY':'fixture-model-key','BACKSTAGE_SDK_PYTHON':'fixture-sdk',
+         'BACKSTAGE_CLI_GATE_A':'fixture-gate'}
     child=launcher.launch_bridge('http://127.0.0.1:57321',42,100,path,env)
     assert child.pid==1234
     args,kwargs=popen.call_args
     assert 'fixture-token' not in args[0]
     assert kwargs['env']['BACKSTAGE_WORKER_TOKEN']=='fixture-token'
     assert 'API_KEY' not in kwargs['env']
+    assert kwargs['env']['TIANYI_API_KEY']=='fixture-model-key'
+    assert kwargs['env']['BACKSTAGE_SDK_PYTHON']=='fixture-sdk'
+    assert kwargs['env']['BACKSTAGE_CLI_GATE_A']=='fixture-gate'
+    assert 'fixture-model-key' not in args[0]
     assert kwargs['env']['BACKSTAGE_SSH_PID']=='42'
     assert kwargs['cwd']==str(launcher.Path(launcher.__file__).resolve().parent.parent)
 

@@ -8,7 +8,8 @@ from PIL import Image
 
 ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT/'fixed-recap-prototype'))
-from core import Token,RecapError,compact,METRICS,require_account
+from core import Token,RecapError,compact,METRICS,require_account,parse_count
+from desktop import AddressSeed, _SEED_ISSUER, address_seed_candidates
 
 _CROP_ISSUER = object()
 _NAVIGATION_LABELS = {'主播管理', '主播列表', '主播详情', '进入直播间', '搜索或输入网址', '搜索或输入web地址'}
@@ -19,6 +20,7 @@ _AUTH_MARKERS = ('扫码登录', '请登录', '安全验证', '滑块验证', '�
 class LocalCrop:
     image: bytes
     purpose: str
+    box: tuple
     _issuer: object
     _window: dict
     _guard: object
@@ -53,6 +55,10 @@ def make_local_crop(view, anchor, purpose, guard, account=None):
         raise RecapError('visual_crop_anchor_invalid')
     if purpose == 'metric' and name not in METRICS:
         raise RecapError('visual_crop_anchor_invalid')
+    if purpose == 'metric':
+        if not isinstance(account, str) or not account:
+            raise RecapError('visual_crop_anchor_invalid')
+        require_account(tokens + view.uia, account)
     if purpose == 'identity':
         if not isinstance(account, str) or not account or '抖音号' not in name:
             raise RecapError('visual_crop_anchor_invalid')
@@ -64,23 +70,72 @@ def make_local_crop(view, anchor, purpose, guard, account=None):
         if not (0 <= x < right <= image.width and 0 <= y < bottom <= image.height):
             raise RecapError('visual_crop_outside_image')
         margin = max(1, int(anchor.h))
-        box = (max(0, int(x-margin)), max(0, int(y-margin)),
-               min(image.width, int(right+margin)), min(image.height, int(bottom+margin)))
+        # 指标沿现有 summary_metrics 的卡片几何，单项独立取标签上方，绝不合并整行。
+        box = ((max(0, int(x-anchor.w)), max(0, int(y-margin*5)),
+                min(image.width, int(right+anchor.w)), min(image.height, int(bottom)))
+               if purpose == 'metric' else
+               (max(0, int(x-margin)), max(0, int(y-margin)),
+                min(image.width, int(right+margin)), min(image.height, int(bottom+margin))))
         if (box[2]-box[0])*(box[3]-box[1]) > image.width*image.height/8:
             raise RecapError('visual_crop_too_large')
+        numeric_count = 0
         for item in tokens:
             if item == anchor:
                 continue
             l, t, r, b = item.box
             if max(l, box[0]) < min(r, box[2]) and max(t, box[1]) < min(b, box[3]):
+                if purpose == 'metric' and parse_count(item.text)[0] is not None:
+                    numeric_count += 1
+                    if numeric_count == 1:
+                        continue
                 raise RecapError('visual_crop_content_ambiguous')
         out = io.BytesIO()
         image.crop(box).save(out, format='PNG')
     current = guard(window)
     if not isinstance(current, dict) or any(current.get(k) != window.get(k) for k in ('handle', 'pid', 'process_created', 'rect')):
         raise RecapError('visual_crop_window_changed')
-    return LocalCrop(out.getvalue(), purpose, _CROP_ISSUER,
+    return LocalCrop(out.getvalue(), purpose, box, _CROP_ISSUER,
                      {**window, 'rect': list(window['rect'])}, guard)
+
+
+def make_address_crop(view, seed, guard):
+    if (not isinstance(seed, AddressSeed) or seed._issuer is not _SEED_ISSUER
+            or seed.title != view.window.get('title') or not view.captured_at):
+        raise RecapError('address_seed_unavailable')
+    window = view.window
+    live = guard(window)
+    if not isinstance(live, dict) or any(live.get(k) != window.get(k)
+                                        for k in ('handle', 'pid', 'process_created', 'rect')):
+        raise RecapError('visual_crop_window_changed')
+    if any(any(marker in compact(q.text) for marker in _AUTH_MARKERS) for q in view.tokens + view.uia):
+        raise RecapError('needs_login_or_verification')
+    left, top, right, bottom = window['rect']
+    if not (left < seed.x < right and top < seed.y < bottom and right > left and bottom > top):
+        raise RecapError('address_seed_outside_window')
+    with Image.open(io.BytesIO(view.image)) as image:
+        if image.size != view.size:
+            raise RecapError('visual_crop_source_invalid')
+        x = (seed.x-left)*image.width/(right-left)
+        y = (seed.y-top)*image.height/(bottom-top)
+        # 复用既有 UIA 中心点的 8 像素框及四倍锚点高度边距。
+        rx = 36*image.width/(right-left)
+        ry = 36*image.height/(bottom-top)
+        box = (max(0, int(x-rx)), max(0, int(y-ry)),
+               min(image.width, math.ceil(x+rx)), min(image.height, math.ceil(y+ry)))
+        if box[2] <= box[0] or box[3] <= box[1] or (box[2]-box[0])*(box[3]-box[1]) > image.width*image.height/8:
+            raise RecapError('visual_crop_too_large')
+        allowed = {'搜索或输入网址', '搜索或输入web地址', 'searchorenterwebaddress'}
+        for token in view.tokens:
+            l, t, r, b = token.box
+            if max(l, box[0]) < min(r, box[2]) and max(t, box[1]) < min(b, box[3]):
+                if compact(token.text).casefold() not in allowed:
+                    raise RecapError('visual_crop_content_ambiguous')
+        out = io.BytesIO()
+        image.crop(box).save(out, format='PNG')
+    crop = LocalCrop(out.getvalue(), 'navigation', box, _CROP_ISSUER,
+                     {**window, 'rect': list(window['rect'])}, guard)
+    crop.ensure_current()
+    return crop
 
 
 def validate_box(value,size):
@@ -98,9 +153,46 @@ def validate_box(value,size):
 class GLMVision:
     def __init__(self,runtime): self.runtime=runtime
 
-    def locate(self,view,goal,toolbar=False):
-        # 页面导航不属于可发送给视觉服务的身份或指标裁区。
-        raise RecapError('navigation_visual_not_authorized')
+    def locate(self,view,goal,toolbar=False,*,seed=None,guard=None):
+        if seed is None or guard is None:
+            raise RecapError('navigation_visual_not_authorized')
+        crop = make_address_crop(view, seed, guard)
+        with Image.open(io.BytesIO(crop.image)) as image:
+            size = image.size
+        prompt = ('只检查这张浏览器局部图中是否确有网址地址输入框。返回JSON：'
+                  '{"status":"found|missing|ambiguous|blocked","kind":"address_bar|null",'
+                  '"box":[x1,y1,x2,y2]或null}。坐标相对于本局部图；不能确认则返回missing。')
+        try:
+            result = self.runtime.run_crop(crop, prompt)
+            if set(result) != {'status', 'kind', 'box'}:
+                raise ValueError('invalid_visual_fields')
+            validate_box(result, size)
+            if result['status'] != 'found':
+                raise RecapError('visual_' + result['status'])
+            if result['kind'] != 'address_bar':
+                raise ValueError('invalid_visual_kind')
+            crop.ensure_current()
+            x, y, right, bottom = result['box']
+            return Token('confirmed_address_bar', (x+crop.box[0], y+crop.box[1],
+                         right+crop.box[0], bottom+crop.box[1]), 1., 'vision')
+        except RecapError:
+            raise
+        except (ValueError, RuntimeError):
+            raise RecapError('visual_address_unconfirmed') from None
 
-    def read(self,image,fields,instruction):
-        raise RecapError('image_visual_disabled')
+    def read(self,view,fields,instruction,*,anchor=None,guard=None,account=None):
+        if anchor is None or guard is None or len(fields) != 1 or fields[0] not in METRICS:
+            raise RecapError('image_visual_disabled')
+        crop = make_local_crop(view,anchor,'metric',guard,account)
+        prompt = ('读取本张单个指标卡片的数值原文，仅返回JSON {"value":字符串或null}；'
+                  '不清楚则null，不推测。指标名称：' + fields[0])
+        try:
+            result=self.runtime.run_crop(crop,prompt)
+            if set(result)!={'value'} or (result['value'] is not None and not isinstance(result['value'],str)):
+                raise ValueError('invalid_visual_fields')
+            crop.ensure_current()
+            return {fields[0]:result['value']}
+        except RecapError:
+            raise
+        except (ValueError,RuntimeError):
+            raise RecapError('visual_metric_unconfirmed') from None
