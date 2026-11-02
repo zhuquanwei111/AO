@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
+import queue
+import re
 import subprocess
 import sys
+import threading
 
 from .backstage_bridge import BackstageFatalError, validate_worker_url, verify_ssh_tunnel
 
@@ -40,13 +44,76 @@ def launch_bridge(url: str, ssh_pid: int, ssh_created_filetime: int, token_path:
                BACKSTAGE_SSH_PID=str(ssh_pid),BACKSTAGE_SSH_CREATED_FILETIME=str(ssh_created_filetime),
                PYTHONUTF8='1',PYTHONDONTWRITEBYTECODE='1')
     try:
-        process=subprocess.Popen([sys.executable,'-m','screen_assistant_server.backstage_bridge'],
+        process=subprocess.Popen([sys.executable,'-m','screen_assistant_server.backstage_bridge','--startup-handshake'],
                                  cwd=str(Path(__file__).resolve().parent.parent),
-                                 env=env,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,
+                                 env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,
                                  stderr=subprocess.DEVNULL,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
     except OSError:
         raise BackstageFatalError('bridge process could not start') from None
-    return process.pid
+    replies=queue.Queue(maxsize=1)
+    def read_startup():
+        try: replies.put(process.stdout.readline(1025))
+        except (OSError,ValueError): replies.put(b'')
+    threading.Thread(target=read_startup,daemon=True).start()
+    try:
+        line=replies.get(timeout=15)
+    except queue.Empty:
+        line=b''
+    try:
+        reply=json.loads(line) if len(line)<=1024 else None
+    except (ValueError,UnicodeError,TypeError):
+        reply=None
+    if reply=={'stage':'preclaim','status':'ready'} and process.poll() is None:
+        try:
+            process.stdin.write(b'go\n'); process.stdin.flush(); process.stdin.close()
+        except (OSError,ValueError):
+            reply=None
+        else:
+            return process
+    try:
+        code=process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.terminate()
+        try: code=process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill(); code=process.wait(timeout=5)
+    process.stdout.close()
+    if process.stdin and not process.stdin.closed:
+        process.stdin.close()
+    stage=reply.get('stage') if isinstance(reply,dict) else None
+    error=reply.get('error') if isinstance(reply,dict) else None
+    setting=reply.get('setting') if isinstance(reply,dict) else None
+    if stage not in ('config','lock'): stage='unknown'
+    if error not in ('BackstageFatalError','ValueError','ImportError','OSError'): error='unknown'
+    known_settings=('BACKSTAGE_SERVER_URL','BACKSTAGE_WORKER_TOKEN','BACKSTAGE_CLI_PYTHON',
+                    'BACKSTAGE_CLI_ENTRY','BACKSTAGE_SSH_PID','BACKSTAGE_SSH_CREATED_FILETIME')
+    suffix=f', setting={setting}' if setting in known_settings else ''
+    raise BackstageFatalError(f'bridge startup failed: stage={stage}, category={error}, exit={code}{suffix}')
+
+
+def supervise_bridge(process):
+    """等待子进程退出，仅保留有界且白名单允许的状态。"""
+    captured=bytearray()
+    def drain():
+        while True:
+            block=process.stdout.read(1024)
+            if not block: break
+            if len(captured)<1025:
+                captured.extend(block[:1025-len(captured)])
+    thread=threading.Thread(target=drain,daemon=True)
+    thread.start()
+    code=process.wait()
+    thread.join(timeout=5)
+    process.stdout.close()
+    try:
+        result=json.loads(captured) if len(captured)<=1024 else None
+    except (ValueError,UnicodeError,TypeError):
+        result=None
+    category=result.get('error') if isinstance(result,dict) and result.get('stage')=='runtime' else None
+    if not isinstance(category,str) or not (category=='bridge_fatal' or re.fullmatch(r'http_rejected_[0-9]{3}',category)):
+        category='unknown'
+    print(f'bridge exited: stage=runtime, category={category}, exit={code}',flush=True)
+    return code
 
 
 def main():
@@ -58,12 +125,13 @@ def main():
     if os.name!='nt' or not os.environ.get('LOCALAPPDATA'):
         raise BackstageFatalError('interactive Windows user required')
     token_path=Path(os.environ['LOCALAPPDATA'])/'screen-assistant'/'recap-bridge'/'private-config-v1'/'worker-token.env'
-    pid=launch_bridge(args.server_url,args.ssh_pid,args.ssh_created_filetime,token_path,os.environ)
-    print(f'bridge process started: {pid}; readiness not confirmed')
+    process=launch_bridge(args.server_url,args.ssh_pid,args.ssh_created_filetime,token_path,os.environ)
+    print(f'bridge process started: {process.pid}; preclaim initialization ready; claim not confirmed',flush=True)
+    return supervise_bridge(process)
 
 
 if __name__=='__main__':
-    try: main()
+    try: raise SystemExit(main())
     except BackstageFatalError as error:
         print(str(error),file=sys.stderr)
         raise SystemExit(2) from None

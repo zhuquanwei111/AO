@@ -9,6 +9,8 @@ import subprocess
 import sys
 import time
 import ntpath
+import argparse
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -739,13 +741,20 @@ class BackstageBridge:
         self._post_result(task, payload)
         return True
 
-    def serve_forever(self) -> None:
+    def serve_forever(self, *, on_ready=None, on_failure=None, check_only=False) -> None:
         with bridge_instance_lock():
+            if on_ready:
+                on_ready()
+            if check_only:
+                return
             while True:
                 try:
                     if not self._run_once():
                         self.sleep(self.config.poll_seconds)
                 except BackstageFatalError as exc:
+                    if on_failure:
+                        match=re.fullmatch(r'backstage HTTP rejected request: ([0-9]{3})',str(exc))
+                        on_failure('http_rejected_'+match.group(1) if match else 'bridge_fatal')
                     print(f"backstage bridge stopped: {exc}", file=sys.stderr)
                     raise SystemExit(2) from None
                 except BackstageTransientError as exc:
@@ -753,9 +762,46 @@ class BackstageBridge:
                     self.sleep(self.config.poll_seconds)
 
 
-def main() -> None:
-    BackstageBridge(BridgeConfig.from_env()).serve_forever()
+def main(argv=None) -> int:
+    parser=argparse.ArgumentParser()
+    mode=parser.add_mutually_exclusive_group()
+    mode.add_argument('--check',action='store_true')
+    mode.add_argument('--startup-handshake',action='store_true')
+    args=parser.parse_args(argv)
+    stage='config'
+    try:
+        config=BridgeConfig.from_env()
+        stage='lock'
+        def ready():
+            nonlocal stage
+            if args.check or args.startup_handshake:
+                print(json.dumps({'stage':'preclaim','status':'ready'}),flush=True)
+            if args.startup_handshake and sys.stdin.buffer.readline(16)!=b'go\n':
+                raise BackstageFatalError('startup acknowledgement missing')
+            stage='running'
+        def failure(category):
+            if args.startup_handshake:
+                try:
+                    print(json.dumps({'stage':'runtime','status':'failed','error':category}),flush=True)
+                except (BrokenPipeError,OSError):
+                    pass
+        BackstageBridge(config).serve_forever(on_ready=ready,on_failure=failure,check_only=args.check)
+        return 0
+    except (BackstageFatalError,ValueError,ImportError,OSError) as error:
+        if stage=='running':
+            raise
+        if args.check or args.startup_handshake:
+            result={'stage':stage,'status':'failed','error':type(error).__name__}
+            known_settings=('BACKSTAGE_SERVER_URL','BACKSTAGE_WORKER_TOKEN','BACKSTAGE_CLI_PYTHON',
+                            'BACKSTAGE_CLI_ENTRY','BACKSTAGE_SSH_PID','BACKSTAGE_SSH_CREATED_FILETIME')
+            for name in known_settings:
+                if str(error)==f'missing required setting: {name}':
+                    result['setting']=name
+                    break
+            print(json.dumps(result),flush=True)
+            return 2
+        raise
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
