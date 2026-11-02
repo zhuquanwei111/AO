@@ -496,25 +496,18 @@ private struct LiveSessionOverviewView: View {
         Section(header: Text("后台复盘"),
                 footer: Text("后台页面读数仅供参考，不代表平台最终结算。")) {
             row("任务状态", statusText(recap))
-            if let metrics = recap.metrics {
-                metricRow("累计观众", value: metrics.cumulativeAudience, approximate: recap.approximateMetrics.contains("累计观众"))
-                metricRow("新增粉丝", value: metrics.newFollowers, approximate: recap.approximateMetrics.contains("新增粉丝"))
-                metricRow("评论人数", value: metrics.commentCount, approximate: recap.approximateMetrics.contains("评论人数"))
-                metricRow("送礼人数", value: metrics.giftGivers, approximate: recap.approximateMetrics.contains("送礼人数"))
-                metricRow("获得音浪", value: metrics.soundEnergy, approximate: recap.approximateMetrics.contains("获得音浪"))
-            } else {
-                Text("暂无本场后台复盘数据").foregroundColor(.secondary)
-            }
+            metricRow("累计观众", value: recap.metrics?.cumulativeAudience, recap: recap)
+            metricRow("新增粉丝", value: recap.metrics?.newFollowers, recap: recap)
+            metricRow("评论人数", value: recap.metrics?.commentCount, recap: recap)
+            metricRow("送礼人数", value: recap.metrics?.giftGivers, recap: recap)
+            metricRow("获得音浪", value: recap.metrics?.soundEnergy, recap: recap)
         }
     }
 
     @ViewBuilder
-    private func metricRow(_ name: String, value: Int?, approximate: Bool) -> some View {
-        if let value {
-            row(name, "\(approximate ? "约" : "")\(value)")
-        } else {
-            row(name, "暂无数据")
-        }
+    private func metricRow(_ name: String, value: Int?, recap: LiveBackstageRecap) -> some View {
+        row(name, OperatorPresentation.recapMetric(value: value,
+            approximate: recap.approximateMetrics.contains(name), missing: recap.missingFields[name] != nil))
     }
 
     private func statusText(_ recap: LiveBackstageRecap) -> String {
@@ -525,12 +518,7 @@ private struct LiveSessionOverviewView: View {
         case "capturing": return "取数任务已领取，等待本场结果"
         case "not_connected": return "后台当前未连接，暂无本场复盘；后续状态以服务端回报为准。此状态不代表实时辅助已停用。"
         case "captured_locally":
-            guard let metrics = recap.metrics,
-                  metrics.cumulativeAudience != nil,
-                  metrics.newFollowers != nil,
-                  metrics.commentCount != nil,
-                  metrics.giftGivers != nil,
-                  metrics.soundEnergy != nil else {
+            guard recap.availableMetricCount == 5 else {
                 return "复盘读数待确认"
             }
             return "已取得五项"

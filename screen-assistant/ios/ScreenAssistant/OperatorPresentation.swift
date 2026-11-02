@@ -2,6 +2,11 @@ import Foundation
 
 /// 面向运营的时间与人数格式；缺失读数不转换为零。
 enum OperatorPresentation {
+    static func recapMetric(value: Int?, approximate: Bool, missing: Bool) -> String {
+        guard !missing, let value, value >= 0 else { return "暂无数据" }
+        return "\(approximate ? "约" : "")\(value)"
+    }
+
     static func observationUploadDescription(value: (String) -> Int) -> String {
         let unsent = ["limit_comment", "limit_count", "bytes_comment", "bytes_count",
                       "oversize_comment", "oversize_count", "invalid_comment", "invalid_count",

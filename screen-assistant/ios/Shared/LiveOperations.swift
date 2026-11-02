@@ -372,6 +372,19 @@ struct LiveBackstageRecap: Decodable {
     let missingFields: [String: String]
     let startSignalSource: String
     let stopSignalSource: String?
+    private var metricValues: [(String, Int?)] {
+        [("累计观众", metrics?.cumulativeAudience), ("新增粉丝", metrics?.newFollowers),
+         ("评论人数", metrics?.commentCount), ("送礼人数", metrics?.giftGivers),
+         ("获得音浪", metrics?.soundEnergy)]
+    }
+    var availableMetricCount: Int {
+        metricValues.filter { missingFields[$0.0] == nil && ($0.1 ?? -1) >= 0 }.count
+    }
+    var hasMissingFieldConflict: Bool {
+        metricValues.contains { key, value in
+            missingFields[key] != nil && (value != nil || !(rawDisplays?[key] ?? "").isEmpty)
+        }
+    }
     enum CodingKeys: String, CodingKey {
         case taskID = "task_id", status, douyinAccount = "douyin_account"
         case roomID = "room_id", stopSignalReceived = "stop_signal_received"
