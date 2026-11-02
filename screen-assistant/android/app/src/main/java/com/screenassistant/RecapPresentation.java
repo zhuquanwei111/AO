@@ -31,13 +31,14 @@ final class RecapPresentation {
         {
             JSONObject metrics = backstage == null ? null : backstage.optJSONObject("metrics");
             JSONObject raw = backstage == null ? null : backstage.optJSONObject("raw_displays");
+            JSONObject missing = backstage == null ? null : backstage.optJSONObject("missing_fields");
             JSONArray approximate = backstage == null ? null : backstage.optJSONArray("approximate_metrics");
             String[] names = {"累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪"};
             out.append("\n\n平台数据");
             for (String name : names) {
                 out.append("\n").append(name).append("：");
                 Object value = metrics == null ? null : metrics.opt(name);
-                if (!(value instanceof Number) || ((Number) value).doubleValue() < 0
+                if ((missing != null && missing.has(name)) || !(value instanceof Number) || ((Number) value).doubleValue() < 0
                         || !Double.isFinite(((Number) value).doubleValue())
                         || Math.floor(((Number) value).doubleValue()) != ((Number) value).doubleValue()) {
                     out.append("暂无数据");

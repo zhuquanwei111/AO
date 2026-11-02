@@ -59,6 +59,19 @@ public class RecapPresentationTest {
         assertTrue(invalid.contains("获得音浪：约 32000"));
         assertFalse(invalid.contains("invalid"));
     }
+
+    @Test public void explicitlyMissingFieldCannotBecomeSuccessThroughConflictingValues() throws Exception {
+        JSONObject data = fixture("partial"), backstage = data.getJSONObject("backstage_recap");
+        backstage.getJSONObject("missing_fields").put("累计观众", "未确认");
+        backstage.getJSONObject("raw_displays").put("评论人数", "12");
+        backstage.getJSONObject("metrics").put("新增粉丝", 0);
+        backstage.getJSONObject("raw_displays").put("新增粉丝", "--");
+        String text = RecapPresentation.summary(data);
+        assertTrue(text.contains("累计观众：暂无数据"));
+        assertTrue(text.contains("评论人数：暂无数据"));
+        assertTrue(text.contains("新增粉丝：0"));
+        assertFalse(text.contains("未确认"));
+    }
     @Test public void absentCountDiffersFromRealZero() throws Exception {
         JSONObject data = new JSONObject().put("online_count", new JSONObject().put("status", "unknown")
                 .put("peak", JSONObject.NULL).put("coverage", new JSONObject().put("sample_issues", "source_missing")));
