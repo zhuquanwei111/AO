@@ -14,4 +14,12 @@ assert(OperatorPresentation.people(nil, approximate: false, locale: locale) == n
 assert(OperatorPresentation.people(0, approximate: false, locale: locale) == "0 人")
 assert(OperatorPresentation.people(1200, approximate: true, locale: locale) == "约1,200 人")
 assert(OperatorPresentation.people(.nan, approximate: false, locale: locale) == nil)
+func upload(_ counts: [String: Int]) -> String {
+    OperatorPresentation.observationUploadDescription { counts[$0, default: 0] }
+}
+assert(upload(["cancel_unsent": 1, "received": 1]) == "已收到部分画面信息；提示以实际收到的建议为准。")
+assert(upload(["expired": 1]) == "暂未收到画面信息。")
+assert(upload(["oversize_comment": 1]) == "部分画面信息未送达。")
+assert(upload(["unknown": 1]) == "部分发送结果未确认。")
+assert(upload(["rejected": 1]) == "部分画面信息未送达。")
 print("OK: locale, timezone, cross-day duration and missing versus zero")

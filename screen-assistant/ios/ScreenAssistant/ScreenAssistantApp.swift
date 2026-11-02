@@ -803,18 +803,7 @@ final class AppModel: ObservableObject {
     private static func observationUploadDescription() -> String {
         guard let defaults = AppGroup.defaults else { return "画面信息状态暂不可用" }
         func value(_ key: String) -> Int { defaults.integer(forKey: "observation.upload.\(key)") }
-        let unsent = ["limit_comment", "limit_count", "bytes_comment", "bytes_count",
-                      "oversize_comment", "oversize_count", "invalid_comment", "invalid_count",
-                      "overflow_comment", "overflow_count", "expired", "cancel_unsent"]
-            .reduce(0) { $0 + value($1) }
-        var messages: [String] = []
-        if unsent > 0 || value("rejected") > 0 { messages.append("部分画面信息未送达") }
-        if value("unknown") > 0 { messages.append("部分发送结果未确认") }
-        if !messages.isEmpty { return messages.joined(separator: "；") + "。请检查服务和网络。" }
-        if value("received") > 0 || value("duplicate") > 0 || value("merged") > 0 {
-            return "已收到部分画面信息；提示以实际收到的建议为准。"
-        }
-        return "暂未收到画面信息。"
+        return OperatorPresentation.observationUploadDescription(value: value)
     }
 
     private static func isServiceFailure(_ phase: ControlState.ServicePhase) -> Bool {
