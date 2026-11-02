@@ -137,7 +137,7 @@ def test_preclaim_check_reports_safe_stage_without_secret(monkeypatch,capsys,sta
 def test_launcher_rejects_child_exit_before_ready_without_secret(tmp_path,monkeypatch):
     from screen_assistant_server import backstage_launcher as launcher
     path=tmp_path/'worker-token.env'; path.write_bytes(b'BACKSTAGE_WORKER_TOKEN=fixture-token\n')
-    child=Mock(pid=1234,stdout=io.BytesIO(b'')); child.poll.return_value=13; child.wait.return_value=13
+    child=Mock(pid=1234,stdout=io.BytesIO(b''),stderr=io.BytesIO()); child.poll.return_value=13; child.wait.return_value=13
     monkeypatch.setattr(launcher.subprocess,'Popen',Mock(return_value=child))
     monkeypatch.setattr(launcher,'verify_ssh_tunnel',Mock())
     with pytest.raises(BackstageFatalError) as error:
@@ -146,10 +146,25 @@ def test_launcher_rejects_child_exit_before_ready_without_secret(tmp_path,monkey
     assert '13' in str(error.value)
 
 
+def test_launcher_times_out_and_stops_only_its_child(tmp_path,monkeypatch):
+    from screen_assistant_server import backstage_launcher as launcher
+    path=tmp_path/'worker-token.env'; path.write_bytes(b'BACKSTAGE_WORKER_TOKEN=fixture-token\n')
+    child=Mock(pid=1234,stdout=io.BytesIO(b''),stderr=io.BytesIO(),stdin=io.BytesIO())
+    child.wait.side_effect=[subprocess.TimeoutExpired('fixture',2),-1]
+    monkeypatch.setattr(launcher.subprocess,'Popen',Mock(return_value=child))
+    monkeypatch.setattr(launcher,'verify_ssh_tunnel',Mock())
+    mailbox=Mock(); mailbox.get.side_effect=launcher.queue.Empty
+    monkeypatch.setattr(launcher.queue,'Queue',lambda **_kwargs:mailbox)
+    with pytest.raises(BackstageFatalError) as error:
+        launcher.launch_bridge('http://127.0.0.1:57321',42,100,path,{})
+    child.terminate.assert_called_once()
+    assert 'exit=-1' in str(error.value) and 'fixture-token' not in str(error.value)
+
+
 def test_launcher_reports_only_whitelisted_child_error(tmp_path,monkeypatch):
     from screen_assistant_server import backstage_launcher as launcher
     path=tmp_path/'worker-token.env'; path.write_bytes(b'BACKSTAGE_WORKER_TOKEN=fixture-token\n')
-    child=Mock(pid=1234,stdout=io.BytesIO(b'{"stage":"config","status":"failed","error":"fixture-token"}\n'))
+    child=Mock(pid=1234,stdout=io.BytesIO(b'{"stage":"config","status":"failed","error":"fixture-token"}\n'),stderr=io.BytesIO())
     child.poll.return_value=2; child.wait.return_value=2
     monkeypatch.setattr(launcher.subprocess,'Popen',Mock(return_value=child))
     monkeypatch.setattr(launcher,'verify_ssh_tunnel',Mock())
@@ -163,7 +178,7 @@ def test_launcher_reports_runtime_exit_after_ready(tmp_path,monkeypatch,capsys):
     from screen_assistant_server import backstage_launcher as launcher
     path=tmp_path/'worker-token.env'; path.write_bytes(b'BACKSTAGE_WORKER_TOKEN=fixture-token\n')
     child=Mock(pid=1234,stdout=io.BytesIO(b'{"stage":"preclaim","status":"ready"}\n'
-        b'{"stage":"runtime","status":"failed","error":"http_rejected_403"}\n'),stdin=io.BytesIO())
+        b'{"stage":"runtime","status":"failed","error":"http_rejected_403"}\n'),stdin=io.BytesIO(),stderr=io.BytesIO())
     child.poll.return_value=None; child.wait.return_value=2
     monkeypatch.setattr(launcher.subprocess,'Popen',Mock(return_value=child))
     monkeypatch.setattr(launcher,'verify_ssh_tunnel',Mock())
@@ -176,11 +191,17 @@ def test_launcher_reports_runtime_exit_after_ready(tmp_path,monkeypatch,capsys):
 
 def test_supervisor_discards_large_untrusted_output(capsys):
     from screen_assistant_server import backstage_launcher as launcher
-    child=Mock(stdout=io.BytesIO(b'fixture-token'+b'x'*5000))
+    child=Mock(stdout=io.BytesIO(b'fixture-token'+b'x'*5000),stderr=io.BytesIO(),safe_stderr=bytearray(),stderr_thread=Mock())
     child.wait.return_value=7
     assert launcher.supervise_bridge(child)==7
     output=capsys.readouterr().out
     assert 'fixture-token' not in output and 'category=unknown' in output and 'exit=7' in output
+
+
+def test_stderr_projection_exposes_only_exception_category():
+    from screen_assistant_server.backstage_launcher import stderr_category
+    assert stderr_category(b'Traceback\nTypeError: fixture-token\n')=='TypeError'
+    assert stderr_category(b'fixture-token\n')=='unknown'
 
 
 def test_launcher_supervises_real_child_with_bounded_safe_status(tmp_path):
@@ -217,6 +238,7 @@ def test_secure_launcher_injects_only_single_field_into_child(tmp_path, monkeypa
     popen=Mock()
     popen.return_value.pid=1234
     popen.return_value.stdout=io.BytesIO(b'{"stage":"preclaim","status":"ready"}\n')
+    popen.return_value.stderr=io.BytesIO()
     popen.return_value.stdin=io.BytesIO()
     popen.return_value.poll.return_value=None
     popen.return_value.wait.side_effect=subprocess.TimeoutExpired('fixture',2)

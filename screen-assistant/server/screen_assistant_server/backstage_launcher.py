@@ -47,9 +47,18 @@ def launch_bridge(url: str, ssh_pid: int, ssh_created_filetime: int, token_path:
         process=subprocess.Popen([sys.executable,'-m','screen_assistant_server.backstage_bridge','--startup-handshake'],
                                  cwd=str(Path(__file__).resolve().parent.parent),
                                  env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,
-                                 stderr=subprocess.DEVNULL,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+                                 stderr=subprocess.PIPE,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
     except OSError:
         raise BackstageFatalError('bridge process could not start') from None
+    process.safe_stderr=bytearray()
+    def drain_stderr():
+        while True:
+            block=process.stderr.read(1024)
+            if not block: break
+            if len(process.safe_stderr)<4096:
+                process.safe_stderr.extend(block[:4096-len(process.safe_stderr)])
+    process.stderr_thread=threading.Thread(target=drain_stderr,daemon=True)
+    process.stderr_thread.start()
     replies=queue.Queue(maxsize=1)
     def read_startup():
         try: replies.put(process.stdout.readline(1025))
@@ -80,15 +89,27 @@ def launch_bridge(url: str, ssh_pid: int, ssh_created_filetime: int, token_path:
     process.stdout.close()
     if process.stdin and not process.stdin.closed:
         process.stdin.close()
+    process.stderr_thread.join(timeout=5)
+    process.stderr.close()
     stage=reply.get('stage') if isinstance(reply,dict) else None
     error=reply.get('error') if isinstance(reply,dict) else None
     setting=reply.get('setting') if isinstance(reply,dict) else None
     if stage not in ('config','lock'): stage='unknown'
     if error not in ('BackstageFatalError','ValueError','ImportError','OSError'): error='unknown'
+    if error=='unknown': error=stderr_category(process.safe_stderr)
     known_settings=('BACKSTAGE_SERVER_URL','BACKSTAGE_WORKER_TOKEN','BACKSTAGE_CLI_PYTHON',
                     'BACKSTAGE_CLI_ENTRY','BACKSTAGE_SSH_PID','BACKSTAGE_SSH_CREATED_FILETIME')
     suffix=f', setting={setting}' if setting in known_settings else ''
     raise BackstageFatalError(f'bridge startup failed: stage={stage}, category={error}, exit={code}{suffix}')
+
+
+def stderr_category(data):
+    """只投影固定异常类别，不输出进程诊断正文。"""
+    allowed=('ModuleNotFoundError','ImportError','ValueError','TypeError','OSError','RuntimeError')
+    for name in allowed:
+        if re.search(rb'(?m)^'+name.encode('ascii')+rb'(?::|\s|$)',bytes(data)):
+            return name
+    return 'unknown'
 
 
 def supervise_bridge(process):
@@ -105,13 +126,15 @@ def supervise_bridge(process):
     code=process.wait()
     thread.join(timeout=5)
     process.stdout.close()
+    process.stderr_thread.join(timeout=5)
+    process.stderr.close()
     try:
         result=json.loads(captured) if len(captured)<=1024 else None
     except (ValueError,UnicodeError,TypeError):
         result=None
     category=result.get('error') if isinstance(result,dict) and result.get('stage')=='runtime' else None
     if not isinstance(category,str) or not (category=='bridge_fatal' or re.fullmatch(r'http_rejected_[0-9]{3}',category)):
-        category='unknown'
+        category=stderr_category(process.safe_stderr)
     print(f'bridge exited: stage=runtime, category={category}, exit={code}',flush=True)
     return code
 
