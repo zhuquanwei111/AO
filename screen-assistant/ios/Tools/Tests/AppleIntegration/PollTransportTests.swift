@@ -108,13 +108,14 @@ final class PollTransportTests: XCTestCase {
         let keys = ["累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪"]
         func decode(code: String = "not_live", status: String = "failed", stop: Bool = true,
                     room: Any? = NSNull(), metrics: [String: Any]? = nil,
-                    reasons: [String: String]? = nil) throws -> LiveBackstageRecap {
+                    reasons: [String: String]? = nil, raw: [String: String]? = nil) throws -> LiveBackstageRecap {
             var obj: [String: Any] = ["task_id": "test", "status": status, "douyin_account": "test",
                 "stop_signal_received": stop, "started_at_ms": 1,
                 "metrics": metrics ?? Dictionary(uniqueKeysWithValues: keys.map { ($0, NSNull()) }),
                 "approximate_metrics": [], "missing_fields": reasons ?? Dictionary(uniqueKeysWithValues: keys.map { ($0, code) }),
                 "start_signal_source": "ios_app"]
             if let room { obj["room_id"] = room }
+            if let raw { obj["raw_displays"] = raw }
             return try JSONDecoder().decode(LiveBackstageRecap.self, from: JSONSerialization.data(withJSONObject: obj))
         }
         XCTAssertEqual(BackstageStatusPresentation.confirmedBusinessOutcome(try decode()), "主播当前未开播")
@@ -134,6 +135,8 @@ final class PollTransportTests: XCTestCase {
         XCTAssertNil(BackstageStatusPresentation.confirmedBusinessOutcome(try decode(metrics: metrics)))
         metrics.removeValue(forKey: keys[0])
         XCTAssertNil(BackstageStatusPresentation.confirmedBusinessOutcome(try decode(metrics: metrics)))
+        XCTAssertNil(BackstageStatusPresentation.confirmedBusinessOutcome(try decode(raw: [keys[0]: "1"])))
+        XCTAssertNil(BackstageStatusPresentation.confirmedBusinessOutcome(try decode(code: "account_not_found", raw: [keys[4]: "--"])))
     }
     func testBackstageMetricPreservesZeroAndHonorsExplicitMissing() {
         XCTAssertEqual(OperatorPresentation.recapMetric(value: 0, approximate: false, missing: false), "0")

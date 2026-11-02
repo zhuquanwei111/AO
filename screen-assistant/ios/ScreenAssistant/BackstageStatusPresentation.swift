@@ -5,7 +5,8 @@ enum BackstageStatusPresentation {
     static func confirmedBusinessOutcome(_ recap: LiveBackstageRecap) -> String? {
         let keys = ["累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪"]
         guard recap.status == "failed", recap.stopSignalReceived, recap.roomIDExplicitlyNull,
-              recap.metrics?.allExplicitlyNull == true, recap.missingFields.count == keys.count,
+              recap.metrics?.allExplicitlyNull == true, !recap.hasMissingFieldConflict,
+              recap.missingFields.count == keys.count,
               let code = recap.missingFields[keys[0]],
               keys.allSatisfy({ recap.missingFields[$0] == code }) else { return nil }
         switch code {
