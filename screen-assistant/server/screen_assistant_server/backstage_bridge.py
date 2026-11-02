@@ -8,11 +8,14 @@ import signal
 import subprocess
 import sys
 import time
+import ntpath
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from urllib.request import Request, ProxyHandler, HTTPRedirectHandler, HTTPHandler, build_opener
+from http.client import HTTPConnection
 
 
 METRIC_KEYS = ("累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪")
@@ -28,6 +31,98 @@ class BackstageTransientError(RuntimeError):
 
 class BackstageCliRecordError(ValueError):
     """CLI record不属于当前场次或不符合当前回写契约。"""
+
+
+class VerifiedTunnelHTTPHandler(HTTPHandler):
+    def __init__(self, verify):
+        super().__init__()
+        self.verify = verify
+
+    def http_open(self, request):
+        verify = self.verify
+
+        class VerifiedConnection(HTTPConnection):
+            def connect(self):
+                super().connect()
+                try:
+                    verify()
+                except Exception:
+                    self.close()
+                    raise
+
+        return self.do_open(VerifiedConnection, request)
+
+
+def validate_worker_url(value: str) -> str:
+    """worker凭据仅发送到经运维确认的本机SSH转发入口。"""
+    try:
+        parsed=urlsplit(value)
+        port=parsed.port
+    except (ValueError,AttributeError):
+        raise BackstageFatalError('worker endpoint must be an explicit loopback tunnel') from None
+    if (parsed.scheme!='http' or parsed.hostname!='127.0.0.1' or port is None or
+            not 1<=port<=65535 or value!=f'http://127.0.0.1:{port}'):
+        raise BackstageFatalError('worker endpoint must be an explicit loopback tunnel')
+    return value
+
+
+class NoWorkerRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _windows_process_identity(pid: int):
+    import ctypes
+    from ctypes import wintypes as w
+    kernel=ctypes.WinDLL('kernel32',use_last_error=True)
+    kernel.OpenProcess.argtypes=[w.DWORD,w.BOOL,w.DWORD]; kernel.OpenProcess.restype=w.HANDLE
+    kernel.QueryFullProcessImageNameW.argtypes=[w.HANDLE,w.DWORD,w.LPWSTR,ctypes.POINTER(w.DWORD)]
+    kernel.QueryFullProcessImageNameW.restype=w.BOOL
+    kernel.GetProcessTimes.argtypes=[w.HANDLE]+[ctypes.POINTER(w.FILETIME)]*4
+    kernel.GetProcessTimes.restype=w.BOOL
+    kernel.CloseHandle.argtypes=[w.HANDLE]; kernel.CloseHandle.restype=w.BOOL
+    handle=kernel.OpenProcess(0x1000,False,pid)
+    if not handle: raise BackstageFatalError('ssh tunnel process unavailable')
+    try:
+        path=ctypes.create_unicode_buffer(32768); size=w.DWORD(len(path))
+        times=[w.FILETIME() for _ in range(4)]
+        if not kernel.QueryFullProcessImageNameW(handle,0,path,ctypes.byref(size)) or not kernel.GetProcessTimes(handle,*[ctypes.byref(t) for t in times]):
+            raise BackstageFatalError('ssh tunnel identity unavailable')
+        return path.value,(times[0].dwHighDateTime<<32)|times[0].dwLowDateTime
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def _windows_listeners(port: int):
+    root=os.environ.get('SYSTEMROOT','')
+    if not root: raise BackstageFatalError('system root unavailable')
+    executable=ntpath.join(root,'System32','netstat.exe')
+    env={key:value for key,value in os.environ.items() if key.upper() in {'SYSTEMROOT','WINDIR'}}
+    try:
+        result=subprocess.run([executable,'-ano','-p','tcp'],capture_output=True,text=True,
+                              timeout=5,check=True,env=env,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+    except (OSError,subprocess.SubprocessError):
+        raise BackstageFatalError('ssh tunnel listener unavailable') from None
+    rows=[]
+    for line in result.stdout.splitlines():
+        fields=line.split()
+        if len(fields)!=5 or fields[0].upper()!='TCP' or fields[3].upper()!='LISTENING': continue
+        address,separator,number=fields[1].rpartition(':')
+        if separator and number.isdecimal() and int(number)==port and fields[4].isdecimal():
+            rows.append((address,int(fields[4])))
+    return rows
+
+
+def verify_ssh_tunnel(url: str, pid: int, created_filetime: int):
+    validate_worker_url(url)
+    if os.name!='nt' or type(pid) is not int or pid<=0 or type(created_filetime) is not int or created_filetime<=0:
+        raise BackstageFatalError('ssh tunnel identity invalid')
+    actual_path,actual_created=_windows_process_identity(pid)
+    expected=ntpath.join(os.environ.get('SYSTEMROOT',''),'System32','OpenSSH','ssh.exe')
+    if not os.environ.get('SYSTEMROOT') or ntpath.normcase(ntpath.normpath(actual_path))!=ntpath.normcase(ntpath.normpath(expected)) or actual_created!=created_filetime:
+        raise BackstageFatalError('ssh tunnel identity mismatch')
+    if _windows_listeners(urlsplit(url).port)!=[('127.0.0.1',pid)]:
+        raise BackstageFatalError('ssh tunnel listener mismatch')
 
 
 @contextmanager
@@ -88,6 +183,8 @@ class BridgeConfig:
     poll_seconds: float = 2.0
     request_timeout: float = 15.0
     cli_timeout: float = 480.0
+    ssh_pid: int | None = None
+    ssh_created_filetime: int | None = None
 
     def __post_init__(self):
         if not 60.0 <= self.cli_timeout <= 600.0:
@@ -108,8 +205,14 @@ class BridgeConfig:
         if not 60.0 <= cli_timeout <= 600.0:
             raise ValueError("BACKSTAGE_CLI_TIMEOUT_SECONDS must be between 60 and 600")
 
+        url=validate_worker_url(required("BACKSTAGE_SERVER_URL"))
+        try:
+            pid=int(required("BACKSTAGE_SSH_PID")); created=int(required("BACKSTAGE_SSH_CREATED_FILETIME"))
+        except ValueError:
+            raise BackstageFatalError('ssh tunnel identity invalid') from None
+        verify_ssh_tunnel(url,pid,created)
         return cls(
-            server_url=required("BACKSTAGE_SERVER_URL").rstrip("/"),
+            server_url=url,
             worker_token=required("BACKSTAGE_WORKER_TOKEN"),
             cli_python=required("BACKSTAGE_CLI_PYTHON"),
             cli_entry=required("BACKSTAGE_CLI_ENTRY"),
@@ -119,6 +222,7 @@ class BridgeConfig:
             gate_a=optional("BACKSTAGE_CLI_GATE_A"),
             poll_seconds=max(0.5, float(os.environ.get("BACKSTAGE_POLL_SECONDS", "2"))),
             cli_timeout=cli_timeout,
+            ssh_pid=pid, ssh_created_filetime=created,
         )
 
 
@@ -135,14 +239,17 @@ class BackstageBridge:
         self.sleep = sleep
 
     def _http(self, method: str, path: str, payload: dict | None = None) -> dict:
-        url = self.config.server_url + "/" + path.lstrip("/")
+        url = validate_worker_url(self.config.server_url) + "/" + path.lstrip("/")
+        verify_ssh_tunnel(self.config.server_url,self.config.ssh_pid,self.config.ssh_created_filetime)
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
         request = Request(url, data=body, method=method, headers={
             "X-Backstage-Worker-Token": self.config.worker_token,
             "Content-Type": "application/json",
         })
         try:
-            with urlopen(request, timeout=self.config.request_timeout) as response:
+            opener=build_opener(ProxyHandler({}),NoWorkerRedirect(),VerifiedTunnelHTTPHandler(
+                lambda: verify_ssh_tunnel(self.config.server_url,self.config.ssh_pid,self.config.ssh_created_filetime)))
+            with opener.open(request, timeout=self.config.request_timeout) as response:
                 try:
                     payload = json.loads(response.read().decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):

@@ -862,9 +862,12 @@ def test_worker_auth_http_error_is_fatal_not_a_poll_retry(monkeypatch):
     def forbidden(*_args, **_kwargs):
         raise HTTPError("http://localhost/claim", 403, "forbidden", {}, None)
 
-    monkeypatch.setattr("screen_assistant_server.backstage_bridge.urlopen", forbidden)
+    class Opener:
+        open = staticmethod(forbidden)
+    monkeypatch.setattr("screen_assistant_server.backstage_bridge.build_opener", lambda *_: Opener())
+    monkeypatch.setattr("screen_assistant_server.backstage_bridge.verify_ssh_tunnel", lambda *_: None)
     bridge = BackstageBridge(
-        BridgeConfig("http://localhost", "worker", "python", "recap.py"),
+        BridgeConfig("http://127.0.0.1:8000", "worker", "python", "recap.py"),
     )
     with pytest.raises(BackstageFatalError, match="403"):
         bridge.http("POST", "v1/live/sessions/backstage/tasks/claim")
@@ -1029,7 +1032,10 @@ def test_cli_timeout_terminates_its_process_tree_and_returns_needs_input(monkeyp
 
 
 def test_bridge_cli_timeout_config_is_bounded(monkeypatch):
-    monkeypatch.setenv("BACKSTAGE_SERVER_URL", "http://localhost")
+    monkeypatch.setenv("BACKSTAGE_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("BACKSTAGE_SSH_PID", "123")
+    monkeypatch.setenv("BACKSTAGE_SSH_CREATED_FILETIME", "456")
+    monkeypatch.setattr("screen_assistant_server.backstage_bridge.verify_ssh_tunnel", lambda *_: None)
     monkeypatch.setenv("BACKSTAGE_WORKER_TOKEN", "worker")
     monkeypatch.setenv("BACKSTAGE_CLI_PYTHON", "python")
     monkeypatch.setenv("BACKSTAGE_CLI_ENTRY", "recap.py")

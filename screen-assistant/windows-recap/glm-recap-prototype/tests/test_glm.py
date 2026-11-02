@@ -112,9 +112,11 @@ class GLMTests(unittest.TestCase):
                     return View(tokens,scenario.image.read_bytes(),scenario.get(window),(600,400),'fake',[])
             driver=Driver(scenario,scenario,None,Path(folder)/'data/evidence',
                 'https://union.bytedance.com/open/portal/',vision=Vision())
+            driver.target=Mock(side_effect=AssertionError('不得调用旧视觉导航'))
             runner=Runner(Store(Path(folder)/'data'),driver)
             record=runner.start('glm-fake','demo',None,'test_simulated')
             self.assertEqual(record['status'],'waiting_for_stop',record)
+            driver.target.assert_not_called()
             self.assertIn('OCR',record['binding_evidence']['locator'])
             actions=list(scenario.inputs)
             self.assertEqual(runner.start('glm-fake','demo',None,'test_simulated'),record)
