@@ -965,6 +965,7 @@ final class AppModel: ObservableObject {
     }
 
     private static func backstageStatusText(_ recap: LiveBackstageRecap) -> String {
+        if let outcome = BackstageStatusPresentation.confirmedBusinessOutcome(recap) { return outcome }
         let count = recap.metrics.map { _ in recap.availableMetricCount }
         return BackstageStatusPresentation.summary(status: recap.status, claimedAtMS: recap.claimedAtMS,
                                                    receivedMetricCount: count)
