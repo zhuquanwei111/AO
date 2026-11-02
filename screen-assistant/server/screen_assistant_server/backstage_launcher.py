@@ -76,7 +76,7 @@ def launch_bridge(url: str, ssh_pid: int, ssh_created_filetime: int, token_path:
         try:
             process.stdin.write(b'go\n'); process.stdin.flush(); process.stdin.close()
         except (OSError,ValueError):
-            reply=None
+            reply={'stage':'handshake','error':'OSError'}
         else:
             return process
     try:
@@ -94,7 +94,7 @@ def launch_bridge(url: str, ssh_pid: int, ssh_created_filetime: int, token_path:
     stage=reply.get('stage') if isinstance(reply,dict) else None
     error=reply.get('error') if isinstance(reply,dict) else None
     setting=reply.get('setting') if isinstance(reply,dict) else None
-    if stage not in ('config','lock'): stage='unknown'
+    if stage not in ('config','lock','handshake'): stage='unknown'
     if error not in ('BackstageFatalError','ValueError','ImportError','OSError'): error='unknown'
     if error=='unknown': error=stderr_category(process.safe_stderr)
     known_settings=('BACKSTAGE_SERVER_URL','BACKSTAGE_WORKER_TOKEN','BACKSTAGE_CLI_PYTHON',

@@ -776,8 +776,10 @@ def main(argv=None) -> int:
             nonlocal stage
             if args.check or args.startup_handshake:
                 print(json.dumps({'stage':'preclaim','status':'ready'}),flush=True)
-            if args.startup_handshake and sys.stdin.buffer.readline(16)!=b'go\n':
-                raise BackstageFatalError('startup acknowledgement missing')
+            if args.startup_handshake:
+                stage='handshake'
+                if sys.stdin.buffer.readline(16)!=b'go\n':
+                    raise BackstageFatalError('startup acknowledgement missing')
             stage='running'
         def failure(category):
             if args.startup_handshake:

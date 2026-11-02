@@ -117,7 +117,9 @@ def test_handshake_without_parent_ack_cannot_claim(monkeypatch,capsys):
     monkeypatch.setattr(bridge.BackstageBridge,'_run_once',run)
     assert bridge.main(['--startup-handshake'])==2
     run.assert_not_called()
-    assert 'fixture-token' not in capsys.readouterr().out
+    output=capsys.readouterr().out
+    assert 'fixture-token' not in output
+    assert '"stage": "handshake"' in output
 
 
 @pytest.mark.parametrize('stage',['config','lock'])
@@ -144,6 +146,20 @@ def test_launcher_rejects_child_exit_before_ready_without_secret(tmp_path,monkey
         launcher.launch_bridge('http://127.0.0.1:57321',42,100,path,{})
     assert 'fixture-token' not in str(error.value)
     assert '13' in str(error.value)
+
+
+def test_launcher_reports_handshake_write_failure(tmp_path,monkeypatch):
+    from screen_assistant_server import backstage_launcher as launcher
+    path=tmp_path/'worker-token.env'; path.write_bytes(b'BACKSTAGE_WORKER_TOKEN=fixture-token\n')
+    closed=io.BytesIO(); closed.close()
+    child=Mock(pid=1234,stdout=io.BytesIO(b'{"stage":"preclaim","status":"ready"}\n'),
+               stderr=io.BytesIO(),stdin=closed)
+    child.poll.return_value=None; child.wait.return_value=2
+    monkeypatch.setattr(launcher.subprocess,'Popen',Mock(return_value=child))
+    monkeypatch.setattr(launcher,'verify_ssh_tunnel',Mock())
+    with pytest.raises(BackstageFatalError) as error:
+        launcher.launch_bridge('http://127.0.0.1:57321',42,100,path,{})
+    assert 'stage=handshake' in str(error.value) and 'fixture-token' not in str(error.value)
 
 
 def test_launcher_times_out_and_stops_only_its_child(tmp_path,monkeypatch):
