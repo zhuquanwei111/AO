@@ -1,5 +1,6 @@
 import io
 import asyncio
+from contextlib import redirect_stdout
 import json
 import subprocess
 import sys
@@ -148,6 +149,48 @@ class MemoryVisualTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'gate_a_not_verified'):
                 GLMRuntime(folder).run_crop(crop, 'fixture')
             run.assert_not_called()
+
+    def test_worker_failure_makes_request_count_unknown(self):
+        anchor = Token('主播列表', (100, 80, 160, 100))
+        crop = make_local_crop(self.view([anchor]), anchor, 'navigation', lambda window: window)
+        replies = [subprocess.CompletedProcess([], 2, b'{"status":"FAIL"}', b''),
+                   subprocess.CompletedProcess([], 0, b'x' * 16385, b''),
+                   subprocess.CompletedProcess([], 0, b'not-json', b''),
+                   subprocess.CompletedProcess([], 0, b'{"status":"FAIL"}', b''),
+                   subprocess.CompletedProcess([], 0, b'{"status":"OK","result":{},"http_requests":0}', b'')]
+        with tempfile.TemporaryDirectory() as folder, \
+             patch.dict('os.environ', {'TIANYI_API_KEY': 'fake', 'BACKSTAGE_SDK_PYTHON': sys.executable}), \
+             patch('glm_runtime.require_gate_a'):
+            for reply in replies:
+                runtime = GLMRuntime(folder, gate='fixture-gate')
+                with patch('subprocess.run', return_value=reply), self.assertRaises(RuntimeError):
+                    runtime.run_crop(crop, 'fixture')
+                self.assertIsNone(runtime.http_requests)
+
+    def test_cli_finalization_persists_unknown_request_count(self):
+        import recap_glm
+        anchor = Token('主播列表', (100, 80, 160, 100))
+        crop = make_local_crop(self.view([anchor]), anchor, 'navigation', lambda window: window)
+        with tempfile.TemporaryDirectory() as folder:
+            runtime = GLMRuntime(folder, gate='fixture-gate')
+            desktop = Mock()
+            desktop.bind.side_effect = lambda account: runtime.run_crop(crop, 'fixture')
+            wire = Mock(); wire.close.return_value = True
+            modules = {'glm_desktop': types.SimpleNamespace(GLMDesktop=Mock(return_value=desktop)),
+                       'window_probe': types.SimpleNamespace(Probe=Mock()),
+                       'ocr_local': types.SimpleNamespace(LocalOCR=Mock()),
+                       'transport': types.SimpleNamespace(MCP=Mock(return_value=wire))}
+            args = ['recap_glm.py', 'start', '--task', 'task', '--account', 'demo',
+                    '--session-id', 'session', '--source', 'android_app', '--data', folder,
+                    '--scratch', folder, '--desktop-authorized']
+            failure = subprocess.CompletedProcess([], 2, b'{"status":"FAIL"}', b'')
+            with patch.object(sys, 'argv', args), patch.dict(sys.modules, modules), \
+                 patch.object(recap_glm, 'GLMRuntime', return_value=runtime), \
+                 patch.dict('os.environ', {'TIANYI_API_KEY': 'fake', 'BACKSTAGE_SDK_PYTHON': sys.executable}), \
+                 patch('glm_runtime.require_gate_a'), patch('subprocess.run', return_value=failure), \
+                 redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(recap_glm.main(), 2)
+            self.assertIsNone(json.loads(output.getvalue())['record']['normal_path_llm_calls'])
 
     def test_moved_window_rejects_crop_before_worker(self):
         anchor = Token('主播列表', (100, 80, 160, 100))

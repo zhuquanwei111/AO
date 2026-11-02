@@ -88,15 +88,19 @@ class GLMRuntime:
             self.http_requests = None
             raise RuntimeError('visual_worker_failed') from None
         if result.returncode != 0 or len(result.stdout) > 16384:
+            self.http_requests = None
             raise RuntimeError('visual_worker_failed')
         try:
             reply = json.loads(result.stdout)
         except (ValueError, UnicodeError):
+            self.http_requests = None
             raise RuntimeError('visual_worker_invalid_reply') from None
         if not isinstance(reply, dict) or reply.get('status') != 'OK' or not isinstance(reply.get('result'), dict):
+            self.http_requests = None
             raise RuntimeError('visual_worker_invalid_reply')
         requests = reply.get('http_requests')
         if type(requests) is not int or not 1 <= requests <= 3:
+            self.http_requests = None
             raise RuntimeError('visual_worker_invalid_reply')
         self.http_requests = None if self.http_requests is None else self.http_requests + requests
         return reply['result']
