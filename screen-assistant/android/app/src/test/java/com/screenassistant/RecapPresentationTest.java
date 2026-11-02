@@ -22,10 +22,10 @@ public class RecapPresentationTest {
         throw new AssertionError(name);
     }
 
-    @Test public void backstageUsesActualRawDisplaysAndShowsMissingFields() throws Exception {
+    @Test public void backstageUsesVerifiedNumericValuesAndShowsMissingFields() throws Exception {
         String partial = RecapPresentation.summary(fixture("partial"));
-        assertTrue(partial.contains("累计观众：约1.2万"));
-        assertTrue(partial.contains("获得音浪：3.2万"));
+        assertTrue(partial.contains("累计观众：约 12000"));
+        assertTrue(partial.contains("获得音浪：约 32000"));
         assertTrue(partial.contains("评论人数：暂无数据"));
         assertFalse(partial.contains("约 约"));
         assertFalse(partial.contains("页面未读到"));
@@ -58,6 +58,8 @@ public class RecapPresentationTest {
         assertTrue(invalid.contains("送礼人数：4"));
         assertTrue(invalid.contains("获得音浪：约 32000"));
         assertFalse(invalid.contains("invalid"));
+        backstage.getJSONObject("raw_displays").put("送礼人数", "99万");
+        assertTrue(RecapPresentation.summary(data).contains("送礼人数：4"));
     }
 
     @Test public void explicitlyMissingFieldCannotBecomeSuccessThroughConflictingValues() throws Exception {
