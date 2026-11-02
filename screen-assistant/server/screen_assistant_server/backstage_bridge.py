@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import contextmanager
 import signal
 import subprocess
 import sys
@@ -27,6 +28,44 @@ class BackstageTransientError(RuntimeError):
 
 class BackstageCliRecordError(ValueError):
     """CLI record不属于当前场次或不符合当前回写契约。"""
+
+
+@contextmanager
+def bridge_instance_lock(name: str = 'ScreenAssistantBackstageBridge'):
+    """同一主机仅允许一个桥；退出或进程结束由系统释放锁。"""
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel.CreateMutexW.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        ctypes.set_last_error(0)
+        handle = kernel.CreateMutexW(None, False, 'Global\\' + name)
+        error = ctypes.get_last_error()
+        if not handle:
+            raise BackstageFatalError('bridge instance lock unavailable')
+        if error == 183:
+            kernel.CloseHandle(handle)
+            raise BackstageFatalError('bridge already running')
+        try:
+            yield
+        finally:
+            kernel.CloseHandle(handle)
+    else:
+        import fcntl
+        import tempfile
+        path = Path(tempfile.gettempdir()) / f'{name}-{os.getuid()}.lock'
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise BackstageFatalError('bridge already running') from None
+            yield
+        finally:
+            os.close(fd)
 
 
 @dataclass(frozen=True)
@@ -143,8 +182,14 @@ class BackstageBridge:
 
     def _cli(self, command: str, task: dict) -> CliInvocation:
         entry = Path(self.config.cli_entry)
-        child_env = {key: value for key, value in os.environ.items()
-                     if key != "BACKSTAGE_WORKER_TOKEN" and not key.startswith("AO_")}
+        # 本地识别不需要模型或worker凭据；仅传运行所需系统变量及明确路径。
+        allowed = {"SYSTEMROOT", "WINDIR", "PATH", "PATHEXT", "TEMP", "TMP",
+                   "LOCALAPPDATA", "APPDATA", "USERPROFILE", "COMSPEC", "PROGRAMFILES",
+                   "PROGRAMFILES(X86)", "OS", "HOME", "LANG", "LC_ALL", "BACKSTAGE_CLI_DATA", "BACKSTAGE_CLI_MODELS",
+                   "BACKSTAGE_CLI_SCRATCH", "BACKSTAGE_MCP_CLIENT_PYTHON",
+                   "BACKSTAGE_WINDOWS_MCP_PYTHON"}
+        child_env = {key: value for key, value in os.environ.items() if key.upper() in allowed}
+        child_env.update(PYTHONUTF8="1", PYTHONDONTWRITEBYTECODE="1")
         try:
             process_options = {
                 "cwd": str(entry.parent), "env": child_env,
@@ -443,6 +488,10 @@ class BackstageBridge:
         return current
 
     def run_once(self) -> bool:
+        with bridge_instance_lock():
+            return self._run_once()
+
+    def _run_once(self) -> bool:
         claimed = self.http("POST", "v1/live/sessions/backstage/tasks/claim")
         if not isinstance(claimed, dict):
             raise BackstageFatalError("backstage claim response is invalid")
@@ -584,16 +633,17 @@ class BackstageBridge:
         return True
 
     def serve_forever(self) -> None:
-        while True:
-            try:
-                if not self.run_once():
+        with bridge_instance_lock():
+            while True:
+                try:
+                    if not self._run_once():
+                        self.sleep(self.config.poll_seconds)
+                except BackstageFatalError as exc:
+                    print(f"backstage bridge stopped: {exc}", file=sys.stderr)
+                    raise SystemExit(2) from None
+                except BackstageTransientError as exc:
+                    print(f"backstage bridge paused: {type(exc).__name__}", file=sys.stderr)
                     self.sleep(self.config.poll_seconds)
-            except BackstageFatalError as exc:
-                print(f"backstage bridge stopped: {exc}", file=sys.stderr)
-                raise SystemExit(2) from None
-            except BackstageTransientError as exc:
-                print(f"backstage bridge paused: {type(exc).__name__}", file=sys.stderr)
-                self.sleep(self.config.poll_seconds)
 
 
 def main() -> None:

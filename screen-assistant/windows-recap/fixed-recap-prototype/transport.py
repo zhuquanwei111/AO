@@ -49,8 +49,10 @@ class MCP:
         self.trace.parent.mkdir(parents=True,exist_ok=True)
         # 外部进程的未约束诊断可能包含图像或页面内容，不持久化stderr。
         self.stderr=None
-        child_env={key:value for key,value in os.environ.items()
-            if key not in {'TIANYI_API_KEY','BACKSTAGE_WORKER_TOKEN'} and not key.startswith('AO_')}
+        allowed={'SYSTEMROOT','WINDIR','PATH','PATHEXT','TEMP','TMP','LOCALAPPDATA','APPDATA',
+                 'USERPROFILE','COMSPEC','PROGRAMFILES','PROGRAMFILES(X86)','OS','HOME','LANG','LC_ALL',
+                 'BACKSTAGE_WINDOWS_MCP_PYTHON'}
+        child_env={key:value for key,value in os.environ.items() if key.upper() in allowed}
         self.process=subprocess.Popen([self.python,str(self.client)],stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,encoding='utf-8',bufsize=1,
             env=child_env,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
@@ -78,8 +80,6 @@ class MCP:
                 'is_error':bool(reply.get('is_error'))}
             if tool=='Shortcut' and arguments.get('shortcut') in ('ctrl+t','ctrl+l','end','esc'):
                 event['shortcut']=arguments['shortcut']
-            if tool=='App' and arguments.get('mode')=='launch':
-                event['app_result_text']='\n'.join(item.get('text','') for item in reply.get('content',[]))[:1024]
             stream.write(json.dumps(event)+'\n')
         check_reply(reply)
         return reply

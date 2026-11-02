@@ -78,7 +78,7 @@ class LLMDesktop(Desktop):
         self.mcp.note('edge_launch_diagnostics',candidate_count=len(windows),
             candidate_counts=counts,source='current_Win32_Edge_windows',
             candidates=[{key:window.get(key) for key in
-                ('handle','pid','process_created','title','rect','minimized')} for window in windows],
+                ('handle','pid','process_created','rect','minimized')} for window in windows],
             elapsed_ms=round((time.monotonic()-began)*1000))
         if len(windows)!=1: raise RecapError('edge_launch_unconfirmed')
         return windows
@@ -126,7 +126,8 @@ class LLMDesktop(Desktop):
         self.identity(view,account,True)
         room_id=self.room_identity(view)  # 保留可见URL/UIA/OCR的原场次核对，不让模型猜roomID。
         evidence=self.save_minimal(view,'binding.png')
-        return {'douyin_account':account,'room_id':room_id,'window':room,
+        window_identity={key:room[key] for key in ('handle','pid','process_created')}
+        return {'douyin_account':account,'room_id':room_id,'window':window_identity,
                 'screenshot':str(evidence.relative_to(self.evidence.parent)),
                 'account_verified_on_page':True,'room_id_source':'visible_browser_address_bar_UIA_or_OCR',
                 'page_live_status':'已开播','observed_at':view.captured_at,
@@ -135,18 +136,4 @@ class LLMDesktop(Desktop):
                 'new_window_created':True}
 
     def capture(self,binding):
-        room=self.focus(binding['window']); self.key(room,'esc'); view=self.observe(room,False)
-        self.identity(view,binding['douyin_account'])
-        if self.room_identity(view)!=binding['room_id']: raise RecapError('room_changed')
-        view=self.observe(room,False); self.identity(view,binding['douyin_account'])
-        result=metrics_from_tokens(view.tokens)
-        evidence=self.save_minimal(view,'metrics.png')
-        method='Windows-MCP screenshot + local RapidOCR 3.10.0'
-        if result['missing_fields']:
-            raws=self.vision.read(evidence,('account',)+METRICS,
-                '读取抖音号account及左侧五项汇总的显示原文。仅本场：累计观众、新增粉丝、评论人数、送礼人数、获得音浪；保留万等单位，读不清null。')
-            if raws['account']!=binding['douyin_account']: raise RecapError('wrong_identity')
-            result=fill_missing(result,raws); method+='; missing-only visual review gpt-6.1-sol'
-        return {**result,'metrics_captured_at':view.captured_at,'capture_method':method,
-                'capture_evidence':{'metrics_screenshot':str(evidence.relative_to(self.evidence.parent)),
-                                    'account_verified_on_page':True,'room_id_reverified':binding['room_id']}}
+        return Desktop.capture(self,binding)

@@ -1,4 +1,4 @@
-"""屏识助手单场取数组件；单一GLM路由，业务运行不使用AO或Codex。"""
+"""屏识助手单场取数组件；本地识别，不发送或保存截图。"""
 import argparse
 import json
 import os
@@ -65,7 +65,6 @@ def main():
     args.data=require_external_path(args.data)
     args.models=require_external_path(args.models)
     args.scratch=require_external_path(args.scratch)
-    args.gate_a=require_external_path(args.gate_a)
     began=time.monotonic(); store=Store(args.data)
     if args.command in ('status','result'):
         record=store.get(args.task)
@@ -86,17 +85,8 @@ def main():
             if not created:
                 print(json.dumps({'task_ref':str(store.path(task)),'record':record},ensure_ascii=False))
                 return operation_exit_code(args.command,record)
-            store.update(task,execution_route='tianyi_agents_sdk_fixed_steps',model=MODEL,
+            store.update(task,execution_route='local_ocr_fixed_steps',model=None,
                          normal_path_llm_calls=0,llm_runtime_invocations=0)
-        try:
-            require_gate_a(args.gate_a)
-            require_sdk_runtime()
-        except ValueError as error:
-            record=store.update(task,status='needs_input',reason=str(error))
-            print(json.dumps({'task_ref':str(store.path(task)),'record':record},ensure_ascii=False)); return 2
-        if not os.environ.get('TIANYI_API_KEY'):
-            record=store.update(task,status='needs_input',reason='missing_current_process_tianyi_key')
-            print(json.dumps({'task_ref':str(store.path(task)),'record':record},ensure_ascii=False)); return 2
         from glm_vision import GLMVision
         from glm_desktop import GLMDesktop
         from window_probe import Probe
@@ -128,7 +118,7 @@ def main():
             record=store.update(task,llm_runtime_invocations=old.get('llm_runtime_invocations',0)+runtime.calls,
                 normal_path_llm_calls=(old['normal_path_llm_calls']+runtime.http_requests)
                     if old.get('normal_path_llm_calls') is not None and runtime.http_requests is not None else None,
-                model_call_count_semantics='actual HTTP requests counted by the SDK client hook; HTTP retry disabled')
+                model_call_count_semantics='当前本地识别路径禁用图片及模型调用')
             if args.command=='start':
                 record=Runner(store,None).finish_unbound_execution(task,
                     cleanup_confirmed=cleanup_confirmed and runtime.calls==0)

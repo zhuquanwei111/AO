@@ -981,6 +981,7 @@ def test_cli_process_uses_argument_list_and_never_receives_worker_token(monkeypa
         return FakeProcess()
 
     monkeypatch.setenv("BACKSTAGE_WORKER_TOKEN", "worker-secret")
+    monkeypatch.setenv("TIANYI_API_KEY", "fixture-model-key")
     monkeypatch.setenv("AO_SESSION_ID", "ao-session-test")
     monkeypatch.setattr("screen_assistant_server.backstage_bridge.subprocess.Popen", popen)
     bridge = BackstageBridge(config)
@@ -996,6 +997,7 @@ def test_cli_process_uses_argument_list_and_never_receives_worker_token(monkeypa
     assert "--account=a;& arbitrary" in args
     assert kwargs.get("shell", False) is False
     assert "BACKSTAGE_WORKER_TOKEN" not in kwargs["env"]
+    assert not bool(kwargs["env"].get("TIANYI_API_KEY"))
     assert "AO_SESSION_ID" not in kwargs["env"]
     assert "worker-secret" not in args and "worker-secret" not in kwargs["env"].values()
 

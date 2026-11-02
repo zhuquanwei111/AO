@@ -54,8 +54,8 @@ class GLMTests(unittest.TestCase):
 
     def test_missing_credential_does_not_start_process(self):
         from glm_runtime import GLMRuntime
-        with tempfile.TemporaryDirectory() as folder,patch.dict('os.environ',{},clear=True),patch('glm_runtime.subprocess.Popen') as process:
-            with self.assertRaisesRegex(RuntimeError,'missing_current_process_tianyi_key'):
+        with tempfile.TemporaryDirectory() as folder,patch.dict('os.environ',{},clear=True),patch('subprocess.Popen') as process:
+            with self.assertRaisesRegex(RuntimeError,'image_visual_disabled'):
                 GLMRuntime(folder).run(Path(folder)/'missing.png','goal')
             process.assert_not_called()
 
@@ -122,6 +122,7 @@ class GLMTests(unittest.TestCase):
             record=runner.stop('glm-fake','test_simulated')
             self.assertEqual(record['status'],'captured_locally',record)
             self.assertEqual(record['metrics'],{'累计观众':100,'新增粉丝':1,'评论人数':9,'送礼人数':2,'获得音浪':300})
+            self.assertEqual(record['normal_path_llm_calls'],0)
             actions=list(scenario.inputs)
             self.assertEqual(runner.stop('glm-fake','test_simulated'),record)
             self.assertEqual(scenario.inputs,actions)

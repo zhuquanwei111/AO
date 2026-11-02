@@ -55,7 +55,7 @@ class GLMDesktop(LLMDesktop):
             try: return self.probe.foreground(window)
             except RecapError as error:
                 if error.reason=='foreground_changed' and hasattr(self.probe,'foreground_info'):
-                    self.mcp.note('foreground_mismatch',expected=window,actual=self.probe.foreground_info())
+                    self.mcp.note('foreground_mismatch')
                 raise
         return None
 

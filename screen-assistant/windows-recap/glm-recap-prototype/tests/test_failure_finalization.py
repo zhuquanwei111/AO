@@ -213,7 +213,7 @@ class MCPClosureTests(unittest.TestCase):
             self.assertTrue(client._call_inflight)
             self.assertIs(client.close(), False)
 
-    def test_app_error_actual_reply_is_recorded_before_error_check(self):
+    def test_app_error_is_recorded_without_raw_reply(self):
         with tempfile.TemporaryDirectory() as folder:
             client = self.client(folder)
             client.open = Mock()
@@ -221,7 +221,8 @@ class MCPClosureTests(unittest.TestCase):
             with self.assertRaisesRegex(RecapError, 'mcp_tool_error'):
                 client.call('App', mode='launch', name='Microsoft Edge')
             event = json.loads(client.trace.read_text(encoding='utf-8').splitlines()[-1])
-            self.assertEqual(event['app_result_text'], 'Failed to launch fake Edge')
+            self.assertTrue(event['is_error'])
+            self.assertNotIn('Failed to launch fake Edge', client.trace.read_text(encoding='utf-8'))
             self.assertFalse(client._call_inflight)
 
 
