@@ -186,11 +186,55 @@ class MemoryVisualTests(unittest.TestCase):
             failure = subprocess.CompletedProcess([], 2, b'{"status":"FAIL"}', b'')
             with patch.object(sys, 'argv', args), patch.dict(sys.modules, modules), \
                  patch.object(recap_glm, 'GLMRuntime', return_value=runtime), \
+                 patch.object(recap_glm, 'require_gate_a'), patch.object(recap_glm, 'require_sdk_runtime'), \
                  patch.dict('os.environ', {'TIANYI_API_KEY': 'fake', 'BACKSTAGE_SDK_PYTHON': sys.executable}), \
                  patch('glm_runtime.require_gate_a'), patch('subprocess.run', return_value=failure), \
                  redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(recap_glm.main(), 2)
             self.assertIsNone(json.loads(output.getvalue())['record']['normal_path_llm_calls'])
+
+    def test_cli_checks_visual_configuration_before_desktop_start(self):
+        import recap_glm
+        with tempfile.TemporaryDirectory() as folder:
+            wire = Mock(); wire.close.return_value = True
+            desktop_constructor = Mock()
+            modules = {'glm_desktop': types.SimpleNamespace(GLMDesktop=desktop_constructor),
+                       'window_probe': types.SimpleNamespace(Probe=Mock()),
+                       'ocr_local': types.SimpleNamespace(LocalOCR=Mock()),
+                       'transport': types.SimpleNamespace(MCP=Mock(return_value=wire))}
+            args = ['recap_glm.py', 'start', '--task', 'task', '--account', 'demo',
+                    '--session-id', 'session', '--source', 'android_app', '--data', folder,
+                    '--scratch', folder, '--desktop-authorized']
+            with patch.object(sys, 'argv', args), patch.dict(sys.modules, modules), \
+                 patch.object(recap_glm, 'require_gate_a', side_effect=ValueError('private fixture')), \
+                 patch.dict('os.environ', {'TIANYI_API_KEY': 'fake'}, clear=True), \
+                 redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(recap_glm.main(), 2)
+            record = json.loads(output.getvalue())['record']
+            self.assertEqual(record['reason'], 'visual_runtime_unavailable')
+            self.assertNotIn('private fixture', output.getvalue())
+            desktop_constructor.assert_not_called()
+
+    def test_cli_rejects_missing_key_or_sdk_before_desktop_start(self):
+        import recap_glm
+        for env, sdk_error in (({}, None), ({'TIANYI_API_KEY': 'fake'}, ValueError('sdk missing'))):
+            with self.subTest(sdk_error=sdk_error), tempfile.TemporaryDirectory() as folder:
+                wire = Mock(); wire.close.return_value = True
+                desktop_constructor = Mock()
+                modules = {'glm_desktop': types.SimpleNamespace(GLMDesktop=desktop_constructor),
+                           'window_probe': types.SimpleNamespace(Probe=Mock()),
+                           'ocr_local': types.SimpleNamespace(LocalOCR=Mock()),
+                           'transport': types.SimpleNamespace(MCP=Mock(return_value=wire))}
+                args = ['recap_glm.py', 'start', '--task', 'task', '--account', 'demo',
+                        '--session-id', 'session', '--source', 'android_app', '--data', folder,
+                        '--scratch', folder, '--desktop-authorized']
+                with patch.object(sys, 'argv', args), patch.dict(sys.modules, modules), \
+                     patch.object(recap_glm, 'require_gate_a'), \
+                     patch.object(recap_glm, 'require_sdk_runtime', side_effect=sdk_error), \
+                     patch.dict('os.environ', env, clear=True), redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(recap_glm.main(), 2)
+                self.assertEqual(json.loads(output.getvalue())['record']['reason'], 'visual_runtime_unavailable')
+                desktop_constructor.assert_not_called()
 
     def test_moved_window_rejects_crop_before_worker(self):
         anchor = Token('主播列表', (100, 80, 160, 100))

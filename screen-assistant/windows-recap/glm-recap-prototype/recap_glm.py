@@ -1,4 +1,4 @@
-"""屏识助手单场取数组件；本地识别，不发送或保存截图。"""
+"""屏识助手单场取数组件；本地识别并受限发送必要局部图，不保存图片。"""
 import argparse
 import json
 import os
@@ -85,7 +85,7 @@ def main():
             if not created:
                 print(json.dumps({'task_ref':str(store.path(task)),'record':record},ensure_ascii=False))
                 return operation_exit_code(args.command,record)
-            store.update(task,execution_route='local_ocr_fixed_steps',model=None,
+            store.update(task,execution_route='local_ocr_and_guarded_visual',model=None,
                          normal_path_llm_calls=0,llm_runtime_invocations=0)
         from glm_vision import GLMVision
         from glm_desktop import GLMDesktop
@@ -104,6 +104,14 @@ def main():
                 args.scratch/task/'mcp-events.jsonl',
                 args.scratch/task/'observations')
         try:
+            # 在桌面动作前检查视觉依赖；不打印凭据或异常正文。
+            try:
+                if not os.environ.get('TIANYI_API_KEY'):
+                    raise ValueError('missing_visual_key')
+                require_gate_a(args.gate_a)
+                require_sdk_runtime()
+            except (ValueError, OSError):
+                raise RecapError('visual_runtime_unavailable') from None
             desktop=GLMDesktop(mcp,Probe(),LocalOCR(args.models),store.root/(task+'-evidence'),
                 'https://union.bytedance.com/open/portal/index',vision=GLMVision(runtime))
             runner=Runner(StartedStore(store.root),desktop)
@@ -118,7 +126,8 @@ def main():
             record=store.update(task,llm_runtime_invocations=old.get('llm_runtime_invocations',0)+runtime.calls,
                 normal_path_llm_calls=(old['normal_path_llm_calls']+runtime.http_requests)
                     if old.get('normal_path_llm_calls') is not None and runtime.http_requests is not None else None,
-                model_call_count_semantics='当前本地识别路径禁用图片及模型调用')
+                model=MODEL if runtime.calls else old.get('model'),
+                model_call_count_semantics='仅计已确认的模型请求；失败时次数未知')
             if args.command=='start':
                 record=Runner(store,None).finish_unbound_execution(task,
                     cleanup_confirmed=cleanup_confirmed and runtime.calls==0)
