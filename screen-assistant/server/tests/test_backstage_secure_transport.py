@@ -33,9 +33,11 @@ def test_tunnel_identity_and_listener_must_match(monkeypatch):
     bridge.verify_ssh_tunnel('http://127.0.0.1:57321',42,100)
     with pytest.raises(BackstageFatalError):
         bridge.verify_ssh_tunnel('http://127.0.0.1:57321',42,101)
-    monkeypatch.setattr(bridge,'_windows_listeners',lambda _: [('0.0.0.0',42)])
-    with pytest.raises(BackstageFatalError):
-        bridge.verify_ssh_tunnel('http://127.0.0.1:57321',42,100)
+    for rows in ([('0.0.0.0',42)],[('127.0.0.1',43)],
+                 [('127.0.0.1',42),('127.0.0.1',43)],[]):
+        monkeypatch.setattr(bridge,'_windows_listeners',lambda _,rows=rows: rows)
+        with pytest.raises(BackstageFatalError):
+            bridge.verify_ssh_tunnel('http://127.0.0.1:57321',42,100)
 
 
 @pytest.mark.skipif(os.name!='nt',reason='Windows netstat listener parsing')
