@@ -5,9 +5,60 @@ import org.json.JSONObject;
 import org.junit.Test;
 import java.util.Locale;
 import java.util.TimeZone;
+import java.nio.charset.StandardCharsets;
+import java.io.InputStream;
 import static org.junit.Assert.*;
 
 public class RecapPresentationTest {
+    private JSONObject fixture(String name) throws Exception {
+        try (InputStream in = getClass().getResourceAsStream("/backstage-summary-fixtures.json")) {
+            assertNotNull(in);
+            JSONArray cases = new JSONArray(new String(in.readAllBytes(), StandardCharsets.UTF_8));
+            for (int i = 0; i < cases.length(); i++) {
+                JSONObject item = cases.getJSONObject(i);
+                if (name.equals(item.getString("case"))) return item.getJSONObject("summary");
+            }
+        }
+        throw new AssertionError(name);
+    }
+
+    @Test public void backstageUsesActualRawDisplaysAndShowsMissingFields() throws Exception {
+        String partial = RecapPresentation.summary(fixture("partial"));
+        assertTrue(partial.contains("累计观众：约1.2万"));
+        assertTrue(partial.contains("获得音浪：3.2万"));
+        assertTrue(partial.contains("评论人数：暂无数据"));
+        assertFalse(partial.contains("约 约"));
+        assertFalse(partial.contains("页面未读到"));
+        String complete = RecapPresentation.summary(fixture("captured_locally"));
+        assertTrue(complete.contains("新增粉丝：2"));
+        assertFalse(complete.contains("部分数据暂不可用"));
+        String missing = RecapPresentation.summary(fixture("needs_input"));
+        for (String name : new String[]{"累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪"})
+            assertTrue(missing.contains(name + "：暂无数据"));
+        assertTrue(missing.contains("部分数据暂不可用"));
+        String absent = RecapPresentation.summary(new JSONObject());
+        assertTrue(absent.contains("累计观众：暂无数据"));
+        assertTrue(absent.contains("获得音浪：暂无数据"));
+        assertTrue(absent.contains("平台数据暂不可用"));
+    }
+
+    @Test public void backstageLegacyZeroAndInvalidRawUseNumericFallback() throws Exception {
+        JSONObject data = fixture("partial"), backstage = data.getJSONObject("backstage_recap");
+        backstage.getJSONObject("metrics").put("新增粉丝", 0);
+        backstage.remove("raw_displays");
+        String legacy = RecapPresentation.summary(data);
+        assertTrue(legacy.contains("新增粉丝：0"));
+        assertTrue(legacy.contains("累计观众：约 12000"));
+        backstage.put("raw_displays", new JSONObject().put("累计观众", " ")
+                .put("新增粉丝", new JSONObject().put("invalid", true))
+                .put("送礼人数", "**").put("获得音浪", "3..2万"));
+        String invalid = RecapPresentation.summary(data);
+        assertTrue(invalid.contains("累计观众：约 12000"));
+        assertTrue(invalid.contains("新增粉丝：0"));
+        assertTrue(invalid.contains("送礼人数：4"));
+        assertTrue(invalid.contains("获得音浪：约 32000"));
+        assertFalse(invalid.contains("invalid"));
+    }
     @Test public void absentCountDiffersFromRealZero() throws Exception {
         JSONObject data = new JSONObject().put("online_count", new JSONObject().put("status", "unknown")
                 .put("peak", JSONObject.NULL).put("coverage", new JSONObject().put("sample_issues", "source_missing")));

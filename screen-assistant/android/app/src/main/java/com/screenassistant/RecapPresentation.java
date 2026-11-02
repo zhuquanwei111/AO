@@ -3,6 +3,7 @@ package com.screenassistant;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import java.text.DateFormat;
+import java.text.Normalizer;
 import java.util.Calendar;
 import java.util.Date;
 import java.util.Locale;
@@ -27,19 +28,34 @@ final class RecapPresentation {
         if (hasCount) out.append("\n仅供参考，可能不完整");
         else out.append("\n暂无可用的在线人数数据");
         JSONObject backstage = data.optJSONObject("backstage_recap");
-        if (backstage != null && backstage.optJSONObject("metrics") != null) {
-            JSONObject metrics = backstage.optJSONObject("metrics");
+        {
+            JSONObject metrics = backstage == null ? null : backstage.optJSONObject("metrics");
+            JSONObject raw = backstage == null ? null : backstage.optJSONObject("raw_displays");
+            JSONArray approximate = backstage == null ? null : backstage.optJSONArray("approximate_metrics");
             String[] names = {"累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪"};
-            boolean any = false;
-            for (String name : names) if (metrics.has(name) && !metrics.isNull(name)) {
-                if (!any) { out.append("\n\n平台数据"); any = true; }
+            out.append("\n\n平台数据");
+            for (String name : names) {
                 out.append("\n").append(name).append("：");
-                JSONArray approximate = backstage.optJSONArray("approximate_metrics");
-                if (approximate != null) for (int i = 0; i < approximate.length(); i++)
-                    if (name.equals(approximate.optString(i))) { out.append("约 "); break; }
-                out.append(metrics.opt(name));
+                Object value = metrics == null ? null : metrics.opt(name);
+                if (!(value instanceof Number) || ((Number) value).doubleValue() < 0
+                        || !Double.isFinite(((Number) value).doubleValue())
+                        || Math.floor(((Number) value).doubleValue()) != ((Number) value).doubleValue()) {
+                    out.append("暂无数据");
+                    continue;
+                }
+                Object rawValue = raw == null ? null : raw.opt(name);
+                String display = rawValue instanceof String ? DisplayText.plain((String) rawValue) : "";
+                String normalized = Normalizer.normalize(display, Normalizer.Form.NFKC).replaceAll("\\s+", "");
+                if (normalized.matches("约?(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\\.[0-9]+)?[万亿千wWkK]?")) {
+                    out.append(display);
+                } else {
+                    if (approximate != null) for (int i = 0; i < approximate.length(); i++)
+                        if (name.equals(approximate.optString(i))) { out.append("约 "); break; }
+                    out.append(value);
+                }
             }
-            if (any && !"captured_locally".equals(backstage.optString("status"))) out.append("\n部分数据暂不可用");
+            if (backstage == null) out.append("\n平台数据暂不可用");
+            else if (!"captured_locally".equals(backstage.optString("status"))) out.append("\n部分数据暂不可用");
         }
         return out.toString();
     }
