@@ -105,7 +105,8 @@ def launch_bridge(url: str, ssh_pid: int, ssh_created_filetime: int, token_path:
 
 def stderr_category(data):
     """只投影固定异常类别，不输出进程诊断正文。"""
-    allowed=('ModuleNotFoundError','ImportError','ValueError','TypeError','OSError','RuntimeError')
+    allowed=('ModuleNotFoundError','ImportError','ValueError','TypeError','OSError','RuntimeError',
+             'AttributeError','SyntaxError','UnicodeDecodeError')
     for name in allowed:
         if re.search(rb'(?m)^'+name.encode('ascii')+rb'(?::|\s|$)',bytes(data)):
             return name

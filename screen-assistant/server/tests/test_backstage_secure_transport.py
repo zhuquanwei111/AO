@@ -38,6 +38,16 @@ def test_tunnel_identity_and_listener_must_match(monkeypatch):
         bridge.verify_ssh_tunnel('http://127.0.0.1:57321',42,100)
 
 
+@pytest.mark.skipif(os.name!='nt',reason='Windows netstat listener parsing')
+def test_windows_listener_parses_ascii_rows_with_non_utf8_localized_header(monkeypatch):
+    from screen_assistant_server import backstage_bridge as bridge
+    monkeypatch.setenv('SYSTEMROOT',r'C:\Windows')
+    run=Mock(return_value=Mock(stdout=b'\xff\xfe localized header\r\n  TCP  127.0.0.1:57321  0.0.0.0:0  LISTENING  42\r\n'))
+    monkeypatch.setattr(bridge.subprocess,'run',run)
+    assert bridge._windows_listeners(57321)==[('127.0.0.1',42)]
+    assert not run.call_args.kwargs.get('text',False)
+
+
 def test_worker_token_is_not_forwarded_on_redirect(monkeypatch):
     from screen_assistant_server import backstage_bridge as bridge
     received=[]
@@ -217,6 +227,8 @@ def test_supervisor_discards_large_untrusted_output(capsys):
 def test_stderr_projection_exposes_only_exception_category():
     from screen_assistant_server.backstage_launcher import stderr_category
     assert stderr_category(b'Traceback\nTypeError: fixture-token\n')=='TypeError'
+    assert stderr_category(b'Traceback\nUnicodeDecodeError: fixture-token\n')=='UnicodeDecodeError'
+    assert stderr_category(b'Traceback\nAttributeError: fixture-token\n')=='AttributeError'
     assert stderr_category(b'fixture-token\n')=='unknown'
 
 

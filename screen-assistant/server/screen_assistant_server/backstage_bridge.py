@@ -101,16 +101,18 @@ def _windows_listeners(port: int):
     executable=ntpath.join(root,'System32','netstat.exe')
     env={key:value for key,value in os.environ.items() if key.upper() in {'SYSTEMROOT','WINDIR'}}
     try:
-        result=subprocess.run([executable,'-ano','-p','tcp'],capture_output=True,text=True,
+        result=subprocess.run([executable,'-ano','-p','tcp'],capture_output=True,
                               timeout=5,check=True,env=env,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
     except (OSError,subprocess.SubprocessError):
         raise BackstageFatalError('ssh tunnel listener unavailable') from None
     rows=[]
     for line in result.stdout.splitlines():
         fields=line.split()
-        if len(fields)!=5 or fields[0].upper()!='TCP' or fields[3].upper()!='LISTENING': continue
-        address,separator,number=fields[1].rpartition(':')
-        if separator and number.isdecimal() and int(number)==port and fields[4].isdecimal():
+        if len(fields)!=5 or fields[0].upper()!=b'TCP' or fields[3].upper()!=b'LISTENING': continue
+        address,separator,number=fields[1].rpartition(b':')
+        if separator and number.isdigit() and int(number)==port and fields[4].isdigit():
+            try: address=address.decode('ascii')
+            except UnicodeDecodeError: continue
             rows.append((address,int(fields[4])))
     return rows
 
