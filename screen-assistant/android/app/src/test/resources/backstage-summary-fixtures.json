@@ -1,0 +1,174 @@
+[
+  {
+    "case": "captured_locally",
+    "summary": {
+      "session_id": "2ef29471ff394a3eacfbd7804320f9ac",
+      "started_at_ms": 1790000000000,
+      "stopped_at_ms": 1790000000000,
+      "online_count": {
+        "status": "unknown",
+        "unit": "person",
+        "peak": null,
+        "time_weighted_average": null,
+        "coverage": {
+          "recorded_samples": 0,
+          "valid_value_samples": 0,
+          "covered_duration_ms": 0,
+          "sample_issues": {}
+        }
+      },
+      "online_count_by_source": [],
+      "audio_fusion": {
+        "background_analysis_busy_count": 0
+      },
+      "backstage_recap": {
+        "task_id": "c044a6a14b8a4162a1eff5bdbef26734",
+        "status": "captured_locally",
+        "douyin_account": "fixture-account",
+        "stop_signal_received": true,
+        "started_at_ms": 1790000000000,
+        "stopped_at_ms": 1790000000000,
+        "claimed_at_ms": 1790000000000,
+        "received_at_ms": 1790000000000,
+        "room_id": null,
+        "metrics": {
+          "新增粉丝": 2,
+          "累计观众": 1,
+          "获得音浪": 5,
+          "评论人数": 3,
+          "送礼人数": 4
+        },
+        "raw_displays": {
+          "新增粉丝": "2",
+          "累计观众": "1",
+          "获得音浪": "5",
+          "评论人数": "3",
+          "送礼人数": "4"
+        },
+        "approximate_metrics": [],
+        "metrics_captured_at": "2026-10-27T13:00:08+08:00",
+        "capture_method": "受控测试",
+        "value_semantics": "合成数据",
+        "missing_fields": {},
+        "start_signal_source": "android_app",
+        "stop_signal_source": "android_app"
+      }
+    }
+  },
+  {
+    "case": "partial",
+    "summary": {
+      "session_id": "3934c9c57fd948ed8ec6656e25a9a166",
+      "started_at_ms": 1790000000000,
+      "stopped_at_ms": 1790000000000,
+      "online_count": {
+        "status": "unknown",
+        "unit": "person",
+        "peak": null,
+        "time_weighted_average": null,
+        "coverage": {
+          "recorded_samples": 0,
+          "valid_value_samples": 0,
+          "covered_duration_ms": 0,
+          "sample_issues": {}
+        }
+      },
+      "online_count_by_source": [],
+      "audio_fusion": {
+        "background_analysis_busy_count": 0
+      },
+      "backstage_recap": {
+        "task_id": "e7b42d45efe844abaa44cc942cc5c827",
+        "status": "partial",
+        "douyin_account": "fixture-account",
+        "stop_signal_received": true,
+        "started_at_ms": 1790000000000,
+        "stopped_at_ms": 1790000000000,
+        "claimed_at_ms": 1790000000000,
+        "received_at_ms": 1790000000000,
+        "room_id": null,
+        "metrics": {
+          "新增粉丝": 7,
+          "累计观众": 12000,
+          "获得音浪": 32000,
+          "评论人数": null,
+          "送礼人数": 4
+        },
+        "raw_displays": {
+          "新增粉丝": "7",
+          "累计观众": "约1.2万",
+          "获得音浪": "3.2万",
+          "送礼人数": "4"
+        },
+        "approximate_metrics": [
+          "累计观众",
+          "获得音浪"
+        ],
+        "metrics_captured_at": "2026-10-27T13:00:08+08:00",
+        "capture_method": "受控测试",
+        "value_semantics": "合成数据",
+        "missing_fields": {
+          "评论人数": "页面未读到"
+        },
+        "start_signal_source": "android_app",
+        "stop_signal_source": "android_app"
+      }
+    }
+  },
+  {
+    "case": "needs_input",
+    "summary": {
+      "session_id": "e46db6ed89d6436cad17c3ef5735fc3c",
+      "started_at_ms": 1790000000000,
+      "stopped_at_ms": 1790000000000,
+      "online_count": {
+        "status": "unknown",
+        "unit": "person",
+        "peak": null,
+        "time_weighted_average": null,
+        "coverage": {
+          "recorded_samples": 0,
+          "valid_value_samples": 0,
+          "covered_duration_ms": 0,
+          "sample_issues": {}
+        }
+      },
+      "online_count_by_source": [],
+      "audio_fusion": {
+        "background_analysis_busy_count": 0
+      },
+      "backstage_recap": {
+        "task_id": "0442946fa1d648a287c8b7b4b7aacae4",
+        "status": "needs_input",
+        "douyin_account": "fixture-account",
+        "stop_signal_received": true,
+        "started_at_ms": 1790000000000,
+        "stopped_at_ms": 1790000000000,
+        "claimed_at_ms": 1790000000000,
+        "received_at_ms": 1790000000000,
+        "room_id": null,
+        "metrics": {
+          "新增粉丝": null,
+          "累计观众": null,
+          "获得音浪": null,
+          "评论人数": null,
+          "送礼人数": null
+        },
+        "raw_displays": {},
+        "approximate_metrics": [],
+        "metrics_captured_at": null,
+        "capture_method": "受控测试",
+        "value_semantics": "合成数据",
+        "missing_fields": {
+          "新增粉丝": "未读取",
+          "累计观众": "未读取",
+          "获得音浪": "未读取",
+          "评论人数": "未读取",
+          "送礼人数": "未读取"
+        },
+        "start_signal_source": "android_app",
+        "stop_signal_source": "android_app"
+      }
+    }
+  }
+]
