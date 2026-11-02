@@ -22,6 +22,60 @@ public class RecapPresentationTest {
         throw new AssertionError(name);
     }
 
+    private JSONObject businessFixture(String name) throws Exception {
+        try (InputStream in = getClass().getResourceAsStream("/business-outcome-summary-fixtures.json")) {
+            assertNotNull(in);
+            JSONArray cases = new JSONArray(new String(in.readAllBytes(), StandardCharsets.UTF_8));
+            for (int i = 0; i < cases.length(); i++) {
+                JSONObject item = cases.getJSONObject(i);
+                if (name.equals(item.getString("case"))) return item.getJSONObject("summary");
+            }
+        }
+        throw new AssertionError(name);
+    }
+
+    @Test public void confirmedBusinessOutcomesAreDisplayedWithoutInventingMetrics() throws Exception {
+        String[][] cases = {{"confirmed_not_live", "主播当前未开播"},
+                {"confirmed_account_not_found", "未找到该抖音号"}};
+        for (String[] item : cases) {
+            JSONObject data = businessFixture(item[0]);
+            String text = RecapPresentation.summary(data);
+            assertTrue(text.contains(item[1]));
+            assertFalse(text.contains("部分数据暂不可用"));
+            assertTrue(text.contains("累计观众：暂无数据"));
+            assertTrue(text.contains("获得音浪：暂无数据"));
+            assertTrue(RecapText.terminal(data));
+        }
+    }
+
+    @Test public void inconsistentBusinessReasonsKeepLegacyFallback() throws Exception {
+        JSONObject data = businessFixture("legacy_unknown");
+        JSONObject backstage = data.getJSONObject("backstage_recap");
+        backstage.put("status", "failed");
+        String[] names = {"累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪"};
+        for (String name : names) backstage.getJSONObject("missing_fields").put(name, "not_live");
+        for (int i = 0; i < 12; i++) {
+            JSONObject candidate = new JSONObject(data.toString());
+            JSONObject recap = candidate.getJSONObject("backstage_recap");
+            if (i == 0) recap.getJSONObject("missing_fields").remove("累计观众");
+            if (i == 1) recap.getJSONObject("missing_fields").put("累计观众", "account_not_found");
+            if (i == 2) recap.getJSONObject("missing_fields").put("累计观众", "unknown_future_value");
+            if (i == 3) recap.getJSONObject("metrics").put("累计观众", 0);
+            if (i == 4) recap.put("room_id", "room");
+            if (i == 5) recap.put("stop_signal_received", false);
+            if (i == 6) recap.put("status", "needs_input");
+            if (i == 7) candidate.put("stopped_at_ms", JSONObject.NULL);
+            if (i == 8) recap.getJSONObject("metrics").remove("累计观众");
+            if (i == 9) recap.remove("room_id");
+            if (i == 10) recap.getJSONObject("missing_fields").put("累计观众", JSONObject.NULL);
+            if (i == 11) recap.put("stop_signal_received", "true");
+            String text = RecapPresentation.summary(candidate);
+            assertTrue(text.contains("部分数据暂不可用"));
+            assertFalse(text.contains("主播当前未开播"));
+            assertFalse(text.contains("未找到该抖音号"));
+        }
+    }
+
     @Test public void backstageUsesVerifiedNumericValuesAndShowsMissingFields() throws Exception {
         String partial = RecapPresentation.summary(fixture("partial"));
         assertTrue(partial.contains("累计观众：约 12000"));

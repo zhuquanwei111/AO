@@ -9,6 +9,7 @@ import java.util.Locale;
 
 /** 仅整理复盘的展示内容，不改变服务端记录。 */
 final class RecapPresentation {
+    private static final String[] METRICS = {"累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪"};
     private RecapPresentation() { }
 
     static String summary(JSONObject data) {
@@ -31,9 +32,8 @@ final class RecapPresentation {
             JSONObject metrics = backstage == null ? null : backstage.optJSONObject("metrics");
             JSONObject missing = backstage == null ? null : backstage.optJSONObject("missing_fields");
             JSONArray approximate = backstage == null ? null : backstage.optJSONArray("approximate_metrics");
-            String[] names = {"累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪"};
             out.append("\n\n平台数据");
-            for (String name : names) {
+            for (String name : METRICS) {
                 out.append("\n").append(name).append("：");
                 Object value = metrics == null ? null : metrics.opt(name);
                 if ((missing != null && missing.has(name)) || !(value instanceof Number) || ((Number) value).doubleValue() < 0
@@ -46,10 +46,31 @@ final class RecapPresentation {
                     if (name.equals(approximate.optString(i))) { out.append("约 "); break; }
                 out.append(value);
             }
-            if (backstage == null) out.append("\n平台数据暂不可用");
+            String judgment = businessJudgment(data, backstage);
+            if (judgment != null) out.append("\n").append(judgment);
+            else if (backstage == null) out.append("\n平台数据暂不可用");
             else if (!"captured_locally".equals(backstage.optString("status"))) out.append("\n部分数据暂不可用");
         }
         return out.toString();
+    }
+
+    private static String businessJudgment(JSONObject summary, JSONObject recap) {
+        if (recap == null || summary.optLong("stopped_at_ms", 0) <= 0
+                || !"failed".equals(recap.optString("status"))
+                || !Boolean.TRUE.equals(recap.opt("stop_signal_received"))
+                || !recap.has("room_id") || !recap.isNull("room_id")) return null;
+        JSONObject metrics = recap.optJSONObject("metrics"), missing = recap.optJSONObject("missing_fields");
+        if (metrics == null || missing == null) return null;
+        String reason = null;
+        for (String name : METRICS) {
+            if (!metrics.has(name) || !metrics.isNull(name) || !(missing.opt(name) instanceof String)) return null;
+            String current = missing.optString(name);
+            if (reason == null) reason = current;
+            else if (!reason.equals(current)) return null;
+        }
+        if ("not_live".equals(reason)) return "主播当前未开播";
+        if ("account_not_found".equals(reason)) return "未找到该抖音号";
+        return null;
     }
 
     private static boolean appendCount(StringBuilder out, JSONObject count) {
