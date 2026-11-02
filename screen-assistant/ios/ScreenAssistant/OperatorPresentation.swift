@@ -10,11 +10,18 @@ enum OperatorPresentation {
         var messages: [String] = []
         if unsent > 0 || value("rejected") > 0 { messages.append("曾有画面信息未送达") }
         if value("unknown") > 0 { messages.append("曾有发送结果未确认") }
-        if !messages.isEmpty { return messages.joined(separator: "；") + "。" }
+        if value("expired") > 0 || value("cancel_unsent") > 0 {
+            messages.append("部分识别内容未发送")
+        }
+        if !messages.isEmpty { return "本机历史：" + messages.joined(separator: "；") + "。" }
         if value("received") > 0 || value("duplicate") > 0 || value("merged") > 0 {
-            return "曾收到过画面信息；本场建议以实际收到为准。"
+            return "本机历史：曾收到过画面信息。"
         }
         return "暂未收到画面信息。"
+    }
+
+    static func personROISummary(configured: Bool) -> String {
+        configured ? "已设置，请按示意图核对" : "未单独设置"
     }
 
     static func date(_ milliseconds: Int64, locale: Locale = .autoupdatingCurrent,

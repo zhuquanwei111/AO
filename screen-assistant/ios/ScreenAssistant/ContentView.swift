@@ -235,7 +235,7 @@ private struct AdvancedSettingsView: View {
                     }
                     .disabled(model.liveActive)
 
-                    Text("当前人物区域：\(roiSummary(for: model.personROI))")
+                    Text("人物区域：\(OperatorPresentation.personROISummary(configured: SharedConfig.personROI() != nil))")
                         .font(.footnote)
                         .foregroundColor(.secondary)
 

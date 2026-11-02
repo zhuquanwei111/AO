@@ -17,9 +17,17 @@ assert(OperatorPresentation.people(.nan, approximate: false, locale: locale) == 
 func upload(_ counts: [String: Int]) -> String {
     OperatorPresentation.observationUploadDescription { counts[$0, default: 0] }
 }
-assert(upload(["cancel_unsent": 1, "received": 1]) == "曾收到过画面信息；本场建议以实际收到为准。")
-assert(upload(["expired": 1]) == "暂未收到画面信息。")
-assert(upload(["oversize_comment": 1]) == "曾有画面信息未送达。")
-assert(upload(["unknown": 1]) == "曾有发送结果未确认。")
-assert(upload(["rejected": 1]) == "曾有画面信息未送达。")
+let pastUnsent = "本机历史：部分识别内容未发送。"
+assert(upload(["cancel_unsent": 1, "received": 1]) == pastUnsent)
+assert(upload(["expired": 1]) == pastUnsent)
+assert(upload(["cancel_unsent": 1, "expired": 1]) == pastUnsent)
+assert(upload(["expired": 1, "unknown": 1]) == "本机历史：曾有发送结果未确认；部分识别内容未发送。")
+assert(upload(["waiting_batches": 1]) == "暂未收到画面信息。")
+assert(upload(["overflow_batch": 1, "overflow_comment": 1]) == "本机历史：曾有画面信息未送达。")
+assert(upload(["oversize_comment": 1]) == "本机历史：曾有画面信息未送达。")
+assert(upload(["unknown": 1]) == "本机历史：曾有发送结果未确认。")
+assert(upload(["rejected": 1]) == "本机历史：曾有画面信息未送达。")
+assert(upload(["received": 1]) == "本机历史：曾收到过画面信息。")
+assert(OperatorPresentation.personROISummary(configured: true) == "已设置，请按示意图核对")
+assert(OperatorPresentation.personROISummary(configured: false) == "未单独设置")
 print("OK: locale, timezone, cross-day duration and missing versus zero")
