@@ -25,6 +25,7 @@ struct AudioCaptureSettings: Codable, Equatable {
 }
 
 struct AudioCaptureStatus: Codable {
+    static let receivingPCMPhase = "接收系统PCM；来源需核对"
     var phase = "未启用"
     var copiedApp = 0
     var copiedMic = 0

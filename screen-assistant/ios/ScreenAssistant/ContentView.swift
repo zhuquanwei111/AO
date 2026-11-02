@@ -114,7 +114,7 @@ struct ContentView: View {
                     }
 
                     Section {
-                        NavigationLink("当前收到的运营事件记录") {
+                        NavigationLink("本场建议记录") {
                             LiveEventListView(events: model.liveEvents)
                         }
                     }
@@ -123,7 +123,7 @@ struct ContentView: View {
                 if model.liveStopped {
                     Section(header: Text("本场复盘"),
                             footer: Text("结束辅助不会替你关闭 iOS 系统广播；如果系统仍显示正在广播，请从系统广播状态栏停止。")) {
-                        NavigationLink("场次概览与事件记录") {
+                        NavigationLink("本场复盘") {
                             LiveSessionOverviewView(model: model)
                         }
                     }
@@ -367,7 +367,7 @@ private struct AdvancedSettingsView: View {
                         }
                         Text("未确认时转写仅作参考，不生成语速或停顿结论。")
                             .font(.footnote).foregroundColor(.secondary)
-                        Text(model.audioStatus.phase == "接收系统PCM；来源需核对"
+                        Text(model.audioStatus.phase == AudioCaptureStatus.receivingPCMPhase
                              ? "正在接收音频，请确认声音来源" : model.audioStatus.phase).font(.footnote)
                         if model.audioStatus.issue != nil {
                             Text("音频处理暂不可用，请检查广播与音频设置。")
