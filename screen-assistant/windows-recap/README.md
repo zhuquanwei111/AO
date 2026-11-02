@@ -36,6 +36,8 @@ MCP 两份 requirements 只锁直接依赖；其传递依赖尚无完整锁，�
 | `BACKSTAGE_SDK_PYTHON` | 已安装 Agents SDK 的独立解释器 |
 | `BACKSTAGE_CLI_GATE_A` | 现有模型与路由匹配的视觉能力 Gate 路径 |
 | `TIANYI_API_KEY` | 由受控父进程环境提供的天翼模型凭据 |
+| `BACKSTAGE_POLL_SECONDS` | 可选轮询间隔，默认2秒，最低0.5秒 |
+| `BACKSTAGE_CLI_TIMEOUT_SECONDS` | 可选 CLI 超时，默认480秒，允许60至600秒 |
 
 桥沿现有参数传外部路径；CLI会拒绝将记录、模型或scratch写入源码安装目录。模型凭据仅继承到受控桥、CLI 和视觉 SDK 子进程，不放入参数、日志或图片；worker 令牌不传给 CLI、MCP 或模型，`AO_*` 也不继承。启动桌面动作前检查模型凭据、Gate 和 SDK 路径；不能通过时以安全原因停止。
 

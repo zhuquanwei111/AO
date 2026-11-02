@@ -39,7 +39,8 @@ def launch_bridge(url: str, ssh_pid: int, ssh_created_filetime: int, token_path:
              'COMSPEC','PROGRAMFILES','PROGRAMFILES(X86)','OS','HOME','LANG','LC_ALL',
              'BACKSTAGE_CLI_PYTHON','BACKSTAGE_CLI_ENTRY','BACKSTAGE_CLI_DATA','BACKSTAGE_CLI_MODELS',
              'BACKSTAGE_CLI_SCRATCH','BACKSTAGE_MCP_CLIENT_PYTHON','BACKSTAGE_WINDOWS_MCP_PYTHON',
-             'BACKSTAGE_SDK_PYTHON','BACKSTAGE_CLI_GATE_A','TIANYI_API_KEY'}
+             'BACKSTAGE_SDK_PYTHON','BACKSTAGE_CLI_GATE_A','TIANYI_API_KEY',
+             'BACKSTAGE_POLL_SECONDS','BACKSTAGE_CLI_TIMEOUT_SECONDS'}
     env={key:value for key,value in source_env.items() if key.upper() in allowed}
     env.update(BACKSTAGE_SERVER_URL=url,BACKSTAGE_WORKER_TOKEN=token,
                BACKSTAGE_SSH_PID=str(ssh_pid),BACKSTAGE_SSH_CREATED_FILETIME=str(ssh_created_filetime),
