@@ -129,4 +129,28 @@ class GLMTests(unittest.TestCase):
             self.assertEqual(runner.stop('glm-fake','test_simulated'),record)
             self.assertEqual(scenario.inputs,actions)
 
+    def test_legacy_driver_binding_uses_local_steps_without_images(self):
+        sys.path.insert(0,str(ROOT.parent/'fixed-recap-prototype/tests'))
+        from test_fixed_path import Scenario
+        from desktop import View
+        from llm_desktop import LLMDesktop
+        with tempfile.TemporaryDirectory() as folder:
+            scenario=Scenario(folder); original_call=scenario.call
+            def call(tool,**args):
+                if tool=='ControlStatus': return {'content':[{'text':'{"state":"ai","generation":7}'}]}
+                return original_call(tool,**args)
+            scenario.call=call; scenario.note=lambda *args,**kwargs:None
+            class Driver(LLMDesktop):
+                def observe(self,window,use_uia=False):
+                    return View(scenario.tokens(),scenario.image.read_bytes(),scenario.get(window),(600,400),'fake',[])
+            driver=Driver(scenario,scenario,None,Path(folder)/'evidence',
+                          'https://union.bytedance.com/open/portal/',vision=Mock())
+            driver.target=Mock(side_effect=AssertionError('不得调用旧视觉导航'))
+            driver.save_minimal=Mock(side_effect=AssertionError('不得保存图片'))
+            binding=driver.bind('demo')
+            self.assertEqual(binding['douyin_account'],'demo')
+            self.assertEqual(binding['room_id'],'1234567890123456789')
+            driver.target.assert_not_called(); driver.save_minimal.assert_not_called()
+            self.assertNotIn('screenshot',binding)
+
 if __name__=='__main__': unittest.main()

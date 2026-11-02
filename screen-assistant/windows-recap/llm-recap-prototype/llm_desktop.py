@@ -5,9 +5,8 @@ import time
 
 LEGACY=Path(__file__).resolve().parent.parent/'fixed-recap-prototype'
 if str(LEGACY) not in sys.path: sys.path.insert(0,str(LEGACY))
-from core import RecapError, compact, require_account, metrics_from_tokens, METRICS
+from core import RecapError, compact, require_account
 from desktop import Desktop, portal_page_evidence
-from vision import fill_missing
 
 
 class LLMDesktop(Desktop):
@@ -82,58 +81,6 @@ class LLMDesktop(Desktop):
             elapsed_ms=round((time.monotonic()-began)*1000))
         if len(windows)!=1: raise RecapError('edge_launch_unconfirmed')
         return windows
-
-    def bind(self,account):
-        self.guard(); windows=self.probe.windows()
-        portals=[w for w in windows if '直播服务平台' in w['title']]
-        if len(portals)>1 or (not portals and len(windows)>1): raise RecapError('edge_window_ambiguous')
-        if not windows:
-            windows=self.launch_edge()
-        window=self.focus(portals[0] if portals else windows[0])
-        view=self.open_entry(window,not bool(portals))
-        if not any('请输入主播' in compact(q.text) for q in view.tokens):
-            if not any(compact(q.text)=='主播列表' for q in view.tokens):
-                view,token=self.target(window,'侧边导航“主播管理”这一行右侧的展开箭头，用来展开其子菜单'); self.click(view,token)
-            view,token=self.target(window,'“主播管理”展开后的侧边导航“主播列表”，不是表格内容'); self.click(view,token)
-        view,search=self.target(window,'主播列表页面右上方用于搜索主播昵称或抖音号/ID的输入框，可能提示“请输入主播昵称或ID”或“请输入主播昵称或抖音号”；不是左侧导航')
-        self.type_account(view,search,account)
-        view,token=self.target(window,'搜索输入框下方候选中显示“抖音号：'+account+'”的唯一候选；不要选搜索框或相似账号')
-        self.identity(view,account); self.click(view,token)
-        def filtered_ready(current):
-            # 裸账号只判断加载就绪，后续仍由identity核对资料身份。
-            try: require_account(current.tokens,account)
-            except RecapError:
-                if not any(compact(q.text)==account and q.score>=.85 for q in current.tokens):
-                    raise RecapError('locator_missing')
-            return True
-        self.wait(window,filtered_ready,timeout=60,use_uia=False)
-        view,token=self.target(window,'已完成加载的筛选结果中，抖音号完全为“'+account+'”的主播所在行“主播详情”；看不到该账号或仍显示旧列表/加载遮罩则missing，不能选别的主播行')
-        self.identity(view,account); self.click(view,token)
-        view,token=self.target(window,'当前主播详情页“进入直播间”'); self.identity(view,account)
-        before={w['handle'] for w in self.probe.windows()}; self.click(view,token)
-        deadline=time.monotonic()+20
-        while True:
-            new=[w for w in self.probe.windows() if w['handle'] not in before and '直播服务平台' in w['title']]
-            if new or time.monotonic()>=deadline: break
-            time.sleep(.5)
-        if len(new)!=1: raise RecapError('room_window_missing_or_ambiguous')
-        room=self.focus(new[0])
-        def room_loaded(current):
-            if not any(any(label in compact(q.text) for label in ('抖音号','累计观众','新增粉丝','跟播列表'))
-                       for q in current.tokens): raise RecapError('locator_missing')
-            return True
-        view,_=self.wait(room,room_loaded,timeout=60,use_uia=False)
-        self.identity(view,account,True)
-        room_id=self.room_identity(view)  # 保留可见URL/UIA/OCR的原场次核对，不让模型猜roomID。
-        evidence=self.save_minimal(view,'binding.png')
-        window_identity={key:room[key] for key in ('handle','pid','process_created')}
-        return {'douyin_account':account,'room_id':room_id,'window':window_identity,
-                'screenshot':str(evidence.relative_to(self.evidence.parent)),
-                'account_verified_on_page':True,'room_id_source':'visible_browser_address_bar_UIA_or_OCR',
-                'page_live_status':'已开播','observed_at':view.captured_at,
-                'locator':'gpt-6.1-sol restricted visual decisions + guarded Windows-MCP',
-                'visible_live_time':[q.text for q in view.tokens if '已开播' in compact(q.text)],
-                'new_window_created':True}
 
     def capture(self,binding):
         return Desktop.capture(self,binding)
