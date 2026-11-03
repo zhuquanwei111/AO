@@ -72,6 +72,27 @@ def address_seed_candidates(snapshot, title, rect):
     return seeds
 
 
+def safe_window_metadata(windows):
+    """仅投影窗口结构，不输出标题、地址或页面内容。"""
+    rows=[]
+    for item in windows[:12]:
+        title=item.get('title','').casefold()
+        category=('empty' if not title else 'new_tab' if ('新建标签页' in title or 'new tab' in title)
+                  else 'portal' if '直播服务平台' in title else 'other')
+        name=item.get('window_class','')
+        cls=name if re.fullmatch(r'Chrome_WidgetWin_[0-9]{1,3}',name) or name=='#32770' else 'other_or_unknown'
+        structural=('top_level_candidate' if cls=='Chrome_WidgetWin_1' and item.get('owner')==0
+                    and item.get('root_owner')==item.get('handle') and item.get('enabled') is True
+                    and item.get('minimized') is False else 'unknown')
+        rows.append({'handle':item.get('handle'),'pid':item.get('pid'),'class':cls,
+                     'owner':item.get('owner'),'root_owner':item.get('root_owner'),
+                     'style':item.get('style'),'exstyle':item.get('exstyle'),
+                     'visible':item.get('visible'),'enabled':item.get('enabled'),
+                     'minimized':item.get('minimized'),'structural_class':structural,
+                     'rect':item.get('rect'),'title_category':category})
+    return {'candidates':rows,'metadata_truncated':len(windows)>12}
+
+
 def uia_tokens(text,title):
     """仅解析本版Snapshot可见树格式，静态无坐标文字只用于核对，绝不猜位置。"""
     result=[]; selected=False
@@ -348,17 +369,30 @@ class Desktop:
         """在原有15秒上限内等待唯一具名窗口，不选择歧义候选。"""
         began=time.monotonic()
         deadline=began+15
+        last_signature=None; changes=0
         while True:
             self.guard()
             windows=self.probe.windows()
             current=time.monotonic()
-            if hasattr(self.mcp,'note'):
+            metadata=safe_window_metadata(windows)
+            signature=(len(windows),tuple(sorted((item.get('handle',0),item.get('pid',0)) for item in windows)),repr(metadata))
+            changed=signature!=last_signature
+            if changed:
+                changes+=1; last_signature=signature
+            if hasattr(self.mcp,'note') and changed and changes<=8:
                 self.mcp.note('edge_launch_candidates',candidate_count=len(windows),
                               untitled_count=sum(not item.get('title') for item in windows),
-                              elapsed_ms=round((current-began)*1000))
+                              elapsed_ms=round((current-began)*1000),**metadata)
             if len(windows)==1 and windows[0].get('title') and current<=deadline:
+                if hasattr(self.mcp,'note'):
+                    self.mcp.note('edge_window_final',candidate_count=len(windows),outcome='unique',
+                                  elapsed_ms=round((current-began)*1000),changes_truncated=changes>8,**metadata)
                 return windows[0]
             if current>=deadline:
+                if hasattr(self.mcp,'note'):
+                    self.mcp.note('edge_window_final',candidate_count=len(windows),
+                                  outcome='none' if not windows else 'ambiguous_or_unknown',
+                                  elapsed_ms=round((current-began)*1000),changes_truncated=changes>8,**metadata)
                 raise RecapError('edge_launch_unconfirmed')
             time.sleep(.5)
 

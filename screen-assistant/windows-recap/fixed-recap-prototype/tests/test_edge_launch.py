@@ -2,10 +2,18 @@ import unittest
 from unittest.mock import Mock, patch
 
 from core import RecapError
-from desktop import Desktop
+from desktop import Desktop, safe_window_metadata
 
 
 class EdgeLaunchTests(unittest.TestCase):
+    def test_window_diagnostics_do_not_include_title_or_unrecognized_class(self):
+        row={'handle':1,'pid':2,'title':'private-title-example','window_class':'private-class',
+             'owner':0,'root_owner':1,'style':0,'exstyle':0,'enabled':True,
+             'minimized':False,'rect':[0,0,800,600]}
+        value=str(safe_window_metadata([row]))
+        self.assertNotIn('private-title-example',value)
+        self.assertNotIn('private-class',value)
+        self.assertIn('other_or_unknown',value)
     def driver(self, samples):
         driver = object.__new__(Desktop)
         driver.probe = Mock()
@@ -52,6 +60,28 @@ class EdgeLaunchTests(unittest.TestCase):
             with patch('desktop.time.monotonic', side_effect=[0, 16]):
                 with self.assertRaisesRegex(RecapError, 'edge_launch_unconfirmed'):
                     driver.wait_edge_launch()
+
+    def test_unchanged_candidates_emit_one_bounded_safe_snapshot(self):
+        candidates=[{'handle':1,'pid':5,'title':'private-title-A'},
+                    {'handle':2,'pid':5,'title':''}]
+        driver=self.driver([candidates,candidates,candidates])
+        with patch('desktop.time.monotonic',side_effect=[0,1,2,16]),patch('desktop.time.sleep'):
+            with self.assertRaisesRegex(RecapError,'edge_launch_unconfirmed'):
+                driver.wait_edge_launch()
+        changes=[item for item in driver.mcp.note.call_args_list if item.args[0]=='edge_launch_candidates']
+        self.assertEqual(len(changes),1)
+        self.assertNotIn('private-title-A',str(driver.mcp.note.call_args_list))
+
+    def test_changes_are_bounded_and_final_event_marks_truncation(self):
+        samples=[[{'handle':i,'pid':5,'title':''}] for i in range(1,11)]
+        driver=self.driver(samples)
+        with patch('desktop.time.monotonic',side_effect=[0,*range(1,10),16]),patch('desktop.time.sleep'):
+            with self.assertRaisesRegex(RecapError,'edge_launch_unconfirmed'):
+                driver.wait_edge_launch()
+        changes=[item for item in driver.mcp.note.call_args_list if item.args[0]=='edge_launch_candidates']
+        self.assertEqual(len(changes),8)
+        final=driver.mcp.note.call_args_list[-1]
+        self.assertTrue(final.kwargs['changes_truncated'])
 
     def test_user_control_stops_wait_without_following_window_read(self):
         driver = self.driver([])

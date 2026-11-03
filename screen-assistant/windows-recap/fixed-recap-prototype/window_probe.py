@@ -13,6 +13,11 @@ class Probe:
             (self.u.IsWindowVisible,[w.HWND],w.BOOL),(self.u.IsIconic,[w.HWND],w.BOOL),
             (self.u.GetForegroundWindow,[],w.HWND),(self.u.GetWindowRect,[w.HWND,ctypes.POINTER(w.RECT)],w.BOOL),
             (self.u.GetWindowTextW,[w.HWND,w.LPWSTR,ctypes.c_int],ctypes.c_int),
+            (self.u.GetClassNameW,[w.HWND,w.LPWSTR,ctypes.c_int],ctypes.c_int),
+            (self.u.GetWindow,[w.HWND,w.UINT],w.HWND),
+            (self.u.GetAncestor,[w.HWND,w.UINT],w.HWND),
+            (self.u.GetWindowLongW,[w.HWND,ctypes.c_int],w.LONG),
+            (self.u.IsWindowEnabled,[w.HWND],w.BOOL),
             (self.u.GetWindowThreadProcessId,[w.HWND,ctypes.POINTER(w.DWORD)],w.DWORD),
             (self.k.OpenProcess,[w.DWORD,w.BOOL,w.DWORD],w.HANDLE),
             (self.k.QueryFullProcessImageNameW,[w.HANDLE,w.DWORD,w.LPWSTR,ctypes.POINTER(w.DWORD)],w.BOOL),
@@ -45,8 +50,16 @@ class Probe:
                 # 最大化窗口的非客户区可超出屏幕数像素，截图只取当前可见交集。
                 vx,vy,vw,vh=[self.u.GetSystemMetrics(i) for i in (76,77,78,79)]
                 visible=[max(vx,rect.left),max(vy,rect.top),min(vx+vw,rect.right),min(vy+vh,rect.bottom)]
+                class_name=ctypes.create_unicode_buffer(256)
+                self.u.GetClassNameW(hwnd,class_name,len(class_name))
                 rows.append({'handle':int(hwnd),'pid':pid.value,'process_created':born,
                     'title':title.value,'rect':visible,
+                    'window_class':class_name.value,'owner':int(self.u.GetWindow(hwnd,4) or 0),
+                    'root_owner':int(self.u.GetAncestor(hwnd,3) or 0),
+                    'style':int(self.u.GetWindowLongW(hwnd,-16))&0xffffffff,
+                    'exstyle':int(self.u.GetWindowLongW(hwnd,-20))&0xffffffff,
+                    'enabled':bool(self.u.IsWindowEnabled(hwnd)),
+                    'visible':True,
                     'minimized':bool(self.u.IsIconic(hwnd))})
             finally: self.k.CloseHandle(process)
             return True
