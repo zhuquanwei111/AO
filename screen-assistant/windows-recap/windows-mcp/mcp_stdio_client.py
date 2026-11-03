@@ -15,6 +15,19 @@ ROOT = Path(__file__).resolve().parent
 TOOLS = {'Screenshot', 'Snapshot', 'Click', 'Type', 'Scroll', 'Shortcut', 'Wait', 'App', 'ControlStatus'}
 
 
+def server_parameters(windows_mcp_python):
+    # 仅限本专用服务进程；仍须拒绝返回的截断树。
+    return StdioServerParameters(
+        command=str(Path(windows_mcp_python).resolve()),
+        args=['-m', 'windows_mcp', 'serve', '--config', str(ROOT / 'config.toml'),
+              '--tools', ','.join(sorted(TOOLS))],
+        cwd=ROOT,
+        env={'ANONYMIZED_TELEMETRY': 'false', 'POSTHOG_API_KEY': '',
+             'WINDOWS_MCP_SCREENSHOT_BACKEND': 'pillow', 'PYTHONUTF8': '1',
+             'PYTHON_DOTENV_DISABLED': 'true', 'WINDOWS_MCP_MAX_TREE_ELEMENTS': '2000'},
+    )
+
+
 async def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--requests', type=Path, help='从UTF-8 JSONL文件读取请求，避免PTY输入干扰')
@@ -22,15 +35,7 @@ async def main():
     windows_mcp_python=os.environ.get('BACKSTAGE_WINDOWS_MCP_PYTHON')
     if not windows_mcp_python or not Path(windows_mcp_python).is_file():
         raise RuntimeError('windows_mcp_runtime_missing')
-    params = StdioServerParameters(
-        command=str(Path(windows_mcp_python).resolve()),
-        args=['-m', 'windows_mcp', 'serve', '--config', str(ROOT / 'config.toml'),
-              '--tools', ','.join(sorted(TOOLS))],
-        cwd=ROOT,
-        env={'ANONYMIZED_TELEMETRY': 'false', 'POSTHOG_API_KEY': '',
-             'WINDOWS_MCP_SCREENSHOT_BACKEND': 'pillow', 'PYTHONUTF8': '1',
-             'PYTHON_DOTENV_DISABLED': 'true'},
-    )
+    params = server_parameters(windows_mcp_python)
     async with stdio_client(params) as (reader, writer):
         async with ClientSession(reader, writer, read_timeout_seconds=timedelta(seconds=60)) as session:
             await session.initialize()
