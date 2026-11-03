@@ -10,7 +10,7 @@ from PIL import Image
 ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT/'fixed-recap-prototype'))
 from core import Token,RecapError,compact,METRICS,require_account,parse_count
-from desktop import AddressSeed, _SEED_ISSUER, address_seed_candidates
+from desktop import AddressSeed, _SEED_ISSUER, address_seed_candidates, portal_url_matches
 from glm_runtime import VisualRuntimeError
 
 _CROP_ISSUER = object()
@@ -195,18 +195,16 @@ class GLMVision:
 
     def verify_portal(self,view,guard):
         crop=make_window_image(view,'navigation',guard)
-        prompt=('逐字读取地址中的origin、机构产品名brand及主播管理或工作台navigation。'
-                '无法确认则null，只返回JSON {"origin":字符串或null,"brand":字符串或null,"navigation":字符串或null}。')
+        prompt=('只逐字读取当前浏览器地址栏的URL为origin，不读取页面品牌或导航来判定归属；'
+                '地址栏省略协议时保留原样，不能用网页正文或标题补造URL。'
+                '无法读取则null，只返回JSON {"origin":字符串或null}。')
         try:
             result=self.runtime.run_crop(crop,prompt)
-            if set(result)!={'origin','brand','navigation'} or any(value is not None and not isinstance(value,str) for value in result.values()):
+            if set(result)!={'origin'} or any(value is not None and not isinstance(value,str) for value in result.values()):
                 raise ValueError('invalid_visual_fields')
             crop.ensure_current()
-            origin=compact(result['origin'] or '')
-            if not re.match(r'^(?:https?://)?union\.bytedance\.com/open/portal(?:[/?#]|$)',origin,re.I):
+            if not portal_url_matches(result['origin']):
                 raise RecapError('portal_origin_unconfirmed')
-            if '直播服务平台' not in (result['brand'] or '') or not any(v in (result['navigation'] or '') for v in ('主播','工作台')):
-                raise RecapError('portal_page_unconfirmed')
         except VisualRuntimeError as error:
             raise RecapError(error.reason) from None
         except RecapError:
