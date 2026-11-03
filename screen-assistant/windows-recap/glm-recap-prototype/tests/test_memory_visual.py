@@ -22,7 +22,8 @@ class MemoryVisualTests(unittest.TestCase):
     def view(self, tokens):
         image = io.BytesIO()
         Image.new('RGB', (800, 600), 'white').save(image, 'PNG')
-        return View(tokens, image.getvalue(), {'handle': 1, 'pid': 2, 'process_created': 3, 'title': 'Target', 'rect': [0, 0, 800, 600]},
+        return View(tokens, image.getvalue(), {'handle': 1, 'pid': 2, 'process_created': 3, 'title': 'Target', 'rect': [0, 0, 800, 600],
+                    'window_class':'Chrome_WidgetWin_1','owner':0,'root_owner':1,'visible':True,'enabled':True,'minimized':False},
                     (800, 600), 'fixture-time', [])
 
     def test_address_seed_requires_unique_named_edit_and_untruncated_target_window(self):
@@ -160,6 +161,34 @@ class MemoryVisualTests(unittest.TestCase):
             driver.bind('fixture-account')
         driver.type_replacement.assert_called_once()
         driver.vision.runtime.run_crop.assert_called_once()
+
+    def test_bind_targets_portal_with_unknown_background(self):
+        from glm_desktop import GLMDesktop
+        driver=object.__new__(GLMDesktop)
+        driver.guard=Mock(); driver.mcp=Mock(); driver.probe=Mock()
+        portal={**self.view([]).window,'title':'直播服务平台'}
+        driver.probe.windows.return_value=[portal,{'handle':2,'title':''}]
+        driver.focus=Mock(return_value=portal); driver.wait_entry=Mock(side_effect=RecapError('fixture_stop'))
+        with self.assertRaisesRegex(RecapError,'fixture_stop'):
+            driver.bind('demo')
+        driver.focus.assert_called_once_with(portal)
+
+    def test_bind_rejects_two_main_windows_and_accepts_one_portal(self):
+        from glm_desktop import GLMDesktop
+        driver=object.__new__(GLMDesktop)
+        driver.guard=Mock(); driver.mcp=Mock(); driver.probe=Mock()
+        portal={**self.view([]).window,'title':'直播服务平台'}
+        second={**portal,'handle':2,'root_owner':2,'pid':3,'title':'直播服务平台'}
+        driver.probe.windows.return_value=[portal,second]
+        driver.focus=Mock(return_value=portal)
+        with self.assertRaisesRegex(RecapError,'edge_window_ambiguous'):
+            driver.bind('demo')
+        driver.focus.assert_not_called()
+        driver.probe.windows.return_value=[portal]
+        driver.wait_entry=Mock(side_effect=RecapError('fixture_stop'))
+        with self.assertRaisesRegex(RecapError,'fixture_stop'):
+            driver.bind('demo')
+        driver.focus.assert_called_once_with(portal)
 
     def test_only_current_unique_authorized_anchor_can_form_crop(self):
         anchor = Token('主播列表', (100, 80, 160, 100))

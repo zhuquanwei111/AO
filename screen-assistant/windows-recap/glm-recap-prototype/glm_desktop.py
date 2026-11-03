@@ -6,7 +6,7 @@ import json
 
 sys.path.insert(0,str(Path(__file__).resolve().parent.parent/'llm-recap-prototype'))
 from llm_desktop import LLMDesktop
-from desktop import Desktop, portal_page_evidence
+from desktop import Desktop, portal_page_evidence, select_edge_target
 from core import RecapError, unique_label, compact
 from vision import fill_missing
 from transport import check_reply
@@ -125,10 +125,10 @@ class GLMDesktop(LLMDesktop):
         self.guard()
         self.mcp.call('Snapshot',use_vision=False,use_dom=False,use_ui_tree=False,use_annotation=False)
         windows=self.probe.windows()
-        portals=[window for window in windows if '直播服务平台' in window['title']]
-        if len(portals)>1 or (not portals and len(windows)>1): raise RecapError('edge_window_ambiguous')
-        window=self.focus(portals[0] if portals else (windows[0] if windows else self.wait_edge_started()))
-        if not portals:
+        target=select_edge_target(windows) if windows else self.wait_edge_started()
+        portal='直播服务平台' in target['title']
+        window=self.focus(target)
+        if not portal:
             self.key(window,'ctrl+t')
             view=self.navigate_entry(window)
         else:
@@ -174,9 +174,6 @@ class GLMDesktop(LLMDesktop):
 
     def navigate_entry(self,window):
         live=self.guard(window)
-        matches=[item for item in self.probe.windows() if item['title']==live['title']]
-        if len(matches)!=1 or matches[0]['handle']!=live['handle']:
-            raise RecapError('edge_window_ambiguous')
         self.key(live,'ctrl+l')
         self.key(live,'esc')
         view=self.observe(live,False,ocr_optional=True)

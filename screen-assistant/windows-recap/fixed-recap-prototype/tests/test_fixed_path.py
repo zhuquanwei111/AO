@@ -12,13 +12,16 @@ class Scenario:
     def __init__(self,folder):
         self.folder=Path(folder); self.stage='home'; self.inputs=[]
         self.window={'handle':1,'pid':20,'process_created':100,'title':'直播服务平台',
-                     'rect':[250,150,1450,950],'minimized':False}
-        self.room={**self.window,'handle':2,'rect':[470,210,1670,1010]}
+                     'rect':[250,150,1450,950],'minimized':False,'visible':True,'enabled':True,
+                     'window_class':'Chrome_WidgetWin_1','owner':0,'root_owner':1}
+        self.room={**self.window,'handle':2,'root_owner':2,'rect':[470,210,1670,1010]}
         self.image=self.folder/'fake.png'; Image.new('RGB',(600,400),'white').save(self.image)
 
     def windows(self): return [self.window,self.room] if self.stage=='room' else [self.window]
     def get(self,signature): return self.room if signature['handle']==2 else self.window
     def foreground(self,signature): return self.get(signature)
+    def ensure_point(self,window,point): return None
+    def ensure_unobstructed(self,window): return None
 
     def call(self,tool,**args):
         if tool=='ControlStatus': return {'content':[{'text':'{"state":"ai"}'}]}

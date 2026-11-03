@@ -93,6 +93,23 @@ def safe_window_metadata(windows):
     return {'candidates':rows,'metadata_truncated':len(windows)>12}
 
 
+def select_edge_target(windows):
+    """只选择唯一的结构化Edge顶层窗口；其他窗口不视为安全。"""
+    targets=[item for item in windows if item.get('window_class')=='Chrome_WidgetWin_1'
+             and item.get('owner')==0 and item.get('root_owner')==item.get('handle')
+             and item.get('visible') is True and item.get('enabled') is True
+             and item.get('minimized') is False and item.get('handle') and item.get('pid')
+             and item.get('process_created') and bool(item.get('title'))]
+    portals=[item for item in targets if '直播服务平台' in item['title']]
+    if len(portals)==1: return portals[0]
+    if len(portals)>1: raise RecapError('edge_window_ambiguous')
+    tabs=[item for item in targets if any(name in item['title'].casefold() for name in ('新建标签页','new tab'))]
+    if len(tabs)==1: return tabs[0]
+    if len(tabs)>1 or len(targets)>1: raise RecapError('edge_window_ambiguous')
+    if len(targets)==1: return targets[0]
+    raise RecapError('edge_window_unconfirmed')
+
+
 def uia_tokens(text,title):
     """仅解析本版Snapshot可见树格式，静态无坐标文字只用于核对，绝不猜位置。"""
     result=[]; selected=False
@@ -228,6 +245,7 @@ class Desktop:
         live=self.probe.get(window)
         try: return self.probe.foreground(live)
         except RecapError: pass
+        self.probe.ensure_switch_safe(live)
         matches=[w for w in self.probe.windows() if w['title']==live['title']]
         if len(matches)!=1: raise RecapError('window_title_ambiguous')
         self.mcp.call('App',mode='switch',name=live['title'])
@@ -237,6 +255,7 @@ class Desktop:
         live=self.guard(window)
         region=live['rect']
         if not self.probe.contained(region): raise RecapError('window_outside_screen')
+        self.probe.ensure_unobstructed(live)
         if use_uia:
             reply=self.mcp.call('Snapshot',use_vision=True,use_dom=False,use_annotation=False,
                                 use_ui_tree=True,region=region)
@@ -244,6 +263,7 @@ class Desktop:
             reply=self.mcp.call('Screenshot',use_annotation=False,region=region)
         captured_at=now()  # 工具返回截图时，不把后续OCR结束时间冒作截图时间。
         self.guard(live)  # 在耗时OCR前记录本次截图正常取得的租约，并复核前台。
+        self.probe.ensure_unobstructed(live)
         text=check_reply(reply)
         images=[q['image_data'] for q in reply.get('content',[]) if 'image_data' in q]
         if len(images)!=1 or not isinstance(images[0],str): raise RecapError('screenshot_missing')
@@ -307,6 +327,9 @@ class Desktop:
         point=view.point(token)
         x,y,r,b=current['rect']
         if not (x<point[0]<r and y<point[1]<b): raise RecapError('locator_outside_window')
+        self.probe.ensure_unobstructed(view.window)
+        self.probe.ensure_point(view.window,point)
+        self.probe.ensure_unobstructed(view.window)
         self.mcp.call('Click',loc=point,button='left',clicks=1)
 
     def key(self,window,key):
@@ -322,6 +345,9 @@ class Desktop:
             point=view.point(token)
             x,y,r,b=live['rect']
             if not (x<point[0]<r and y<point[1]<b): raise RecapError('locator_outside_window')
+            self.probe.ensure_unobstructed(view.window)
+            self.probe.ensure_point(view.window,point)
+            self.probe.ensure_unobstructed(view.window)
             self.mcp.call('Type',loc=point,text=chunk,clear=index==0,
                           caret_position='end',press_enter=index==len(chunks)-1)
 
@@ -332,6 +358,9 @@ class Desktop:
             if live['rect']!=view.window['rect']: raise RecapError('window_moved_before_action')
             point=view.point(token); x,y,r,b=live['rect']
             if not (x<point[0]<r and y<point[1]<b): raise RecapError('locator_outside_window')
+            self.probe.ensure_unobstructed(view.window)
+            self.probe.ensure_point(view.window,point)
+            self.probe.ensure_unobstructed(view.window)
             self.mcp.call('Type',loc=point,text=account[start:start+19],clear=index==0,
                           caret_position='end',press_enter=False)
 
@@ -383,11 +412,13 @@ class Desktop:
                 self.mcp.note('edge_launch_candidates',candidate_count=len(windows),
                               untitled_count=sum(not item.get('title') for item in windows),
                               elapsed_ms=round((current-began)*1000),**metadata)
-            if len(windows)==1 and windows[0].get('title') and current<=deadline:
+            try: target=select_edge_target(windows)
+            except RecapError: target=None
+            if target is not None and current<=deadline:
                 if hasattr(self.mcp,'note'):
-                    self.mcp.note('edge_window_final',candidate_count=len(windows),outcome='unique',
+                    self.mcp.note('edge_window_final',candidate_count=len(windows),outcome='unique_target',
                                   elapsed_ms=round((current-began)*1000),changes_truncated=changes>8,**metadata)
-                return windows[0]
+                return target
             if current>=deadline:
                 if hasattr(self.mcp,'note'):
                     self.mcp.note('edge_window_final',candidate_count=len(windows),

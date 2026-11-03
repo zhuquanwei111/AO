@@ -5,6 +5,11 @@ from core import RecapError
 from desktop import Desktop, safe_window_metadata
 
 
+def main_window():
+    return {'handle':1,'pid':2,'process_created':3,'title':'Edge','window_class':'Chrome_WidgetWin_1',
+            'owner':0,'root_owner':1,'visible':True,'enabled':True,'minimized':False}
+
+
 class EdgeLaunchTests(unittest.TestCase):
     def test_window_diagnostics_do_not_include_title_or_unrecognized_class(self):
         row={'handle':1,'pid':2,'title':'private-title-example','window_class':'private-class',
@@ -23,31 +28,31 @@ class EdgeLaunchTests(unittest.TestCase):
         return driver
 
     def test_transient_multiple_candidates_wait_for_unique_window(self):
-        main = {'handle': 1, 'title': 'Edge'}
+        main = main_window()
         helper = {'handle': 2, 'title': ''}
         driver = self.driver([[main, helper], [main]])
         with patch('desktop.time.monotonic', side_effect=[0, 1, 2]), patch('desktop.time.sleep'):
             self.assertEqual(driver.wait_edge_launch(), main)
-        self.assertEqual(driver.guard.call_count, 2)
+        self.assertEqual(driver.guard.call_count, 1)
 
     def test_empty_then_multiple_then_unique_within_one_deadline(self):
-        main = {'handle': 1, 'title': 'Edge'}
+        main = main_window()
         helper = {'handle': 2, 'title': ''}
         driver = self.driver([[], [main, helper], [main]])
         with patch('desktop.time.monotonic', side_effect=[0, 1, 2, 3]), patch('desktop.time.sleep'):
             self.assertEqual(driver.wait_edge_launch(), main)
-        self.assertEqual(driver.probe.windows.call_count, 3)
+        self.assertEqual(driver.probe.windows.call_count, 2)
 
     def test_single_candidate_returns_without_wait(self):
-        main = {'handle': 1, 'title': 'Edge'}
+        main = main_window()
         driver = self.driver([[main]])
         with patch('desktop.time.monotonic', side_effect=[0, 1]), patch('desktop.time.sleep') as sleep:
             self.assertEqual(driver.wait_edge_launch(), main)
         sleep.assert_not_called()
 
     def test_deadline_is_not_reset_by_changing_candidates(self):
-        main = {'handle': 1, 'title': 'Edge'}
-        helper = {'handle': 2, 'title': ''}
+        main = main_window()
+        helper = {**main_window(),'handle':2,'pid':3,'root_owner':2}
         driver = self.driver([[], [main, helper], [main]])
         with patch('desktop.time.monotonic', side_effect=[0, 1, 14, 16]), patch('desktop.time.sleep'):
             with self.assertRaisesRegex(RecapError, 'edge_launch_unconfirmed'):
@@ -92,7 +97,7 @@ class EdgeLaunchTests(unittest.TestCase):
         driver.probe.windows.assert_not_called()
 
     def test_bind_launches_once_then_waits_before_navigation(self):
-        main = {'handle': 1, 'title': 'Edge'}
+        main = main_window()
         helper = {'handle': 2, 'title': ''}
         driver = self.driver([[], [main, helper], [main]])
         driver.focus = Mock(return_value=main)
