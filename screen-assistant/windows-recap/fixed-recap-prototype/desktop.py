@@ -254,13 +254,21 @@ def snapshot_diagnostics(text,title,uia_requested,ocr_tokens):
             'uia_address_candidates':len(bars) if tree_present else None,**ocr}
 
 
+def portal_url_matches(value):
+    """平台归属只核HTTPS及精确主机；地址栏省略协议时沿用HTTPS展示形式。"""
+    if not isinstance(value,str): return False
+    value=value.strip()
+    if '://' not in value: value='https://'+value
+    try:
+        parsed=urlparse(value)
+        return parsed.scheme=='https' and parsed.hostname=='union.bytedance.com' and '\\' not in parsed.netloc
+    except ValueError:
+        return False
+
+
 def portal_page_evidence(tokens):
-    texts=[compact(q.text) for q in tokens if q.score>=.85]
-    origin=any(re.search(r'(?<![\w.-])(?:https?://)?union\.bytedance\.com/open/portal(?:[/?#]|$)',text,re.I)
-               for text in texts)
-    brand=any('直播服务平台' in text for text in texts)
-    navigation=any(text in ('工作台','主播管理','主播列表') or '请输入主播' in text for text in texts)
-    return {'portal_origin_visible':origin,'portal_brand_visible':brand,'portal_navigation_visible':navigation}
+    # 品牌、导航、账号及登录状态不再作为平台域名归属的前置。
+    return {'portal_origin_visible':any(portal_url_matches(q.text) for q in tokens if q.score>=.85)}
 
 
 class Desktop:

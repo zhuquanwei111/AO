@@ -126,16 +126,17 @@ def main():
             old=store.get(task)
             diagnostics=getattr(runtime,'diagnostics',None)
             selection=getattr(desktop,'window_selection_diagnostics',None)
+            navigation=getattr(desktop,'navigation_diagnostics',None)
             record=store.update(task,llm_runtime_invocations=old.get('llm_runtime_invocations',0)+runtime.calls,
                 visual_diagnostics=diagnostics if isinstance(diagnostics,list) else None,
                 window_selection_diagnostics=selection if isinstance(selection,list) else None,
+                navigation_diagnostics=navigation if isinstance(navigation,list) else None,
                 normal_path_llm_calls=(old['normal_path_llm_calls']+runtime.http_requests)
                     if old.get('normal_path_llm_calls') is not None and runtime.http_requests is not None else None,
                 model=MODEL if runtime.calls else old.get('model'),
                 model_call_count_semantics='仅计已确认的模型请求；失败时次数未知')
-            if args.command=='start':
-                record=Runner(store,None).finish_unbound_execution(task,
-                    cleanup_confirmed=cleanup_confirmed and getattr(runtime,'all_workers_finished',runtime.calls==0))
+            record=Runner(store,None).finish_execution(task,
+                cleanup_confirmed=cleanup_confirmed and getattr(runtime,'all_workers_finished',runtime.calls==0))
     print(json.dumps({'task_ref':str(store.path(record['local_test_id'])),
         'operation_elapsed_ms':round((time.monotonic()-began)*1000),'record':record},ensure_ascii=False,indent=2))
     return operation_exit_code(args.command,record)

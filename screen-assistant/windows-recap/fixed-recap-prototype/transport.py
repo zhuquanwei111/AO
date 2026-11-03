@@ -27,6 +27,7 @@ class MCP:
         self.observations=Path(observations or self.trace.parent/'observations').resolve()
         self.process=None; self.lines=queue.Queue(); self._call_inflight=False
         self._close_confirmed=False
+        self._started=False
 
     def _read(self):
         try:
@@ -56,6 +57,7 @@ class MCP:
         self.process=subprocess.Popen([self.python,str(self.client)],stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,encoding='utf-8',bufsize=1,
             env=child_env,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        self._started=True
         threading.Thread(target=self._read,daemon=True).start()
         ready=self._receive()
         if not ready.get('ready') or set(ready.get('tools',[]))!=TOOLS:
@@ -85,7 +87,8 @@ class MCP:
         return reply
 
     def close(self):
-        if not self.process: return self._close_confirmed
+        if not self.process: return self._close_confirmed or not self._started
+        self._started=True
         confirmed=False
         try:
             self.process.stdin.close()

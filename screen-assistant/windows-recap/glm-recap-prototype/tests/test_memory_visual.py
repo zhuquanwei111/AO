@@ -56,6 +56,7 @@ class MemoryVisualTests(unittest.TestCase):
         view.address_seeds = tuple(address_seed_candidates(tree, 'Target', view.window['rect']))
         driver = object.__new__(GLMDesktop)
         driver.guard = lambda window: window
+        driver.mcp = Mock()
         driver.probe = Mock(); driver.probe.windows.return_value = [view.window]
         driver.key = Mock(); driver.observe = Mock(return_value=view)
         driver.type_replacement = Mock(); driver.wait_entry = Mock(return_value='confirmed')

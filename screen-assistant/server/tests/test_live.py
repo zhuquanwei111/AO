@@ -220,7 +220,7 @@ def test_backstage_task_late_result_identity_idempotency_and_summary(tmp_path):
         assert busy.status_code == 201
         busy_headers = {"X-Live-Session-Token": busy.json()["session_token"]}
         busy_start = client.post(f"/v1/live/sessions/{busy.json()['session_id']}/start", headers=busy_headers)
-        assert busy_start.status_code == 200 and busy_start.json()["task_status"] == "not_connected"
+        assert busy_start.status_code == 200 and busy_start.json()["task_status"] == "waiting_for_stop"
         assert client.post("/v1/live/sessions/backstage/tasks/claim", headers=worker_headers).json()["task"]["task_id"] == task_id
 
         assert client.post(session_url + "/stop", headers=app_headers).json()["backstage_status"] == "capturing"
@@ -345,7 +345,7 @@ def test_busy_task_preserves_owner_and_allows_live_observations(tmp_path):
         url = f"/v1/live/sessions/{second['session_id']}"
         start = client.post(url + "/start", headers=second_headers)
         assert start.status_code == 200
-        assert start.json()["task_status"] == "not_connected"
+        assert start.json()["task_status"] == "waiting_for_stop"
         assert start.json()["task_id"] != first_id
         assert client.post(url + "/start", headers=second_headers).json()["task_id"] == start.json()["task_id"]
         assert client.post(url + "/start", headers=second_headers, json={"source": "android_app"}).status_code == 409
@@ -360,7 +360,12 @@ def test_busy_task_preserves_owner_and_allows_live_observations(tmp_path):
         wait_for_fusion(client)
         assert len(client.get(url + "/prompts", headers=second_headers).json()["prompts"]) == 1
         recap = client.get(url + "/summary", headers=second_headers).json()["backstage_recap"]
-        assert recap["status"] == "not_connected" and recap["metrics"] is None
+        assert recap["status"] == "waiting_for_stop" and recap["metrics"] is None
+        same = client.post(url + "/start", headers=second_headers).json()
+        assert same["status"] == "duplicate" and same["task_id"] == start.json()["task_id"]
+        assert same["task_status"] == "waiting_for_stop"
+        # 第二场在领取前已结束，不得在第一场回写后再绑定后来直播。
+        assert client.post(url + "/stop", headers=second_headers).json()["backstage_status"] == "not_connected"
         assert client.post(first_url + "/stop", headers=first_headers).json()["backstage_status"] == "capturing"
         assert client.post("/v1/live/sessions/backstage/tasks/claim", headers=worker_headers).json()["task"]["task_id"] == first_id
         result = {"task_id": first_id, "douyin_account": "first-account", "status": "needs_input",
@@ -369,9 +374,6 @@ def test_busy_task_preserves_owner_and_allows_live_observations(tmp_path):
                   "capture_method": "fixture", "value_semantics": "no captured values"}
         assert client.post(first_url + "/backstage/result", headers=worker_headers, json=result).status_code == 200
         assert client.post("/v1/live/sessions/backstage/tasks/claim", headers=worker_headers).json()["status"] == "idle"
-        same = client.post(url + "/start", headers=second_headers).json()
-        assert same["status"] == "duplicate" and same["task_id"] == start.json()["task_id"]
-        assert same["task_status"] == "not_connected"
         assert client.post(url + "/stop", headers=second_headers).json()["backstage_status"] == "not_connected"
         stopped_recap = client.get(url + "/summary", headers=second_headers).json()["backstage_recap"]
         assert stopped_recap["status"] == "not_connected" and stopped_recap["stop_signal_received"] is True

@@ -213,22 +213,7 @@ class Probe:
         class_name=ctypes.create_unicode_buffer(256)
         if not self.u.GetClassNameW(hit,class_name,len(class_name)) or class_name.value.casefold()=='static':
             raise RecapError('point_target_mismatch')
-        current=live['handle']; visited={current}
-        for _ in range(32):
-            client_point=w.POINT(int(point[0]),int(point[1]))
-            if not self.u.ScreenToClient(current,ctypes.byref(client_point)):
-                raise RecapError('point_target_mismatch')
-            child=self.u.ChildWindowFromPointEx(current,client_point,1)  # 只跳过不可见子窗，不跳过disabled。
-            if not child: raise RecapError('point_target_mismatch')
-            child=int(child)
-            if child==current: break
-            if child in visited or not self.u.IsWindowEnabled(child): raise RecapError('point_target_mismatch')
-            child_class=ctypes.create_unicode_buffer(256)
-            if not self.u.GetClassNameW(child,child_class,len(child_class)) or child_class.value.casefold()=='static':
-                raise RecapError('point_target_mismatch')
-            visited.add(child); current=child
-        else:
-            raise RecapError('point_target_mismatch')
+        # 以系统实际命中的窗口判断归属；内部渲染层和非客户区不代表输入目标。
         if self.foreground(window)['rect']!=window.get('rect'):
             raise RecapError('window_moved_before_action')
 

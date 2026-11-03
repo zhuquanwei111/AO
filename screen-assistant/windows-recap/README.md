@@ -61,6 +61,10 @@ MCP 两份 requirements 只锁直接依赖；其传递依赖尚无完整锁，�
 
 恢复依据：[Windows-MCP 0.8.8 `switch_app`/`bring_window_to_top`](https://github.com/CursorTouch/Windows-MCP/blob/v0.8.8/src/windows_mcp/desktop/service.py)、[微软 IsIconic](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-isiconic)、[EnumWindows 返回语义](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enumwindows)。这些资料证明正常最小化窗口可经官方流程恢复；没有选窗摘要的历史任务仍不能据此断言具体失败原因。
 
+平台归属仅复用 `urllib.parse.urlparse` 比较HTTPS及精确主机名 `union.bytedance.com`，不限制路径，不要求页面品牌、导航文字或额外内容识别。沿用地址栏省略HTTPS的既有显示形式；已有URL可读时不再调用视觉模型确认品牌，原视觉URL读取分支也只读取地址栏URL。其他主机、伪同域和网页文字中嵌入的URL不作为平台归属。平台内登录页仍交登录/验证码流程处理；账号、本场、历史场和指标来源继续分别核对，域名通过不表示绑定或取数成功。依据：[Python标准URL解析](https://docs.python.org/3.13/library/urllib.parse.html)。
+
+导航中的只读模型连接/请求超时及已确认的408/409/429/5xx使用原有观察循环，整段最多恢复两次，每次重新观察目标窗口；其他HTTP错误或未知状态不按暂态恢复，不重置原24次调用/240秒模型预算。主播列表导航由模型在当前侧栏、浮层或二级入口选择下一步，最多六个步骤，搜索输入框已经可见时直接使用，不以固定OCR菜单词作前置。完整失败回执且MCP已无在途请求时只重新观察再决定，不直接重放点击；工具超时、断管等执行结果无法安全确认时保留unknown并停止动作，同一未确认点击点不能因模型返回不同大小的框而重复。用户接管、登录和账号/场次边界不靠重试绕过。任务 `navigation_diagnostics`仅记录固定阶段、原因及恢复计数；图片、模型原文和页面仍不落盘。复用依据：[SDK错误及有限重试](https://github.com/openai/openai-python#retries)和现有Windows-MCP动作；SDK仍使用原天翼路由，未改变供应商、SDK重试配置或工具白名单。
+
 ## 许可与来源
 
 保留源清单提供的RapidOCR及模型许可材料。RapidOCR代码为Apache-2.0，随附模型许可另见`fixed-recap-prototype/rapidocr-MODEL_LICENSES.md`及`ocr-model-manifest.json`。锁定的Agents SDK与Python MCP SDK为MIT，Windows-MCP 0.8.8为MIT，分别见[OpenAI Agents SDK许可](https://github.com/openai/openai-agents-python/blob/main/LICENSE)、[Python MCP SDK许可](https://github.com/modelcontextprotocol/python-sdk/blob/main/LICENSE)和[Windows-MCP 0.8.8发行说明](https://pypi.org/project/windows-mcp/0.8.8/)。本目录不内嵌这些依赖包；两份直接依赖列表没有完整锁定全部传递依赖，安装方仍须随实际分发检查其许可。本目录仅包含客户端适配源码，不包含Windows-MCP二进制包、模型权重、API密钥、桌面截图或本地结果。

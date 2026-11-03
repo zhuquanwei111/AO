@@ -102,22 +102,110 @@ class GLMDesktop(LLMDesktop):
                       discarded_observation=True)
         return self.focus(window)
 
-    def target(self,window,goal,toolbar=False):
+    def _navigation_note(self,stage,outcome,reason=None):
+        row={'stage':stage,'outcome':outcome,
+             'model_recoveries':getattr(self,'_model_recoveries',0),
+             'action_reobservations':getattr(self,'_action_reobservations',0),
+             'visual_reobservations':getattr(self,'_visual_reobservations',0),
+             'focus_recoveries':getattr(self,'_focus_recoveries',0)}
+        if reason is not None: row['reason']=reason
+        records=getattr(self,'navigation_diagnostics',None)
+        if not isinstance(records,list): records=[]; self.navigation_diagnostics=records
+        if len(records)<48: records.append(row)
+        else: records[-1]=row
+        self.mcp.note('navigation_step',**row)
+
+    def _navigation_decision(self,window,decide,stage):
+        # 复用原观察/焦点恢复，只读模型请求失败才可重新截图后恢复。
         missing_retries=0
-        for attempt in range(5):
-            view=self.observe(window,False,ocr_optional=True)
+        last_reason='navigation_unconfirmed'
+        for attempt in range(8):
             try:
-                token=self.vision.locate(view,goal,toolbar,guard=self.guard)
+                view=self.observe(window,False,ocr_optional=True)
+                token=decide(view)
                 self.guard(view.window)
+                self._navigation_note(stage,'confirmed')
                 return view,token
             except RecapError as error:
-                if error.reason=='visual_missing' and missing_retries<1:
-                    missing_retries+=1
+                last_reason=error.reason
+                used=getattr(self,'_model_recoveries',0)
+                runtime=getattr(self.vision,'runtime',None)
+                deadline=getattr(runtime,'deadline',None)
+                in_budget=type(deadline) not in (int,float) or time.monotonic()<deadline
+                transient=error.reason in ('visual_worker_connection_error','visual_worker_request_timeout')
+                if error.reason=='visual_worker_http_error':
+                    diagnostics=getattr(runtime,'diagnostics',None)
+                    last=diagnostics[-1] if isinstance(diagnostics,list) and diagnostics else None
+                    status=last.get('http_status') if isinstance(last,dict) and last.get('category')=='http_error' else None
+                    transient=type(status) is int and (status in (408,409,429) or 500<=status<=599)
+                if transient and used<2 and in_budget:
+                    try: self.guard()
+                    except RecapError as stopped:
+                        self._navigation_note(stage,'stopped',stopped.reason)
+                        raise
+                    self._model_recoveries=used+1
+                    self._navigation_note(stage,'retrying',error.reason)
                     time.sleep(1)
                     continue
-                if error.reason!='foreground_changed' or attempt==4: raise
-                window=self._recover_focus(window)
-        raise RecapError('foreground_changed')
+                if (error.reason=='visual_missing' or stage=='search_menu' and error.reason=='visual_ambiguous') and missing_retries<1:
+                    missing_retries+=1
+                    self._visual_reobservations=getattr(self,'_visual_reobservations',0)+1
+                    self._navigation_note(stage,'retrying',error.reason)
+                    time.sleep(1)
+                    continue
+                if error.reason=='foreground_changed' and attempt<7:
+                    try: window=self._recover_focus(window)
+                    except RecapError as recovery:
+                        self._navigation_note(stage,'stopped',recovery.reason)
+                        raise
+                    self._navigation_note(stage,'retrying',error.reason)
+                    continue
+                self._navigation_note(stage,'stopped',error.reason)
+                raise
+            except OSError:
+                self._navigation_note(stage,'stopped','mcp_pipe_outcome_unknown')
+                raise RecapError('mcp_pipe_outcome_unknown') from None
+        self._navigation_note(stage,'stopped',last_reason)
+        raise RecapError(last_reason)
+
+    def target(self,window,goal,toolbar=False):
+        return self._navigation_decision(window,
+            lambda view:self.vision.locate(view,goal,toolbar,guard=self.guard),
+            'address_bar' if goal=='地址栏' else 'target')
+
+    def search_entry(self,window):
+        uncertain_action=None
+        for _ in range(6):
+            view,token=self._navigation_decision(window,
+                lambda current:self.vision.next_search_action(current,self.guard),'search_menu')
+            if token.text=='search_field': return view,token
+            if token.text!='navigation_entry':
+                self._navigation_note('search_menu','stopped','search_navigation_unconfirmed')
+                raise RecapError('search_navigation_unconfirmed')
+            signature=(tuple(view.point(token)),tuple(view.window['rect']),
+                       view.window['handle'],view.window.get('pid'),view.window.get('process_created'))
+            if uncertain_action==signature:
+                self._navigation_note('menu_action','stopped','menu_action_outcome_unknown')
+                raise RecapError('menu_action_outcome_unknown')
+            uncertain_action=None
+            try:
+                self.click(view,token)
+            except RecapError as error:
+                wire=getattr(self.mcp,'wire',self.mcp)
+                settled=getattr(wire,'_call_inflight',False) is False
+                used=getattr(self,'_action_reobservations',0)
+                if error.reason in ('mcp_tool_error','mcp_text_error') and settled and used<1:
+                    self._action_reobservations=used+1
+                    uncertain_action=signature
+                    self._navigation_note('menu_action','reobserve',error.reason)
+                    continue
+                self._navigation_note('menu_action','stopped',error.reason)
+                raise
+            except OSError:
+                self._navigation_note('menu_action','stopped','mcp_pipe_outcome_unknown')
+                raise RecapError('mcp_pipe_outcome_unknown') from None
+        self._navigation_note('search_menu','stopped','search_navigation_budget_exhausted')
+        raise RecapError('search_navigation_budget_exhausted')
 
     def bind(self,account):
         self.expected_account=account
@@ -138,11 +226,7 @@ class GLMDesktop(LLMDesktop):
             view=self.navigate_entry(window)
         else:
             view=self.wait_entry(window)
-        if not any('请输入主播' in compact(q.text) for q in view.tokens):
-            if not any(compact(q.text)=='主播列表' for q in view.tokens):
-                view,token=self.target(window,'侧边导航主播管理的展开箭头'); self.click(view,token)
-            view,token=self.target(window,'侧边导航主播列表'); self.click(view,token)
-        view,search=self.target(window,'主播列表页面搜索主播昵称或抖音号的输入框，不是侧边导航')
+        view,search=self.search_entry(window)
         self.type_account(view,search,account)
         view,token=self.target(window,'搜索框下方抖音号完全为 '+account+' 的唯一主播候选，不能选搜索框或其他账号')
         self.vision.verify_identity(view,account,self.guard); self.click(view,token)
@@ -181,20 +265,36 @@ class GLMDesktop(LLMDesktop):
         live=self.guard(window)
         self.key(live,'ctrl+l')
         self.key(live,'esc')
-        view=self.observe(live,False,ocr_optional=True)
-        target=self.vision.locate(view,'地址栏',guard=self.guard)
+        view,target=self.target(live,'地址栏',True)
         self.type_replacement(view,target,self.portal_url)
         time.sleep(1)
         return self.wait_entry(live)
 
     def wait_entry(self,window,timeout=20):
-        view=self.observe(window,False,ocr_optional=True)
-        if not all(portal_page_evidence(view.tokens).values()):
-            self.vision.verify_portal(view,self.guard)
+        def confirm(view):
+            if not all(portal_page_evidence(view.tokens).values()):
+                self.vision.verify_portal(view,self.guard)
+        view,_=self._navigation_decision(window,confirm,'portal_url')
         return view
 
     def capture(self,binding):
-        return Desktop.capture(self,binding)
+        result=Desktop.capture(self,binding)
+        result['window_cleanup']='preserved_user_window'
+        if binding.get('new_window_created') is True and self._verified_room_id==binding['room_id']:
+            result['window_cleanup']='unconfirmed'
+            try:
+                room=self.guard(binding['window'])
+                self.key(room,'alt+f4')
+                deadline=time.monotonic()+3
+                while True:
+                    if not any(row['handle']==room['handle'] for row in self.probe.windows()):
+                        result['window_cleanup']='closed_created_room'
+                        break
+                    if time.monotonic()>=deadline: break
+                    time.sleep(.1)
+            except RecapError as error:
+                self.mcp.note('created_room_cleanup_unconfirmed',reason=error.reason)
+        return result
 
     def refine_metrics(self,view,result):
         self._used_visual_metric=False
@@ -211,6 +311,9 @@ class GLMDesktop(LLMDesktop):
                 self._used_visual_metric |= updated['metrics'] != result['metrics']
                 result=updated
             except RecapError as error:
+                if error.reason.startswith('visual_worker_'):
+                    result.setdefault('missing_reasons',{})[name]=error.reason
+                    continue
                 if error.reason not in ('locator_missing','locator_ambiguous','visual_crop_anchor_invalid',
                         'visual_crop_anchor_ambiguous','visual_crop_content_ambiguous','visual_crop_too_large',
                         'visual_metric_unconfirmed'):

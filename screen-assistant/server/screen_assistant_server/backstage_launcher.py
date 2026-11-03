@@ -12,6 +12,7 @@ import sys
 import threading
 
 from .backstage_bridge import BackstageFatalError, validate_worker_url, verify_ssh_tunnel
+from . import backstage_bridge
 
 
 def read_worker_token(path: Path) -> str:
@@ -136,9 +137,15 @@ def supervise_bridge(process):
     except (ValueError,UnicodeError,TypeError):
         result=None
     category=result.get('error') if isinstance(result,dict) and result.get('stage')=='runtime' else None
-    if not isinstance(category,str) or not (category=='bridge_fatal' or re.fullmatch(r'http_rejected_[0-9]{3}',category)):
+    if not isinstance(category,str) or not (category in ('bridge_fatal','runtime_exception') or re.fullmatch(r'http_rejected_[0-9]{3}',category)):
         category=stderr_category(process.safe_stderr)
-    print(f'bridge exited: stage=runtime, category={category}, exit={code}',flush=True)
+    if category=='runtime_exception' or isinstance(result,dict) and 'phase' in result and category!='unknown':
+        detail=backstage_bridge.safe_runtime_diagnostic(result)
+        child_code=detail['cli_exit_code'] if detail['cli_exit_code'] is not None else 'unknown'
+        print(f"bridge exited: stage=runtime, category={category}, phase={detail['phase']}, "
+              f"exception={detail['exception_class']}, cli_exit={child_code}, exit={code}",flush=True)
+    else:
+        print(f'bridge exited: stage=runtime, category={category}, exit={code}',flush=True)
     return code
 
 
