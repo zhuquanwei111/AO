@@ -43,6 +43,38 @@ agent/RAG/历史上下文/个性化；不持久化句子或回复日志。
 | `MAX_SENTENCE_CHARS` | `2000` | 规范化后句子长度上限，超出 422 |
 | `MODEL_TIMEOUT_SECONDS` | `30` | 模型请求总超时（超时映射 504） |
 | `MODEL_CONNECT_TIMEOUT_SECONDS` | `5` | 模型连接超时 |
+| `LIVE_FUSION_CONCURRENCY` | `2` | 每个服务进程内普通融合执行上限，允许 1–16 |
+| `LIVE_FUSION_QUEUE_LIMIT` | `16` | 每个服务进程内等待分析的不同场次上限，允许 1–256 |
+
+实时观察已保存并安排分析时返回 `status=accepted`、`reason=scheduled`、`prompt_id=null`；队列满而观察已保存时 `reason=analysis_busy`，本次不安排分析。结果仍通过 `/prompts` 获取，`scheduled` 不表示已生成提示。上述上限是进程内保护值，不是性能保证；进程退出后未完成的内存调度不会自动恢复。
+
+`/prompts` 的成功响应顶层含 `server_time_ms` 和 `server_processing_ms`：前者是与 `expires_at_ms` 同源的服务时钟毫秒；后者是从路由处理入口到长轮询结束后的单调耗时，整数毫秒向下取整。响应设置 `Cache-Control: no-store`。客户端使用本次请求完整往返的单调耗时（毫秒向上取整）减去服务处理时长，并从 `expires_at_ms - server_time_ms` 扣除该差值及 1 毫秒取整余量，再按单调时间扣除后续排队和显示时间。字段缺失、非法或处理时长大于往返时间时不得据此延长提示有效期；旧服务缺少这些字段。该计算依赖响应未被缓存和服务时钟未异常跳变，不是任意网络条件下的绝对保证。
+
+`/observations` 的 `comment` 与 `online_count` 可在顶层提供 `capture_batch_id`（1–128 字符）；`comment` 还可提供 `line_index`（0–65535 的整数，必须同时提供批次）与 `capture_comment_count`（严格整数 1–128，必须同时提供批次和行号）。数量是该采集轮冻结待发送的评论 OCR 观察项总数，不是语义评论数或观众数；同批每项须使用相同总数和不同的行号，行号允许有洞。收齐前不将该批评论送入融合；未收齐到期的批次不生成提示。未提供数量的旧请求走原兼容路径，不视为已确认的完整批次。字段缺省兼容旧客户端；重试沿用相同 `event_id` 及完整请求。只有服务端实际部署支持此契约后，客户端才能发送新字段；旧服务会拒绝这些字段。
+
+评论项的 `reason=batch_incomplete` 表示该合法项已接收但批次尚未收齐；`batch_expired` 表示该项到达时已超过批次收齐期限。同事件原样重试为 `duplicate_event`，事件 ID 改内容或批次行号、预期数冲突按现有规则返回 409。收齐的末项如本身可用，成功安排分析为 `scheduled`、队列满为 `analysis_busy`；末项不可靠或重复消息等则保留 `source_unreliable`、`duplicate_message` 等行级原因，即使它已计入批次收齐。行级原因本身不证明整批是否安排分析或模型是否生成；末项不可靠且队列满时通过 `stage=scheduler` 的 `scheduler_full` 诊断区分，不增加复合响应字段。
+
+创建场次的 `capabilities` 指示已支持的可选能力：`observation_batch_metadata` 为真时表示支持批次 ID、行号、评论观察项总数及收齐门控；`typed_prompts` 为假时不要依赖提示类型。服务端缺少能力对象或相应字段时视为不支持。带采集批次的评论仍按事件 ID 和完整请求做幂等校验，有平台消息 ID 时继续按该 ID 去重；不套用旧 iOS 文本与位置的粗粒度去重。无批次的旧请求继续原规则。
+
+新生成的融合提示可含 `prompt_type`：`comment_reply` 的 `display_text` 为主播可直接说出的话，`reply_to` 包含场次内临时 `comment_id`、可空 `nickname` 和从 OCR 识别提取的 `text`；这些不是平台身份或原文保证。`operation_notice` 的 `display_text` 是运营行动提醒。旧事件可能没有类型，未知类型应中性展示；旧提示字段、游标与服务端时间元数据继续保留。可用正文只表示已观察 OCR 内局部来源与边界满足规则，不证明画面外无遗漏或识别绝对正确；没有独立可用证据的昵称不点名，未知等级仅筛选时按零处理。
+
+新评论回复的 `reply_to.text` 和 `nickname` 不写入 SQLite，仅在同一服务进程内保留至提示到期；有效 `/prompts` 有上下文时提供完整引用。历史 `/events`、重启或上下文失效后省略 `reply_to`，建议正文、类型和游标仍可读取；客户端应把缺引用视为未知。缓存随已保存提示增长，受既有每场 1000 个事件及最多 8 个活动场次约束。过期上下文在后续请求时惰性回收，场次停止或服务关闭时清理；空闲时不承诺内存的即时物理擦除。该限制仅针对新引用，派生的建议可能复述评论，不代表历史数据或其他表已清除。
+
+评论回复按场次、来源、可用昵称（未知昵称为独立组）和精确规范化正文施加 20 秒成功输出冷却；新的非紧急运营动作按主题施加 30 秒冷却，既有 fixture、人物及安全提醒沿用原规则。冷却只限制回复，不删除观察，不证明同一人或同一消息，也不合并群体人数。首版不将上一收齐批次视为必然紧邻的上一采集轮；跨帧连续性并未确认，同一真实用户在冷却期再次发送相同内容时也可能不再单独回复。
+
+可靠评论回复成功保存后，每场至多保留一个固定截止的短期训练机会；只有随后新接受的观察触发现有调度，才可产生话题延续、互动邀请或表达节奏的条件式话术训练。同次排空、保存前的观察和事件原样重试不单独触发；机会解锁后至多先成功处理一条普通回复，再尝试一次训练，紧急或高优先级状态候选及既有抑制规则仍优先。成功训练后继续处理已就绪的普通评论。模板不调用模型，不代表主播已采用或现场出现冷场、人数变化等状态。
+
+训练成功保存后同场冷却 30 秒、同主题冷却 90 秒，失败不计成功；截止固定为产生该机会的评论回复生成时刻加 30 秒，后续回复及重试不续期。选择和保存时均要求截止前至少剩 3 秒；不足则放弃该机会、不写事件或成功冷却，并保留仅含原截止的短期标记，原截止之前的回复不再建立机会；原截止后只有新的成功回复才能建立机会。服务端满足条件也不保证网络或排队后可读。机会依据已保存回复事件的非正文来源/时间摘要，不读取过期 OCR 文本或昵称，stop/到期时的后续访问/进程退出清理；其他运营提示仍按原有期限和规则处理，训练不延长评论观察或引用的有效期。
+
+评论批次仍须在采集后 10 秒内收齐；收齐且正文可用后，评论回复从首次观察起最多可处理 20 秒，提示生成后仍有效 15 秒。模型失败不计入成功冷却；仅后续新观察可自然触发重试，同一候选最多两次实际模型调用，不自动循环。缺少模型密钥时不发起调用；服务停止或候选过期后不重试。超时无法证明供应商是否完成处理。
+
+评论回复及旧普通运营建议请求使用 512 token 输出预算；供应商返回 `finish_reason=length` 时不保存残缺结果，不当成明确拒答。评论回复沿同一候选的有界自然重试规则处理；旧普通候选沿既有同场有界执行槽、10 秒观察窗口和新观察触发，不承诺每个候选最多调用两次。预算是工程初值，并非真实供应商质量或性能保证。每场最多接收 10000 条观察；过期批次清除正文和重建结果，保留批次及尝试摘要直到停止，以维持运行期重复与冲突判断。该进程内状态不会在重启后恢复。
+
+`capture_batch_id` 应为每个实际采集轮新生成且不复用的 UUID；每项重试保持原事件 ID、行号、总数、采集时间和完整请求。批次收齐状态只存在于服务进程内：重启后未完成批次不恢复，已接收的旧事件重试仍按原事件幂等返回；客户端不应换事件 ID 或刷新采集时间来续传旧评论，新一轮使用新 UUID。不同事件复用旧批次的冲突只在当前运行期检测，不保证跨重启检测，也不承诺全局恰好一次。
+
+音频响应含 `transcripts` 时，`fusion_schedule` 标记本次融合触发为 `scheduled` 或 `analysis_busy`；该字段不表示提示已生成，也不概括后台音频作业的其他触发。没有返回转写时不提供该字段。
+
+后台音频转写保存后若融合触发因容量或关闭门禁未安排，场次 `/summary` 的 `audio_fusion.background_analysis_busy_count` 持久累计这类后台触发次数，初始为 0。计数不含转写正文、不自动重试，也不表示某条提示的最终状态。
 
 ## 启动路径
 
@@ -188,8 +220,10 @@ MISCONF（详见上方「重要」），写命令全拒、服务按契约 503；
 | `POST /v1/live/sessions` | 可无请求体，或 `{"description":"本场选填说明"}` | 201：`session_id, started_at_ms, session_token` |
 | `POST /v1/live/sessions/{id}/comments` | 下述观察对象 | 200：`status, counted, reason, prompt_id, received_at_ms, effective_at_ms, time_basis` |
 | `GET /v1/live/sessions/{id}/prompts` | `after` 默认空；`wait_ms` 默认0、范围0—15000 | `prompts, next_cursor, stopped, session_id` |
-| `POST /v1/live/sessions/{id}/stop` | 无请求体；重复调用幂等 | `session_id, stopped_at_ms` |
+| `POST /v1/live/sessions/{id}/stop` | 无请求体；顺序重复调用幂等 | `200`：`session_id, stopped_at_ms`；并发重复停止返回 `409` |
 | `GET /v1/live/sessions/{id}/events` | `after` 默认空；`limit` 默认50、范围1—100 | `events, next_cursor, has_more, session_id, started_at_ms, stopped_at_ms` |
+
+停止请求完成后顺序重复调用返回 `200`，`stopped_at_ms` 不变。若同一场次的停止正在处理中，并发重复请求返回 `409`（`detail` 为 `live session already stopping`）；客户端应视为停止尚未确认，稍后重试或核对场次状态，不应当作失败终态。其他原因的 `409` 应按对应错误处理。
 
 除创建外，均需 `X-Live-Session-Token: <创建返回的令牌>`；只存 SHA-256 摘要，
 令牌仅创建时返回，调用方应妥善保存且不得写日志。不存在/不匹配均403；同幂等ID内容
@@ -265,6 +299,23 @@ loopback Redis，核对目录身份后为旧测试提供 `TEST_REDIS_URL`，结�
 本地验证不替代iOS接线、Apple构建、真机后台/PiP或抖音实播验证。
 
 ## M3：iOS 运营观察接线（本地实现）
+
+### 后台复盘与实时场次状态
+
+后台只处理一个未决任务。`POST /start` 返回 `status=started` 表示实时场次已启动，不能单凭它或 `task_id` 断言后台执行器已领取。重复 start 返回同一任务及其当前状态；实时观察和提示不依赖后台汇总完成。
+
+| 场景 | 现有字段及含义 |
+| --- | --- |
+| 后台已有未决任务，新场启动 | `task_status=not_connected`；本场后台取数不可用，不排队、不自动补领或重试。实时场次继续。 |
+| 正常场次开始，可能尚未有 worker | `task_status=waiting_for_stop`；不证明执行器在线或已领取。执行器未配置/离线时，停止前也可能保持此状态。 |
+| 任务已领取 | `summary.backstage_recap.claimed_at_ms` 非空；停止前状态仍为 `waiting_for_stop`。 |
+| 场次停止 | 已领取且结果未到时为 `capturing`；未领取为 `not_connected`，不会迟到领取。`stop_signal_received`、`stopped_at_ms` 和来源反映实际停止信号。 |
+| 结果回写 | `status` 为 `captured_locally`、`partial`、`needs_input` 或 `failed`，具体数据和采集时间按返回字段显示；未取得时 `metrics`、`received_at_ms` 为 null。 |
+| 没有配置账号 | start 为 `not_configured`、`task_id` 为 null；summary 的 `backstage_recap` 可为 null。 |
+
+`not_connected` 既可能来自后台忙，也可能来自场次停止时未领取；现有字段不区分原因，也不能反向推断执行器在线状态。旧客户端可能将它显示成待处理或已绑定，需要客户端按上述状态更新；服务端改动本身不改变已安装 App 的文案。
+
+对于确认遗留的未领取任务，受控 worker 可调用 `POST /v1/live/sessions/backstage/tasks/{task_id}/recover`，使用既有 worker 鉴权并提交 `expected_status=waiting_for_stop` 和准确的整数 `expected_created_at_ms`。服务端仅接受至少 24 小时、未领取、未停止、无结果且场次未停止的精确任务；领取与恢复通过 SQLite 写事务互斥。恢复保留场次及任务原记录，任务转为 `not_connected`，新增 `recovered_at_ms` 与固定 `recovery_reason=stale_unclaimed` 审计字段，不生成 stop 或复盘结果。重复相同身份请求返回原恢复时间；其他状态或创建时间变化返回 409。恢复并不停止原场，也不使已有 `not_connected` 任务重新领取。新字段由启动时的增量迁移加入；部署前须备份数据库，回退时保留新增列和原数据。
 
 M3 在 M2 fixture 契约上增加 `input_mode=live_observation`，不改变旧 `/v1/answer`。
 ReplayKit OCR 保留逐行文本框：iOS 将裁剪ROI内的 Vision 框映射为全屏左上原点归一化

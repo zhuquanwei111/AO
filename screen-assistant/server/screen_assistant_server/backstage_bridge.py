@@ -3,18 +3,44 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import contextmanager
 import signal
 import subprocess
 import sys
 import time
+import ntpath
+import argparse
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from urllib.request import Request, ProxyHandler, HTTPRedirectHandler, HTTPHandler, build_opener
+from http.client import HTTPConnection
 
 
 METRIC_KEYS = ("累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪")
+
+RUNTIME_PHASES=frozenset({'idle','claim_request','claim_validate','wait_stop','stop_validate',
+    'payload_prepare','result_post','result_ack'} | {
+    'cli_'+command+suffix for command in ('start','stop','result')
+    for suffix in ('','_start','_wait','_parse','_validate')})
+RUNTIME_EXCEPTION_CLASSES=frozenset(('BackstageFatalError','BackstageTransientError','BackstageCliRecordError',
+    'ModuleNotFoundError','ImportError','FileNotFoundError','PermissionError','NotADirectoryError',
+    'IsADirectoryError','BrokenPipeError','ConnectionResetError','ConnectionAbortedError','ConnectionRefusedError',
+    'TimeoutError','TimeoutExpired','RemoteDisconnected','IncompleteRead','BadStatusLine','CannotSendRequest',
+    'ResponseNotReady','InvalidURL','ValueError','TypeError','KeyError','IndexError','AttributeError',
+    'UnicodeDecodeError','JSONDecodeError','OSError','RuntimeError','AssertionError','other_exception'))
+
+
+def safe_runtime_diagnostic(value):
+    """只投影固定运行阶段、异常类别和真实取得的CLI退出码。"""
+    value=value if isinstance(value,dict) else {}
+    phase=value.get('phase'); category=value.get('exception_class'); code=value.get('cli_exit_code')
+    return {'phase':phase if isinstance(phase,str) and phase in RUNTIME_PHASES else 'unknown',
+        'exception_class':category if isinstance(category,str) and category in RUNTIME_EXCEPTION_CLASSES else 'other_exception',
+        'cli_exit_code':code if type(code) is int and -2147483648<=code<=4294967295 else None}
 
 
 class BackstageFatalError(RuntimeError):
@@ -27,6 +53,138 @@ class BackstageTransientError(RuntimeError):
 
 class BackstageCliRecordError(ValueError):
     """CLI record不属于当前场次或不符合当前回写契约。"""
+
+
+class VerifiedTunnelHTTPHandler(HTTPHandler):
+    def __init__(self, verify):
+        super().__init__()
+        self.verify = verify
+
+    def http_open(self, request):
+        verify = self.verify
+
+        class VerifiedConnection(HTTPConnection):
+            def connect(self):
+                super().connect()
+                try:
+                    verify()
+                except Exception:
+                    self.close()
+                    raise
+
+        return self.do_open(VerifiedConnection, request)
+
+
+def validate_worker_url(value: str) -> str:
+    """worker凭据仅发送到经运维确认的本机SSH转发入口。"""
+    try:
+        parsed=urlsplit(value)
+        port=parsed.port
+    except (ValueError,AttributeError):
+        raise BackstageFatalError('worker endpoint must be an explicit loopback tunnel') from None
+    if (parsed.scheme!='http' or parsed.hostname!='127.0.0.1' or port is None or
+            not 1<=port<=65535 or value!=f'http://127.0.0.1:{port}'):
+        raise BackstageFatalError('worker endpoint must be an explicit loopback tunnel')
+    return value
+
+
+class NoWorkerRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _windows_process_identity(pid: int):
+    import ctypes
+    from ctypes import wintypes as w
+    kernel=ctypes.WinDLL('kernel32',use_last_error=True)
+    kernel.OpenProcess.argtypes=[w.DWORD,w.BOOL,w.DWORD]; kernel.OpenProcess.restype=w.HANDLE
+    kernel.QueryFullProcessImageNameW.argtypes=[w.HANDLE,w.DWORD,w.LPWSTR,ctypes.POINTER(w.DWORD)]
+    kernel.QueryFullProcessImageNameW.restype=w.BOOL
+    kernel.GetProcessTimes.argtypes=[w.HANDLE]+[ctypes.POINTER(w.FILETIME)]*4
+    kernel.GetProcessTimes.restype=w.BOOL
+    kernel.CloseHandle.argtypes=[w.HANDLE]; kernel.CloseHandle.restype=w.BOOL
+    handle=kernel.OpenProcess(0x1000,False,pid)
+    if not handle: raise BackstageFatalError('ssh tunnel process unavailable')
+    try:
+        path=ctypes.create_unicode_buffer(32768); size=w.DWORD(len(path))
+        times=[w.FILETIME() for _ in range(4)]
+        if not kernel.QueryFullProcessImageNameW(handle,0,path,ctypes.byref(size)) or not kernel.GetProcessTimes(handle,*[ctypes.byref(t) for t in times]):
+            raise BackstageFatalError('ssh tunnel identity unavailable')
+        return path.value,(times[0].dwHighDateTime<<32)|times[0].dwLowDateTime
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def _windows_listeners(port: int):
+    root=os.environ.get('SYSTEMROOT','')
+    if not root: raise BackstageFatalError('system root unavailable')
+    executable=ntpath.join(root,'System32','netstat.exe')
+    env={key:value for key,value in os.environ.items() if key.upper() in {'SYSTEMROOT','WINDIR'}}
+    try:
+        result=subprocess.run([executable,'-ano','-p','tcp'],capture_output=True,
+                              timeout=5,check=True,env=env,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+    except (OSError,subprocess.SubprocessError):
+        raise BackstageFatalError('ssh tunnel listener unavailable') from None
+    rows=[]
+    for line in result.stdout.splitlines():
+        fields=line.split()
+        if len(fields)!=5 or fields[0].upper()!=b'TCP' or fields[3].upper()!=b'LISTENING': continue
+        address,separator,number=fields[1].rpartition(b':')
+        if separator and number.isdigit() and int(number)==port and fields[4].isdigit():
+            try: address=address.decode('ascii')
+            except UnicodeDecodeError: continue
+            rows.append((address,int(fields[4])))
+    return rows
+
+
+def verify_ssh_tunnel(url: str, pid: int, created_filetime: int):
+    validate_worker_url(url)
+    if os.name!='nt' or type(pid) is not int or pid<=0 or type(created_filetime) is not int or created_filetime<=0:
+        raise BackstageFatalError('ssh tunnel identity invalid')
+    actual_path,actual_created=_windows_process_identity(pid)
+    expected=ntpath.join(os.environ.get('SYSTEMROOT',''),'System32','OpenSSH','ssh.exe')
+    if not os.environ.get('SYSTEMROOT') or ntpath.normcase(ntpath.normpath(actual_path))!=ntpath.normcase(ntpath.normpath(expected)) or actual_created!=created_filetime:
+        raise BackstageFatalError('ssh tunnel identity mismatch')
+    if _windows_listeners(urlsplit(url).port)!=[('127.0.0.1',pid)]:
+        raise BackstageFatalError('ssh tunnel listener mismatch')
+
+
+@contextmanager
+def bridge_instance_lock(name: str = 'ScreenAssistantBackstageBridge'):
+    """同一主机仅允许一个桥；退出或进程结束由系统释放锁。"""
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel.CreateMutexW.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        ctypes.set_last_error(0)
+        handle = kernel.CreateMutexW(None, False, 'Global\\' + name)
+        error = ctypes.get_last_error()
+        if not handle:
+            raise BackstageFatalError('bridge instance lock unavailable')
+        if error == 183:
+            kernel.CloseHandle(handle)
+            raise BackstageFatalError('bridge already running')
+        try:
+            yield
+        finally:
+            kernel.CloseHandle(handle)
+    else:
+        import fcntl
+        import tempfile
+        path = Path(tempfile.gettempdir()) / f'{name}-{os.getuid()}.lock'
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise BackstageFatalError('bridge already running') from None
+            yield
+        finally:
+            os.close(fd)
 
 
 @dataclass(frozen=True)
@@ -49,6 +207,8 @@ class BridgeConfig:
     poll_seconds: float = 2.0
     request_timeout: float = 15.0
     cli_timeout: float = 480.0
+    ssh_pid: int | None = None
+    ssh_created_filetime: int | None = None
 
     def __post_init__(self):
         if not 60.0 <= self.cli_timeout <= 600.0:
@@ -69,8 +229,14 @@ class BridgeConfig:
         if not 60.0 <= cli_timeout <= 600.0:
             raise ValueError("BACKSTAGE_CLI_TIMEOUT_SECONDS must be between 60 and 600")
 
+        url=validate_worker_url(required("BACKSTAGE_SERVER_URL"))
+        try:
+            pid=int(required("BACKSTAGE_SSH_PID")); created=int(required("BACKSTAGE_SSH_CREATED_FILETIME"))
+        except ValueError:
+            raise BackstageFatalError('ssh tunnel identity invalid') from None
+        verify_ssh_tunnel(url,pid,created)
         return cls(
-            server_url=required("BACKSTAGE_SERVER_URL").rstrip("/"),
+            server_url=url,
             worker_token=required("BACKSTAGE_WORKER_TOKEN"),
             cli_python=required("BACKSTAGE_CLI_PYTHON"),
             cli_entry=required("BACKSTAGE_CLI_ENTRY"),
@@ -80,6 +246,7 @@ class BridgeConfig:
             gate_a=optional("BACKSTAGE_CLI_GATE_A"),
             poll_seconds=max(0.5, float(os.environ.get("BACKSTAGE_POLL_SECONDS", "2"))),
             cli_timeout=cli_timeout,
+            ssh_pid=pid, ssh_created_filetime=created,
         )
 
 
@@ -94,16 +261,24 @@ class BackstageBridge:
         self.http = http or self._http
         self.cli = cli or self._cli
         self.sleep = sleep
+        self.runtime_phase='idle'
+        self.last_cli_exit_code=None
+
+    def _phase(self,value):
+        self.runtime_phase=value
 
     def _http(self, method: str, path: str, payload: dict | None = None) -> dict:
-        url = self.config.server_url + "/" + path.lstrip("/")
+        url = validate_worker_url(self.config.server_url) + "/" + path.lstrip("/")
+        verify_ssh_tunnel(self.config.server_url,self.config.ssh_pid,self.config.ssh_created_filetime)
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
         request = Request(url, data=body, method=method, headers={
             "X-Backstage-Worker-Token": self.config.worker_token,
             "Content-Type": "application/json",
         })
         try:
-            with urlopen(request, timeout=self.config.request_timeout) as response:
+            opener=build_opener(ProxyHandler({}),NoWorkerRedirect(),VerifiedTunnelHTTPHandler(
+                lambda: verify_ssh_tunnel(self.config.server_url,self.config.ssh_pid,self.config.ssh_created_filetime)))
+            with opener.open(request, timeout=self.config.request_timeout) as response:
                 try:
                     payload = json.loads(response.read().decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):
@@ -142,9 +317,30 @@ class BackstageBridge:
         return args
 
     def _cli(self, command: str, task: dict) -> CliInvocation:
+        self._phase('cli_'+command)
+        self.last_cli_exit_code=None
+        if command == "start" and task.get("stop_signal_received") is True:
+            # 重启后只读原场记录；已结束且未绑定的任务绝不能重新导航到后来直播。
+            saved = self._cli("result", task)
+            self._phase('cli_result_validate')
+            record = self._record(saved)
+            if (saved.returncode == 0 and record is not None
+                    and self._record_problem(task, record, allow_missing_stop_source=True) is None):
+                status = record.get("status")
+                bound = status == "waiting_for_stop" and self._binding_evidence_problem(record) is None
+                if bound or status in {"captured_locally", "partial", "needs_input", "failed"}:
+                    return CliInvocation(saved.output, 2 if status in {"needs_input", "failed"} else 0)
+            return CliInvocation(None, None, "stopped_before_binding")
         entry = Path(self.config.cli_entry)
-        child_env = {key: value for key, value in os.environ.items()
-                     if key != "BACKSTAGE_WORKER_TOKEN" and not key.startswith("AO_")}
+        # 仅传明确运行配置及视觉模型凭据，worker凭据不得传给CLI。
+        allowed = {"SYSTEMROOT", "WINDIR", "PATH", "PATHEXT", "TEMP", "TMP",
+                   "LOCALAPPDATA", "APPDATA", "USERPROFILE", "COMSPEC", "PROGRAMFILES",
+                   "PROGRAMFILES(X86)", "OS", "HOME", "LANG", "LC_ALL", "BACKSTAGE_CLI_DATA", "BACKSTAGE_CLI_MODELS",
+                   "BACKSTAGE_CLI_SCRATCH", "BACKSTAGE_MCP_CLIENT_PYTHON",
+                   "BACKSTAGE_WINDOWS_MCP_PYTHON", "BACKSTAGE_SDK_PYTHON",
+                   "BACKSTAGE_CLI_GATE_A", "TIANYI_API_KEY"}
+        child_env = {key: value for key, value in os.environ.items() if key.upper() in allowed}
+        child_env.update(PYTHONUTF8="1", PYTHONDONTWRITEBYTECODE="1")
         try:
             process_options = {
                 "cwd": str(entry.parent), "env": child_env,
@@ -155,14 +351,19 @@ class BackstageBridge:
                 process_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
             else:
                 process_options["start_new_session"] = True
+            self._phase('cli_'+command+'_start')
             process = subprocess.Popen(self._cli_args(command, task), **process_options)
             try:
+                self._phase('cli_'+command+'_wait')
                 stdout, _ = process.communicate(timeout=self.config.cli_timeout)
             except subprocess.TimeoutExpired:
                 self._terminate_process_tree(process)
+                self.last_cli_exit_code=getattr(process,'returncode',None)
                 return CliInvocation(None, getattr(process, "returncode", None), "cli_timeout")
         except OSError:
             return CliInvocation(None, None, "cli_execution_unavailable")
+        self.last_cli_exit_code=process.returncode
+        self._phase('cli_'+command+'_parse')
         try:
             output = json.loads(stdout)
         except (json.JSONDecodeError, TypeError):
@@ -411,9 +612,11 @@ class BackstageBridge:
         }
 
     def _post_result(self, task: dict, payload: dict) -> None:
+        self._phase('result_post')
         response = self.http(
             "POST", f"v1/live/sessions/{task['session_id']}/backstage/result", payload,
         )
+        self._phase('result_ack')
         if not isinstance(response, dict):
             raise BackstageFatalError("backstage result acknowledgement is invalid")
         if (response.get("status") not in {"accepted", "duplicate"}
@@ -428,6 +631,7 @@ class BackstageBridge:
     def _wait_for_app_stop(self, task: dict, identity: tuple[str, str]) -> dict:
         """等待原 App 场次 stop；校验身份/source 后返回终态 task。"""
         current = task
+        self._phase('wait_stop')
         while current.get("stop_signal_received") is not True:
             current = self._task(task["task_id"])
             if (current.get("session_id"), current.get("douyin_account")) != identity:
@@ -437,13 +641,21 @@ class BackstageBridge:
             if current.get("stop_signal_received") is not True:
                 self.sleep(self.config.poll_seconds)
 
+        self._phase('stop_validate')
         expected_source = task.get("start_signal_source")
         if current.get("stop_signal_source") != expected_source:
             raise BackstageFatalError("backstage task source mismatch")
         return current
 
     def run_once(self) -> bool:
+        with bridge_instance_lock():
+            return self._run_once()
+
+    def _run_once(self) -> bool:
+        self.last_cli_exit_code=None
+        self._phase('claim_request')
         claimed = self.http("POST", "v1/live/sessions/backstage/tasks/claim")
+        self._phase('claim_validate')
         if not isinstance(claimed, dict):
             raise BackstageFatalError("backstage claim response is invalid")
         task = claimed.get("task")
@@ -459,7 +671,9 @@ class BackstageBridge:
             raise BackstageFatalError("claimed backstage task source mismatch")
 
         identity = (task["session_id"], task["douyin_account"])
+        self._phase('cli_start')
         start = self._invocation(self.cli("start", task))
+        self._phase('cli_start_validate')
         start_record = self._record(start)
         start_problem = self._record_problem(
             task, start_record, allow_missing_stop_source=True,
@@ -469,6 +683,15 @@ class BackstageBridge:
             return True
 
         start_status = start_record.get("status") if start_record else None
+        if (task.get("stop_signal_received") is True and start.returncode == 0
+                and start_status in {"captured_locally", "partial"}):
+            try:
+                self._phase('payload_prepare')
+                payload = self.result_payload(task, {"record": start_record})
+            except BackstageCliRecordError as exc:
+                payload = self._null_failure_payload(task, str(exc))
+            self._post_result(task, payload)
+            return True
         if start_record and start_status in {"needs_input", "failed"}:
             task = self._wait_for_app_stop(task, identity)
             start_reason = self._reason(start, "cli_start_failed")
@@ -481,6 +704,7 @@ class BackstageBridge:
                     )
                 else:
                     try:
+                        self._phase('payload_prepare')
                         payload = self.result_payload(
                             task, {"record": self._payload_record(start)},
                             allow_missing_stop_source=True,
@@ -493,6 +717,7 @@ class BackstageBridge:
             # For an unbound needs_input or terminal failed record, persist the
             # real App stop through the CLI. The CLI's stop path closes the local
             # record without starting another desktop capture for an unbound task.
+            self._phase('cli_stop')
             stop = self._invocation(self.cli("stop", task))
             stop_record = self._record(stop)
             stop_problem = self._record_problem(
@@ -511,6 +736,7 @@ class BackstageBridge:
                 payload = self._null_failure_payload(task, reason)
             else:
                 try:
+                    self._phase('payload_prepare')
                     payload = self.result_payload(task, {"record": self._payload_record(stop)})
                 except BackstageCliRecordError as exc:
                     payload = self._null_failure_payload(task, str(exc))
@@ -533,6 +759,7 @@ class BackstageBridge:
             self._write_cli_failure(task, identity, reason)
             return True
 
+        self._phase('cli_stop')
         stop = self._invocation(self.cli("stop", task))
         stop_record = self._record(stop)
         stop_problem = self._record_problem(task, stop_record, allow_missing_stop_source=False)
@@ -548,6 +775,7 @@ class BackstageBridge:
                 )
             else:
                 try:
+                    self._phase('payload_prepare')
                     payload = self.result_payload(task, {"record": self._payload_record(stop)})
                 except BackstageCliRecordError as exc:
                     payload = self._null_failure_payload(task, str(exc))
@@ -561,6 +789,7 @@ class BackstageBridge:
             self._post_result(task, self._null_failure_payload(task, reason))
             return True
 
+        self._phase('cli_result')
         result = self._invocation(self.cli("result", task))
         result_record = self._record(result)
         result_problem = self._record_problem(task, result_record, allow_missing_stop_source=False)
@@ -577,28 +806,91 @@ class BackstageBridge:
             ))
             return True
         try:
+            self._phase('payload_prepare')
             payload = self.result_payload(task, {"record": self._payload_record(result)})
         except BackstageCliRecordError as exc:
             payload = self._null_failure_payload(task, str(exc))
         self._post_result(task, payload)
         return True
 
-    def serve_forever(self) -> None:
-        while True:
-            try:
-                if not self.run_once():
+    def serve_forever(self, *, on_ready=None, on_failure=None, check_only=False) -> None:
+        with bridge_instance_lock():
+            if on_ready:
+                on_ready()
+            if check_only:
+                return
+            while True:
+                try:
+                    if not self._run_once():
+                        self.sleep(self.config.poll_seconds)
+                except BackstageFatalError as exc:
+                    if on_failure:
+                        match=re.fullmatch(r'backstage HTTP rejected request: ([0-9]{3})',str(exc))
+                        on_failure('http_rejected_'+match.group(1) if match else 'bridge_fatal')
+                    print('backstage bridge stopped: BackstageFatalError', file=sys.stderr)
+                    raise SystemExit(2) from None
+                except BackstageTransientError as exc:
+                    print(f"backstage bridge paused: {type(exc).__name__}", file=sys.stderr)
                     self.sleep(self.config.poll_seconds)
-            except BackstageFatalError as exc:
-                print(f"backstage bridge stopped: {exc}", file=sys.stderr)
-                raise SystemExit(2) from None
-            except BackstageTransientError as exc:
-                print(f"backstage bridge paused: {type(exc).__name__}", file=sys.stderr)
-                self.sleep(self.config.poll_seconds)
 
 
-def main() -> None:
-    BackstageBridge(BridgeConfig.from_env()).serve_forever()
+def main(argv=None) -> int:
+    parser=argparse.ArgumentParser()
+    mode=parser.add_mutually_exclusive_group()
+    mode.add_argument('--check',action='store_true')
+    mode.add_argument('--startup-handshake',action='store_true')
+    args=parser.parse_args(argv)
+    stage='config'
+    try:
+        config=BridgeConfig.from_env()
+        stage='lock'
+        bridge=BackstageBridge(config)
+        runtime_details={}
+        def ready():
+            nonlocal stage
+            if args.check or args.startup_handshake:
+                print(json.dumps({'stage':'preclaim','status':'ready'}),flush=True)
+            if args.startup_handshake:
+                stage='handshake'
+                if sys.stdin.buffer.readline(16)!=b'go\n':
+                    raise BackstageFatalError('startup acknowledgement missing')
+            stage='running'
+        def failure(category):
+            if args.startup_handshake:
+                try:
+                    result={'stage':'runtime','status':'failed','error':category}
+                    if category=='runtime_exception':
+                        result.update(runtime_details)
+                    else:
+                        result.update(safe_runtime_diagnostic({'phase':bridge.runtime_phase,
+                            'exception_class':'BackstageFatalError','cli_exit_code':bridge.last_cli_exit_code}))
+                    print(json.dumps(result),flush=True)
+                except (BrokenPipeError,OSError):
+                    pass
+        try:
+            bridge.serve_forever(on_ready=ready,on_failure=failure,check_only=args.check)
+        except Exception as error:
+            if stage!='running': raise
+            runtime_details=safe_runtime_diagnostic({'phase':bridge.runtime_phase,
+                'exception_class':type(error).__name__,'cli_exit_code':bridge.last_cli_exit_code})
+            failure('runtime_exception')
+            return 2
+        return 0
+    except (BackstageFatalError,ValueError,ImportError,OSError) as error:
+        if stage=='running':
+            raise
+        if args.check or args.startup_handshake:
+            result={'stage':stage,'status':'failed','error':type(error).__name__}
+            known_settings=('BACKSTAGE_SERVER_URL','BACKSTAGE_WORKER_TOKEN','BACKSTAGE_CLI_PYTHON',
+                            'BACKSTAGE_CLI_ENTRY','BACKSTAGE_SSH_PID','BACKSTAGE_SSH_CREATED_FILETIME')
+            for name in known_settings:
+                if str(error)==f'missing required setting: {name}':
+                    result['setting']=name
+                    break
+            print(json.dumps(result),flush=True)
+            return 2
+        raise
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

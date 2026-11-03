@@ -1,12 +1,15 @@
 """本后台有限步骤适配。只用现有Windows-MCP输入，UIA可见控件／当前截图OCR。"""
 from dataclasses import dataclass
+import base64
+import binascii
+import io
 from pathlib import Path
 import re
 import time
 from urllib.parse import urlparse
 from PIL import Image
 
-from core import Token, RecapError, compact, unique_label, require_account, metrics_from_tokens
+from core import Token, RecapError, compact, unique_label, require_account, summary_metrics
 from flow import now
 from transport import check_reply
 
@@ -14,16 +17,145 @@ from transport import check_reply
 @dataclass
 class View:
     tokens: list
-    image: Path
+    image: bytes
     window: dict
     size: tuple
     captured_at: str
     uia: list
+    address_seeds: tuple = ()
+    address_seed_error: str | None = None
 
     def point(self, token):
         if token.source=='uia': return [round(token.x),round(token.y)]
         x,y,r,b=self.window['rect']
         return [round(x+token.x*(r-x)/self.size[0]),round(y+token.y*(b-y)/self.size[1])]
+
+
+_SEED_ISSUER = object()
+
+
+@dataclass(frozen=True)
+class AddressSeed:
+    x: int
+    y: int
+    title: str
+    _issuer: object
+
+
+def address_seed_candidates(snapshot, title, rect):
+    """仅将本轮唯一窗口内的具名 Edit 中心作为裁图区种子。"""
+    if not isinstance(snapshot, str) or 'UI Tree:' not in snapshot or '[truncated:' in snapshot:
+        raise RecapError('address_seed_unavailable')
+    tree = snapshot.split('UI Tree:', 1)[1]
+    headers = re.findall(r'window "([^"\n]*)"', tree)
+    if headers.count(title) != 1:
+        raise RecapError('address_seed_window_ambiguous')
+    selected = False
+    seeds = []
+    labels = {'地址和搜索栏', '地址和搜索', 'address and search bar'}
+    for line in tree.splitlines():
+        header = re.search(r'window "([^"\n]*)"', line)
+        if header:
+            selected = header[1] == title
+            continue
+        if not selected:
+            continue
+        item = re.search(r'\((-?\d+),\s*(-?\d+)\)\s+([^\s]+)\s+"([^"\n]*)"', line)
+        if not item or item[3].casefold() not in ('edit', '编辑', '编辑框') or item[4].casefold() not in labels:
+            continue
+        x, y = int(item[1]), int(item[2])
+        if not (rect[0] < x < rect[2] and rect[1] < y < rect[3]):
+            raise RecapError('address_seed_outside_window')
+        seeds.append(AddressSeed(x, y, title, _SEED_ISSUER))
+    if len(seeds) != 1:
+        raise RecapError('address_seed_missing_or_ambiguous')
+    return seeds
+
+
+def safe_window_metadata(windows):
+    """仅投影窗口结构，不输出标题、地址或页面内容。"""
+    rows=[]
+    for item in windows[:12]:
+        title=_edge_title(item).casefold()
+        category=('empty' if not title else 'new_tab' if ('新建标签页' in title or 'new tab' in title)
+                  else 'portal' if '直播服务平台' in title else 'other')
+        name=item.get('window_class','')
+        if not isinstance(name,str): name=''
+        cls=name if re.fullmatch(r'Chrome_WidgetWin_[0-9]{1,3}',name) or name=='#32770' else 'other_or_unknown'
+        structural=('top_level_candidate' if cls=='Chrome_WidgetWin_1' and item.get('owner')==0
+                    and item.get('root_owner')==item.get('handle') and item.get('enabled') is True
+                    and item.get('minimized') is False else 'unknown')
+        rows.append({'handle':item.get('handle'),'pid':item.get('pid'),'class':cls,
+                     'owner':item.get('owner'),'root_owner':item.get('root_owner'),
+                     'style':item.get('style'),'exstyle':item.get('exstyle'),
+                     'visible':item.get('visible'),'enabled':item.get('enabled'),
+                     'minimized':item.get('minimized'),'structural_class':structural,
+                     'identity_missing':[key for key in ('handle','pid','process_created')
+                         if type(item.get(key)) is not int or item[key]<=0],
+                     'rect':item.get('rect'),'title_category':category})
+    return {'candidates':rows,'metadata_truncated':len(windows)>12}
+
+
+def _edge_title(window):
+    title=window.get('title')
+    return title if isinstance(title,str) else ''
+
+
+def _edge_identity(window):
+    return all(type(window.get(key)) is int and window[key]>0 for key in ('handle','pid','process_created'))
+
+
+def edge_main_candidates(windows):
+    return [item for item in windows if _edge_identity(item)
+            and item.get('window_class')=='Chrome_WidgetWin_1'
+            and type(item.get('owner')) is int and item['owner']==0
+            and type(item.get('root_owner')) is int and item['root_owner']==item['handle']
+            and item.get('visible') is True]
+
+
+def _edge_usable(windows):
+    return [item for item in edge_main_candidates(windows) if item.get('enabled') is True
+            and item.get('minimized') is False and bool(_edge_title(item))]
+
+
+def select_edge_target(windows):
+    """只选择唯一的结构化Edge顶层窗口；其他窗口不视为安全。"""
+    targets=_edge_usable(windows)
+    portals=[item for item in targets if '直播服务平台' in item['title']]
+    if len(portals)==1: return portals[0]
+    if len(portals)>1: raise RecapError('edge_window_ambiguous')
+    tabs=[item for item in targets if any(name in item['title'].casefold() for name in ('新建标签页','new tab'))]
+    if len(tabs)==1: return tabs[0]
+    if len(tabs)>1 or len(targets)>1: raise RecapError('edge_window_ambiguous')
+    if len(targets)==1: return targets[0]
+    raise RecapError('edge_window_unconfirmed')
+
+
+def edge_selection_summary(windows):
+    """选择与诊断共用同一候选判定，不输出原始标题或页面。"""
+    structural=edge_main_candidates(windows); usable=_edge_usable(windows)
+    portal=[row for row in usable if '直播服务平台' in row['title']]
+    tabs=[row for row in usable if any(q in row['title'].casefold() for q in ('新建标签页','new tab'))]
+    result={'probe_rows_count':len(windows),'verified_identity_count':sum(_edge_identity(row) for row in windows),
+            'structural_count':len(structural),'usable_count':len(usable),
+            'portal_count':len(portal),'newtab_count':len(tabs),
+            'disabled_count':sum(row.get('enabled') is False for row in structural),
+            'minimized_count':sum(row.get('minimized') is True for row in structural),
+            'untitled_count':sum(not _edge_title(row) for row in structural),
+            'chosen_handle':None,'chosen_kind':None,'reject_code':None,**safe_window_metadata(windows)}
+    try: chosen=select_edge_target(windows)
+    except RecapError:
+        code=('no_candidates' if not windows else 'no_verified_identity' if not result['verified_identity_count'] else
+              'no_structural_main' if not structural else 'main_disabled' if all(row.get('enabled') is False for row in structural) else
+              'main_minimized' if all(row.get('enabled') is True and row.get('minimized') is True for row in structural) else
+              'main_untitled' if all(not _edge_title(row) for row in structural) else
+              'main_unusable' if not usable else 'multiple_portal' if len(portal)>1 else
+              'multiple_newtab' if len(tabs)>1 else 'multiple_main')
+        result['reject_code']=code
+    else:
+        result['chosen_handle']=chosen['handle']
+        result['chosen_kind']='portal' if chosen in portal else 'new_tab' if chosen in tabs else 'ordinary'
+    return result
 
 
 def uia_tokens(text,title):
@@ -62,10 +194,10 @@ def room_from_tokens(tokens):
 
 def _blank_entry_boxes(image,anchor):
     """仅当前入口工具栏行的浅色宽框，复用OpenCV；不识别任意应用控件。"""
-    if image is None or not Path(image).is_file(): return []
+    if not isinstance(image, bytes) or not image: return []
     import cv2
     import numpy as np
-    with Image.open(image) as img: pixels=np.asarray(img.convert('RGB'))
+    with Image.open(io.BytesIO(image)) as img: pixels=np.asarray(img.convert('RGB'))
     height,width=pixels.shape[:2]
     y0=max(0,round(anchor.y-anchor.h*.3)); y1=min(height,round(anchor.y+anchor.h*.3))
     right=min(width,round(anchor.box[0]))
@@ -99,7 +231,7 @@ def entry_address_candidates(tokens,image=None):
         candidates=[q for q in raw if q.box[2]<anchor.box[0] and
                     q.box[1]>tabs[0].box[3] and abs(q.y-anchor.y)<=max(q.h,anchor.h)*.75]
     ocr_count=len(candidates); visual=[]
-    visual_examined=len(toolbar)==1 and not raw and image is not None and Path(image).is_file()
+    visual_examined=len(toolbar)==1 and not raw and isinstance(image, bytes) and bool(image)
     if visual_examined:
         visual=_blank_entry_boxes(image,toolbar[0]); candidates=visual
     return candidates,{'source':'current_window_screenshot_toolbar_box' if visual_examined else 'current_window_screenshot_ocr',
@@ -122,13 +254,21 @@ def snapshot_diagnostics(text,title,uia_requested,ocr_tokens):
             'uia_address_candidates':len(bars) if tree_present else None,**ocr}
 
 
+def portal_url_matches(value):
+    """平台归属只核HTTPS及精确主机；地址栏省略协议时沿用HTTPS展示形式。"""
+    if not isinstance(value,str): return False
+    value=value.strip()
+    if '://' not in value: value='https://'+value
+    try:
+        parsed=urlparse(value)
+        return parsed.scheme=='https' and parsed.hostname=='union.bytedance.com' and '\\' not in parsed.netloc
+    except ValueError:
+        return False
+
+
 def portal_page_evidence(tokens):
-    texts=[compact(q.text) for q in tokens if q.score>=.85]
-    origin=any(re.search(r'(?<![\w.-])(?:https?://)?union\.bytedance\.com/open/portal(?:[/?#]|$)',text,re.I)
-               for text in texts)
-    brand=any('直播服务平台' in text for text in texts)
-    navigation=any(text in ('工作台','主播管理','主播列表') or '请输入主播' in text for text in texts)
-    return {'portal_origin_visible':origin,'portal_brand_visible':brand,'portal_navigation_visible':navigation}
+    # 品牌、导航、账号及登录状态不再作为平台域名归属的前置。
+    return {'portal_origin_visible':any(portal_url_matches(q.text) for q in tokens if q.score>=.85)}
 
 
 class Desktop:
@@ -140,6 +280,48 @@ class Desktop:
         self.mcp,self.probe,self.ocr=mcp,probe,ocr
         self.evidence=Path(evidence); self.evidence.mkdir(parents=True,exist_ok=True)
         self.portal_url=portal_url
+        self.window_selection_diagnostics=[]
+
+    def record_edge_selection(self,windows,stage,*,final=False,restore_target=None):
+        summary={'stage':stage,**edge_selection_summary(windows)}
+        if restore_target is not None:
+            summary.update(chosen_handle=restore_target['handle'],chosen_kind='minimized_restore',
+                           reject_code=None,restore_required=True)
+        context=getattr(self.probe,'selection_context',None)
+        context=context() if callable(context) else None
+        if isinstance(context,dict):
+            summary.update({key:context[key] for key in ('foreground_handle','foreground_root')
+                            if type(context.get(key)) is int})
+        inventory=getattr(self.probe,'last_window_inventory',None)
+        if isinstance(inventory,dict):
+            summary['inventory']={key:inventory[key] for key in ('enum_ok','raw_count','visible_count',
+                'verified_process_count','process_lookup_failed_count','rect_failed_count',
+                'class_lookup_failed_count','title_missing_count') if key in inventory}
+            if inventory.get('enum_ok') is False:
+                summary.update(reject_code='inventory_incomplete',chosen_handle=None,chosen_kind=None)
+        records=getattr(self,'window_selection_diagnostics',None)
+        if not isinstance(records,list): records=[]; self.window_selection_diagnostics=records
+        if len(records)<8:
+            records.append(summary)
+            if hasattr(self.mcp,'note'): self.mcp.note('edge_selection',**summary)
+        elif final:
+            summary['changes_truncated']=True
+            records[-1]=summary
+            if hasattr(self.mcp,'note'): self.mcp.note('edge_selection',**summary)
+        return summary
+
+    def select_existing_edge(self,windows):
+        summary=self.record_edge_selection(windows,'existing')
+        if summary['reject_code']=='inventory_incomplete': raise RecapError('edge_window_inventory_incomplete')
+        try: return select_edge_target(windows),False
+        except RecapError as error:
+            if error.reason!='edge_window_unconfirmed': raise
+            mains=edge_main_candidates(windows)
+            if (len(mains)==1 and mains[0].get('enabled') is True
+                    and mains[0].get('minimized') is True and _edge_title(mains[0])):
+                self.record_edge_selection(windows,'restore_candidate',restore_target=mains[0])
+                return mains[0],True
+            raise
 
     def guard(self,window=None):
         reply=self.mcp.call('ControlStatus')
@@ -156,20 +338,23 @@ class Desktop:
             raise RecapError('unknown_control_status')
         if window: return self.probe.foreground(window)
 
-    def focus(self,window):
+    def focus(self,window,*,restore=False):
         self.guard()
         live=self.probe.get(window)
         try: return self.probe.foreground(live)
         except RecapError: pass
+        if restore: self.probe.ensure_switch_safe(live,allow_restore=True)
+        else: self.probe.ensure_switch_safe(live)
         matches=[w for w in self.probe.windows() if w['title']==live['title']]
         if len(matches)!=1: raise RecapError('window_title_ambiguous')
         self.mcp.call('App',mode='switch',name=live['title'])
         return self.probe.foreground(live)
 
-    def observe(self,window,use_uia=False):
+    def observe(self,window,use_uia=False,*,ocr_optional=False):
         live=self.guard(window)
         region=live['rect']
         if not self.probe.contained(region): raise RecapError('window_outside_screen')
+        self.ensure_clear(live,'before_screenshot')
         if use_uia:
             reply=self.mcp.call('Snapshot',use_vision=True,use_dom=False,use_annotation=False,
                                 use_ui_tree=True,region=region)
@@ -177,20 +362,45 @@ class Desktop:
             reply=self.mcp.call('Screenshot',use_annotation=False,region=region)
         captured_at=now()  # 工具返回截图时，不把后续OCR结束时间冒作截图时间。
         self.guard(live)  # 在耗时OCR前记录本次截图正常取得的租约，并复核前台。
+        self.ensure_clear(live,'after_screenshot')
         text=check_reply(reply)
-        paths=[Path(q['image_path']) for q in reply.get('content',[]) if 'image_path' in q]
-        if len(paths)!=1 or not paths[0].is_file(): raise RecapError('screenshot_missing')
-        image=paths[0]
-        with Image.open(image) as img: size=img.size
+        images=[q['image_data'] for q in reply.get('content',[]) if 'image_data' in q]
+        if len(images)!=1 or not isinstance(images[0],str): raise RecapError('screenshot_missing')
+        try: image=base64.b64decode(images[0],validate=True)
+        except (ValueError,binascii.Error): raise RecapError('invalid_screenshot') from None
+        with Image.open(io.BytesIO(image)) as img: size=img.size
         uia=uia_tokens(text,live['title']) if use_uia else []
-        tokens=self.ocr.read(image)
+        try:
+            tokens=self.ocr.read(image)
+        except Exception:
+            if not ocr_optional: raise
+            tokens=[]
+            if hasattr(self.mcp,'note'): self.mcp.note('local_ocr_unavailable')
         if hasattr(self.mcp,'note'):
             self.mcp.note('snapshot_diagnostics',window_handle=live['handle'],window_pid=live['pid'],
-                          screenshot=image.name,**snapshot_diagnostics(text,live['title'],use_uia,tokens))
+                          **snapshot_diagnostics(text,live['title'],use_uia,tokens))
         for q in tokens:
-            if compact(q.text) in ('扫码登录','请登录','安全验证','滑块验证','短信登录'):
+            if any(marker in compact(q.text) for marker in ('扫码登录','请登录','安全验证','滑块验证','短信登录','验证码')):
                 raise RecapError('needs_login_or_verification')
-        return View(tokens,image,live,size,captured_at,uia)
+        seeds=(); seed_error=None
+        if use_uia:
+            try: seeds=tuple(address_seed_candidates(text,live['title'],live['rect']))
+            except RecapError as error: seed_error=error.reason
+        return View(tokens,image,live,size,captured_at,uia,seeds,seed_error)
+
+    def ensure_clear(self,window,stage):
+        try: self.probe.ensure_unobstructed(window)
+        except RecapError as error:
+            if hasattr(self.mcp,'note'):
+                details=getattr(self.probe,'last_occlusion',{})
+                details=details if isinstance(details,dict) else {}
+                safe={key:details[key] for key in ('category','handle','cloaked','cloak_hresult','exstyle') if key in details}
+                self.mcp.note('window_guard_rejected',stage=stage,reason=error.reason,
+                              target_handle=window['handle'],**safe)
+            raise
+        excluded=getattr(self.probe,'occlusion_exclusions',{})
+        if isinstance(excluded,dict) and excluded and hasattr(self.mcp,'note'):
+            self.mcp.note('window_guard_clear',stage=stage,target_handle=window['handle'],exclusions=excluded)
 
     def wait(self,window,select,timeout=20,use_uia=True):
         began=time.monotonic(); deadline=began+timeout
@@ -230,6 +440,9 @@ class Desktop:
         point=view.point(token)
         x,y,r,b=current['rect']
         if not (x<point[0]<r and y<point[1]<b): raise RecapError('locator_outside_window')
+        self.ensure_clear(view.window,'before_click_hit_test')
+        self.probe.ensure_point(view.window,point)
+        self.ensure_clear(view.window,'before_click')
         self.mcp.call('Click',loc=point,button='left',clicks=1)
 
     def key(self,window,key):
@@ -245,8 +458,24 @@ class Desktop:
             point=view.point(token)
             x,y,r,b=live['rect']
             if not (x<point[0]<r and y<point[1]<b): raise RecapError('locator_outside_window')
+            self.ensure_clear(view.window,'before_type_hit_test')
+            self.probe.ensure_point(view.window,point)
+            self.ensure_clear(view.window,'before_type')
             self.mcp.call('Type',loc=point,text=chunk,clear=index==0,
                           caret_position='end',press_enter=index==len(chunks)-1)
+
+    def type_account(self,view,token,account):
+        # 不提交搜索；短分段沿用现有输入保护，避免长文本剪贴板分支。
+        for index,start in enumerate(range(0,len(account),19)):
+            live=self.guard(view.window)
+            if live['rect']!=view.window['rect']: raise RecapError('window_moved_before_action')
+            point=view.point(token); x,y,r,b=live['rect']
+            if not (x<point[0]<r and y<point[1]<b): raise RecapError('locator_outside_window')
+            self.ensure_clear(view.window,'before_account_hit_test')
+            self.probe.ensure_point(view.window,point)
+            self.ensure_clear(view.window,'before_account_type')
+            self.mcp.call('Type',loc=point,text=account[start:start+19],clear=index==0,
+                          caret_position='end',press_enter=False)
 
     def wait_entry(self,window,timeout=20):
         def confirmed(view):
@@ -271,14 +500,58 @@ class Desktop:
         candidates,diagnostic=entry_address_candidates(view.tokens,view.image)
         if hasattr(self.mcp,'note'):
             self.mcp.note('entry_address_candidates',window_handle=view.window['handle'],
-                          window_pid=view.window['pid'],window_title=view.window['title'],
-                          screenshot=view.image.name,**diagnostic)
+                          window_pid=view.window['pid'],
+                          **diagnostic)
         if not candidates: raise RecapError('address_bar_missing')
         if len(candidates)>1: raise RecapError('address_bar_ambiguous')
         self.type_replacement(view,candidates[0],self.portal_url)
         return self.wait_entry(live)
 
+    def wait_edge_launch(self):
+        """在原有15秒上限内等待唯一具名窗口，不选择歧义候选。"""
+        began=time.monotonic()
+        deadline=began+15
+        last_signature=None; changes=0
+        while True:
+            self.guard()
+            windows=self.probe.windows()
+            current=time.monotonic()
+            metadata=safe_window_metadata(windows)
+            inventory=getattr(self.probe,'last_window_inventory',None)
+            inventory=inventory if isinstance(inventory,dict) else None
+            signature=(len(windows),tuple(sorted((item.get('handle',0),item.get('pid',0)) for item in windows)),
+                       repr(metadata),repr(inventory))
+            changed=signature!=last_signature
+            if changed:
+                changes+=1; last_signature=signature
+            if hasattr(self.mcp,'note') and changed and changes<=8:
+                self.mcp.note('edge_launch_candidates',candidate_count=len(windows),
+                              untitled_count=sum(not item.get('title') for item in windows),
+                              elapsed_ms=round((current-began)*1000),**metadata)
+            try: target=select_edge_target(windows)
+            except RecapError: target=None
+            if inventory is not None and inventory.get('enum_ok') is False: target=None
+            if changed and changes<=8:
+                selection=self.record_edge_selection(windows,'launch_wait')
+                if selection['reject_code']=='inventory_incomplete': target=None
+            if target is not None and current<=deadline:
+                self.record_edge_selection(windows,'launch_final',final=True)
+                if hasattr(self.mcp,'note'):
+                    self.mcp.note('edge_window_final',candidate_count=len(windows),outcome='unique_target',
+                                  elapsed_ms=round((current-began)*1000),changes_truncated=changes>8,**metadata)
+                return target
+            if current>=deadline:
+                self.record_edge_selection(windows,'launch_final',final=True)
+                if hasattr(self.mcp,'note'):
+                    self.mcp.note('edge_window_final',candidate_count=len(windows),
+                                  outcome='none' if not windows else 'ambiguous_or_unknown',
+                                  elapsed_ms=round((current-began)*1000),changes_truncated=changes>8,**metadata)
+                raise RecapError('edge_launch_unconfirmed')
+            time.sleep(.5)
+
     def bind(self,account):
+        self.expected_account=account
+        self._verified_room_id=None
         self.guard()
         # 先建立只读快照；不截取无关应用图像或提取其UI树。
         self.mcp.call('Snapshot',use_vision=False,use_dom=False,use_ui_tree=False,use_annotation=False)
@@ -290,11 +563,10 @@ class Desktop:
             if len(windows)>1: raise RecapError('edge_window_ambiguous')
             if not windows:
                 self.guard(); self.mcp.call('App',mode='launch',name='Microsoft Edge')
-                deadline=time.monotonic()+15
-                while not windows and time.monotonic()<deadline:
-                    time.sleep(.5); windows=self.probe.windows()
-                if len(windows)!=1: raise RecapError('edge_launch_unconfirmed')
-            window=windows[0]; need_open=True
+                window=self.wait_edge_launch()
+            else:
+                window=windows[0]
+            need_open=True
         window=self.focus(window)
         if need_open:
             # 新标签保护原用户页面；仅输入获准机构入口。
@@ -312,8 +584,7 @@ class Desktop:
                 return unique_label(items,'主播列表')
             view,button=self.wait(window,sidebar); self.click(view,button)
         view,search=self.wait(window,lambda v:self.label(v,'请输入主播',True))
-        self.click(view,search); self.guard(window)
-        self.mcp.call('Type',loc=view.point(search),text=account,clear=True,press_enter=False)
+        self.type_account(view,search,account)
         def candidate(v):
             # 只选当前输入框下方、显示完全相同抖音号的候选，不碰原列表同名项。
             sx,sy=view.point(search)
@@ -326,7 +597,10 @@ class Desktop:
             if len(nearby)!=1: raise RecapError('locator_ambiguous' if nearby else 'locator_missing')
             return nearby[0]
         view,button=self.wait(window,candidate); self.click(view,button)
-        view,button=self.wait(window,lambda v:self.label(v,'主播详情'))
+        def filtered_detail(v):
+            require_account(v.uia+v.tokens,account)
+            return self.label(v,'主播详情')
+        view,button=self.wait(window,filtered_detail)
         self.click(view,button)
         def detail(v):
             require_account(v.uia+v.tokens,account)
@@ -348,13 +622,23 @@ class Desktop:
             if not any('已开播' in compact(q.text) for q in v.tokens+v.uia): raise RecapError('locator_missing')
             return True
         view,_=self.wait(room,room_ready)
-        room_id=self.room_identity(view)
-        evidence=self.save_minimal(view,'binding.png')
-        return {'douyin_account':account,'room_id':room_id,'window':room,
-                'screenshot':str(evidence.relative_to(self.evidence.parent)),'account_verified_on_page':True,
+        try:
+            room_id=room_from_tokens(view.uia+view.tokens)
+        except RecapError:
+            room_id=self.room_identity(view)
+            view=self.observe(room,True)
+            require_account(view.uia+view.tokens,account)
+            if room_from_tokens(view.uia+view.tokens)!=room_id:
+                raise RecapError('room_changed')
+            if not any('已开播' in compact(q.text) for q in view.tokens+view.uia):
+                raise RecapError('live_status_unconfirmed')
+        self._verified_room_id=room_id
+        window_identity={key:room[key] for key in ('handle','pid','process_created')}
+        return {'douyin_account':account,'room_id':room_id,'window':window_identity,
+                'account_verified_on_page':True,
                 'room_id_source':'visible_browser_address_bar_UIA_or_OCR',
                 'page_live_status':'已开播',
-                'visible_live_time':[q.text for q in view.tokens if '已开播' in compact(q.text)],
+                'visible_live_time':[q.text for q in view.tokens if re.fullmatch(r'已开播[\d:：]*',compact(q.text))],
                 'observed_at':view.captured_at,'locator':'UIA if available; current screenshot OCR',
                 'new_window_created':True}
 
@@ -368,19 +652,14 @@ class Desktop:
         return room_from_tokens(address.uia+address.tokens)
 
     def save_minimal(self,view,name):
-        anchors=[q for q in view.tokens if any(label in compact(q.text)
-                 for label in ('抖音号','累计观众','新增粉丝','评论人数','送礼人数','获得音浪','跟播列表'))]
-        if not anchors: raise RecapError('evidence_region_missing')
-        top=min(q.box[1] for q in anchors); bottom=max(q.box[3] for q in anchors)
-        left=min(q.box[0] for q in anchors); right=max(q.box[2] for q in anchors)
-        margin=max(q.h for q in anchors)*4
-        path=self.evidence/name
-        with Image.open(view.image) as img:
-            img.crop((max(0,int(left-margin)),max(0,int(top-margin)),
-                      min(img.width,int(right+margin)),min(img.height,int(bottom+margin)))).save(path)
-        return path
+        raise RecapError('image_evidence_disabled')
+
+    def refine_metrics(self,view,result):
+        return result
 
     def capture(self,binding):
+        self.expected_account=binding['douyin_account']
+        self._verified_room_id=None
         room=self.focus(binding['window'])
         view=self.observe(room,True)
         require_account(view.uia+view.tokens,binding['douyin_account'])
@@ -390,14 +669,15 @@ class Desktop:
             room_id=self.room_identity(view)
             # 只有地址栏动作改变页面焦点时才再取一次清晰指标截图。
             view=self.observe(room,True)
+            if room_from_tokens(view.uia+view.tokens)!=room_id: raise RecapError('room_changed')
         if room_id!=binding['room_id']: raise RecapError('room_changed')
+        self._verified_room_id=room_id
         require_account(view.uia+view.tokens,binding['douyin_account'])
-        result=metrics_from_tokens(view.uia)
-        method='Windows-MCP visible UIA'
-        if result['missing_fields']:
-            result=metrics_from_tokens(view.tokens)
-            method='Windows-MCP screenshot + local RapidOCR 3.10.0'
-        evidence=self.save_minimal(view,'metrics.png')
+        # 指标与证据使用同一次本地OCR，避免UIA数值无法关联到对应裁区。
+        result=summary_metrics(view.tokens)
+        result=self.refine_metrics(view,result)
+        method='Windows-MCP screenshot + local RapidOCR 3.10.0'
+        if getattr(self,'_used_visual_metric',False):
+            method+=' + guarded GLM review'
         return {**result,'metrics_captured_at':view.captured_at,'capture_method':method,
-                'capture_evidence':{'metrics_screenshot':str(evidence.relative_to(self.evidence.parent)),'account_verified_on_page':True,
-                                    'room_id_reverified':binding['room_id']}}
+                'capture_evidence':{'account_verified_on_page':True,'room_id_reverified':binding['room_id']}}

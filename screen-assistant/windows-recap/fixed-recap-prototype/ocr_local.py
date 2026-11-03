@@ -1,4 +1,4 @@
-"""显式本地RapidOCR；截图只能为本地文件，不接受URL。"""
+"""显式本地RapidOCR；运行时截图只接受内存字节。"""
 from pathlib import Path
 from core import Token, RecapError
 from provision_ocr import verify, MODELS
@@ -14,10 +14,9 @@ class LocalOCR:
             'EngineConfig.onnxruntime.inter_op_num_threads':1})
         self.engine=RapidOCR(params=params)
 
-    def read(self,path):
-        path=Path(path)
-        if not path.is_file(): raise RecapError('screenshot_missing')
-        result=self.engine(str(path.resolve()))
+    def read(self,image):
+        if not isinstance(image, bytes) or not image: raise RecapError('screenshot_missing')
+        result=self.engine(image)
         if result.boxes is None or result.txts is None: return []
         return [Token(text,(float(min(p[0] for p in box)),float(min(p[1] for p in box)),
                             float(max(p[0] for p in box)),float(max(p[1] for p in box))),float(score))

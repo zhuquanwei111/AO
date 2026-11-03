@@ -31,7 +31,7 @@ class InstallPathTests(unittest.TestCase):
         with self.assertRaisesRegex(RecapError, "runtime_path_inside_install"):
             require_external_path(ROOT / "scratch")
 
-    def test_sdk_interpreter_must_be_configured_before_desktop_start(self):
+    def test_legacy_sdk_interpreter_check_rejects_missing_path(self):
         with patch.dict(os.environ, {"BACKSTAGE_SDK_PYTHON": "missing-sdk-python.exe"}, clear=True):
             with self.assertRaisesRegex(ValueError, "agent_sdk_runtime_missing"):
                 require_sdk_runtime()
