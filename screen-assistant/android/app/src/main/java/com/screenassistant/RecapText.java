@@ -20,6 +20,9 @@ final class RecapText {
         String status=recap.optString("status");
         return status.equals("waiting_for_stop") || status.equals("capturing");
     }
+    static boolean shouldRefresh(JSONObject summary) {
+        return summary == null || pending(summary);
+    }
     static boolean terminal(JSONObject summary) {
         JSONObject recap=summary.optJSONObject("backstage_recap");
         if (recap==null || summary.isNull("stopped_at_ms")) return false;
