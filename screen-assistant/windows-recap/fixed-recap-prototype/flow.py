@@ -18,19 +18,25 @@ def now():
 @contextmanager
 def lock(path, wait=0):
     deadline=time.monotonic()+wait
-    while True:
-        try:
-            fd = os.open(path, os.O_CREAT|os.O_EXCL|os.O_WRONLY, 0o600)
-            break
-        except FileExistsError:
-            if time.monotonic()>=deadline: raise RecapError('busy') from None
-            time.sleep(.02)
+    fd=os.open(path.with_name(path.name+'.lease'),os.O_CREAT|os.O_RDWR,0o600)
     try:
-        os.write(fd, str(os.getpid()).encode('ascii'))
-        os.close(fd)
+        if os.name=='nt':
+            import msvcrt
+            acquire=lambda:msvcrt.locking(fd,msvcrt.LK_NBLCK,1)
+        else:
+            import fcntl
+            acquire=lambda:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        while True:
+            try:
+                acquire()
+                break
+            except OSError:
+                if time.monotonic()>=deadline: raise RecapError('busy') from None
+                time.sleep(.02)
         yield
     finally:
-        path.unlink(missing_ok=True)
+        # 关闭描述符即释放系统锁；进程被终止也能释放，不删除文件避免换锁竞态。
+        os.close(fd)
 
 
 def atomic_json(path, value):
@@ -200,6 +206,9 @@ class Store:
             if not value['stop_signal_received']:
                 value.update(stop_signal_received=True,stop_signal_source=source,
                              stop_signal_received_at=now())
+                if (value.get('execution_closed') is True and source==value.get('start_signal_source')
+                        and value.get('status') in ('needs_input','failed')):
+                    value.update(status='failed',phase='finished')
                 atomic_json(self.path(task),value)
             return value
 
@@ -240,8 +249,12 @@ class Runner:
         if record.get('reason','').endswith('outcome_unknown'):
             return record
         if record['status']=='capturing':
-            if (self.store.root/'desktop.lock').exists(): return record
-            return self._fail(task,'capture_outcome_unknown')
+            try:
+                with lock(self.store.root/'desktop.lock'):
+                    return self._fail(task,'capture_outcome_unknown')
+            except RecapError as error:
+                if error.reason=='busy': return record
+                raise
         if not record['binding_evidence']:
             return self.finalize_stopped_unbound(task)
         try:
@@ -261,10 +274,10 @@ class Runner:
         began=time.monotonic()
         record=self.store.update(task,status='capturing',phase='capturing',capture_handling_started_at=now())
         result=self.desktop.capture(record['binding_evidence'])
+        result.setdefault('window_cleanup','preserved_by_prototype')
         return self.store.update(task,**result,
             status='partial' if result.get('missing_fields') else 'captured_locally',phase='finished',
             capture_before_final_save_ms=round((time.monotonic()-began)*1000),
-            window_cleanup='preserved_by_prototype',
             value_semantics='stop信号触发后读取的本场左侧汇总，不确认平台结算；测试信号只代表测试快照')
 
     @staticmethod
@@ -279,6 +292,19 @@ class Runner:
                 and isinstance(record.get('reason'),str) and bool(record['reason'])
                 and not record['reason'].endswith('outcome_unknown')
                 and record['reason']!='agent_worker_no_receipt')
+
+    def finish_execution(self,task,*,cleanup_confirmed):
+        """由当前执行者在工具及视觉进程退出后确认，不据文件存在推断存活。"""
+        record=self.finish_unbound_execution(task,cleanup_confirmed=cleanup_confirmed)
+        if (cleanup_confirmed is not True or record.get('status') not in ('needs_input','failed')
+                or record.get('reason','').endswith('outcome_unknown')
+                or record.get('reason')=='agent_worker_no_receipt'):
+            return record
+        with lock(self.store.root/'desktop.lock',wait=2):
+            fields={'execution_closed':True}
+            if record.get('stop_signal_received') is True and record.get('stop_signal_source')==record.get('start_signal_source'):
+                fields.update(status='failed',phase='finished')
+            return self.store.update(task,**fields)
 
     def finish_unbound_execution(self,task,*,cleanup_confirmed):
         """仅由执行者在同步调用返回且MCP正常关闭后调用，不迁移旧记录。"""

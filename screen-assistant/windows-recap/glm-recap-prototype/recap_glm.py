@@ -133,9 +133,8 @@ def main():
                     if old.get('normal_path_llm_calls') is not None and runtime.http_requests is not None else None,
                 model=MODEL if runtime.calls else old.get('model'),
                 model_call_count_semantics='仅计已确认的模型请求；失败时次数未知')
-            if args.command=='start':
-                record=Runner(store,None).finish_unbound_execution(task,
-                    cleanup_confirmed=cleanup_confirmed and getattr(runtime,'all_workers_finished',runtime.calls==0))
+            record=Runner(store,None).finish_execution(task,
+                cleanup_confirmed=cleanup_confirmed and getattr(runtime,'all_workers_finished',runtime.calls==0))
     print(json.dumps({'task_ref':str(store.path(record['local_test_id'])),
         'operation_elapsed_ms':round((time.monotonic()-began)*1000),'record':record},ensure_ascii=False,indent=2))
     return operation_exit_code(args.command,record)

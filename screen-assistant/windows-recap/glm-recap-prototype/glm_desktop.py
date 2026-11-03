@@ -194,7 +194,23 @@ class GLMDesktop(LLMDesktop):
         return view
 
     def capture(self,binding):
-        return Desktop.capture(self,binding)
+        result=Desktop.capture(self,binding)
+        result['window_cleanup']='preserved_user_window'
+        if binding.get('new_window_created') is True and self._verified_room_id==binding['room_id']:
+            result['window_cleanup']='unconfirmed'
+            try:
+                room=self.guard(binding['window'])
+                self.key(room,'alt+f4')
+                deadline=time.monotonic()+3
+                while True:
+                    if not any(row['handle']==room['handle'] for row in self.probe.windows()):
+                        result['window_cleanup']='closed_created_room'
+                        break
+                    if time.monotonic()>=deadline: break
+                    time.sleep(.1)
+            except RecapError as error:
+                self.mcp.note('created_room_cleanup_unconfirmed',reason=error.reason)
+        return result
 
     def refine_metrics(self,view,result):
         self._used_visual_metric=False

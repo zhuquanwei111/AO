@@ -85,9 +85,9 @@ class FailureFinalizationTests(unittest.TestCase):
             store,task,start,proof=self.admin_fixture(folder)
             global_path=store.root/'synthetic-global.lock'
             def verify_locks():
-                self.assertTrue(global_path.exists())
-                self.assertTrue((store.root/'desktop.lock').exists())
-                self.assertTrue((store.root/'state.lock').exists())
+                self.assertTrue(global_path.with_name(global_path.name+'.lease').exists())
+                self.assertTrue((store.root/'desktop.lock.lease').exists())
+                self.assertTrue((store.root/'state.lock.lease').exists())
             def owners(): verify_locks(); return True
             def remote(): verify_locks(); return proof
             self.assertEqual(store.admin_abandon_verified(start,remote,owners,lambda:lock(global_path)),'recovered')
@@ -318,7 +318,7 @@ class FailureFinalizationTests(unittest.TestCase):
                      redirect_stdout(io.StringIO()) as output:
                     self.assertEqual(recap_glm.main(), 2)
                 record = json.loads(output.getvalue())['record']
-                self.assertEqual(record['status'], 'failed' if cleanup and settled and not calls else 'needs_input')
+                self.assertEqual(record['status'], 'failed' if cleanup and settled else 'needs_input')
                 self.assertEqual(record['stop_signal_source'], 'android_app')
                 self.assertIsNone(record['metrics'])
                 if cleanup and settled:
