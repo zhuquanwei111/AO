@@ -22,6 +22,29 @@ class EdgeLaunchTests(unittest.TestCase):
             self.assertEqual(driver.wait_edge_launch(), main)
         self.assertEqual(driver.guard.call_count, 2)
 
+    def test_empty_then_multiple_then_unique_within_one_deadline(self):
+        main = {'handle': 1, 'title': 'Edge'}
+        helper = {'handle': 2, 'title': ''}
+        driver = self.driver([[], [main, helper], [main]])
+        with patch('desktop.time.monotonic', side_effect=[0, 1, 2, 3]), patch('desktop.time.sleep'):
+            self.assertEqual(driver.wait_edge_launch(), main)
+        self.assertEqual(driver.probe.windows.call_count, 3)
+
+    def test_single_candidate_returns_without_wait(self):
+        main = {'handle': 1, 'title': 'Edge'}
+        driver = self.driver([[main]])
+        with patch('desktop.time.monotonic', side_effect=[0, 1]), patch('desktop.time.sleep') as sleep:
+            self.assertEqual(driver.wait_edge_launch(), main)
+        sleep.assert_not_called()
+
+    def test_deadline_is_not_reset_by_changing_candidates(self):
+        main = {'handle': 1, 'title': 'Edge'}
+        helper = {'handle': 2, 'title': ''}
+        driver = self.driver([[], [main, helper], [main]])
+        with patch('desktop.time.monotonic', side_effect=[0, 1, 14, 16]), patch('desktop.time.sleep'):
+            with self.assertRaisesRegex(RecapError, 'edge_launch_unconfirmed'):
+                driver.wait_edge_launch()
+
     def test_no_window_or_multiple_main_windows_fails_closed(self):
         for candidates in ([], [{'handle': 1, 'title': 'A'}, {'handle': 2, 'title': 'B'}],
                            [{'handle': 3, 'title': ''}]):
@@ -52,6 +75,13 @@ class EdgeLaunchTests(unittest.TestCase):
         self.assertEqual(len(launches), 1)
         driver.focus.assert_called_once_with(main)
         driver.navigate_entry.assert_called_once_with(main)
+
+    def test_bind_propagates_launch_tool_failure_without_wait(self):
+        driver = self.driver([[]])
+        driver.mcp.call.side_effect = [None, RecapError('mcp_tool_error')]
+        with self.assertRaisesRegex(RecapError, 'mcp_tool_error'):
+            driver.bind('fixture-account')
+        self.assertEqual(driver.probe.windows.call_count, 1)
 
 
 if __name__ == '__main__': unittest.main()
