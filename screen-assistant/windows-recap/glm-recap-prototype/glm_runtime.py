@@ -13,6 +13,29 @@ MODEL='glm-5.3-flash'
 BASE_URL='https://ai.ctaigw.cn/v1'
 
 
+class VisualRuntimeError(RuntimeError):
+    def __init__(self,reason):
+        self.reason=reason
+        super().__init__(reason)
+
+
+def safe_worker_diagnostic(value):
+    fields={'phase','category','request_attempts','http_status','output_chars','output_tokens'}
+    phases={'job_validate','sdk_import','sdk_config','sdk_request','response_parse','response_validate','sdk_close'}
+    categories={'job_invalid','sdk_unavailable','sdk_configuration_failed','request_timeout','connection_error',
+                'http_error','sdk_response_invalid','output_budget_exhausted','json_parse_failed','result_invalid',
+                'sdk_failure','sdk_cleanup_failed','response_ok'}
+    if (not isinstance(value,dict) or set(value)!=fields
+            or not isinstance(value['phase'],str) or not isinstance(value['category'],str)
+            or value['phase'] not in phases or value['category'] not in categories):
+        return None
+    for key,low,high in (('request_attempts',0,3),('http_status',100,599),
+                         ('output_chars',0,10000000),('output_tokens',0,10000000)):
+        number=value[key]
+        if number is not None and (type(number) is not int or not low<=number<=high): return None
+    return dict(value)
+
+
 def parse_final(text,receipt=None):
     text=text.strip()
     if text.startswith('```json\n') and text.endswith('```'): text=text[8:-3].strip()
@@ -46,6 +69,7 @@ class GLMRuntime:
         self.scratch=Path(scratch).resolve(); self.scratch.mkdir(parents=True,exist_ok=True)
         self.calls=0; self.http_requests=0; self.context=context or {}; self.gate=gate; self.deadline=time.monotonic()+240
         self.all_workers_finished=True
+        self.diagnostics=[]
 
     def run(self,image,prompt,schema=None,challenge=None):
         raise RuntimeError('image_visual_disabled')
@@ -80,6 +104,15 @@ class GLMRuntime:
         env = {key: value for key, value in os.environ.items() if key.upper() in allowed}
         env.update(PYTHONUTF8='1', PYTHONDONTWRITEBYTECODE='1', RECAP_VISUAL_CAPABILITY=capability)
         self.calls += 1
+        metadata={'input_bytes':len(crop.image),
+                  'input_width':int.from_bytes(crop.image[16:20],'big'),
+                  'input_height':int.from_bytes(crop.image[20:24],'big')}
+        def fail(category,phase='worker_reply',exit_code=None,diagnostic=None):
+            safe={'phase':phase,'category':category,'worker_exit_code':exit_code,**metadata}
+            if diagnostic is not None: safe.update(diagnostic)
+            self.diagnostics.append(safe)
+            self.http_requests=None
+            raise VisualRuntimeError('visual_worker_'+category)
         self.all_workers_finished=False
         try:
             result = subprocess.run([sdk_python, '-B', str(Path(__file__).with_name('agent_worker.py'))],
@@ -87,23 +120,29 @@ class GLMRuntime:
                 timeout=min(110, max(.1, self.deadline-time.monotonic())),
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             self.all_workers_finished=True
-        except (OSError, subprocess.TimeoutExpired):
-            self.http_requests = None
-            raise RuntimeError('visual_worker_failed') from None
-        if result.returncode != 0 or len(result.stdout) > 16384:
-            self.http_requests = None
-            raise RuntimeError('visual_worker_failed')
+        except subprocess.TimeoutExpired:
+            fail('worker_timeout','worker_start')
+        except OSError:
+            fail('worker_start_failed','worker_start')
+        if len(result.stdout) > 16384: fail('worker_reply_invalid',exit_code=result.returncode)
         try:
             reply = json.loads(result.stdout)
         except (ValueError, UnicodeError):
-            self.http_requests = None
-            raise RuntimeError('visual_worker_invalid_reply') from None
+            fail('worker_reply_invalid',exit_code=result.returncode)
+        diagnostic=safe_worker_diagnostic(reply.get('diagnostic')) if isinstance(reply,dict) else None
+        if result.returncode!=0:
+            if (isinstance(reply,dict) and reply.get('status')=='FAIL' and diagnostic is not None
+                    and diagnostic['category']!='response_ok'):
+                fail(diagnostic['category'],exit_code=result.returncode,diagnostic=diagnostic)
+            fail('worker_nonzero_exit',exit_code=result.returncode)
         if not isinstance(reply, dict) or reply.get('status') != 'OK' or not isinstance(reply.get('result'), dict):
-            self.http_requests = None
-            raise RuntimeError('visual_worker_invalid_reply')
+            fail('worker_reply_invalid',exit_code=result.returncode)
+        if diagnostic is not None and (diagnostic['category']!='response_ok' or diagnostic['phase']!='response_validate'):
+            fail('worker_reply_invalid',exit_code=result.returncode)
         requests = reply.get('http_requests')
         if type(requests) is not int or not 1 <= requests <= 3:
-            self.http_requests = None
-            raise RuntimeError('visual_worker_invalid_reply')
+            fail('worker_reply_invalid',exit_code=result.returncode)
+        self.diagnostics.append({'phase':'response_validate','category':'response_ok',
+            'worker_exit_code':result.returncode,**metadata,**(diagnostic or {})})
         self.http_requests = None if self.http_requests is None else self.http_requests + requests
         return reply['result']

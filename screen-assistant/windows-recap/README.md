@@ -55,6 +55,8 @@ MCP 两份 requirements 只锁直接依赖；其传递依赖尚无完整锁，�
 
 实现依据：[Windows-MCP 0.8.8 截图实现](https://github.com/CursorTouch/Windows-MCP/blob/v0.8.8/src/windows_mcp/desktop/service.py)、[控制提示](https://github.com/CursorTouch/Windows-MCP/blob/v0.8.8/src/windows_mcp/desktop/control_overlay.py)、[微软 DWM 窗口属性](https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/ne-dwmapi-dwmwindowattribute)、[分层窗口透明度](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getlayeredwindowattributes)、[进程父子元数据](https://learn.microsoft.com/en-us/windows/win32/api/tlhelp32/ns-tlhelp32-processentry32w)。这些资料与离线回归证明适配办法，不代替本次真实平台、账号或五项验收。
 
+视觉worker失败时返回固定阶段/类别及必要数字诊断，经白名单核验后写入本地任务的 `visual_diagnostics`：图像字节数/尺寸、worker退出码、请求钩子尝试次数、实际取得的HTTP状态、输出字符数/令牌数。HTTPX请求钩子在发送前触发，尝试次数不代表网络成功；失败时原 `normal_path_llm_calls` 仍保留未知。SDK请求、响应解析及已知输出预算异常分别归类，不再统一掩盖为地址栏错误；不记录异常正文、请求URL/头、供应商/模型原文或图像。依据：[HTTPX事件钩子](https://www.python-httpx.org/advanced/event-hooks/)、[SDK错误处理](https://github.com/openai/openai-python#handling-errors)及已安装Agents SDK 0.24.0的固定异常分支。所用SDK适配原天翼路由，不调用OpenAI服务。
+
 ## 许可与来源
 
 保留源清单提供的RapidOCR及模型许可材料。RapidOCR代码为Apache-2.0，随附模型许可另见`fixed-recap-prototype/rapidocr-MODEL_LICENSES.md`及`ocr-model-manifest.json`。锁定的Agents SDK与Python MCP SDK为MIT，Windows-MCP 0.8.8为MIT，分别见[OpenAI Agents SDK许可](https://github.com/openai/openai-agents-python/blob/main/LICENSE)、[Python MCP SDK许可](https://github.com/modelcontextprotocol/python-sdk/blob/main/LICENSE)和[Windows-MCP 0.8.8发行说明](https://pypi.org/project/windows-mcp/0.8.8/)。本目录不内嵌这些依赖包；两份直接依赖列表没有完整锁定全部传递依赖，安装方仍须随实际分发检查其许可。本目录仅包含客户端适配源码，不包含Windows-MCP二进制包、模型权重、API密钥、桌面截图或本地结果。

@@ -123,7 +123,9 @@ def main():
             try: cleanup_confirmed=mcp.close() is True
             except Exception: mcp.note('mcp_cleanup_unconfirmed')
             old=store.get(task)
+            diagnostics=getattr(runtime,'diagnostics',None)
             record=store.update(task,llm_runtime_invocations=old.get('llm_runtime_invocations',0)+runtime.calls,
+                visual_diagnostics=diagnostics if isinstance(diagnostics,list) else None,
                 normal_path_llm_calls=(old['normal_path_llm_calls']+runtime.http_requests)
                     if old.get('normal_path_llm_calls') is not None and runtime.http_requests is not None else None,
                 model=MODEL if runtime.calls else old.get('model'),

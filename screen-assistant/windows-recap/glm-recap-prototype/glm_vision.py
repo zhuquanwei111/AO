@@ -11,6 +11,7 @@ ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT/'fixed-recap-prototype'))
 from core import Token,RecapError,compact,METRICS,require_account,parse_count
 from desktop import AddressSeed, _SEED_ISSUER, address_seed_candidates
+from glm_runtime import VisualRuntimeError
 
 _CROP_ISSUER = object()
 _NAVIGATION_LABELS = {'主播管理', '主播列表', '主播详情', '进入直播间', '搜索或输入网址', '搜索或输入web地址'}
@@ -196,6 +197,8 @@ class GLMVision:
                 raise RecapError('portal_origin_unconfirmed')
             if '直播服务平台' not in (result['brand'] or '') or not any(v in (result['navigation'] or '') for v in ('主播','工作台')):
                 raise RecapError('portal_page_unconfirmed')
+        except VisualRuntimeError as error:
+            raise RecapError(error.reason) from None
         except RecapError:
             raise
         except (ValueError,RuntimeError):
@@ -218,6 +221,8 @@ class GLMVision:
             if result['account'] != account: raise RecapError('wrong_identity')
             if live and not any(re.fullmatch(r'已开播[\d:：]*', compact(q.text)) for q in view.tokens + view.uia):
                 raise RecapError('live_status_unconfirmed')
+        except VisualRuntimeError as error:
+            raise RecapError(error.reason) from None
         except RecapError:
             raise
         except (ValueError,RuntimeError):
@@ -249,6 +254,8 @@ class GLMVision:
             sy = (crop.box[3] - crop.box[1]) / size[1]
             return Token('confirmed_address_bar' if kind == 'address_bar' else 'confirmed_target', (x*sx+crop.box[0], y*sy+crop.box[1],
                          right*sx+crop.box[0], bottom*sy+crop.box[1]), 1., 'vision')
+        except VisualRuntimeError as error:
+            raise RecapError(error.reason) from None
         except RecapError:
             raise
         except (ValueError, RuntimeError):
@@ -268,6 +275,8 @@ class GLMVision:
                 raise ValueError('invalid_visual_fields')
             crop.ensure_current()
             return {fields[0]:result['value']}
+        except VisualRuntimeError as error:
+            raise RecapError(error.reason) from None
         except RecapError:
             raise
         except (ValueError,RuntimeError):
