@@ -61,14 +61,24 @@ def make_local_crop(view, anchor, purpose, guard, account=None):
         if not isinstance(account, str) or not account:
             raise RecapError('visual_crop_anchor_invalid')
         require_account(tokens + view.uia, account)
+    neighbor = None
     if purpose == 'identity':
         if not isinstance(account, str) or not account or '抖音号' not in name:
             raise RecapError('visual_crop_anchor_invalid')
-        require_account(tokens, account)
+        # 账号由本次视觉结果核对；OCR只限定这一条身份区域，不要求先读对账号。
+        if name.rstrip(':：') == '抖音号':
+            adjacent = [q for q in tokens if q != anchor and
+                        0 <= q.box[0]-anchor.box[2] <= anchor.h*5 and abs(q.y-anchor.y) <= anchor.h]
+            if len(adjacent) != 1:
+                raise RecapError('visual_crop_anchor_ambiguous')
+            neighbor = adjacent[0]
     with Image.open(io.BytesIO(view.image)) as image:
         if image.size != view.size:
             raise RecapError('visual_crop_source_invalid')
         x, y, right, bottom = anchor.box
+        if neighbor is not None:
+            x, y = min(x, neighbor.box[0]), min(y, neighbor.box[1])
+            right, bottom = max(right, neighbor.box[2]), max(bottom, neighbor.box[3])
         if not (0 <= x < right <= image.width and 0 <= y < bottom <= image.height):
             raise RecapError('visual_crop_outside_image')
         margin = max(1, int(anchor.h))
@@ -82,7 +92,7 @@ def make_local_crop(view, anchor, purpose, guard, account=None):
             raise RecapError('visual_crop_too_large')
         numeric_count = 0
         for item in tokens:
-            if item == anchor:
+            if item == anchor or item == neighbor:
                 continue
             l, t, r, b = item.box
             if max(l, box[0]) < min(r, box[2]) and max(t, box[1]) < min(b, box[3]):
@@ -208,6 +218,8 @@ class GLMVision:
         if not isinstance(account,str) or not account:
             raise RecapError('wrong_identity')
         candidates=[q for q in view.tokens if '抖音号' in compact(q.text) and account in compact(q.text) and q.score>=.85]
+        if not candidates:
+            candidates=[q for q in view.tokens if '抖音号' in compact(q.text) and q.score>=.85]
         if len(candidates)!=1: raise RecapError('visual_crop_anchor_ambiguous')
         crop=make_local_crop(view,candidates[0],'identity',guard,account)
         prompt=('读取当前主播资料或结果行的抖音号account及直播状态live_status；'

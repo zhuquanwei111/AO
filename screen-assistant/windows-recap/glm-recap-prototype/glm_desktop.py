@@ -211,6 +211,9 @@ class GLMDesktop(LLMDesktop):
                 self._used_visual_metric |= updated['metrics'] != result['metrics']
                 result=updated
             except RecapError as error:
+                if error.reason.startswith('visual_worker_'):
+                    result.setdefault('missing_reasons',{})[name]=error.reason
+                    continue
                 if error.reason not in ('locator_missing','locator_ambiguous','visual_crop_anchor_invalid',
                         'visual_crop_anchor_ambiguous','visual_crop_content_ambiguous','visual_crop_too_large',
                         'visual_metric_unconfirmed'):
