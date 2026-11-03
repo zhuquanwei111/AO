@@ -75,7 +75,7 @@ def main():
             validate_app_source(store.get(task),args.source)
             record=store.stop_signal(task,args.source)
             if record['status'] in ('captured_locally','partial','failed') or not record['binding_evidence']:
-                if record['status'] not in ('captured_locally','partial','failed'):
+                if not record['binding_evidence']:
                     record=Runner(store,None).finalize_stopped_unbound(task)
                 print(json.dumps({'task_ref':str(store.path(task)),'record':record},ensure_ascii=False))
                 return operation_exit_code(args.command,record)
@@ -130,7 +130,7 @@ def main():
                 model_call_count_semantics='仅计已确认的模型请求；失败时次数未知')
             if args.command=='start':
                 record=Runner(store,None).finish_unbound_execution(task,
-                    cleanup_confirmed=cleanup_confirmed and runtime.calls==0)
+                    cleanup_confirmed=cleanup_confirmed and getattr(runtime,'all_workers_finished',runtime.calls==0))
     print(json.dumps({'task_ref':str(store.path(record['local_test_id'])),
         'operation_elapsed_ms':round((time.monotonic()-began)*1000),'record':record},ensure_ascii=False,indent=2))
     return operation_exit_code(args.command,record)

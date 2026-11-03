@@ -1,6 +1,7 @@
 """离线替身验证；不启动MCP、模型或桌面。"""
 import io
 from contextlib import redirect_stdout
+from contextlib import nullcontext
 import json
 from pathlib import Path
 import subprocess
@@ -19,6 +20,90 @@ from transport import MCP
 
 
 class FailureFinalizationTests(unittest.TestCase):
+    def admin_fixture(self,folder):
+        task='1749b7977a99471db445c195bb8efe70'; session='d2407d04df6e45799d1f36795aac31af'
+        start='2026-11-03T11:48:41.202482+08:00'
+        store=Store(folder); store.create(task,'synthetic',session,'android_app')
+        store.update(task,status='needs_input',phase='binding',reason='visual_address_unconfirmed',start_signal_received_at=start)
+        store.stop_signal(task,'android_app')
+        proof={'task_id':task,'session_id':session,'status':'needs_input','start_signal_source':'android_app',
+               'stop_signal_source':'android_app','created_at_ms':1793677720507,'stopped_at_ms':1793677931394,
+               'received_at_ms':1793677932615,'result_exists':True,'account_matches':True,'active_claimed_count':0}
+        return store,task,start,proof
+
+    def test_admin_release_is_single_task_audited_idempotent_and_preserves_result(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store,task,start,proof=self.admin_fixture(folder); before=store.get(task)
+            self.assertEqual(store.admin_abandon_verified(start,lambda:proof,lambda:True,nullcontext),'recovered')
+            after=store.get(task)
+            for key in ('status','reason','metrics','binding_evidence','stop_signal_received'):
+                self.assertEqual(before[key],after[key])
+            self.assertEqual(after['events'][-1]['historical_cleanup'],'unknown')
+            self.assertNotIn('mcp_closed_normally',after['events'][-1])
+            self.assertEqual(store.admin_abandon_verified(start,lambda:proof,lambda:True,nullcontext),'already_recovered')
+            self.assertEqual(len(after['events']),1)
+            self.assertTrue(store.create('second','synthetic','second-session','android_app')[1])
+            self.assertEqual(store.get(task),after)
+
+    def test_admin_release_rejects_remote_owner_source_and_index_conflicts(self):
+        for variant in ('remote','owner','source','active','created','binding','stop','other_claimed','account'):
+            with self.subTest(variant=variant),tempfile.TemporaryDirectory() as folder:
+                store,task,start,proof=self.admin_fixture(folder)
+                if variant=='remote': proof['received_at_ms']=0
+                if variant=='other_claimed': proof['active_claimed_count']=1
+                if variant=='account': proof['account_matches']=False
+                if variant=='source': store.update(task,stop_signal_source='ios_app')
+                if variant=='binding': store.update(task,binding_evidence={'room_id':'synthetic'})
+                if variant=='stop': store.update(task,stop_signal_received=False)
+                if variant=='active':
+                    from flow import atomic_json
+                    atomic_json(store.root/'active.json',{'task':'other'})
+                if variant=='created': start='different'
+                before=store.path(task).read_bytes()
+                with self.assertRaises(RecapError):
+                    store.admin_abandon_verified(start,lambda:proof,lambda:variant!='owner',nullcontext)
+                self.assertEqual(store.path(task).read_bytes(),before)
+
+    def test_admin_release_recovers_after_atomic_index_write_failure(self):
+        import flow
+        with tempfile.TemporaryDirectory() as folder:
+            store,task,start,proof=self.admin_fixture(folder)
+            actual=flow.atomic_json
+            def interrupted(path,value):
+                if path.name=='active.json': raise OSError('synthetic')
+                return actual(path,value)
+            with patch('flow.atomic_json',side_effect=interrupted):
+                with self.assertRaises(OSError):
+                    store.admin_abandon_verified(start,lambda:proof,lambda:True,nullcontext)
+            self.assertEqual(json.loads((store.root/'active.json').read_text(encoding='utf-8'))['task'],task)
+            self.assertEqual(len(store.get(task)['events']),1)
+            self.assertEqual(store.admin_abandon_verified(start,lambda:proof,lambda:True,nullcontext),'recovered')
+            self.assertEqual(len(store.get(task)['events']),1)
+
+    def test_admin_remote_and_owner_checks_run_inside_all_locks(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store,task,start,proof=self.admin_fixture(folder)
+            global_path=store.root/'synthetic-global.lock'
+            def verify_locks():
+                self.assertTrue(global_path.exists())
+                self.assertTrue((store.root/'desktop.lock').exists())
+                self.assertTrue((store.root/'state.lock').exists())
+            def owners(): verify_locks(); return True
+            def remote(): verify_locks(); return proof
+            self.assertEqual(store.admin_abandon_verified(start,remote,owners,lambda:lock(global_path)),'recovered')
+            self.assertEqual(len(store.get(task)['events']),1)
+
+    def test_admin_release_rejects_held_global_or_desktop_lock(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store,task,start,proof=self.admin_fixture(folder)
+            global_path=store.root/'synthetic-global.lock'
+            with lock(global_path):
+                with self.assertRaisesRegex(RecapError,'busy'):
+                    store.admin_abandon_verified(start,lambda:proof,lambda:True,lambda:lock(global_path))
+            with lock(store.root/'desktop.lock'):
+                with self.assertRaisesRegex(RecapError,'busy'):
+                    store.admin_abandon_verified(start,lambda:proof,lambda:True,nullcontext)
+            self.assertEqual(store.get(task)['events'],[])
     def setup_task(self, folder, reason='edge_launch_unconfirmed'):
         store = Store(folder)
         store.create('first', 'demo_account', 'first-session', 'android_app')
@@ -59,6 +144,35 @@ class FailureFinalizationTests(unittest.TestCase):
             self.assertEqual(runner.stop('first', 'android_app')['status'], 'failed')
             self.assertEqual(store.path('first').read_bytes(), before)
 
+    def test_closed_visual_failure_releases_only_after_same_source_stop(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store=Store(folder); desktop=Mock()
+            desktop.bind.side_effect=RecapError('visual_address_unconfirmed')
+            runner=Runner(store,desktop)
+            runner.start('first','demo_account','first-session','android_app')
+            runner.finish_unbound_execution('first',cleanup_confirmed=True)
+            self.assert_blocked(store)
+            stopped=runner.stop('first','android_app')
+            self.assertEqual(stopped['status'],'needs_input')
+            self.assertEqual(stopped['reason'],'visual_address_unconfirmed')
+            self.assertIsNone(stopped['metrics'])
+            before=store.path('first').read_bytes()
+            self.assertEqual(runner.stop('first','android_app')['status'],'needs_input')
+            self.assertEqual(store.path('first').read_bytes(),before)
+            self.assertTrue(store.create('second','demo_account','second-session','android_app')[1])
+
+    def test_failed_binding_needs_same_source_stop_and_confirmed_close(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store=Store(folder); desktop=Mock()
+            desktop.bind.side_effect=RecapError('not_live')
+            runner=Runner(store,desktop)
+            self.assertEqual(runner.start('first','demo_account','first-session','android_app')['status'],'failed')
+            self.assert_blocked(store)
+            runner.finish_unbound_execution('first',cleanup_confirmed=True)
+            self.assert_blocked(store)
+            runner.stop('first','android_app')
+            self.assertTrue(store.create('second','demo_account','second-session','android_app')[1])
+
     def test_unconfirmed_cleanup_and_still_running_are_not_released(self):
         for close in (None, False):
             with self.subTest(close=close), tempfile.TemporaryDirectory() as folder:
@@ -77,6 +191,43 @@ class FailureFinalizationTests(unittest.TestCase):
                 self.assertEqual(runner.stop('first', 'android_app')['status'], 'needs_input')
                 self.assert_blocked(store)
             self.assertEqual(runner.stop('first', 'android_app')['status'], 'failed')
+
+    def test_receipt_creation_identity_mismatch_cannot_finalize(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store,runner=self.setup_task(folder)
+            runner.finish_unbound_execution('first',cleanup_confirmed=True)
+            record=store.get('first'); events=record['events']
+            events[-1]['start_signal_received_at']='different'
+            store.update('first',events=events)
+            store.stop_signal('first','android_app')
+            self.assertEqual(runner.finalize_stopped_unbound('first')['status'],'needs_input')
+            self.assert_blocked(store)
+
+    def test_stop_before_close_and_lock_conflict_preserve_old_record(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store=Store(folder); desktop=Mock()
+            desktop.bind.side_effect=RecapError('visual_address_unconfirmed')
+            runner=Runner(store,desktop)
+            runner.start('first','demo_account','first-session','android_app')
+            runner.stop('first','android_app')
+            self.assert_blocked(store)
+            with lock(store.root/'desktop.lock'):
+                self.assertEqual(runner.finish_unbound_execution('first',cleanup_confirmed=True)['events'],[])
+            self.assert_blocked(store)
+            runner.finish_unbound_execution('first',cleanup_confirmed=True)
+            before=store.path('first').read_bytes()
+            self.assertTrue(store.create('second','demo_account','second-session','android_app')[1])
+            self.assertEqual(store.path('first').read_bytes(),before)
+
+    def test_wrong_active_task_cannot_finalize_or_replace_index(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store,runner=self.setup_task(folder)
+            runner.finish_unbound_execution('first',cleanup_confirmed=True)
+            store.stop_signal('first','android_app')
+            from flow import atomic_json
+            atomic_json(store.root/'active.json',{'task':'different'})
+            self.assertEqual(runner.finalize_stopped_unbound('first')['status'],'needs_input')
+            self.assertEqual(json.loads((store.root/'active.json').read_text(encoding='utf-8'))['task'],'different')
 
     def test_bound_unknown_unlisted_reason_wrong_source_and_foreign_receipt_stay_blocked(self):
         for variant in ('bound', 'unknown', 'unlisted', 'source', 'foreign_receipt'):
@@ -133,12 +284,13 @@ class FailureFinalizationTests(unittest.TestCase):
 
     def test_cli_finally_waits_for_close_and_consumes_early_stop_only_afterwards(self):
         import recap_glm
-        for cleanup in (True, False):
-            with self.subTest(cleanup=cleanup), tempfile.TemporaryDirectory() as folder:
+        for cleanup, calls, settled in ((True,0,True),(False,0,True),(True,1,True),(True,1,False)):
+            with self.subTest(cleanup=cleanup,calls=calls,settled=settled), tempfile.TemporaryDirectory() as folder:
                 store = Store(folder)
-                runtime = SimpleNamespace(calls=0, http_requests=0)
+                runtime = SimpleNamespace(calls=calls, http_requests=0,all_workers_finished=settled)
                 desktop = Mock()
-                desktop.bind.side_effect = RecapError('edge_launch_unconfirmed')
+                reason='visual_address_unconfirmed' if calls else 'edge_launch_unconfirmed'
+                desktop.bind.side_effect = RecapError(reason)
                 wire = Mock()
                 def close():
                     before = Runner(store, None).stop('wired', 'android_app')
@@ -166,10 +318,10 @@ class FailureFinalizationTests(unittest.TestCase):
                      redirect_stdout(io.StringIO()) as output:
                     self.assertEqual(recap_glm.main(), 2)
                 record = json.loads(output.getvalue())['record']
-                self.assertEqual(record['status'], 'failed' if cleanup else 'needs_input')
+                self.assertEqual(record['status'], 'failed' if cleanup and settled and not calls else 'needs_input')
                 self.assertEqual(record['stop_signal_source'], 'android_app')
                 self.assertIsNone(record['metrics'])
-                if cleanup:
+                if cleanup and settled:
                     self.assertTrue(store.create('next', 'demo_account', 'next-session', 'android_app')[1])
                 else:
                     with self.assertRaisesRegex(RecapError, 'busy'):

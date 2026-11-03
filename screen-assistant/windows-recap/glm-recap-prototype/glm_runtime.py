@@ -45,6 +45,7 @@ class GLMRuntime:
     def __init__(self,scratch,context=None,gate=None):
         self.scratch=Path(scratch).resolve(); self.scratch.mkdir(parents=True,exist_ok=True)
         self.calls=0; self.http_requests=0; self.context=context or {}; self.gate=gate; self.deadline=time.monotonic()+240
+        self.all_workers_finished=True
 
     def run(self,image,prompt,schema=None,challenge=None):
         raise RuntimeError('image_visual_disabled')
@@ -79,11 +80,13 @@ class GLMRuntime:
         env = {key: value for key, value in os.environ.items() if key.upper() in allowed}
         env.update(PYTHONUTF8='1', PYTHONDONTWRITEBYTECODE='1', RECAP_VISUAL_CAPABILITY=capability)
         self.calls += 1
+        self.all_workers_finished=False
         try:
             result = subprocess.run([sdk_python, '-B', str(Path(__file__).with_name('agent_worker.py'))],
                 input=data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env,
                 timeout=min(110, max(.1, self.deadline-time.monotonic())),
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            self.all_workers_finished=True
         except (OSError, subprocess.TimeoutExpired):
             self.http_requests = None
             raise RuntimeError('visual_worker_failed') from None
