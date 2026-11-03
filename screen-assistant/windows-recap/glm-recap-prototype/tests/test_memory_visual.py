@@ -127,6 +127,20 @@ class MemoryVisualTests(unittest.TestCase):
         with self.assertRaisesRegex(RecapError, 'live_status_unconfirmed'):
             vision.verify_identity(view, '123456', lambda w: w, live=True)
 
+    def test_pre_live_identity_never_sends_full_window_or_other_account(self):
+        runtime = Mock(); vision = GLMVision(runtime)
+        view = self.view([])
+        with self.assertRaises(RecapError):
+            vision.verify_identity(view, '123456', lambda w: w)
+        runtime.run_crop.assert_not_called()
+        view = self.view([Token('抖音号:123456',(100,80,230,100)),
+                          Token('抖音号:654321',(400,80,530,100))])
+        runtime.run_crop.return_value = {'account': '123456', 'live_status': None}
+        vision.verify_identity(view, '123456', lambda w: w)
+        crop = runtime.run_crop.call_args.args[0]
+        self.assertLess((crop.box[2]-crop.box[0])*(crop.box[3]-crop.box[1]), 800*600)
+        self.assertLess(crop.box[2], 400)
+
     def test_product_bind_reaches_guarded_navigation_and_stops_at_fixture_boundary(self):
         from glm_desktop import GLMDesktop
         tree = 'UI Tree:\ndesktop\n└── window "Target"\n    └── (350,50) edit "地址和搜索栏" [focused]'

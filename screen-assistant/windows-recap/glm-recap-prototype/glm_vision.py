@@ -204,12 +204,9 @@ class GLMVision:
     def verify_identity(self,view,account,guard,live=False):
         if not isinstance(account,str) or not account:
             raise RecapError('wrong_identity')
-        if live:
-            candidates=[q for q in view.tokens if '抖音号' in compact(q.text) and account in compact(q.text) and q.score>=.85]
-            if len(candidates)!=1: raise RecapError('visual_crop_anchor_ambiguous')
-            crop=make_local_crop(view,candidates[0],'identity',guard,account)
-        else:
-            crop=make_window_image(view,'identity',guard)
+        candidates=[q for q in view.tokens if '抖音号' in compact(q.text) and account in compact(q.text) and q.score>=.85]
+        if len(candidates)!=1: raise RecapError('visual_crop_anchor_ambiguous')
+        crop=make_local_crop(view,candidates[0],'identity',guard,account)
         prompt=('读取当前主播资料或结果行的抖音号account及直播状态live_status；'
                 '搜索框输入不算账号，无法确认则null。只返回JSON '
                 '{"account":字符串或null,"live_status":字符串或null}。')
