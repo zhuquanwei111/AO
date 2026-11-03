@@ -184,14 +184,14 @@ class WindowSafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(RecapError,'foreground_changed'):
             probe.foreground(target)
 
-    def test_disabled_child_cannot_be_skipped_by_point_lookup(self):
+    def test_disabled_actual_hit_cannot_receive_input(self):
         probe=object.__new__(Probe); probe.u=Mock(); target=candidate(1)
         probe.get=Mock(return_value=target)
         probe.u.GetForegroundWindow.return_value=1
         probe.u.GetAncestor.return_value=1
         probe.u.IsWindowVisible.return_value=True
         probe.u.IsWindowEnabled.side_effect=lambda hwnd: hwnd != 4
-        probe.u.WindowFromPoint.return_value=1
+        probe.u.WindowFromPoint.return_value=4
         probe.u.ScreenToClient.return_value=True
         probe.u.ChildWindowFromPointEx.return_value=4
         def classname(hwnd,buffer,size): buffer.value='Chrome_WidgetWin_1'; return len(buffer.value)
