@@ -76,10 +76,11 @@ def safe_window_metadata(windows):
     """仅投影窗口结构，不输出标题、地址或页面内容。"""
     rows=[]
     for item in windows[:12]:
-        title=item.get('title','').casefold()
+        title=_edge_title(item).casefold()
         category=('empty' if not title else 'new_tab' if ('新建标签页' in title or 'new tab' in title)
                   else 'portal' if '直播服务平台' in title else 'other')
         name=item.get('window_class','')
+        if not isinstance(name,str): name=''
         cls=name if re.fullmatch(r'Chrome_WidgetWin_[0-9]{1,3}',name) or name=='#32770' else 'other_or_unknown'
         structural=('top_level_candidate' if cls=='Chrome_WidgetWin_1' and item.get('owner')==0
                     and item.get('root_owner')==item.get('handle') and item.get('enabled') is True
@@ -89,17 +90,37 @@ def safe_window_metadata(windows):
                      'style':item.get('style'),'exstyle':item.get('exstyle'),
                      'visible':item.get('visible'),'enabled':item.get('enabled'),
                      'minimized':item.get('minimized'),'structural_class':structural,
+                     'identity_missing':[key for key in ('handle','pid','process_created')
+                         if type(item.get(key)) is not int or item[key]<=0],
                      'rect':item.get('rect'),'title_category':category})
     return {'candidates':rows,'metadata_truncated':len(windows)>12}
 
 
+def _edge_title(window):
+    title=window.get('title')
+    return title if isinstance(title,str) else ''
+
+
+def _edge_identity(window):
+    return all(type(window.get(key)) is int and window[key]>0 for key in ('handle','pid','process_created'))
+
+
+def edge_main_candidates(windows):
+    return [item for item in windows if _edge_identity(item)
+            and item.get('window_class')=='Chrome_WidgetWin_1'
+            and type(item.get('owner')) is int and item['owner']==0
+            and type(item.get('root_owner')) is int and item['root_owner']==item['handle']
+            and item.get('visible') is True]
+
+
+def _edge_usable(windows):
+    return [item for item in edge_main_candidates(windows) if item.get('enabled') is True
+            and item.get('minimized') is False and bool(_edge_title(item))]
+
+
 def select_edge_target(windows):
     """只选择唯一的结构化Edge顶层窗口；其他窗口不视为安全。"""
-    targets=[item for item in windows if item.get('window_class')=='Chrome_WidgetWin_1'
-             and item.get('owner')==0 and item.get('root_owner')==item.get('handle')
-             and item.get('visible') is True and item.get('enabled') is True
-             and item.get('minimized') is False and item.get('handle') and item.get('pid')
-             and item.get('process_created') and bool(item.get('title'))]
+    targets=_edge_usable(windows)
     portals=[item for item in targets if '直播服务平台' in item['title']]
     if len(portals)==1: return portals[0]
     if len(portals)>1: raise RecapError('edge_window_ambiguous')
@@ -108,6 +129,33 @@ def select_edge_target(windows):
     if len(tabs)>1 or len(targets)>1: raise RecapError('edge_window_ambiguous')
     if len(targets)==1: return targets[0]
     raise RecapError('edge_window_unconfirmed')
+
+
+def edge_selection_summary(windows):
+    """选择与诊断共用同一候选判定，不输出原始标题或页面。"""
+    structural=edge_main_candidates(windows); usable=_edge_usable(windows)
+    portal=[row for row in usable if '直播服务平台' in row['title']]
+    tabs=[row for row in usable if any(q in row['title'].casefold() for q in ('新建标签页','new tab'))]
+    result={'probe_rows_count':len(windows),'verified_identity_count':sum(_edge_identity(row) for row in windows),
+            'structural_count':len(structural),'usable_count':len(usable),
+            'portal_count':len(portal),'newtab_count':len(tabs),
+            'disabled_count':sum(row.get('enabled') is False for row in structural),
+            'minimized_count':sum(row.get('minimized') is True for row in structural),
+            'untitled_count':sum(not _edge_title(row) for row in structural),
+            'chosen_handle':None,'chosen_kind':None,'reject_code':None,**safe_window_metadata(windows)}
+    try: chosen=select_edge_target(windows)
+    except RecapError:
+        code=('no_candidates' if not windows else 'no_verified_identity' if not result['verified_identity_count'] else
+              'no_structural_main' if not structural else 'main_disabled' if all(row.get('enabled') is False for row in structural) else
+              'main_minimized' if all(row.get('enabled') is True and row.get('minimized') is True for row in structural) else
+              'main_untitled' if all(not _edge_title(row) for row in structural) else
+              'main_unusable' if not usable else 'multiple_portal' if len(portal)>1 else
+              'multiple_newtab' if len(tabs)>1 else 'multiple_main')
+        result['reject_code']=code
+    else:
+        result['chosen_handle']=chosen['handle']
+        result['chosen_kind']='portal' if chosen in portal else 'new_tab' if chosen in tabs else 'ordinary'
+    return result
 
 
 def uia_tokens(text,title):
@@ -224,6 +272,48 @@ class Desktop:
         self.mcp,self.probe,self.ocr=mcp,probe,ocr
         self.evidence=Path(evidence); self.evidence.mkdir(parents=True,exist_ok=True)
         self.portal_url=portal_url
+        self.window_selection_diagnostics=[]
+
+    def record_edge_selection(self,windows,stage,*,final=False,restore_target=None):
+        summary={'stage':stage,**edge_selection_summary(windows)}
+        if restore_target is not None:
+            summary.update(chosen_handle=restore_target['handle'],chosen_kind='minimized_restore',
+                           reject_code=None,restore_required=True)
+        context=getattr(self.probe,'selection_context',None)
+        context=context() if callable(context) else None
+        if isinstance(context,dict):
+            summary.update({key:context[key] for key in ('foreground_handle','foreground_root')
+                            if type(context.get(key)) is int})
+        inventory=getattr(self.probe,'last_window_inventory',None)
+        if isinstance(inventory,dict):
+            summary['inventory']={key:inventory[key] for key in ('enum_ok','raw_count','visible_count',
+                'verified_process_count','process_lookup_failed_count','rect_failed_count',
+                'class_lookup_failed_count','title_missing_count') if key in inventory}
+            if inventory.get('enum_ok') is False:
+                summary.update(reject_code='inventory_incomplete',chosen_handle=None,chosen_kind=None)
+        records=getattr(self,'window_selection_diagnostics',None)
+        if not isinstance(records,list): records=[]; self.window_selection_diagnostics=records
+        if len(records)<8:
+            records.append(summary)
+            if hasattr(self.mcp,'note'): self.mcp.note('edge_selection',**summary)
+        elif final:
+            summary['changes_truncated']=True
+            records[-1]=summary
+            if hasattr(self.mcp,'note'): self.mcp.note('edge_selection',**summary)
+        return summary
+
+    def select_existing_edge(self,windows):
+        summary=self.record_edge_selection(windows,'existing')
+        if summary['reject_code']=='inventory_incomplete': raise RecapError('edge_window_inventory_incomplete')
+        try: return select_edge_target(windows),False
+        except RecapError as error:
+            if error.reason!='edge_window_unconfirmed': raise
+            mains=edge_main_candidates(windows)
+            if (len(mains)==1 and mains[0].get('enabled') is True
+                    and mains[0].get('minimized') is True and _edge_title(mains[0])):
+                self.record_edge_selection(windows,'restore_candidate',restore_target=mains[0])
+                return mains[0],True
+            raise
 
     def guard(self,window=None):
         reply=self.mcp.call('ControlStatus')
@@ -240,12 +330,13 @@ class Desktop:
             raise RecapError('unknown_control_status')
         if window: return self.probe.foreground(window)
 
-    def focus(self,window):
+    def focus(self,window,*,restore=False):
         self.guard()
         live=self.probe.get(window)
         try: return self.probe.foreground(live)
         except RecapError: pass
-        self.probe.ensure_switch_safe(live)
+        if restore: self.probe.ensure_switch_safe(live,allow_restore=True)
+        else: self.probe.ensure_switch_safe(live)
         matches=[w for w in self.probe.windows() if w['title']==live['title']]
         if len(matches)!=1: raise RecapError('window_title_ambiguous')
         self.mcp.call('App',mode='switch',name=live['title'])
@@ -418,7 +509,10 @@ class Desktop:
             windows=self.probe.windows()
             current=time.monotonic()
             metadata=safe_window_metadata(windows)
-            signature=(len(windows),tuple(sorted((item.get('handle',0),item.get('pid',0)) for item in windows)),repr(metadata))
+            inventory=getattr(self.probe,'last_window_inventory',None)
+            inventory=inventory if isinstance(inventory,dict) else None
+            signature=(len(windows),tuple(sorted((item.get('handle',0),item.get('pid',0)) for item in windows)),
+                       repr(metadata),repr(inventory))
             changed=signature!=last_signature
             if changed:
                 changes+=1; last_signature=signature
@@ -428,12 +522,18 @@ class Desktop:
                               elapsed_ms=round((current-began)*1000),**metadata)
             try: target=select_edge_target(windows)
             except RecapError: target=None
+            if inventory is not None and inventory.get('enum_ok') is False: target=None
+            if changed and changes<=8:
+                selection=self.record_edge_selection(windows,'launch_wait')
+                if selection['reject_code']=='inventory_incomplete': target=None
             if target is not None and current<=deadline:
+                self.record_edge_selection(windows,'launch_final',final=True)
                 if hasattr(self.mcp,'note'):
                     self.mcp.note('edge_window_final',candidate_count=len(windows),outcome='unique_target',
                                   elapsed_ms=round((current-began)*1000),changes_truncated=changes>8,**metadata)
                 return target
             if current>=deadline:
+                self.record_edge_selection(windows,'launch_final',final=True)
                 if hasattr(self.mcp,'note'):
                     self.mcp.note('edge_window_final',candidate_count=len(windows),
                                   outcome='none' if not windows else 'ambiguous_or_unknown',

@@ -57,6 +57,10 @@ MCP 两份 requirements 只锁直接依赖；其传递依赖尚无完整锁，�
 
 视觉worker失败时返回固定阶段/类别及必要数字诊断，经白名单核验后写入本地任务的 `visual_diagnostics`：图像字节数/尺寸、worker退出码、请求钩子尝试次数、实际取得的HTTP状态、输出字符数/令牌数。HTTPX请求钩子在发送前触发，尝试次数不代表网络成功；失败时原 `normal_path_llm_calls` 仍保留未知。SDK请求、响应解析及已知输出预算异常分别归类，不再统一掩盖为地址栏错误；不记录异常正文、请求URL/头、供应商/模型原文或图像。依据：[HTTPX事件钩子](https://www.python-httpx.org/advanced/event-hooks/)、[SDK错误处理](https://github.com/openai/openai-python#handling-errors)及已安装Agents SDK 0.24.0的固定异常分支。所用SDK适配原天翼路由，不调用OpenAI服务。
 
+已有窗口选择会将安全摘要写入本地任务的 `window_selection_diagnostics`，包括枚举是否完整、已核进程/结构化主窗/可用候选计数、标题固定类别、必要句柄和固定拒绝原因；不写原标题、URL或页面内容。唯一正常普通标题的Edge主窗可继续新标签页导航，不要求事先位于机构页。唯一已核、可见、enabled且无owner的结构化主窗若只是最小化，复用官方 `App.switch` 恢复，再重新核对真实前台和恢复后的窗口矩形；不能拿最小化前的坐标截图或输入。多目标歧义、disabled、身份缺失、未知窗口类型和不完整枚举继续拒绝，原接管、遮挡和输入落点检查保留。
+
+恢复依据：[Windows-MCP 0.8.8 `switch_app`/`bring_window_to_top`](https://github.com/CursorTouch/Windows-MCP/blob/v0.8.8/src/windows_mcp/desktop/service.py)、[微软 IsIconic](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-isiconic)、[EnumWindows 返回语义](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enumwindows)。这些资料证明正常最小化窗口可经官方流程恢复；没有选窗摘要的历史任务仍不能据此断言具体失败原因。
+
 ## 许可与来源
 
 保留源清单提供的RapidOCR及模型许可材料。RapidOCR代码为Apache-2.0，随附模型许可另见`fixed-recap-prototype/rapidocr-MODEL_LICENSES.md`及`ocr-model-manifest.json`。锁定的Agents SDK与Python MCP SDK为MIT，Windows-MCP 0.8.8为MIT，分别见[OpenAI Agents SDK许可](https://github.com/openai/openai-agents-python/blob/main/LICENSE)、[Python MCP SDK许可](https://github.com/modelcontextprotocol/python-sdk/blob/main/LICENSE)和[Windows-MCP 0.8.8发行说明](https://pypi.org/project/windows-mcp/0.8.8/)。本目录不内嵌这些依赖包；两份直接依赖列表没有完整锁定全部传递依赖，安装方仍须随实际分发检查其许可。本目录仅包含客户端适配源码，不包含Windows-MCP二进制包、模型权重、API密钥、桌面截图或本地结果。

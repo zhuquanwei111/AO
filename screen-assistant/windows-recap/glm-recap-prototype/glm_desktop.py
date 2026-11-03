@@ -125,9 +125,14 @@ class GLMDesktop(LLMDesktop):
         self.guard()
         self.mcp.call('Snapshot',use_vision=False,use_dom=False,use_ui_tree=False,use_annotation=False)
         windows=self.probe.windows()
-        target=select_edge_target(windows) if windows else self.wait_edge_started()
+        if windows:
+            target,restore=self.select_existing_edge(windows)
+        else:
+            selection=self.record_edge_selection(windows,'existing')
+            if selection['reject_code']=='inventory_incomplete': raise RecapError('edge_window_inventory_incomplete')
+            target=self.wait_edge_started(); restore=False
         portal='直播服务平台' in target['title']
-        window=self.focus(target)
+        window=self.focus(target,restore=True) if restore else self.focus(target)
         if not portal:
             self.key(window,'ctrl+t')
             view=self.navigate_entry(window)

@@ -117,27 +117,44 @@ class Probe:
 
     def windows(self):
         rows=[]
+        inventory={'raw_count':0,'visible_count':0,'verified_process_count':0,
+                   'process_lookup_failed_count':0,'rect_failed_count':0,
+                   'class_lookup_failed_count':0,'title_missing_count':0,'enum_ok':False}
+        self.last_window_inventory=inventory
         def inspect(hwnd,_):
+            inventory['raw_count']+=1
             if not self.u.IsWindowVisible(hwnd): return True
-            title=ctypes.create_unicode_buffer(2048)
-            self.u.GetWindowTextW(hwnd,title,len(title))
+            inventory['visible_count']+=1
             pid=w.DWORD(); self.u.GetWindowThreadProcessId(hwnd,ctypes.byref(pid))
             process=self.k.OpenProcess(0x1000,False,pid.value)
-            if not process: return True
+            if not process:
+                inventory['process_lookup_failed_count']+=1
+                return True
             try:
                 path=ctypes.create_unicode_buffer(32768); size=w.DWORD(len(path))
-                if not self.k.QueryFullProcessImageNameW(process,0,path,ctypes.byref(size)): return True
+                if not self.k.QueryFullProcessImageNameW(process,0,path,ctypes.byref(size)):
+                    inventory['process_lookup_failed_count']+=1
+                    return True
                 if not path.value.lower().endswith('\\msedge.exe'): return True
                 times=[w.FILETIME() for _ in range(4)]
-                if not self.k.GetProcessTimes(process,*[ctypes.byref(q) for q in times]): return True
+                if not self.k.GetProcessTimes(process,*[ctypes.byref(q) for q in times]):
+                    inventory['process_lookup_failed_count']+=1
+                    return True
+                inventory['verified_process_count']+=1
                 born=(times[0].dwHighDateTime<<32)|times[0].dwLowDateTime
+                title=ctypes.create_unicode_buffer(2048)
+                self.u.GetWindowTextW(hwnd,title,len(title))
+                if not title.value: inventory['title_missing_count']+=1
                 rect=w.RECT()
-                if not self.u.GetWindowRect(hwnd,ctypes.byref(rect)): return True
+                if not self.u.GetWindowRect(hwnd,ctypes.byref(rect)):
+                    inventory['rect_failed_count']+=1
+                    return True
                 # 最大化窗口的非客户区可超出屏幕数像素，截图只取当前可见交集。
                 vx,vy,vw,vh=[self.u.GetSystemMetrics(i) for i in (76,77,78,79)]
                 visible=[max(vx,rect.left),max(vy,rect.top),min(vx+vw,rect.right),min(vy+vh,rect.bottom)]
                 class_name=ctypes.create_unicode_buffer(256)
-                self.u.GetClassNameW(hwnd,class_name,len(class_name))
+                if not self.u.GetClassNameW(hwnd,class_name,len(class_name)):
+                    inventory['class_lookup_failed_count']+=1
                 rows.append({'handle':int(hwnd),'pid':pid.value,'process_created':born,
                     'title':title.value,'rect':visible,
                     'window_class':class_name.value,'owner':int(self.u.GetWindow(hwnd,4) or 0),
@@ -150,7 +167,7 @@ class Probe:
             finally: self.k.CloseHandle(process)
             return True
         callback=self.callback(inspect)
-        self.u.EnumWindows(callback,0)
+        inventory['enum_ok']=bool(self.u.EnumWindows(callback,0))
         return rows
 
     def get(self,signature):
@@ -158,6 +175,11 @@ class Probe:
                for k in ('handle','pid','process_created'))]
         if len(found)!=1: raise RecapError('window_lost')
         return found[0]
+
+    def selection_context(self):
+        foreground=self.u.GetForegroundWindow()
+        return {'foreground_handle':int(foreground or 0),
+                'foreground_root':int(self.u.GetAncestor(foreground,2) or 0) if foreground else 0}
 
     def foreground(self,window):
         live=self.get(window)
@@ -167,9 +189,12 @@ class Probe:
             raise RecapError('foreground_changed')
         return live
 
-    def ensure_switch_safe(self,window):
+    def ensure_switch_safe(self,window,*,allow_restore=False):
         live=self.get(window)
-        if live['minimized'] or not self.u.IsWindowEnabled(live['handle']):
+        if (live['minimized'] and not allow_restore) or not self.u.IsWindowEnabled(live['handle']):
+            raise RecapError('foreground_changed')
+        if allow_restore and (live.get('window_class')!='Chrome_WidgetWin_1'
+                or live.get('owner')!=0 or live.get('root_owner')!=live['handle'] or not live.get('title')):
             raise RecapError('foreground_changed')
         foreground=self.u.GetForegroundWindow()
         root=int(self.u.GetAncestor(foreground,2) or 0) if foreground else 0
