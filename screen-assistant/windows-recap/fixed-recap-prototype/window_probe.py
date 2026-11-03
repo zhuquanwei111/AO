@@ -21,6 +21,7 @@ class Probe:
         signatures=[(self.u.EnumWindows,[self.callback,w.LPARAM],w.BOOL),
             (self.u.IsWindow,[w.HWND],w.BOOL),
             (self.u.IsWindowVisible,[w.HWND],w.BOOL),(self.u.IsIconic,[w.HWND],w.BOOL),
+            (self.u.IsZoomed,[w.HWND],w.BOOL),
             (self.u.GetForegroundWindow,[],w.HWND),(self.u.GetWindowRect,[w.HWND,ctypes.POINTER(w.RECT)],w.BOOL),
             (self.u.GetWindowTextW,[w.HWND,w.LPWSTR,ctypes.c_int],ctypes.c_int),
             (self.u.GetClassNameW,[w.HWND,w.LPWSTR,ctypes.c_int],ctypes.c_int),
@@ -156,7 +157,8 @@ class Probe:
                 if not self.u.GetClassNameW(hwnd,class_name,len(class_name)):
                     inventory['class_lookup_failed_count']+=1
                 rows.append({'handle':int(hwnd),'pid':pid.value,'process_created':born,
-                    'title':title.value,'rect':visible,
+                    'title':title.value,'rect':visible,'raw_rect':[rect.left,rect.top,rect.right,rect.bottom],
+                    'maximized':bool(self.u.IsZoomed(hwnd)),
                     'window_class':class_name.value,'owner':int(self.u.GetWindow(hwnd,4) or 0),
                     'root_owner':int(self.u.GetAncestor(hwnd,3) or 0),
                     'style':int(self.u.GetWindowLongW(hwnd,-16))&0xffffffff,

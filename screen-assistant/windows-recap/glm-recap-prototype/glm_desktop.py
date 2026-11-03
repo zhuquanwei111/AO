@@ -6,7 +6,7 @@ import json
 
 sys.path.insert(0,str(Path(__file__).resolve().parent.parent/'llm-recap-prototype'))
 from llm_desktop import LLMDesktop
-from desktop import Desktop, portal_page_evidence, select_edge_target
+from desktop import Desktop, portal_page_evidence, select_edge_target, edge_selection_summary
 from core import RecapError, unique_label, compact
 from vision import fill_missing
 from transport import check_reply
@@ -62,6 +62,7 @@ class GLMDesktop(LLMDesktop):
 
     def open_entry(self,window,need_open):
         # App仍是本机现有Edge，保留正常用户配置；没有AO浏览器／新浏览器配置。
+        window=self.recover_clipped_entry(window)
         if not need_open:
             self.key(window,'esc')
             return self.confirm_portal(window)
@@ -84,6 +85,45 @@ class GLMDesktop(LLMDesktop):
             self.mcp.note('entry_route',route='existing_edge_favorite')
         time.sleep(1)  # 一次正常页面加载等待，不采样直播指标。
         return self.confirm_portal(window)
+
+    def recover_clipped_entry(self,window):
+        # 复用PR3裁切恢复，只在当前结构化选窗和同一进程身份均确认后操作。
+        live=self.guard(window)
+        raw=live.get('raw_rect'); rect=live.get('rect')
+        if not (isinstance(raw,list) and isinstance(rect,list) and len(raw)==len(rect)==4):
+            raise RecapError('window_geometry_missing')
+        rw,rh=raw[2]-raw[0],raw[3]-raw[1]
+        vw,vh=rect[2]-rect[0],rect[3]-rect[1]
+        if min(rw,rh,vw,vh)<=0: raise RecapError('window_geometry_invalid')
+        clipped=vw*2<rw or vh*2<rh
+        self.mcp.note('entry_window_geometry',window_handle=live['handle'],raw_rect=raw,
+                      visible_rect=rect,maximized=live.get('maximized'),severely_clipped=clipped)
+        if not clipped: return live
+        windows=self.probe.windows()
+        summary=edge_selection_summary(windows)
+        inventory=self.probe.last_window_inventory
+        if (not inventory.get('enum_ok') or any(inventory.get(k,0) for k in
+                ('process_lookup_failed_count','rect_failed_count','class_lookup_failed_count'))
+                or summary.get('usable_count')!=1):
+            raise RecapError('window_recovery_ambiguous')
+        selected=select_edge_target(windows)
+        if any(selected.get(k)!=live.get(k) for k in ('handle','pid','process_created')):
+            raise RecapError('window_recovery_ambiguous')
+        self.key(live,'win+up')
+        current=self.guard(live)
+        if not current.get('maximized'): raise RecapError('window_maximize_unconfirmed')
+        new_raw=current.get('raw_rect'); new_rect=current.get('rect')
+        if not (isinstance(new_raw,list) and isinstance(new_rect,list) and len(new_raw)==len(new_rect)==4):
+            raise RecapError('window_geometry_missing')
+        nrw,nrh=new_raw[2]-new_raw[0],new_raw[3]-new_raw[1]
+        nvw,nvh=new_rect[2]-new_rect[0],new_rect[3]-new_rect[1]
+        if min(nrw,nrh,nvw,nvh)<=0 or nvw*2<nrw or nvh*2<nrh:
+            raise RecapError('window_still_clipped')
+        if not current.get('enabled') or current.get('owner')!=0:
+            raise RecapError('window_recovery_ambiguous')
+        self.mcp.note('entry_window_recovered',window_handle=current['handle'],
+                      raw_rect=new_raw,visible_rect=new_rect)
+        return current
 
     def observe(self,window,use_uia=False,*,ocr_optional=False):
         for attempt in range(5):

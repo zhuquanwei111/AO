@@ -16,6 +16,7 @@ class EntryTests(unittest.TestCase):
         d.click=Mock(); d.confirm_portal=Mock(return_value='confirmed')
         d.type_replacement=Mock(); d.mcp=Mock()
         d.portal_url='https://union.bytedance.com/open/portal/index'
+        d.recover_clipped_entry=Mock(side_effect=lambda window: window)
         return d
 
     def test_existing_local_edge_bookmark_preferred(self):
