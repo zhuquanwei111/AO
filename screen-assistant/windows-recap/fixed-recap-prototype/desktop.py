@@ -339,6 +339,24 @@ class Desktop:
         self.type_replacement(view,candidates[0],self.portal_url)
         return self.wait_entry(live)
 
+    def wait_edge_launch(self):
+        """在原有15秒上限内等待唯一具名窗口，不选择歧义候选。"""
+        began=time.monotonic()
+        deadline=began+15
+        while True:
+            self.guard()
+            windows=self.probe.windows()
+            current=time.monotonic()
+            if hasattr(self.mcp,'note'):
+                self.mcp.note('edge_launch_candidates',candidate_count=len(windows),
+                              untitled_count=sum(not item.get('title') for item in windows),
+                              elapsed_ms=round((current-began)*1000))
+            if len(windows)==1 and windows[0].get('title') and current<=deadline:
+                return windows[0]
+            if current>=deadline:
+                raise RecapError('edge_launch_unconfirmed')
+            time.sleep(.5)
+
     def bind(self,account):
         self.expected_account=account
         self._verified_room_id=None
@@ -353,11 +371,10 @@ class Desktop:
             if len(windows)>1: raise RecapError('edge_window_ambiguous')
             if not windows:
                 self.guard(); self.mcp.call('App',mode='launch',name='Microsoft Edge')
-                deadline=time.monotonic()+15
-                while not windows and time.monotonic()<deadline:
-                    time.sleep(.5); windows=self.probe.windows()
-                if len(windows)!=1: raise RecapError('edge_launch_unconfirmed')
-            window=windows[0]; need_open=True
+                window=self.wait_edge_launch()
+            else:
+                window=windows[0]
+            need_open=True
         window=self.focus(window)
         if need_open:
             # 新标签保护原用户页面；仅输入获准机构入口。
