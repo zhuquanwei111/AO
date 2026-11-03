@@ -6,7 +6,9 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
+import android.content.BroadcastReceiver;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.ServiceInfo;
 import android.graphics.Bitmap;
 import android.graphics.PixelFormat;
@@ -20,16 +22,15 @@ import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.os.PowerManager;
 import android.view.Gravity;
 import android.view.LayoutInflater;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.TextView;
 
-import com.google.mlkit.vision.common.InputImage;
-import com.google.mlkit.vision.text.TextRecognition;
-import com.google.mlkit.vision.text.TextRecognizer;
-import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions;
+import com.paddle.ocr.model.OCRRunResult;
 
 import java.nio.ByteBuffer;
 import java.lang.ref.WeakReference;
@@ -48,11 +49,11 @@ import java.util.concurrent.atomic.AtomicInteger;
  *    路径过于复杂，V1 采取安全停止会话并提示重新开始；
  *  - createVirtualDisplay 前必须注册 onStop 回调，回调中回收全部资源。
  *
- * 隐私：全部画面仅在内存处理（Image->Bitmap->ML Kit），不落盘、不缓存句子与回复。
+ * 隐私：全部画面仅在内存处理（Image->Bitmap->Paddle OCR），不落盘、不缓存句子与回复。
  */
 public class CaptureService extends Service {
 
-    public enum Phase { IDLE, RUNNING, PAUSED, STOPPING }
+    public enum Phase { IDLE, STARTING, RUNNING, PAUSED, STOPPING }
 
     public static final String ACTION_START = "com.screenassistant.START";
     public static final String ACTION_PAUSE = "com.screenassistant.PAUSE";
@@ -63,16 +64,19 @@ public class CaptureService extends Service {
     public static volatile Phase phase = Phase.IDLE;
     public static volatile String lastMessage = "";
     public static volatile boolean uiVisible;
+    private static final AtomicInteger visibleAssistantPages = new AtomicInteger();
     private static volatile WeakReference<CaptureService> serviceReference = new WeakReference<>(null);
 
     private static final String EXTRA_RESULT_CODE = "result_code";
     private static final String EXTRA_RESULT_DATA = "result_data";
+    private static final String EXTRA_LEGACY = "legacy_answer";
     private static final int NOTIF_ID = 100;
     private static final String CHANNEL_ID = "capture";
 
     private static final int CONNECT_TIMEOUT_MS = 5000;
     private static final int READ_TIMEOUT_MS = 10000;
-    private static final long REPLY_AUTO_HIDE_MS = 6000L;
+    private static final long REPLY_AUTO_HIDE_MS = 12000L;
+    private static final String OVERLAY_CONFLICT = "提示框遮挡识别区，请调整区域或提示框";
 
     private MediaProjectionManager mpm;
     private NotificationManager notifManager;
@@ -81,17 +85,23 @@ public class CaptureService extends Service {
     private MediaProjection projection;
     private android.hardware.display.VirtualDisplay virtualDisplay;
     private ImageReader imageReader;
-    private TextRecognizer recognizer;
+    private PaddleOcrBridge paddleOcr;
 
     private HandlerThread captureThread;
     private Handler captureHandler;
     private final Handler main = new Handler(Looper.getMainLooper());
     private ExecutorService workExecutor;
     private ExecutorService promptExecutor;
-    private LiveClient.Session liveSession;
-    private LiveFrameAnalyzer liveAnalyzer;
+    private volatile LiveClient.Session liveSession;
+    private boolean operationMode;
+    private volatile LiveConnection liveConnection;
+    static volatile boolean stopInProgress;
+    private boolean connectionWorkerActive;
+    private volatile String connectionStatus = "";
+    private volatile LiveFrameAnalyzer liveAnalyzer;
+    private volatile ObservationClock observationClock;
     private long lastLiveOcr;
-    private long lastLivePerson, lastFrameTimestamp;
+    private long lastFrameTimestamp;
     private AudioCapture audioCapture;
     private boolean microphoneForeground;
     public static volatile java.util.concurrent.CompletableFuture<Void> audioCompletion = java.util.concurrent.CompletableFuture.completedFuture(null);
@@ -100,25 +110,37 @@ public class CaptureService extends Service {
     private final AtomicInteger busyEpoch = new AtomicInteger(-1);
     private volatile boolean tornDown = true;
     private volatile int sessionEpoch = 0;
+    private volatile int messageGeneration;
     private int rotationAtStart;
     private int intervalMs = 5000;
     private String serverUrl = "";
     private int[] screenSize = new int[2];
     private String setupStage = "idle";
     private volatile String teardownReason = "none";
-    private final OverlayMessageState overlayState = new OverlayMessageState();
+    private final OverlayMessageState overlayState = new OverlayMessageState((id, reason) ->
+            logEvent("prompt_outcome", "id=" + safeId(id) + " reason=" + reason));
 
     private View replyOverlayView;
+    private View replyBodyView;
     private TextView replyTextView;
+    private volatile boolean overlayBlocksCapture;
+    private boolean draggingOverlay;
+    private boolean overlayConflictNotified;
+    private String displayedPromptId = "";
+    private String drawnPromptId = "";
+    private int localDebugMessages;
     private final Runnable replyHide = () -> renderOverlay(sessionEpoch);
-
-    private final MediaProjection.Callback projectionCallback = new MediaProjection.Callback() {
-        @Override
-        public void onStop() {
-            logEvent("projection_on_stop", "prior_teardown=" + teardownReason);
-            main.post(() -> teardown("屏幕采集已停止。Android 未提供具体原因；回到应用后可重新开始。若再次发生，请保留诊断日志。", "projection_on_stop"));
+    private boolean screenReceiverRegistered;
+    private final BroadcastReceiver overlayScreenState = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            logEvent("overlay_screen_state", "action=" + intent.getAction()
+                    + " interactive=" + getSystemService(PowerManager.class).isInteractive()
+                    + " phase=" + phase + " ui=" + uiVisible + " torn_down=" + tornDown);
+            renderOverlay(sessionEpoch);
         }
     };
+
+    private MediaProjection.Callback projectionCallback;
 
     private final Runnable tick = new Runnable() {
         @Override
@@ -127,14 +149,27 @@ public class CaptureService extends Service {
             if (uiVisible) { main.post(CaptureService.this::removeReplyOverlay); scheduleTick(intervalMs); return; }
             if (ScreenMetrics.rotation(CaptureService.this) != rotationAtStart) {
                 // 回主线程执行teardown（内部有 stopForeground/stopSelf）
-                main.post(() -> teardown("屏幕方向已变化，会话已停止，请重新框选并开始辅助", "rotation_changed"));
+                int rotationEpoch = sessionEpoch;
+                main.post(() -> {
+                    if (!tornDown && rotationEpoch == sessionEpoch)
+                        teardown("屏幕方向已变化，会话已停止，请重新框选并开始辅助", "rotation_changed");
+                });
                 return;
             }
             if (busyEpoch.get() == sessionEpoch) {
                 scheduleTick(intervalMs);
                 return;
             }
-            if (liveSession != null) { liveTick(); return; }
+            if (operationMode) {
+                if (liveAnalyzer != null) liveTick();
+                else {
+                    // 等待连接时丢弃旧帧；恢复时不把积压画面当成当前观察。
+                    try (Image ignored = imageReader.acquireLatestImage()) { }
+                    catch (RuntimeException ignored) { }
+                    scheduleTick(intervalMs);
+                }
+                return;
+            }
             Image image = null;
             Bitmap crop = null;
             try {
@@ -160,60 +195,63 @@ public class CaptureService extends Service {
             }
             final Bitmap b = crop;
             final String requestUrl = serverUrl;
-            recognizer.process(InputImage.fromBitmap(b, 0))
-                    .addOnSuccessListener(workExecutor, text -> {
-                        b.recycle();
-                        try {
-                            if (epoch != sessionEpoch) return;
-                            String sentence = normalize(text.getText());
-                            if (sentence.isEmpty()) {
-                                busyEpoch.compareAndSet(epoch, -1);
-                                scheduleNext(epoch);
-                                return;
-                            }
-                            if (liveSession != null) return; // 运营模式不以旧问答冒充运营提示
-                            AnswerClient.Result result =
-                                    AnswerClient.post(requestUrl, sentence, CONNECT_TIMEOUT_MS, READ_TIMEOUT_MS);
-                            android.util.Log.i("CaptureService", "answer response status=" + result.httpStatus
-                                    + " outcome=" + result.outcome + " request_id=" + safeId(result.requestId)
-                                    + " reply_chars=" + (result.reply == null ? 0 : result.reply.length())
-                                    + " epoch=" + epoch);
-                            if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch) {
-                                android.util.Log.i("CaptureService", "answer dropped by lifecycle request_id="
-                                        + safeId(result.requestId) + " phase=" + phase + " current_epoch=" + sessionEpoch);
-                                return; // 会话已停/换轮：不得回填
-                            }
-                            if (result.outcome == AnswerClient.Outcome.SUCCESS) {
-                                showReply(result.reply, epoch, result.requestId);
-                            } else if (result.outcome == AnswerClient.Outcome.DROP) {
-                                android.util.Log.w("CaptureService", "answer dropped request_id="
-                                        + safeId(result.requestId) + " status=" + result.httpStatus
-                                        + " error_type=" + errorType(result.error));
-                            }
-                            // DUPLICATE：保留当前展示；DROP：本轮静默丢弃
-                        } catch (Throwable t) {
-                            android.util.Log.w("CaptureService", "round failed", t);
-                        } finally {
-                            busyEpoch.compareAndSet(epoch, -1);
-                            scheduleNext(epoch);
-                        }
-                    })
-                    .addOnFailureListener(workExecutor, e -> {
-                        b.recycle();
-                        android.util.Log.w("CaptureService", "ocr failed", e);
-                        busyEpoch.compareAndSet(epoch, -1);
-                        scheduleNext(epoch);
-                    });
+            workExecutor.execute(() -> {
+                try {
+                    long coldLoadMs = paddleOcr.initializeBlocking();
+                    OCRRunResult ocr = paddleOcr.recognizeBlocking(b);
+                    android.util.Log.d("CaptureService", "Paddle OCR coldLoadMs=" + coldLoadMs
+                            + " totalMs=" + ocr.getTotalTimeMs() + " lines=" + ocr.getLineCount());
+                    if (epoch != sessionEpoch) return;
+                    StringBuilder rawText = new StringBuilder();
+                    for (com.paddle.ocr.model.OCRResult line : ocr.getResults()) {
+                        if (line.getText() == null || line.getText().trim().isEmpty()) continue;
+                        if (rawText.length() > 0) rawText.append(' ');
+                        rawText.append(line.getText());
+                    }
+                    String sentence = normalize(rawText.toString());
+                    if (sentence.isEmpty() || operationMode) return;
+                    AnswerClient.Result result =
+                            AnswerClient.post(requestUrl, sentence, CONNECT_TIMEOUT_MS, READ_TIMEOUT_MS);
+                    android.util.Log.i("CaptureService", "answer response status=" + result.httpStatus
+                            + " outcome=" + result.outcome + " request_id=" + safeId(result.requestId)
+                            + " reply_chars=" + (result.reply == null ? 0 : result.reply.length())
+                            + " epoch=" + epoch);
+                    if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch) {
+                        android.util.Log.i("CaptureService", "answer dropped by lifecycle request_id="
+                                + safeId(result.requestId) + " phase=" + phase + " current_epoch=" + sessionEpoch);
+                        return;
+                    }
+                    if (result.outcome == AnswerClient.Outcome.SUCCESS) {
+                        showReply(result.reply, epoch, result.requestId);
+                    } else if (result.outcome == AnswerClient.Outcome.DROP) {
+                        android.util.Log.w("CaptureService", "answer dropped request_id="
+                                + safeId(result.requestId) + " status=" + result.httpStatus
+                                + " error_type=" + errorType(result.error));
+                    }
+                } catch (Throwable t) {
+                    android.util.Log.e("CaptureService", "Paddle OCR failed; no alternate OCR is used", t);
+                    setState("本次画面识别失败，请检查识别区域后重试。");
+                } finally {
+                    b.recycle();
+                    busyEpoch.compareAndSet(epoch, -1);
+                    scheduleNext(epoch);
+                }
+            });
         }
     };
 
-    public static void requestStart(Context ctx, int resultCode, Intent data) {
+    public static void requestStart(Context ctx, int resultCode, Intent data, boolean legacyAnswer) {
+        if (phase != Phase.IDLE) return;
         logEvent("service_start_requested", "consent=accepted");
         Intent i = new Intent(ctx, CaptureService.class);
         i.setAction(ACTION_START);
         i.putExtra(EXTRA_RESULT_CODE, resultCode);
         i.putExtra(EXTRA_RESULT_DATA, data);
-        ctx.startForegroundService(i);
+        i.putExtra(EXTRA_LEGACY, legacyAnswer);
+        phase = Phase.STARTING;
+        lastMessage = "正在启动本地屏幕采集";
+        try { ctx.startForegroundService(i); }
+        catch (RuntimeException e) { phase = Phase.IDLE; throw e; }
     }
 
     public static void requestPause(Context ctx) {
@@ -233,7 +271,8 @@ public class CaptureService extends Service {
     }
 
     public static void setAssistantUiVisible(boolean visible) {
-        uiVisible = visible;
+        int count = visibleAssistantPages.updateAndGet(value -> visible ? value + 1 : Math.max(0, value - 1));
+        uiVisible = count > 0;
         WeakReference<CaptureService> reference = serviceReference;
         CaptureService service = reference == null ? null : reference.get();
         if (service != null) service.main.post(() -> service.renderOverlay(service.sessionEpoch));
@@ -252,6 +291,11 @@ public class CaptureService extends Service {
         mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
         notifManager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         wm = getSystemService(WindowManager.class);
+        IntentFilter screenEvents = new IntentFilter(Intent.ACTION_SCREEN_ON);
+        screenEvents.addAction(Intent.ACTION_SCREEN_OFF);
+        androidx.core.content.ContextCompat.registerReceiver(this, overlayScreenState, screenEvents,
+                androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED);
+        screenReceiverRegistered = true;
         NotificationChannel ch = new NotificationChannel(CHANNEL_ID, "屏幕识别",
                 NotificationManager.IMPORTANCE_LOW);
         ch.setShowBadge(false);
@@ -260,6 +304,7 @@ public class CaptureService extends Service {
         captureThread.start();
         captureHandler = new Handler(captureThread.getLooper());
         workExecutor = Executors.newSingleThreadExecutor();
+        paddleOcr = new PaddleOcrBridge(this);
         promptExecutor = Executors.newSingleThreadExecutor();
     }
 
@@ -271,10 +316,10 @@ public class CaptureService extends Service {
         switch (action == null ? "" : action) {
             case ACTION_START: {
                 if (!tornDown) return START_NOT_STICKY;
+                operationMode = !intent.getBooleanExtra(EXTRA_LEGACY, false);
                 // Android14：必须先成为 mediaProjection 前台服务，才允许 getMediaProjection()
                 int types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION;
-                LiveClient.Session stored = Prefs.getSession(this);
-                microphoneForeground = android.os.Build.VERSION.SDK_INT >= 30 && stored != null && !stored.stopped
+                microphoneForeground = android.os.Build.VERSION.SDK_INT >= 30 && operationMode
                         && Prefs.getAudioMode(this) == 2 && checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
                         == android.content.pm.PackageManager.PERMISSION_GRANTED;
                 if (android.os.Build.VERSION.SDK_INT >= 30 && microphoneForeground) types |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
@@ -294,8 +339,7 @@ public class CaptureService extends Service {
                 } catch (RuntimeException e) {
                     setupStage = "foreground_service_start";
                     logEvent("foreground_service_start_failed", "stage=" + setupStage + " error=" + e.getClass().getSimpleName());
-                    teardown("启动失败（前台服务阶段，" + e.getClass().getSimpleName()
-                            + "）。请检查屏幕采集权限与系统设置后重新开始。", "foreground_service_start_failed");
+                    teardown("辅助启动失败。请检查屏幕共享权限与系统设置后重新开始。", "foreground_service_start_failed");
                     break;
                 }
                 int code = intent.getIntExtra(EXTRA_RESULT_CODE, 0);
@@ -309,11 +353,12 @@ public class CaptureService extends Service {
             }
             case ACTION_PAUSE: {
                 if (phase == Phase.RUNNING) {
+                    messageGeneration++;
                     captureHandler.removeCallbacks(tick);
                     phase = Phase.PAUSED;
                     overlayState.stop();
                     if (liveAnalyzer != null) liveAnalyzer.invalidateBefore(android.os.SystemClock.elapsedRealtime());
-                    else sessionEpoch++;
+                    else if (!operationMode) sessionEpoch++;
                     if (audioCapture != null) { audioCapture.stop(); audioCapture = null; }
                     main.post(this::removeReplyOverlay);
                     setState("已暂停（保留采集授权）");
@@ -326,7 +371,7 @@ public class CaptureService extends Service {
             case ACTION_RESUME: {
                 if (phase == Phase.PAUSED && !tornDown) {
                     phase = Phase.RUNNING;
-                    overlayState.start();
+                    overlayState.start(operationMode ? connectionStatus : OverlayMessageState.WAITING_TEXT);
                     if (liveAnalyzer != null) liveAnalyzer.invalidateBefore(android.os.SystemClock.elapsedRealtime());
                     startAudio();
                     setState("已继续");
@@ -341,6 +386,12 @@ public class CaptureService extends Service {
             }
             case ACTION_STOP:
             default:
+                if (liveConnection != null) {
+                    synchronized (liveConnection) {
+                        stopInProgress = connectionWorkerActive;
+                        liveConnection.close(true);
+                    }
+                }
                 teardown("已结束辅助", "app_stop_action");
                 break;
         }
@@ -349,18 +400,20 @@ public class CaptureService extends Service {
 
     @Override
     public void onDestroy() {
+        if (screenReceiverRegistered) { unregisterReceiver(overlayScreenState); screenReceiverRegistered = false; }
         logEvent("service_destroyed", "phase=" + phase + " teardown_reason=" + teardownReason);
         teardownInternal();
         LiveFrameAnalyzer closingAnalyzer = liveAnalyzer;
-        TextRecognizer closingRecognizer = recognizer;
+        PaddleOcrBridge closingPaddleOcr = paddleOcr;
         if (workExecutor != null) {
             workExecutor.execute(() -> {
                 if (closingAnalyzer != null) closingAnalyzer.close();
-                if (closingRecognizer != null) closingRecognizer.close();
+                if (closingPaddleOcr != null) closingPaddleOcr.close();
             });
             workExecutor.shutdown();
         }
-        if (promptExecutor != null) promptExecutor.shutdownNow();
+        // 保住迟到创建凭证并幂等结束旧场，再由连接线程自行退出。
+        if (promptExecutor != null) promptExecutor.shutdown();
         if (captureThread != null) captureThread.quitSafely();
         WeakReference<CaptureService> reference = serviceReference;
         if (reference != null && reference.get() == this) serviceReference = new WeakReference<>(null);
@@ -370,6 +423,57 @@ public class CaptureService extends Service {
     @Override
     public IBinder onBind(Intent intent) {
         return null;
+    }
+
+    /** 供 debug 子类复用真实窗口；不创建投影、不启动联网或采集线程任务。 */
+    final boolean showLocalOverlayForDebug() {
+        if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0
+                || phase != Phase.IDLE || !tornDown || uiVisible) return false;
+        screenSize = ScreenMetrics.realSizeDpi(this);
+        if (screenSize[0] <= 0 || screenSize[1] <= 0) return false;
+        tornDown = false;
+        operationMode = false;
+        phase = Phase.RUNNING;
+        localDebugMessages = 0;
+        overlayState.start();
+        renderOverlay(sessionEpoch);
+        return true;
+    }
+
+    final void expandLocalOverlayForDebug() {
+        if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0
+                || phase != Phase.RUNNING || tornDown || operationMode) return;
+        long nowNs = SystemClock.elapsedRealtimeNanos();
+        String label = (++localDebugMessages % 2 == 1) ? "A" : "B";
+        try {
+            // 固定的过去/未来服务时钟，验证产品入队路径不依赖设备墙钟；不联网。
+            long serverNow = "A".equals(label) ? 1_700_000_000_000L : 1_900_000_000_000L;
+            org.json.JSONObject page = new org.json.JSONObject().put("server_time_ms", serverNow)
+                    .put("server_processing_ms", 0).put(PromptTiming.SENT_NS, nowNs).put(PromptTiming.RECEIVED_NS, nowNs);
+            long deadline = PromptTiming.from(page).deadline(new org.json.JSONObject().put("expires_at_ms", serverNow + 15000));
+            submitOverlayMessage("本地固定测试文字" + label + "\n第一行\n第二行\n第三行\n第四行\n第五行",
+                    sessionEpoch, deadline, "debug-" + nowNs, 0);
+        } catch (org.json.JSONException e) { throw new IllegalStateException(e); }
+    }
+
+    /** 由debug服务的系统DUMP入口核对同一个产品TextView；不读取采集帧或联网。 */
+    final void dumpLocalOverlayForDebug(java.io.PrintWriter writer) {
+        if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0 || operationMode) return;
+        TextView body = replyTextView;
+        View window = replyOverlayView;
+        if (body == null || window == null) { writer.println("overlay=absent"); return; }
+        android.graphics.Rect bounds = new android.graphics.Rect();
+        boolean visible = body.getGlobalVisibleRect(bounds);
+        android.text.Layout layout = body.getLayout();
+        int ellipsized = 0;
+        if (layout != null) for (int i=0; i<layout.getLineCount(); i++) ellipsized += layout.getEllipsisCount(i);
+        writer.println("at=" + System.currentTimeMillis() + " id=" + safeId(overlayState.currentId())
+                + " elapsed=" + SystemClock.elapsedRealtime()
+                + " drawn=" + safeId(drawnPromptId) + " body_shown=" + body.isShown()
+                + " visible_rect=" + visible + " bounds=" + bounds.toShortString()
+                + " window=" + window.getWidth() + "x" + window.getHeight() + " ellipsized=" + ellipsized
+                + " source_expires=" + overlayState.sourceExpiryMs() + " visible_until=" + overlayState.expiresAtMs());
+        writer.println("fixed_text=" + body.getText());
     }
 
     private void setup(int resultCode, Intent data) {
@@ -384,9 +488,8 @@ public class CaptureService extends Service {
             sessionEpoch++;
             setupStage = "display_metrics";
             serverUrl = Prefs.getServerUrl(this);
-            LiveClient.Session stored = Prefs.getSession(this);
-            liveSession = stored != null && !stored.stopped ? stored : null;
-            if (liveSession != null) serverUrl = liveSession.baseUrl;
+            liveSession = null; // 实际场次/收件校验后才绑定，不从本地存储推断在线。
+            observationClock = null;
             intervalMs = Prefs.getIntervalSec(this) * 1000;
             int[] size = ScreenMetrics.realSizeDpi(this);
             screenSize = size;
@@ -400,6 +503,16 @@ public class CaptureService extends Service {
             logEvent("media_projection_acquired", "api=" + android.os.Build.VERSION.SDK_INT);
             // Android14：createVirtualDisplay 前必须注册 onStop 回调
             setupStage = "register_projection_callback";
+            final int projectionEpoch = sessionEpoch;
+            projectionCallback = new MediaProjection.Callback() {
+                @Override public void onStop() {
+                    logEvent("projection_on_stop", "prior_teardown=" + teardownReason);
+                    main.post(() -> {
+                        if (!tornDown && sessionEpoch == projectionEpoch)
+                            teardown("屏幕采集已停止。Android 未提供具体原因；回到应用可重新开始。", "projection_on_stop");
+                    });
+                }
+            };
             projection.registerCallback(projectionCallback, captureHandler);
             setupStage = "create_virtual_display";
             virtualDisplay = projection.createVirtualDisplay(
@@ -407,31 +520,25 @@ public class CaptureService extends Service {
                     android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                     imageReader.getSurface(), null, captureHandler);
             logEvent("virtual_display_created", "result=" + (virtualDisplay == null ? "null" : "created"));
-            setupStage = "recognizer";
-            if (recognizer == null) {
-                recognizer = TextRecognition.getClient(
-                        new ChineseTextRecognizerOptions.Builder().build());
-            }
-            final int epoch = sessionEpoch;
-            if (liveSession != null) liveAnalyzer = new LiveFrameAnalyzer(this, recognizer, liveSession,
-                    () -> !tornDown && !uiVisible && phase == Phase.RUNNING && sessionEpoch == epoch, this::setState);
+            if (virtualDisplay == null) throw new IllegalStateException("VirtualDisplay unavailable");
+            setupStage = "paddle_ocr";
             lastLiveOcr = 0;
-            lastLivePerson = 0; lastFrameTimestamp = 0;
-            overlayState.start();
+            lastFrameTimestamp = 0;
+            connectionStatus = operationMode ? LiveConnection.CONNECTING : OverlayMessageState.WAITING_TEXT;
+            overlayState.start(connectionStatus);
             phase = Phase.RUNNING;
             setupStage = "running";
             startAudio();
-            if (liveSession != null) startPromptPolling(liveSession, sessionEpoch);
-            logEvent("capture_running", "session=" + (liveSession == null ? "answer_compatibility" : "operation"));
-            setState("辅助中，等待内容");
-            notifManager.notify(NOTIF_ID, buildNotification("辅助中，等待内容"));
+            if (operationMode) startLiveConnection(sessionEpoch);
+            logEvent("capture_running", "session=" + (operationMode ? "operation_connecting" : "answer_compatibility"));
+            setState(connectionStatus);
+            notifManager.notify(NOTIF_ID, buildNotification(connectionStatus));
             renderOverlay(sessionEpoch);
             scheduleTick(800);
         } catch (Exception e) {
             logEvent("projection_setup_failed", "stage=" + setupStage + " error=" + e.getClass().getSimpleName());
             android.util.Log.e("CaptureService", "projection setup failed at stage=" + setupStage, e);
-            teardown("启动失败（" + setupStage + "，" + e.getClass().getSimpleName()
-                    + "）。请确认权限后重新开始。", "setup_exception");
+            teardown("辅助启动失败，请确认屏幕共享权限后重新开始。", "setup_exception");
         }
     }
 
@@ -459,7 +566,7 @@ public class CaptureService extends Service {
             audioCapture = new AudioCapture(this, projection, liveSession, Prefs.getAudioMode(this), Prefs.hostConfirmed(this),
                     message -> { if (epoch == sessionEpoch) setAudioState(message); });
             audioCompletion = audioCapture.completion;
-        } catch (Exception e) { setAudioState("音频未启动：" + e.getMessage() + "；其他取数继续"); }
+        } catch (Exception e) { android.util.Log.w("CaptureService", "音频未启动", e); setAudioState("音频未启动，请检查音频权限和设置；屏幕辅助继续。"); }
     }
 
     private void setAudioState(String message) {
@@ -473,6 +580,7 @@ public class CaptureService extends Service {
 
     private void liveTick() {
         int epoch = sessionEpoch;
+        if (overlayBlocksCapture) { scheduleNext(epoch); return; }
         if (!busyEpoch.compareAndSet(-1, epoch)) { scheduleNext(epoch); return; }
         LiveFrameAnalyzer.Frame frame = null;
         try (Image image = imageReader.acquireLatestImage()) {
@@ -480,25 +588,25 @@ public class CaptureService extends Service {
                 long now = android.os.SystemClock.elapsedRealtime();
                 if (image.getTimestamp() <= lastFrameTimestamp) {
                     if (liveAnalyzer != null) liveAnalyzer.invalidateBefore(now);
-                    setState("屏幕源时间戳未前进，本轮不发送旧画面");
+                    setState("画面暂未更新，本次未处理旧画面。");
                     busyEpoch.compareAndSet(epoch, -1); scheduleNext(epoch); return;
                 }
                 lastFrameTimestamp = image.getTimestamp();
                 boolean ocr = now - lastLiveOcr >= intervalMs;
-                boolean person = now - lastLivePerson >= 3000;
-                frame = LiveFrameAnalyzer.snapshot(this, image, ocr, person);
+                LiveClient.Session currentSession=liveSession;
+                frame = LiveFrameAnalyzer.snapshot(this, image, ocr, observationClock,
+                        currentSession == null ? null : currentSession.id);
                 if (ocr) lastLiveOcr = now;
-                if (person) lastLivePerson = now;
             }
-        } catch (Exception e) { setState("屏幕取样失败：" + e.getClass().getSimpleName()); }
+        } catch (Exception e) { android.util.Log.w("CaptureService", "屏幕取样失败", e); setState("本次画面读取失败，请检查屏幕共享状态。"); }
         if (frame == null) { busyEpoch.compareAndSet(epoch, -1); scheduleNext(epoch); return; }
         LiveFrameAnalyzer.Frame sample = frame;
         LiveFrameAnalyzer analyzer = liveAnalyzer;
         workExecutor.execute(() -> {
             try {
-                if (!tornDown && phase == Phase.RUNNING && epoch == sessionEpoch) analyzer.analyze(sample);
+                if (!tornDown && !overlayBlocksCapture && phase == Phase.RUNNING && epoch == sessionEpoch) analyzer.analyze(sample);
             } catch (Exception e) {
-                if (!tornDown && epoch == sessionEpoch) setState("本轮观察未取得：" + e.getClass().getSimpleName());
+                if (!tornDown && epoch == sessionEpoch) { android.util.Log.w("CaptureService", "本轮观察未取得", e); setState("本次画面未能处理，请检查识别区域。"); }
             } finally { sample.close(); busyEpoch.compareAndSet(epoch, -1); scheduleNext(epoch); }
         });
     }
@@ -558,42 +666,134 @@ public class CaptureService extends Service {
         showMessage("问答", reply, epoch, 0);
     }
 
-    private void startPromptPolling(LiveClient.Session session, int epoch) {
-        promptExecutor.execute(() -> {
-            String cursor = "";
-            while (!tornDown && epoch == sessionEpoch && !Thread.currentThread().isInterrupted()) {
+    private void startLiveConnection(int epoch) {
+        LiveConnection connection = new LiveConnection(Prefs.liveStore(this),
+                LiveClient.remote(serverUrl, Prefs.getLiveDescription(this), Prefs.getDouyinAccount(this)),
+                new LiveConnection.Listener() {
+                    @Override public void observationClock(LiveClient.Session session, PromptTiming timing) {
+                        if (tornDown || epoch != sessionEpoch) return;
+                        ObservationClock next=ObservationClock.from(session.id, session.startedAt, timing);
+                        observationClock=next;
+                        if (next==null && liveAnalyzer!=null)
+                            liveAnalyzer.invalidateBefore(SystemClock.elapsedRealtime()+1);
+                    }
+                    @Override public void status(String text, boolean discard) {
+                        main.post(() -> {
+                            if (tornDown || epoch != sessionEpoch || text.equals(connectionStatus)) return;
+                            connectionStatus = text;
+                            overlayState.setStatus(text, discard);
+                            setState(text);
+                            notifManager.notify(NOTIF_ID, buildNotification(text));
+                            renderOverlay(epoch);
+                        });
+                    }
+                    @Override public void session(LiveClient.Session session) {
+                        main.post(() -> {
+                            if (tornDown || epoch != sessionEpoch) return;
+                            try (Image ignored = imageReader.acquireLatestImage()) { }
+                            catch (RuntimeException ignored) { }
+                            liveSession = session;
+                            liveAnalyzer = new LiveFrameAnalyzer(CaptureService.this, paddleOcr, session,
+                                    () -> !tornDown && !uiVisible && phase == Phase.RUNNING && sessionEpoch == epoch,
+                                    message -> main.post(() -> {
+                                        if (!tornDown && epoch == sessionEpoch) {
+                                            int diagnostic = message.indexOf("HTTP 422 observations ");
+                                            if (diagnostic >= 0)
+                                                android.util.Log.i("CaptureService", "event=validation_422 " + message.substring(diagnostic));
+                                            setState(message.startsWith("采样上传未确认") ? "部分画面内容发送未确认，请检查连接。" : message);
+                                            overlayState.setStatus(connectionStatus + "\n" + message, false);
+                                            renderOverlay(epoch);
+                                        }
+                                    }));
+                            if (phase == Phase.RUNNING) startAudio();
+                        });
+                    }
+                    @Override public void prompt(org.json.JSONObject prompt) {
+                        long expires = prompt.optLong(PromptTiming.DEADLINE_MS);
+                        String id = prompt.optString("prompt_id");
+                        Integer priority = LiveConnection.strictPriority(prompt);
+                        if (priority == null) return;
+                        logEvent("prompt_received", "id=" + safeId(id) + " type=" + DisplayText.promptType(prompt) + " source_expires=" + prompt.optLong("expires_at_ms")
+                                + " deadline_elapsed=" + expires + " rtt=" + prompt.optLong("_client_rtt_ms")
+                                + " processing=" + prompt.optLong("_client_processing_ms")
+                                + " transport=" + prompt.optLong("_client_transport_ms") + " epoch=" + epoch);
+                        if (expires > SystemClock.elapsedRealtime() && !id.isEmpty())
+                            showMessage(DisplayText.promptLabel(prompt), prompt.optString("display_text"), epoch, expires, id, priority);
+                        else if (!id.isEmpty())
+                            logEvent("prompt_outcome", "id=" + safeId(id) + " reason=source_expired_before_queue");
+                    }
+                    @Override public void promptDropped(String id, String reason) {
+                        logEvent("prompt_outcome", "id=" + safeId(id) + " reason=" + reason);
+                    }
+                    @Override public void ended() {
+                        main.post(() -> {
+                            if (!tornDown && epoch == sessionEpoch) teardown("共享场次已结束", "live_session_end");
+                        });
+                    }
+                });
+        liveConnection = connection;
+        synchronized (connection) { connectionWorkerActive = true; }
+        LiveConnection.beginWorker();
+        try { promptExecutor.execute(() -> {
+            boolean prepared = false;
+            try {
+                while (!tornDown && epoch == sessionEpoch && !connection.isClosed()) {
+                    if (!prepared) prepared = connection.connect();
+                    boolean received = prepared && connection.poll();
+                    if (!received && !connection.isClosed()) {
+                        try { Thread.sleep(2000); }
+                        catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
+                    }
+                }
+            } finally {
                 try {
-                    org.json.JSONObject page = LiveClient.poll(session, cursor);
-                    org.json.JSONArray prompts = page.getJSONArray("prompts");
-                    for (int i = 0; i < prompts.length(); i++) {
-                        org.json.JSONObject prompt = prompts.getJSONObject(i);
-                        long expires = prompt.optLong("expires_at_ms");
-                        if (expires > System.currentTimeMillis()) showMessage("运营", prompt.optString("display_text"), epoch, expires);
+                    boolean shouldEnd;
+                    synchronized (connection) {
+                        shouldEnd = connection.shouldEnd();
+                        if (!shouldEnd) connectionWorkerActive = false;
                     }
-                    cursor = page.getString("next_cursor");
-                    if (page.optBoolean("stopped")) {
-                        Prefs.saveSession(this, session.asStopped());
-                        main.post(() -> { if (epoch == sessionEpoch) teardown("共享场次已结束", "live_session_end"); });
-                        return;
+                    if (shouldEnd) {
+                        try { audioCompletion.get(20, java.util.concurrent.TimeUnit.SECONDS); }
+                        catch (Exception ignored) { /* 仍请求幂等结束 */ }
+                        try { connection.finishStop(); }
+                        catch (Exception e) { logEvent("session_stop_unconfirmed", "error=" + e.getClass().getSimpleName()); }
                     }
-                } catch (Exception e) {
-                    if (tornDown || epoch != sessionEpoch) return;
-                    setState("运营收件暂不可用：" + e.getMessage() + "；自动重试，未显示新提示");
-                    try { Thread.sleep(2000); }
-                    catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); return; }
+                } finally {
+                    synchronized (connection) { connectionWorkerActive = false; stopInProgress = false; }
+                    LiveConnection.endWorker();
+                    Intent changed = new Intent(Prefs.ACTION_STATE).setPackage(getPackageName());
+                    sendBroadcast(changed);
                 }
             }
-        });
+        }); } catch (RuntimeException error) {
+            synchronized (connection) { connectionWorkerActive = false; stopInProgress = false; }
+            LiveConnection.endWorker(); throw error;
+        }
     }
 
     private void showMessage(String purpose, String reply, int epoch, long expiresAt) {
-        String fullText = DisplayText.labeled(purpose, reply);
+        showMessage(purpose, reply, epoch, expiresAt, "", 0);
+    }
+
+    private void showMessage(String purpose, String reply, int epoch, long expiresAt, String id, int priority) {
+        submitOverlayMessage(DisplayText.labeled(purpose, reply), epoch, expiresAt, id, priority);
+    }
+
+    private void submitOverlayMessage(String fullText, int epoch, long expiresAt, String id, int priority) {
+        if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch) return;
+        int generation = messageGeneration;
         if (fullText.isEmpty()) return;
         main.post(() -> {
-            if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch) return;
-            long now = System.currentTimeMillis();
-            if (expiresAt > 0 && expiresAt <= now) return;
-            if (overlayState.update(fullText, expiresAt, now, REPLY_AUTO_HIDE_MS)) renderOverlay(epoch);
+            if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch || generation != messageGeneration) return;
+            long now = SystemClock.elapsedRealtime();
+            if (expiresAt > 0 && expiresAt <= now) {
+                logEvent("prompt_outcome", "id=" + safeId(id) + " reason=source_expired_before_queue"); return;
+            }
+            boolean accepted = overlayState.update(id, fullText, priority, expiresAt, now, REPLY_AUTO_HIDE_MS);
+            logEvent("prompt_processed", "id=" + safeId(id) + " accepted=" + accepted
+                    + " pending=" + overlayState.pendingCount() + " expired=" + overlayState.expiredCount()
+                    + " overflow=" + overlayState.overflowCount() + " epoch=" + epoch);
+            renderOverlay(epoch);
         });
     }
 
@@ -603,10 +803,12 @@ public class CaptureService extends Service {
             return;
         }
         main.removeCallbacks(replyHide);
-        if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch || uiVisible) {
+        if (phase != Phase.RUNNING || tornDown || epoch != sessionEpoch) {
             removeReplyOverlay();
             return;
         }
+        // Handler使用uptime，休眠会推迟它；关屏移窗，亮屏先按连续时钟重算再附着。
+        if (!getSystemService(PowerManager.class).isInteractive()) { removeReplyOverlay(); return; }
         if (android.os.Build.VERSION.SDK_INT >= 23 && !android.provider.Settings.canDrawOverlays(this)) {
             removeReplyOverlay();
             setState("辅助正在运行，但悬浮窗权限不可用。回到应用打开悬浮窗权限后重新开始。");
@@ -614,55 +816,186 @@ public class CaptureService extends Service {
             logEvent("overlay_permission_missing", "phase=" + phase);
             return;
         }
+        if (!overlayState.shouldDisplay(true, uiVisible)) { removeReplyOverlay(); return; }
         try {
             if (replyOverlayView == null) {
-                replyOverlayView = LayoutInflater.from(this).inflate(R.layout.overlay_reply, null);
-                replyTextView = replyOverlayView.findViewById(R.id.tv_reply);
-                replyOverlayView.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
-                    @Override
-                    public void onViewAttachedToWindow(View view) {
-                        logEvent("overlay_attached", "shown=" + view.isShown());
-                    }
-
-                    @Override
-                    public void onViewDetachedFromWindow(View view) {
-                        logEvent("overlay_detached", "phase=" + phase);
+                replyOverlayView = LayoutInflater.from(this).inflate(R.layout.overlay_reply_handle, null);
+                replyBodyView = LayoutInflater.from(this).inflate(R.layout.overlay_reply, null);
+                replyTextView = (TextView) replyBodyView;
+                replyBodyView.setVisibility(View.GONE);
+                replyBodyView.getViewTreeObserver().addOnDrawListener(() -> {
+                    String id = overlayState.currentId();
+                    if (replyBodyView != null && replyTextView != null && !id.equals(drawnPromptId)) {
+                        logEvent("prompt_drawn", "id=" + safeId(id) + " previous=" + safeId(drawnPromptId)
+                                + " at=" + System.currentTimeMillis() + " body_visible=" + replyTextView.isShown()
+                                + " width=" + replyBodyView.getWidth() + " height=" + replyBodyView.getHeight()
+                                + " epoch=" + sessionEpoch);
+                        drawnPromptId = id;
                     }
                 });
+                overlayBlocksCapture = true;
+                replyBodyView.addOnLayoutChangeListener((view,left,top,right,bottom,oldLeft,oldTop,oldRight,oldBottom) -> {
+                    if (!draggingOverlay && (right-left != oldRight-oldLeft || bottom-top != oldBottom-oldTop)) {
+                        overlayBlocksCapture = true;
+                        view.post(this::placeReplyOverlay);
+                    }
+                });
+                float maximum = android.os.Build.VERSION.SDK_INT >= 31
+                        ? getSystemService(android.hardware.input.InputManager.class).getMaximumObscuringOpacityForTouch() : .8f;
+                int handleWidth = Math.round(48 * getResources().getDisplayMetrics().density);
                 WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                        WindowManager.LayoutParams.WRAP_CONTENT,
-                        WindowManager.LayoutParams.WRAP_CONTENT,
-                        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                                | WindowManager.LayoutParams.FLAG_SECURE
-                                | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                                | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-                        PixelFormat.TRANSLUCENT);
-                lp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
-                // Android12+不可信覆盖层的触摸穿透必须满足系统最大遮挡透明度。
-                lp.alpha = android.os.Build.VERSION.SDK_INT >= 31
-                        ? Math.min(.8f, getSystemService(android.hardware.input.InputManager.class).getMaximumObscuringOpacityForTouch()) : .8f;
+                        handleWidth, handleWidth, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_SECURE
+                                | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL, PixelFormat.TRANSLUCENT);
+                lp.gravity = Gravity.TOP | Gravity.START;
+                lp.alpha = OverlayWindowGeometry.handleAlpha(maximum);
                 lp.y = (int) (64 * getResources().getDisplayMetrics().density);
-                lp.width = Math.max(200, screenSize[0]
-                        - (int) (32 * getResources().getDisplayMetrics().density));
+                lp.x = (int) (16 * getResources().getDisplayMetrics().density);
+                WindowManager.LayoutParams body = new WindowManager.LayoutParams(
+                        Math.max(1, Math.min(screenSize[0], Math.max(200, (int) (screenSize[0] * .72f))) - handleWidth),
+                        WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_SECURE
+                                | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                        PixelFormat.TRANSLUCENT);
+                body.gravity = Gravity.TOP | Gravity.START;
+                body.alpha = OverlayWindowGeometry.bodyAlpha(maximum);
+                body.x = lp.x + handleWidth; body.y = lp.y;
+                replyOverlayView.setOnTouchListener(new View.OnTouchListener() {
+                    float downX, downY; int startX, startY;
+                    @Override public boolean onTouch(View view, MotionEvent event) {
+                        if (replyOverlayView == null || replyBodyView == null) return false;
+                        switch (event.getActionMasked()) {
+                            case MotionEvent.ACTION_DOWN:
+                                draggingOverlay = true; overlayBlocksCapture = true;
+                                downX = event.getRawX(); downY = event.getRawY();
+                                startX = lp.x; startY = lp.y; return true;
+                            case MotionEvent.ACTION_MOVE:
+                                int bodyWidth = replyBodyView.getVisibility() == View.VISIBLE ? body.width : 0;
+                                int height = Math.max(handleWidth, replyBodyView.getVisibility() == View.VISIBLE ? replyBodyView.getHeight() : 0);
+                                int[] bounded = OverlayWindowGeometry.clamp(startX + Math.round(event.getRawX() - downX),
+                                        startY + Math.round(event.getRawY() - downY), screenSize[0], screenSize[1],
+                                        handleWidth, bodyWidth, height);
+                                lp.x = bounded[0]; lp.y = bounded[1];
+                                wm.updateViewLayout(replyOverlayView, lp); syncReplyBodyPosition(); return true;
+                            case MotionEvent.ACTION_UP:
+                                view.performClick();
+                            case MotionEvent.ACTION_CANCEL:
+                                draggingOverlay = false; placeReplyOverlay(); return true;
+                            default: return false;
+                        }
+                    }
+                });
                 wm.addView(replyOverlayView, lp);
+                wm.addView(replyBodyView, body);
+                logEvent("overlay_attached", "shown=" + replyOverlayView.isShown());
             }
-            long now = System.currentTimeMillis();
+            long now = SystemClock.elapsedRealtime();
             String text = overlayState.textAt(now);
-            replyTextView.setText(text);
+            boolean expanded = !text.isEmpty();
+            if (overlayConflictNotified && expanded) text = OVERLAY_CONFLICT + "\n" + text;
+            replyTextView.setVisibility(expanded ? View.VISIBLE : View.GONE);
+            if (!text.contentEquals(replyTextView.getText())) replyTextView.setText(text);
             replyOverlayView.setVisibility(View.VISIBLE);
-            logEvent("overlay_visible", "kind=" + (OverlayMessageState.WAITING_TEXT.equals(text) ? "waiting" : "message")
-                    + " attached=" + replyOverlayView.isAttachedToWindow());
-            if (overlayState.isMessageActive(now)) {
-                main.postDelayed(replyHide, Math.max(1, overlayState.expiresAtMs() - now));
+            if (!draggingOverlay) {
+                overlayBlocksCapture = true;
+                replyBodyView.post(this::placeReplyOverlay);
+            }
+            String id = overlayState.currentId();
+            if (!id.equals(displayedPromptId)) {
+                logEvent("prompt_display", "id=" + safeId(id) + " previous=" + safeId(displayedPromptId)
+                        + " at=" + System.currentTimeMillis() + " elapsed=" + now
+                        + " source_expires_elapsed=" + overlayState.sourceExpiryMs()
+                        + " visible_until_elapsed=" + overlayState.expiresAtMs() + " protected_until_elapsed=" + overlayState.protectedUntilMs()
+                        + " short_window=" + (expanded && overlayState.expiresAtMs() - now < OverlayMessageState.MIN_READ_MS)
+                        + " epoch=" + epoch + " attached=" + replyOverlayView.isAttachedToWindow());
+                displayedPromptId = id;
+            }
+            long nextChange = overlayState.nextChangeAtMs(now);
+            if (nextChange > 0) {
+                main.postDelayed(replyHide, Math.max(1, nextChange - now));
             }
         } catch (Exception e) {
             logEvent("overlay_attach_failed", "error=" + e.getClass().getSimpleName());
             android.util.Log.w("CaptureService", "overlay attach failed: " + e.getClass().getSimpleName());
             removeReplyOverlay();
-            setState("辅助正在运行，但悬浮提示未显示（" + e.getClass().getSimpleName()
-                    + "）。请回到应用检查悬浮窗权限后重新开始。");
+            setState("辅助正在运行，但悬浮提示未显示。请回到应用检查悬浮窗权限后重新开始。");
             notifManager.notify(NOTIF_ID, buildNotification("悬浮提示未显示，点此检查"));
+        }
+    }
+
+    private void placeReplyOverlay() {
+        View view = replyOverlayView;
+        if (view == null || replyBodyView == null || draggingOverlay || !view.isAttachedToWindow()
+                || !replyBodyView.isAttachedToWindow()) return;
+        int[] loc = new int[2]; view.getLocationOnScreen(loc);
+        boolean bodyVisible = replyBodyView.getVisibility() == View.VISIBLE;
+        if (bodyVisible && replyBodyView.getHeight() == 0) { overlayBlocksCapture = true; return; }
+        int bodyWidth = bodyVisible ? ((WindowManager.LayoutParams) replyBodyView.getLayoutParams()).width : 0;
+        int combinedWidth = view.getWidth() + bodyWidth;
+        int combinedHeight = Math.max(view.getHeight(), replyBodyView.getVisibility() == View.VISIBLE ? replyBodyView.getHeight() : 0);
+        java.util.List<int[]> areas = new java.util.ArrayList<>();
+        for (String key : Regions.ACTIVE_KEYS) {
+            float[] region = Prefs.getRegion(this, key);
+            if (Regions.valid(region)) areas.add(Regions.crop(region, screenSize[0], screenSize[1]));
+        }
+        int[] target = Regions.placeOverlay(screenSize[0], screenSize[1], combinedWidth, combinedHeight,
+                loc[0], loc[1], areas.toArray(new int[0][]));
+        if (target == null) {
+            overlayBlocksCapture = true;
+            setState("提示框遮挡识别区域，文字采样已暂停；请调整区域或提示框");
+            if (!overlayConflictNotified) {
+                overlayConflictNotified = true;
+                replyTextView.setText(OVERLAY_CONFLICT + "\n" + overlayState.textAt(SystemClock.elapsedRealtime()));
+                android.widget.Toast.makeText(this, "提示框放不下，请调整识别区域", android.widget.Toast.LENGTH_LONG).show();
+            }
+            return;
+        }
+        WindowManager.LayoutParams lp = (WindowManager.LayoutParams) view.getLayoutParams();
+        if (target[0] != loc[0] || target[1] != loc[1]) {
+            lp.x += target[0] - loc[0]; lp.y += target[1] - loc[1];
+            wm.updateViewLayout(view, lp);
+            syncReplyBodyPosition();
+            view.post(this::verifyReplyPlacement);
+        } else { syncReplyBodyPosition(); verifyReplyPlacement(); }
+    }
+
+    private void syncReplyBodyPosition() {
+        if (replyOverlayView == null || replyBodyView == null || !replyOverlayView.isAttachedToWindow()
+                || !replyBodyView.isAttachedToWindow()) return;
+        WindowManager.LayoutParams handle = (WindowManager.LayoutParams) replyOverlayView.getLayoutParams();
+        WindowManager.LayoutParams body = (WindowManager.LayoutParams) replyBodyView.getLayoutParams();
+        int x = handle.x + handle.width;
+        if (body.x != x || body.y != handle.y) {
+            body.x = x; body.y = handle.y; wm.updateViewLayout(replyBodyView, body);
+        }
+    }
+
+    private void verifyReplyPlacement() {
+        View view = replyOverlayView;
+        if (view == null || replyBodyView == null || draggingOverlay || !view.isAttachedToWindow()
+                || !replyBodyView.isAttachedToWindow()) return;
+        int[] loc = new int[2]; view.getLocationOnScreen(loc);
+        boolean bodyVisible = replyBodyView.getVisibility() == View.VISIBLE;
+        if (bodyVisible && replyBodyView.getHeight() == 0) { overlayBlocksCapture = true; return; }
+        int bodyWidth = bodyVisible ? ((WindowManager.LayoutParams) replyBodyView.getLayoutParams()).width : 0;
+        int combinedWidth = view.getWidth() + bodyWidth;
+        int combinedHeight = Math.max(view.getHeight(), replyBodyView.getVisibility() == View.VISIBLE ? replyBodyView.getHeight() : 0);
+        boolean blocked = false;
+        for (String key : Regions.ACTIVE_KEYS) {
+            float[] r = Prefs.getRegion(this, key);
+            if (Regions.valid(r) && Regions.overlaps(loc[0], loc[1], combinedWidth, combinedHeight,
+                    Regions.crop(r, screenSize[0], screenSize[1]))) blocked = true;
+        }
+        overlayBlocksCapture = blocked;
+        if (blocked) {
+            setState("提示框遮挡识别区域，文字采样已暂停；请调整区域或提示框");
+            if (!overlayConflictNotified) {
+                overlayConflictNotified=true;
+                replyTextView.setText(OVERLAY_CONFLICT + "\n" + overlayState.textAt(SystemClock.elapsedRealtime()));
+            }
+        } else if (overlayConflictNotified) {
+            overlayConflictNotified=false;
+            replyTextView.setText(overlayState.textAt(SystemClock.elapsedRealtime()));
         }
     }
 
@@ -681,6 +1014,11 @@ public class CaptureService extends Service {
     }
 
     private void removeReplyOverlay() {
+        if (replyBodyView != null) {
+            try { wm.removeView(replyBodyView); } catch (Exception ignored) { }
+            replyBodyView = null;
+            replyTextView = null;
+        }
         if (replyOverlayView != null) {
             try {
                 wm.removeView(replyOverlayView);
@@ -689,9 +1027,16 @@ public class CaptureService extends Service {
             replyOverlayView = null;
             replyTextView = null;
         }
+        overlayBlocksCapture = false;
+        overlayConflictNotified = false;
+        displayedPromptId = "";
+        drawnPromptId = "";
     }
 
     private void setState(String message) {
+        if (operationMode && (phase == Phase.RUNNING || phase == Phase.PAUSED)
+                && !connectionStatus.isEmpty() && !message.equals(connectionStatus))
+            message = connectionStatus + "\n" + message;
         lastMessage = message + (audioMessage.isEmpty() ? "" : "\n" + audioMessage);
         Intent i = new Intent(Prefs.ACTION_STATE);
         i.setPackage(getPackageName());
@@ -722,6 +1067,7 @@ public class CaptureService extends Service {
         logEvent("teardown_requested", "reason=" + reason + " phase=" + phase + " already_torn_down=" + tornDown);
         if (tornDown) {
             if (phase == Phase.STOPPING) return;
+            phase = Phase.IDLE;
             setState(message);
             stopForegroundAndSelf();
             return;
@@ -741,9 +1087,12 @@ public class CaptureService extends Service {
     }
 
     private void teardownInternal() {
+        if (liveConnection != null) liveConnection.close(false);
         tornDown = true;
+        observationClock = null;
         phase = Phase.IDLE;
         sessionEpoch++;
+        messageGeneration++;
         overlayState.stop();
         if (audioCapture != null) { audioCapture.stop(); audioCapture = null; }
         if (captureHandler != null) captureHandler.removeCallbacksAndMessages(null);

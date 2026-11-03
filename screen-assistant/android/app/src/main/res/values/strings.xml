@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">屏识AI助手</string>
+    <string name="drag_reply_description">拖动提示框</string>
+    <string name="drag_reply_handle">⠿</string>
     <string name="status_idle">状态：未运行</string>
     <string name="label_server">服务地址（远端 /v1/answer）</string>
     <string name="hint_url">例：http://192.168.1.10:8000</string>

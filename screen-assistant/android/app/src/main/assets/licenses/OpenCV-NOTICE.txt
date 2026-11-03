@@ -1,0 +1,8 @@
+OpenCV Android dependency
+
+This application bundles com.quickbirdstudios:opencv:4.5.3.0 from QuickBird
+Studios. Its Maven Central POM declares the Apache-2.0 license. The Apache
+License 2.0 text is included in PaddleOCR-LICENSE.txt.
+
+Artifact: https://central.sonatype.com/artifact/com.quickbirdstudios/opencv/4.5.3.0
+Source project: https://github.com/QuickBirdEng/opencv-android

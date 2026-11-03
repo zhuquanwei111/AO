@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TextView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/drag_handle"
+    android:layout_width="48dp"
+    android:layout_height="48dp"
+    android:background="@drawable/bg_reply"
+    android:gravity="center"
+    android:contentDescription="@string/drag_reply_description"
+    android:text="@string/drag_reply_handle"
+    android:textColor="#FFFFFFFF"
+    android:textSize="24sp" />

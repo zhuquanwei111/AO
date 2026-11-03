@@ -10,6 +10,7 @@ import android.widget.TextView;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Consumer;
+import java.util.function.BooleanSupplier;
 
 /** 折叠设置中的场次参数和内部场次操作；首页只通过开始/结束辅助调用。 */
 final class LivePanel {
@@ -18,14 +19,19 @@ final class LivePanel {
     private final EditText description;
     private final EditText account;
     private final Button endIdleSession;
+    private final Button releaseUnknownCreate;
     private final Runnable stateChanged;
+    private final BooleanSupplier idle;
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private boolean working;
+    private boolean closed;
+    private final Runnable retryStop = this::resumePendingStop;
     private String lastError = "";
 
-    LivePanel(Activity activity, LinearLayout parent, Runnable stateChanged) {
+    LivePanel(Activity activity, LinearLayout parent, Runnable stateChanged, BooleanSupplier idle) {
         this.activity = activity;
         this.stateChanged = stateChanged;
+        this.idle = idle;
         state = new TextView(activity);
         parent.addView(state);
         account = new EditText(activity);
@@ -35,69 +41,51 @@ final class LivePanel {
         parent.addView(account);
         description = new EditText(activity);
         description.setHint("本场说明（选填，最多500字）");
+        description.setText(Prefs.getLiveDescription(activity));
         description.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(500)});
         parent.addView(description);
         endIdleSession = new Button(activity);
         endIdleSession.setText("结束当前辅助场次并查看复盘");
         parent.addView(endIdleSession);
         endIdleSession.setOnClickListener(v -> stopOperationSession(() -> openRecap(), this::showError));
+        releaseUnknownCreate = new Button(activity);
+        releaseUnknownCreate.setText("解除本机开场限制");
+        parent.addView(releaseUnknownCreate);
+        releaseUnknownCreate.setOnClickListener(v -> new android.app.AlertDialog.Builder(activity)
+                .setMessage("上次开场可能已在服务器创建。此操作只解除本机开场限制，不证明服务器没有创建，也不会结束可能遗留的旧场。确认后请自行正常点击开始。")
+                .setPositiveButton("确认解除", (dialog, which) -> releaseCreateRestriction())
+                .setNegativeButton("取消", null).show());
         refresh();
     }
 
-    void beginOrResume(Runnable capture, Consumer<String> onError) {
-        if (working) return;
-        String base = Prefs.getServerUrl(activity);
-        if (!LiveClient.validBaseUrl(base)) {
-            onError.accept("连接设置中的服务地址无效。请检查地址后重试。");
-            return;
+    private void releaseCreateRestriction() {
+        try {
+            boolean released = LiveConnection.releaseUnknownCreate(Prefs.liveStore(activity), true,
+                    () -> !working && idle.getAsBoolean());
+            lastError = released ? "本机开场限制已解除；服务器旧场状态仍未确认。可正常点击开始。"
+                    : "状态已变化或仍在收尾，本机开场限制未解除。请核对原场次后再试。";
+        } catch (java.io.IOException error) {
+            lastError = "本机状态保存失败，开场限制仍未解除。请检查存储后重试。";
         }
+        refresh(); stateChanged.run();
+    }
+
+    void saveInputs() {
         Prefs.setDouyinAccount(activity, account.getText().toString().trim());
-        String descriptionSnapshot = description.getText().toString().trim();
-        LiveClient.Session existing = Prefs.getSession(activity);
-        boolean needsCreate = existing == null || existing.stopped;
-        LiveClient.Session selected = existing;
-        working = true;
-        lastError = "";
-        refreshOnUi();
-        stateChanged.run();
-        io.execute(() -> {
-            try {
-                LiveClient.Session session = selected;
-                if (needsCreate) {
-                    session = LiveClient.create(base, descriptionSnapshot, Prefs.getDouyinAccount(activity));
-                    if (!Prefs.saveSession(activity, session)) {
-                        LiveClient.stop(session);
-                        throw new java.io.IOException("场次凭证保存失败；已请求结束新场次");
-                    }
-                }
-                LiveClient.start(session);
-                activity.runOnUiThread(() -> {
-                    working = false;
-                    refresh();
-                    stateChanged.run();
-                    capture.run();
-                });
-            } catch (Exception e) {
-                String message = (needsCreate ? "场次创建或启动未确认：" : "辅助场次启动未确认：")
-                        + e.getMessage() + "。请检查连接设置后重试；不要重复创建场次。";
-                activity.runOnUiThread(() -> {
-                    working = false;
-                    lastError = message;
-                    refresh();
-                    stateChanged.run();
-                    onError.accept(message);
-                });
-            }
-        });
+        Prefs.setLiveDescription(activity, description.getText().toString().trim());
     }
 
     void stopOperationSession(Runnable onComplete, Consumer<String> onError) {
+        if (CaptureService.phase != CaptureService.Phase.IDLE || CaptureService.stopInProgress) return;
         LiveClient.Session session = Prefs.getSession(activity);
         if (session == null || session.stopped) {
             activity.runOnUiThread(onComplete);
             return;
         }
-        if (working) return;
+        if (isWorking()) return;
+        LiveConnection cleanup = new LiveConnection(Prefs.liveStore(activity),
+                LiveClient.remote(session.baseUrl, "", ""), null);
+        cleanup.close(true); // 在点击时固定旧场次，不能等异步收尾后再读取新场次。
         working = true;
         lastError = "";
         refreshOnUi();
@@ -106,9 +94,11 @@ final class LivePanel {
             try {
                 try { CaptureService.audioCompletion.get(20, java.util.concurrent.TimeUnit.SECONDS); }
                 catch (Exception audioError) { /* stop still closes the already sent audio stream */ }
-                LiveClient.stop(session);
-                if (!Prefs.saveSession(activity, session.asStopped()))
-                    throw new java.io.IOException("服务端已结束，但本地状态保存失败；请重新打开后核对场次状态");
+                LiveConnection.retryPendingStop(Prefs.liveStore(activity),
+                        LiveClient.remote(session.baseUrl, "", ""),
+                        () -> CaptureService.phase == CaptureService.Phase.IDLE && !CaptureService.stopInProgress,
+                        session);
+                if (Prefs.stopPending(activity)) throw new java.io.IOException("原场次仍在收尾");
                 activity.runOnUiThread(() -> {
                     working = false;
                     refresh();
@@ -116,14 +106,15 @@ final class LivePanel {
                     onComplete.run();
                 });
             } catch (Exception e) {
-                String message = "本机采集已停止，但场次结束未确认：" + e.getMessage()
-                        + "。请在设置中重试结束场次；复盘保留服务端实际状态。";
+                android.util.Log.w("LivePanel", "场次结束未确认", e);
+                String message = "屏幕辅助已停止，但本场结束尚未确认。应用打开时会自动重试，请检查连接。";
                 activity.runOnUiThread(() -> {
                     working = false;
                     lastError = message;
                     refresh();
                     stateChanged.run();
                     onError.accept(message);
+                    state.postDelayed(retryStop, 5000);
                 });
             }
         });
@@ -134,17 +125,46 @@ final class LivePanel {
         return session != null && !session.stopped;
     }
 
-    boolean isWorking() { return working; }
+    /** 页面可见时补偿进程退出前已落盘的结束动作。 */
+    void resumePendingStop() {
+        state.removeCallbacks(retryStop);
+        if (closed || !CaptureService.uiVisible || !Prefs.stopPending(activity)) return;
+        if (isWorking() || !idle.getAsBoolean() || CaptureService.stopInProgress) {
+            state.postDelayed(retryStop, 5000); return;
+        }
+        working = true;
+        refresh(); stateChanged.run();
+        io.execute(() -> {
+            try {
+                LiveConnection.retryPendingStop(Prefs.liveStore(activity), LiveClient.remote("", "", ""),
+                        () -> CaptureService.uiVisible && idle.getAsBoolean() && !CaptureService.stopInProgress);
+            } catch (Exception error) {
+                // 不输出请求或凭证；原场次与待结束标记保留，下次可见时重试。
+            }
+            activity.runOnUiThread(() -> {
+                working = false;
+                if (closed) return;
+                refresh(); stateChanged.run();
+                if (CaptureService.uiVisible && Prefs.stopPending(activity)) state.postDelayed(retryStop, 5000);
+            });
+        });
+    }
+
+    boolean isWorking() { return working || LiveConnection.isRecoveringStop(); }
 
     String getSummary() {
-        if (working) return "正在准备辅助场次…";
-        if (!lastError.isEmpty()) return lastError;
+        if (isWorking()) return "本机采集已停止，正在确认场次结束。";
         LiveClient.Session session = Prefs.getSession(activity);
-        if (session == null) return "尚未开始";
+        String stopStatus = RecapText.stopStatus(session != null, session != null && session.stopped,
+                Prefs.stopPending(activity), CaptureService.stopInProgress);
+        if (!stopStatus.isEmpty()) return stopStatus;
+        if (Prefs.createPending(activity)) return "场次创建未确认，未重复创建。请核对原服务端记录后再继续；本地状态提示仍可使用。";
+        if (!lastError.isEmpty()) return lastError;
+        if (session == null) return Prefs.hasCachedRecap(activity) ? "最近场次已结束，可查看已保存复盘。" : "尚未开始";
         if (session.stopped) return "上一场已结束，可查看复盘或开始新辅助";
         return CaptureService.phase == CaptureService.Phase.IDLE
-                ? "辅助场次已就绪，屏幕采集未运行。可继续辅助或结束本场。"
-                : "辅助场次进行中";
+                ? "当前场次的连接尚未确认。可继续辅助或重试结束本场。"
+                : "本场连接与辅助状态见首页。";
     }
 
     private void showError(String message) {
@@ -162,7 +182,11 @@ final class LivePanel {
         boolean active = hasActiveSession();
         endIdleSession.setVisibility(active && CaptureService.phase == CaptureService.Phase.IDLE
                 ? android.view.View.VISIBLE : android.view.View.GONE);
-        endIdleSession.setEnabled(!working);
+        endIdleSession.setEnabled(!isWorking() && !CaptureService.stopInProgress);
+        releaseUnknownCreate.setVisibility(Prefs.createPending(activity)
+                ? android.view.View.VISIBLE : android.view.View.GONE);
+        releaseUnknownCreate.setEnabled(!isWorking() && LiveConnection.canReleaseUnknownCreate(
+                Prefs.liveStore(activity), idle));
     }
 
     void openRecap() {
@@ -176,5 +200,5 @@ final class LivePanel {
         stateChanged.run();
     }
 
-    void close() { io.shutdown(); }
+    void close() { closed = true; state.removeCallbacks(retryStop); io.shutdown(); }
 }
