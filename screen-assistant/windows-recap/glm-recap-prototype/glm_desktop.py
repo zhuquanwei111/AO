@@ -6,8 +6,8 @@ import json
 
 sys.path.insert(0,str(Path(__file__).resolve().parent.parent/'llm-recap-prototype'))
 from llm_desktop import LLMDesktop
-from desktop import Desktop
-from core import RecapError, unique_label
+from desktop import Desktop, portal_page_evidence
+from core import RecapError, unique_label, compact
 from vision import fill_missing
 from transport import check_reply
 
@@ -85,9 +85,9 @@ class GLMDesktop(LLMDesktop):
         time.sleep(1)  # 一次正常页面加载等待，不采样直播指标。
         return self.confirm_portal(window)
 
-    def observe(self,window,use_uia=False):
+    def observe(self,window,use_uia=False,*,ocr_optional=False):
         for attempt in range(5):
-            try: return super().observe(window,use_uia)
+            try: return super().observe(window,use_uia,ocr_optional=ocr_optional)
             except RecapError as error:
                 if error.reason!='foreground_changed' or attempt==4: raise
                 window=self._recover_focus(window)
@@ -103,19 +103,74 @@ class GLMDesktop(LLMDesktop):
         return self.focus(window)
 
     def target(self,window,goal,toolbar=False):
+        missing_retries=0
         for attempt in range(5):
-            view,token=super().target(window,goal,toolbar)
+            view=self.observe(window,False,ocr_optional=True)
             try:
+                token=self.vision.locate(view,goal,toolbar,guard=self.guard)
                 self.guard(view.window)
                 return view,token
             except RecapError as error:
+                if error.reason=='visual_missing' and missing_retries<1:
+                    missing_retries+=1
+                    time.sleep(1)
+                    continue
                 if error.reason!='foreground_changed' or attempt==4: raise
                 window=self._recover_focus(window)
         raise RecapError('foreground_changed')
 
     def bind(self,account):
-        # 导航复用当前窗口的本地OCR/UIA步骤，不发送页面图片。
-        return Desktop.bind(self,account)
+        self.expected_account=account
+        self._verified_room_id=None
+        self.guard()
+        self.mcp.call('Snapshot',use_vision=False,use_dom=False,use_ui_tree=False,use_annotation=False)
+        windows=self.probe.windows()
+        portals=[window for window in windows if '直播服务平台' in window['title']]
+        if len(portals)>1 or (not portals and len(windows)>1): raise RecapError('edge_window_ambiguous')
+        window=self.focus(portals[0] if portals else (windows[0] if windows else self.wait_edge_started()))
+        if not portals:
+            self.key(window,'ctrl+t')
+            view=self.navigate_entry(window)
+        else:
+            view=self.wait_entry(window)
+        if not any('请输入主播' in compact(q.text) for q in view.tokens):
+            if not any(compact(q.text)=='主播列表' for q in view.tokens):
+                view,token=self.target(window,'侧边导航主播管理的展开箭头'); self.click(view,token)
+            view,token=self.target(window,'侧边导航主播列表'); self.click(view,token)
+        view,search=self.target(window,'主播列表页面搜索主播昵称或抖音号的输入框，不是侧边导航')
+        self.type_account(view,search,account)
+        view,token=self.target(window,'搜索框下方抖音号完全为 '+account+' 的唯一主播候选，不能选搜索框或其他账号')
+        self.vision.verify_identity(view,account,self.guard); self.click(view,token)
+        view,token=self.target(window,'当前搜索结果中抖音号完全为 '+account+' 的主播所在行的主播详情，加载中或不确定则missing')
+        self.vision.verify_identity(view,account,self.guard); self.click(view,token)
+        view,token=self.target(window,'当前主播详情页的进入直播间')
+        self.vision.verify_identity(view,account,self.guard)
+        before={item['handle'] for item in self.probe.windows()}; self.click(view,token)
+        deadline=time.monotonic()+20; room_windows=[]
+        while time.monotonic()<deadline:
+            self.guard()
+            room_windows=[item for item in self.probe.windows() if item['handle'] not in before and '直播服务平台' in item['title']]
+            if room_windows: break
+            time.sleep(.5)
+        if len(room_windows)!=1: raise RecapError('room_window_missing_or_ambiguous')
+        room=self.focus(room_windows[0])
+        def room_loaded(current):
+            if not any(any(label in compact(q.text) for label in ('抖音号','累计观众','新增粉丝','跟播列表')) for q in current.tokens):
+                raise RecapError('locator_missing')
+            return True
+        view,_=self.wait(room,room_loaded,timeout=60,use_uia=False)
+        self.vision.verify_identity(view,account,self.guard,live=True)
+        room_id=self.room_identity(view)
+        self._verified_room_id=room_id
+        return {'douyin_account':account,'room_id':room_id,
+                'window':{key:room[key] for key in ('handle','pid','process_created')},
+                'account_verified_on_page':True,'room_id_source':'visible_browser_address_bar_UIA_or_OCR',
+                'page_live_status':'已开播','visible_live_time':[], 'observed_at':view.captured_at,
+                'locator':'guarded target-window visual decisions','new_window_created':True}
+
+    def wait_edge_started(self):
+        self.guard(); self.mcp.call('App',mode='launch',name='Microsoft Edge')
+        return self.wait_edge_launch()
 
     def navigate_entry(self,window):
         live=self.guard(window)
@@ -123,12 +178,18 @@ class GLMDesktop(LLMDesktop):
         if len(matches)!=1 or matches[0]['handle']!=live['handle']:
             raise RecapError('edge_window_ambiguous')
         self.key(live,'ctrl+l')
-        view=self.observe(live,True)
-        if len(view.address_seeds)!=1:
-            raise RecapError(view.address_seed_error or 'address_seed_missing_or_ambiguous')
-        target=self.vision.locate(view,'地址栏',seed=view.address_seeds[0],guard=self.guard)
+        self.key(live,'esc')
+        view=self.observe(live,False,ocr_optional=True)
+        target=self.vision.locate(view,'地址栏',guard=self.guard)
         self.type_replacement(view,target,self.portal_url)
+        time.sleep(1)
         return self.wait_entry(live)
+
+    def wait_entry(self,window,timeout=20):
+        view=self.observe(window,False,ocr_optional=True)
+        if not all(portal_page_evidence(view.tokens).values()):
+            self.vision.verify_portal(view,self.guard)
+        return view
 
     def capture(self,binding):
         return Desktop.capture(self,binding)
@@ -137,7 +198,11 @@ class GLMDesktop(LLMDesktop):
         self._used_visual_metric=False
         for name in list(result.get('missing_fields', [])):
             try:
-                anchor=unique_label(view.tokens,name)
+                try:
+                    anchor=unique_label(view.tokens,name)
+                except RecapError as error:
+                    if error.reason != 'locator_missing': raise
+                    anchor=None
                 values=self.vision.read(view,(name,),'读取单项',anchor=anchor,guard=self.guard,
                                         account=self.expected_account)
                 updated=fill_missing(result,values)

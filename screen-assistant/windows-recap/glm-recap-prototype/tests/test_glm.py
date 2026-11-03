@@ -101,23 +101,25 @@ class GLMTests(unittest.TestCase):
                 return original_call(tool,**args)
             scenario.call=call; scenario.note=lambda *args,**kwargs:None
             class Vision:
-                def locate(self,view,goal,toolbar=False):
+                def locate(self,view,goal,toolbar=False,**kwargs):
                     label={'home':'主播管理','management':'主播列表','list':'请输入主播昵称或抖音号',
                         'candidate':'抖音号:demo','filtered':'主播详情','detail':'进入直播间'}[scenario.stage]
                     return next(q for q in view.tokens if q.text==label)
+                def verify_identity(self,view,account,guard,live=False):
+                    self_identity=any('抖音号:demo' in q.text for q in view.tokens)
+                    if account!='demo' or not self_identity: raise RecapError('wrong_identity')
+                    if live and not any('已开播' in q.text for q in view.tokens): raise RecapError('live_status_unconfirmed')
             class Driver(GLMDesktop):
-                def observe(self,window,use_uia=False):
+                def observe(self,window,use_uia=False,*,ocr_optional=False):
                     tokens=scenario.tokens()
                     if scenario.stage=='filtered': tokens.append(Token('抖音号:demo',(100,60,200,72)))
                     return View(tokens,scenario.image.read_bytes(),scenario.get(window),(600,400),'fake',[])
             driver=Driver(scenario,scenario,None,Path(folder)/'data/evidence',
                 'https://union.bytedance.com/open/portal/',vision=Vision())
-            driver.target=Mock(side_effect=AssertionError('不得调用旧视觉导航'))
             runner=Runner(Store(Path(folder)/'data'),driver)
             record=runner.start('glm-fake','demo',None,'test_simulated')
             self.assertEqual(record['status'],'waiting_for_stop',record)
-            driver.target.assert_not_called()
-            self.assertIn('OCR',record['binding_evidence']['locator'])
+            self.assertIn('visual',record['binding_evidence']['locator'])
             actions=list(scenario.inputs)
             self.assertEqual(runner.start('glm-fake','demo',None,'test_simulated'),record)
             self.assertEqual(scenario.inputs,actions)

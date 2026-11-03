@@ -30,8 +30,8 @@ class LLMDesktop(Desktop):
         self.last_generation=generation
         return self.probe.foreground(window) if window else None
 
-    def observe(self,window,use_uia=False):
-        view=super().observe(window,use_uia)
+    def observe(self,window,use_uia=False,*,ocr_optional=False):
+        view=super().observe(window,use_uia,ocr_optional=ocr_optional)
         self.guard(view.window)
         self.expected_generation=self.last_generation
         return view

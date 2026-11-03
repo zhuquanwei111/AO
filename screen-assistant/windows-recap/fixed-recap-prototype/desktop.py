@@ -212,7 +212,7 @@ class Desktop:
         self.mcp.call('App',mode='switch',name=live['title'])
         return self.probe.foreground(live)
 
-    def observe(self,window,use_uia=False):
+    def observe(self,window,use_uia=False,*,ocr_optional=False):
         live=self.guard(window)
         region=live['rect']
         if not self.probe.contained(region): raise RecapError('window_outside_screen')
@@ -230,7 +230,12 @@ class Desktop:
         except (ValueError,binascii.Error): raise RecapError('invalid_screenshot') from None
         with Image.open(io.BytesIO(image)) as img: size=img.size
         uia=uia_tokens(text,live['title']) if use_uia else []
-        tokens=self.ocr.read(image)
+        try:
+            tokens=self.ocr.read(image)
+        except Exception:
+            if not ocr_optional: raise
+            tokens=[]
+            if hasattr(self.mcp,'note'): self.mcp.note('local_ocr_unavailable')
         if hasattr(self.mcp,'note'):
             self.mcp.note('snapshot_diagnostics',window_handle=live['handle'],window_pid=live['pid'],
                           **snapshot_diagnostics(text,live['title'],use_uia,tokens))
@@ -486,6 +491,6 @@ class Desktop:
         result=self.refine_metrics(view,result)
         method='Windows-MCP screenshot + local RapidOCR 3.10.0'
         if getattr(self,'_used_visual_metric',False):
-            method+=' + local-crop GLM review'
+            method+=' + guarded GLM review'
         return {**result,'metrics_captured_at':view.captured_at,'capture_method':method,
                 'capture_evidence':{'account_verified_on_page':True,'room_id_reverified':binding['room_id']}}

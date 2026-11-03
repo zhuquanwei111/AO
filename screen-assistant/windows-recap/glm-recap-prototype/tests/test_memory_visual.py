@@ -74,9 +74,58 @@ class MemoryVisualTests(unittest.TestCase):
         driver.type_replacement.assert_not_called()
         driver.vision.runtime.run_crop.reset_mock()
         view.address_seeds = ()
-        with self.assertRaises(RecapError): driver.navigate_entry(view.window)
-        driver.vision.runtime.run_crop.assert_not_called()
-        driver.type_replacement.assert_not_called()
+        view.address_seed_error = 'address_seed_unavailable'
+        driver.vision.runtime.run_crop.return_value = {'status': 'found', 'kind': 'address_bar', 'box': [10, 10, 20, 20]}
+        self.assertEqual(driver.navigate_entry(view.window), 'confirmed')
+        driver.vision.runtime.run_crop.assert_called_once()
+        driver.type_replacement.assert_called_once()
+
+    def test_direct_window_vision_blocks_login_and_changed_window(self):
+        vision = GLMVision(Mock())
+        view = self.view([Token('验证码', (1, 1, 30, 20))])
+        with self.assertRaisesRegex(RecapError, 'needs_login_or_verification'):
+            vision.locate(view, '地址栏', guard=lambda window: window)
+        vision.runtime.run_crop.assert_not_called()
+        view = self.view([])
+        with self.assertRaisesRegex(RecapError, 'visual_crop_window_changed'):
+            vision.locate(view, '地址栏', guard=lambda window: {**window, 'rect': [1, 0, 800, 600]})
+        vision.runtime.run_crop.assert_not_called()
+        vision.runtime.run_crop.return_value = {'status': 'blocked', 'kind': None, 'box': None}
+        with self.assertRaisesRegex(RecapError, 'visual_blocked'):
+            vision.locate(view, '地址栏', guard=lambda window: window)
+
+    def test_metric_without_authorized_crop_is_rejected(self):
+        view = self.view([])
+        runtime = Mock()
+        vision = GLMVision(runtime)
+        with self.assertRaisesRegex(RecapError, 'visual_crop_anchor_invalid'):
+            vision.read(view, ('累计观众',), '读取', guard=lambda w: w, account='123456')
+        runtime.run_crop.assert_not_called()
+
+    def test_direct_navigation_target_requires_matching_kind(self):
+        view = self.view([])
+        runtime = Mock()
+        vision = GLMVision(runtime)
+        runtime.run_crop.return_value = {'status': 'found', 'kind': 'target', 'box': [30, 40, 70, 60]}
+        token = vision.locate(view, '主播管理', guard=lambda w: w)
+        self.assertEqual(token.box, (30, 40, 70, 60))
+        runtime.run_crop.return_value = {'status': 'found', 'kind': 'address_bar', 'box': [30, 40, 70, 60]}
+        with self.assertRaises(RecapError):
+            vision.locate(view, '主播管理', guard=lambda w: w)
+
+    def test_visual_identity_requires_exact_account_and_confirmed_live(self):
+        view = self.view([Token('抖音号:123456',(100,80,230,100)),Token('已开播00:01',(300,80,400,100))]); runtime = Mock(); vision = GLMVision(runtime)
+        runtime.run_crop.return_value = {'account': '123456', 'live_status': '已开播00:01'}
+        vision.verify_identity(view, '123456', lambda w: w, live=True)
+        for value in ({'account': '123457', 'live_status': '已开播00:01'},
+                      {'account': None, 'live_status': None}):
+            runtime.run_crop.return_value = value
+            with self.assertRaises(RecapError):
+                vision.verify_identity(view, '123456', lambda w: w, live=True)
+        runtime.run_crop.return_value = {'account': '123456', 'live_status': None}
+        view = self.view([Token('抖音号:123456',(100,80,230,100))])
+        with self.assertRaisesRegex(RecapError, 'live_status_unconfirmed'):
+            vision.verify_identity(view, '123456', lambda w: w, live=True)
 
     def test_product_bind_reaches_guarded_navigation_and_stops_at_fixture_boundary(self):
         from glm_desktop import GLMDesktop
