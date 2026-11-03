@@ -69,7 +69,9 @@ class EntryTests(unittest.TestCase):
         window={'handle':1}; old=Mock(window=window); fresh=Mock(window=window)
         d.guard=Mock(side_effect=[RecapError('foreground_changed'),None,None])
         d.focus=Mock(return_value=window)
-        with patch('llm_desktop.LLMDesktop.target',side_effect=[(old,'stale'),(fresh,'new')]) as target:
+        d.observe=Mock(side_effect=[old,fresh]); d.vision=Mock()
+        d.vision.locate.side_effect=['stale','new']
+        with patch.object(d.vision,'locate',side_effect=['stale','new']) as target:
             self.assertEqual(d.target(window,'goal'),(fresh,'new'))
             self.assertEqual(target.call_count,2)
         d.focus.assert_called_once_with(window)
@@ -78,7 +80,8 @@ class EntryTests(unittest.TestCase):
         d=self.driver(); del d.target
         window={'handle':1}; view=Mock(window=window)
         d.guard=Mock(side_effect=RecapError('USER_CONTROL')); d.focus=Mock()
-        with patch('llm_desktop.LLMDesktop.target',return_value=(view,'unused')):
+        d.observe=Mock(return_value=view); d.vision=Mock(); d.vision.locate.return_value='unused'
+        with patch.object(d.vision,'locate',return_value='unused'):
             with self.assertRaises(RecapError): d.target(window,'goal')
         d.focus.assert_not_called()
 

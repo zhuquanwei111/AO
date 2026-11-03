@@ -1,19 +1,31 @@
 """用官方MCP客户端连接现成Windows-MCP；不实现截图或键鼠底层。"""
 import asyncio
 import argparse
-import base64
 import json
 import os
 import sys
-import uuid
 from datetime import timedelta
 from pathlib import Path
 
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
+from image_wire import serialize_image
 
 ROOT = Path(__file__).resolve().parent
 TOOLS = {'Screenshot', 'Snapshot', 'Click', 'Type', 'Scroll', 'Shortcut', 'Wait', 'App', 'ControlStatus'}
+
+
+def server_parameters(windows_mcp_python):
+    # 仅限本专用服务进程；仍须拒绝返回的截断树。
+    return StdioServerParameters(
+        command=str(Path(windows_mcp_python).resolve()),
+        args=['-m', 'windows_mcp', 'serve', '--config', str(ROOT / 'config.toml'),
+              '--tools', ','.join(sorted(TOOLS))],
+        cwd=ROOT,
+        env={'ANONYMIZED_TELEMETRY': 'false', 'POSTHOG_API_KEY': '',
+             'WINDOWS_MCP_SCREENSHOT_BACKEND': 'pillow', 'PYTHONUTF8': '1',
+             'PYTHON_DOTENV_DISABLED': 'true', 'WINDOWS_MCP_MAX_TREE_ELEMENTS': '2000'},
+    )
 
 
 async def main():
@@ -21,25 +33,9 @@ async def main():
     parser.add_argument('--requests', type=Path, help='从UTF-8 JSONL文件读取请求，避免PTY输入干扰')
     args = parser.parse_args()
     windows_mcp_python=os.environ.get('BACKSTAGE_WINDOWS_MCP_PYTHON')
-    observations=os.environ.get('BACKSTAGE_MCP_OBSERVATIONS_DIR')
     if not windows_mcp_python or not Path(windows_mcp_python).is_file():
         raise RuntimeError('windows_mcp_runtime_missing')
-    if not observations:
-        raise RuntimeError('mcp_observations_dir_missing')
-    observations_dir=Path(observations).resolve()
-    try: observations_dir.relative_to(ROOT.resolve())
-    except ValueError: pass
-    else: raise RuntimeError('mcp_observations_inside_install')
-    observations_dir.mkdir(parents=True,exist_ok=True)
-    params = StdioServerParameters(
-        command=str(Path(windows_mcp_python).resolve()),
-        args=['-m', 'windows_mcp', 'serve', '--config', str(ROOT / 'config.toml'),
-              '--tools', ','.join(sorted(TOOLS))],
-        cwd=ROOT,
-        env={'ANONYMIZED_TELEMETRY': 'false', 'POSTHOG_API_KEY': '',
-             'WINDOWS_MCP_SCREENSHOT_BACKEND': 'pillow', 'PYTHONUTF8': '1',
-             'PYTHON_DOTENV_DISABLED': 'true'},
-    )
+    params = server_parameters(windows_mcp_python)
     async with stdio_client(params) as (reader, writer):
         async with ClientSession(reader, writer, read_timeout_seconds=timedelta(seconds=60)) as session:
             await session.initialize()
@@ -63,10 +59,7 @@ async def main():
                         if block.type == 'text':
                             output.append({'text': block.text})
                         elif block.type == 'image':
-                            extension = 'png' if block.mimeType == 'image/png' else 'jpg'
-                            path = observations_dir / f'{uuid.uuid4().hex}.{extension}'
-                            path.write_bytes(base64.b64decode(block.data))
-                            output.append({'image_path': str(path), 'mime_type': block.mimeType})
+                            output.append(serialize_image(block))
                     emit({'is_error': bool(result.isError), 'content': output})
                     if result.isError and args.requests:
                         break

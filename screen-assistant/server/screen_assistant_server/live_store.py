@@ -173,6 +173,10 @@ class LiveStore:
             )
         if "stop_signal_source" not in task_columns:
             self.db.execute("ALTER TABLE live_backstage_tasks ADD COLUMN stop_signal_source TEXT")
+        if "recovered_at_ms" not in task_columns:
+            self.db.execute("ALTER TABLE live_backstage_tasks ADD COLUMN recovered_at_ms INTEGER")
+        if "recovery_reason" not in task_columns:
+            self.db.execute("ALTER TABLE live_backstage_tasks ADD COLUMN recovery_reason TEXT")
         with self.db:
             self.db.execute(
                 "UPDATE live_backstage_tasks SET stop_signal_source=start_signal_source "
@@ -720,25 +724,61 @@ class LiveStore:
             """, (sid,))
 
     def claim_backstage_task(self):
-        task = self.db.execute("""
-            SELECT t.*,s.stopped_at_ms AS session_stopped_at_ms
-            FROM live_backstage_tasks t JOIN live_sessions s USING(session_id)
-            WHERE t.result_hash IS NULL AND t.status IN ('waiting_for_stop','capturing')
-            ORDER BY t.created_at_ms LIMIT 1
-        """).fetchone()
-        if task is None:
-            return {"status": "idle", "task": None}
-        now = self.clock()
-        status = "capturing" if task["session_stopped_at_ms"] is not None else "waiting_for_stop"
+        self.db.execute("BEGIN IMMEDIATE")
         with self.db:
+            task = self.db.execute("""
+                SELECT t.*,s.stopped_at_ms AS session_stopped_at_ms
+                FROM live_backstage_tasks t JOIN live_sessions s USING(session_id)
+                WHERE t.result_hash IS NULL AND t.status IN ('waiting_for_stop','capturing')
+                ORDER BY t.created_at_ms LIMIT 1
+            """).fetchone()
+            if task is None:
+                return {"status": "idle", "task": None}
+            now = self.clock()
+            status = "capturing" if task["session_stopped_at_ms"] is not None else "waiting_for_stop"
             updated = self.db.execute(
                 "UPDATE live_backstage_tasks SET claimed_at_ms=COALESCE(claimed_at_ms,?),status=? "
-                "WHERE task_id=? AND result_hash IS NULL",
+                "WHERE task_id=? AND result_hash IS NULL AND status IN ('waiting_for_stop','capturing')",
                 (now, status, task["task_id"]),
             ).rowcount
         if not updated:
             return {"status": "idle", "task": None}
         return {"status": "claimed", "task": self.backstage_task(task["task_id"])["task"]}
+
+    def recover_backstage_task(self, task_id: str, expected_created_at_ms: int):
+        now = self.clock()
+        self.db.execute("BEGIN IMMEDIATE")
+        with self.db:
+            row = self.db.execute(
+                "SELECT created_at_ms,status,recovered_at_ms,recovery_reason,claimed_at_ms,received_at_ms,"
+                "result_hash,result_json FROM live_backstage_tasks WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise HTTPException(404, "backstage task not found")
+            if row["created_at_ms"] != expected_created_at_ms:
+                raise HTTPException(409, "backstage task changed")
+            if row["recovered_at_ms"] is not None and row["recovery_reason"] == "stale_unclaimed":
+                if (row["status"] != "not_connected" or row["claimed_at_ms"] is not None
+                        or row["received_at_ms"] is not None or row["result_hash"] is not None
+                        or row["result_json"] is not None):
+                    raise HTTPException(409, "recovered backstage task changed")
+                return {"status": "duplicate", "task_id": task_id, "recovered_at_ms": row["recovered_at_ms"]}
+            updated = self.db.execute("""
+                UPDATE live_backstage_tasks
+                SET status='not_connected', recovered_at_ms=?, recovery_reason='stale_unclaimed'
+                WHERE task_id=? AND created_at_ms=? AND created_at_ms<=?
+                  AND status='waiting_for_stop' AND claimed_at_ms IS NULL AND stopped_at_ms IS NULL
+                  AND stop_signal_source IS NULL AND start_signal_source IN ('ios_app','android_app')
+                  AND received_at_ms IS NULL AND result_hash IS NULL AND result_json IS NULL
+                  AND recovered_at_ms IS NULL AND recovery_reason IS NULL
+                  AND EXISTS (SELECT 1 FROM live_sessions s
+                              WHERE s.session_id=live_backstage_tasks.session_id AND s.stopped_at_ms IS NULL
+                                AND (s.app_source IS NULL OR s.app_source=live_backstage_tasks.start_signal_source))
+            """, (now, task_id, expected_created_at_ms, now - 86_400_000)).rowcount
+            if updated != 1:
+                raise HTTPException(409, "backstage task is not eligible for recovery")
+            return {"status": "recovered", "task_id": task_id, "recovered_at_ms": now}
 
     def backstage_task(self, task_id: str):
         task = self.db.execute("""

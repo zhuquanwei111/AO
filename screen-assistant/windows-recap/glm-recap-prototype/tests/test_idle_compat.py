@@ -2,6 +2,7 @@ from pathlib import Path
 import sys
 import unittest
 import tempfile
+import base64
 from unittest.mock import Mock
 from PIL import Image
 
@@ -52,7 +53,7 @@ class IdleTests(unittest.TestCase):
             def call(tool,**kwargs):
                 if tool=='Screenshot':
                     wire.status.update(state='ai',generation=8)
-                    return {'content':[{'image_path':str(image)}]}
+                    return {'content':[{'image_data':base64.b64encode(image.read_bytes()).decode('ascii')}]}
                 return old_call(tool,**kwargs)
             wire.call=call
             ocr=Mock()

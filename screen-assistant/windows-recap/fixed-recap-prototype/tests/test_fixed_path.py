@@ -12,13 +12,16 @@ class Scenario:
     def __init__(self,folder):
         self.folder=Path(folder); self.stage='home'; self.inputs=[]
         self.window={'handle':1,'pid':20,'process_created':100,'title':'直播服务平台',
-                     'rect':[250,150,1450,950],'minimized':False}
-        self.room={**self.window,'handle':2,'rect':[470,210,1670,1010]}
+                     'rect':[250,150,1450,950],'minimized':False,'visible':True,'enabled':True,
+                     'window_class':'Chrome_WidgetWin_1','owner':0,'root_owner':1}
+        self.room={**self.window,'handle':2,'root_owner':2,'rect':[470,210,1670,1010]}
         self.image=self.folder/'fake.png'; Image.new('RGB',(600,400),'white').save(self.image)
 
     def windows(self): return [self.window,self.room] if self.stage=='room' else [self.window]
     def get(self,signature): return self.room if signature['handle']==2 else self.window
     def foreground(self,signature): return self.get(signature)
+    def ensure_point(self,window,point): return None
+    def ensure_unobstructed(self,window): return None
 
     def call(self,tool,**args):
         if tool=='ControlStatus': return {'content':[{'text':'{"state":"ai"}'}]}
@@ -38,7 +41,7 @@ class Scenario:
         if self.stage=='management': return [q('主播管理',10,60),q('主播列表',10,85)]
         if self.stage=='list': return [q('请输入主播昵称或抖音号',350,30,160)]
         if self.stage=='candidate': return [q('抖音号:demo',350,65,110)]
-        if self.stage=='filtered': return [q('主播详情',450,120)]
+        if self.stage=='filtered': return [q('抖音号:demo',100,60,100),q('主播详情',450,120)]
         if self.stage=='detail': return [q('抖音号:demo',100,60,100),q('进入直播间',450,100)]
         return [q('抖音号:demo',100,60,100),q('跟播列表',10,35),q('已开播00:40:16',230,60,100),
                 q('https://union.bytedance.com/open/portal/live_flow/followRoomDetail?roomID=1234567890123456789',0,8,595),
@@ -53,7 +56,7 @@ class FixedPathTests(unittest.TestCase):
             scenario=Scenario(folder)
             class Driver(Desktop):
                 def observe(self,window,use_uia=False):
-                    return View(scenario.tokens(),scenario.image,scenario.get(window),(600,400),'fake-time',[])
+                    return View(scenario.tokens(),scenario.image.read_bytes(),scenario.get(window),(600,400),'fake-time',[])
             driver=Driver(scenario,scenario,None,Path(folder)/'state/evidence','https://union.bytedance.com/open/portal/')
             runner=Runner(Store(Path(folder)/'state'),driver)
             result=runner.start('test-one','demo',None,'test_simulated')
@@ -66,7 +69,8 @@ class FixedPathTests(unittest.TestCase):
             result=runner.stop('test-one','test_simulated')
             self.assertEqual(result['status'],'captured_locally')
             self.assertEqual(result['metrics'],{'累计观众':100,'新增粉丝':1,'评论人数':9,'送礼人数':2,'获得音浪':300})
-            self.assertTrue((runner.store.root/result['capture_evidence']['metrics_screenshot']).is_file())
+            self.assertEqual(result['capture_evidence']['room_id_reverified'],'1234567890123456789')
+            self.assertFalse(any(path.suffix.lower() in ('.png','.jpg','.jpeg') for path in runner.store.root.rglob('*')))
             self.assertEqual(runner.stop('test-one','test_simulated'),result)
             self.assertEqual(scenario.inputs,inputs)
             self.assertEqual(result['normal_path_llm_calls'],0)

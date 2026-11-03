@@ -156,6 +156,31 @@ def test_real_observation_model_prompt_poll_record_stop_and_isolation(tmp_path):
         assert client.post("/v1/answer", json={"sentence": " "}).status_code == 422
 
 
+def test_backstage_business_outcome_roundtrip_and_idempotency(tmp_path):
+    clock = Clock()
+    config = settings(tmp_path / "live.sqlite3")
+    config = config.__class__(**{**config.__dict__, "backstage_worker_token": "fixture-worker-token"})
+    with TestClient(create_app(config, live_clock=clock)) as client:
+        session, headers = create(client, douyin_account="fixture-account")
+        url = f"/v1/live/sessions/{session['session_id']}"
+        task_id = client.post(url + "/start", headers=headers).json()["task_id"]
+        worker = {"X-Backstage-Worker-Token": "fixture-worker-token"}
+        assert client.post("/v1/live/sessions/backstage/tasks/claim", headers=worker).status_code == 200
+        assert client.post(url + "/stop", headers=headers).status_code == 200
+        result = {"task_id": task_id, "douyin_account": "fixture-account", "status": "failed",
+                  "room_id": None,
+                  "metrics": {key: None for key in ("累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪")},
+                  "stop_signal_received": True, "start_signal_source": "ios_app", "stop_signal_source": "ios_app",
+                  "capture_method": "fixture", "value_semantics": "fixture",
+                  "missing_fields": {key: "not_live" for key in
+                      ("累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪")}}
+        assert client.post(url + "/backstage/result", headers=worker, json=result).status_code == 200
+        assert client.post(url + "/backstage/result", headers=worker, json=result).json()["status"] == "duplicate"
+        recap = client.get(url + "/summary", headers=headers).json()["backstage_recap"]
+        assert set(recap["missing_fields"].values()) == {"not_live"}
+        assert all(value is None for value in recap["metrics"].values())
+
+
 def test_backstage_task_late_result_identity_idempotency_and_summary(tmp_path):
     clock = Clock()
     config = settings(tmp_path / "live.sqlite3")

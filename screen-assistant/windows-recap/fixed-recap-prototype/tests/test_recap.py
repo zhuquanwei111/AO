@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from core import Token, metrics_from_tokens, parse_count, require_account, RecapError
+from core import Token, metrics_from_tokens, summary_metrics, parse_count, require_account, RecapError
 from flow import Store, Runner, atomic_json
 from transport import check_reply
 from desktop import Desktop, View, uia_tokens, room_from_tokens
@@ -13,6 +13,23 @@ def t(text, x, y, w=65, h=16, score=.99):
 
 
 class ParsingTests(unittest.TestCase):
+    def test_summary_row_excludes_same_label_from_comment_region(self):
+        tokens = [t('累计观众',0,100),t('100',15,70,25),
+                  t('新增粉丝',90,100),t('2',110,70,10),
+                  t('送礼人数',180,100),t('3',200,70,10),
+                  t('获得音浪',270,100),t('4',290,70,10),
+                  t('评论人数',0,300),t('999',15,270,25)]
+        result=summary_metrics(tokens)
+        self.assertIsNone(result['metrics']['评论人数'])
+        self.assertEqual(result['metrics']['累计观众'],100)
+        self.assertEqual(result['metrics']['获得音浪'],4)
+
+    def test_summary_requires_unambiguous_row(self):
+        for tokens in ([t('累计观众',0,100),t('1',15,70,10)],
+                       [t('累计观众',0,100),t('累计观众',90,100),
+                        t('新增粉丝',180,100),t('送礼人数',270,100)]):
+            with self.assertRaises(RecapError): summary_metrics(tokens)
+
     def test_raw_approximate_and_missing(self):
         self.assertEqual(parse_count('1,234'), (1234, False))
         self.assertEqual(parse_count('1.2万'), (12000, True))
@@ -75,6 +92,23 @@ class FakeDesktop:
 
 
 class FlowTests(unittest.TestCase):
+    def test_confirmed_business_outcome_keeps_reason_through_app_stop(self):
+        for outcome in ('not_live', 'account_not_found'):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as folder:
+                class Confirmed:
+                    def bind(self, account):
+                        raise RecapError(outcome)
+                store = Store(folder)
+                runner = Runner(store, Confirmed())
+                started = runner.start('task', 'fixture', 'session', 'android_app')
+                self.assertEqual(started['status'], 'failed')
+                self.assertEqual(started['reason'], outcome)
+                self.assertIsNone(started['metrics'])
+                stopped = runner.stop('task', 'android_app')
+                self.assertTrue(stopped['stop_signal_received'])
+                self.assertEqual(stopped['reason'], outcome)
+                self.assertIsNone(stopped['binding_evidence'])
+
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

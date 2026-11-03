@@ -1,4 +1,4 @@
-"""屏识助手单场取数组件；单一GLM路由，业务运行不使用AO或Codex。"""
+"""屏识助手单场取数组件；本地识别并受限发送必要局部图，不保存图片。"""
 import argparse
 import json
 import os
@@ -65,7 +65,6 @@ def main():
     args.data=require_external_path(args.data)
     args.models=require_external_path(args.models)
     args.scratch=require_external_path(args.scratch)
-    args.gate_a=require_external_path(args.gate_a)
     began=time.monotonic(); store=Store(args.data)
     if args.command in ('status','result'):
         record=store.get(args.task)
@@ -76,7 +75,7 @@ def main():
             validate_app_source(store.get(task),args.source)
             record=store.stop_signal(task,args.source)
             if record['status'] in ('captured_locally','partial','failed') or not record['binding_evidence']:
-                if record['status'] not in ('captured_locally','partial','failed'):
+                if not record['binding_evidence']:
                     record=Runner(store,None).finalize_stopped_unbound(task)
                 print(json.dumps({'task_ref':str(store.path(task)),'record':record},ensure_ascii=False))
                 return operation_exit_code(args.command,record)
@@ -86,17 +85,8 @@ def main():
             if not created:
                 print(json.dumps({'task_ref':str(store.path(task)),'record':record},ensure_ascii=False))
                 return operation_exit_code(args.command,record)
-            store.update(task,execution_route='tianyi_agents_sdk_fixed_steps',model=MODEL,
+            store.update(task,execution_route='local_ocr_and_guarded_visual',model=None,
                          normal_path_llm_calls=0,llm_runtime_invocations=0)
-        try:
-            require_gate_a(args.gate_a)
-            require_sdk_runtime()
-        except ValueError as error:
-            record=store.update(task,status='needs_input',reason=str(error))
-            print(json.dumps({'task_ref':str(store.path(task)),'record':record},ensure_ascii=False)); return 2
-        if not os.environ.get('TIANYI_API_KEY'):
-            record=store.update(task,status='needs_input',reason='missing_current_process_tianyi_key')
-            print(json.dumps({'task_ref':str(store.path(task)),'record':record},ensure_ascii=False)); return 2
         from glm_vision import GLMVision
         from glm_desktop import GLMDesktop
         from window_probe import Probe
@@ -108,13 +98,22 @@ def main():
         binding=record.get('binding_evidence') or {}
         runtime=GLMRuntime(args.scratch/task/args.command,{'phase':args.command,
             'douyin_account':record['douyin_account'],
-            'bound_room_id':binding.get('room_id'),'bound_at':binding.get('observed_at')})
+            'bound_room_id':binding.get('room_id'),'bound_at':binding.get('observed_at')}, gate=args.gate_a)
         mcp=MCP(os.environ.get('BACKSTAGE_MCP_CLIENT_PYTHON',''),
                 ROOT/'windows-mcp/mcp_stdio_client.py',
                 args.scratch/task/'mcp-events.jsonl',
                 args.scratch/task/'observations')
+        desktop=None
         try:
-            desktop=GLMDesktop(mcp,Probe(),LocalOCR(args.models),store.root/(task+'-evidence'),
+            # 在桌面动作前检查视觉依赖；不打印凭据或异常正文。
+            try:
+                if not os.environ.get('TIANYI_API_KEY'):
+                    raise ValueError('missing_visual_key')
+                require_gate_a(args.gate_a)
+                require_sdk_runtime()
+            except (ValueError, OSError):
+                raise RecapError('visual_runtime_unavailable') from None
+            desktop=GLMDesktop(mcp,Probe(mcp=mcp),LocalOCR(args.models),store.root/(task+'-evidence'),
                 'https://union.bytedance.com/open/portal/index',vision=GLMVision(runtime))
             runner=Runner(StartedStore(store.root),desktop)
             record=runner.start(task,args.account,args.session_id,args.source) if args.command=='start' else runner.stop(task,args.source)
@@ -125,13 +124,18 @@ def main():
             try: cleanup_confirmed=mcp.close() is True
             except Exception: mcp.note('mcp_cleanup_unconfirmed')
             old=store.get(task)
+            diagnostics=getattr(runtime,'diagnostics',None)
+            selection=getattr(desktop,'window_selection_diagnostics',None)
             record=store.update(task,llm_runtime_invocations=old.get('llm_runtime_invocations',0)+runtime.calls,
+                visual_diagnostics=diagnostics if isinstance(diagnostics,list) else None,
+                window_selection_diagnostics=selection if isinstance(selection,list) else None,
                 normal_path_llm_calls=(old['normal_path_llm_calls']+runtime.http_requests)
                     if old.get('normal_path_llm_calls') is not None and runtime.http_requests is not None else None,
-                model_call_count_semantics='actual HTTP requests counted by the SDK client hook; HTTP retry disabled')
+                model=MODEL if runtime.calls else old.get('model'),
+                model_call_count_semantics='仅计已确认的模型请求；失败时次数未知')
             if args.command=='start':
                 record=Runner(store,None).finish_unbound_execution(task,
-                    cleanup_confirmed=cleanup_confirmed and runtime.calls==0)
+                    cleanup_confirmed=cleanup_confirmed and getattr(runtime,'all_workers_finished',runtime.calls==0))
     print(json.dumps({'task_ref':str(store.path(record['local_test_id'])),
         'operation_elapsed_ms':round((time.monotonic()-began)*1000),'record':record},ensure_ascii=False,indent=2))
     return operation_exit_code(args.command,record)

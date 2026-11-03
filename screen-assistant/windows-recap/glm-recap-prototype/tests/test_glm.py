@@ -54,8 +54,8 @@ class GLMTests(unittest.TestCase):
 
     def test_missing_credential_does_not_start_process(self):
         from glm_runtime import GLMRuntime
-        with tempfile.TemporaryDirectory() as folder,patch.dict('os.environ',{},clear=True),patch('glm_runtime.subprocess.Popen') as process:
-            with self.assertRaisesRegex(RuntimeError,'missing_current_process_tianyi_key'):
+        with tempfile.TemporaryDirectory() as folder,patch.dict('os.environ',{},clear=True),patch('subprocess.Popen') as process:
+            with self.assertRaisesRegex(RuntimeError,'image_visual_disabled'):
                 GLMRuntime(folder).run(Path(folder)/'missing.png','goal')
             process.assert_not_called()
 
@@ -68,7 +68,7 @@ class GLMTests(unittest.TestCase):
             image=Path(folder)/'image.png'; Image.new('RGB',(100,100)).save(image)
             runtime=Mock(); runtime.run.return_value=({'status':'ambiguous','box':None},{})
             with self.assertRaises(RecapError): GLMVision(runtime).locate(Mock(image=image),'target')
-            self.assertEqual(runtime.run.call_count,1)
+            runtime.run.assert_not_called()
 
     def test_read_only_status_without_model_or_desktop(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -101,29 +101,58 @@ class GLMTests(unittest.TestCase):
                 return original_call(tool,**args)
             scenario.call=call; scenario.note=lambda *args,**kwargs:None
             class Vision:
-                def locate(self,view,goal,toolbar=False):
+                def locate(self,view,goal,toolbar=False,**kwargs):
                     label={'home':'主播管理','management':'主播列表','list':'请输入主播昵称或抖音号',
                         'candidate':'抖音号:demo','filtered':'主播详情','detail':'进入直播间'}[scenario.stage]
                     return next(q for q in view.tokens if q.text==label)
+                def verify_identity(self,view,account,guard,live=False):
+                    self_identity=any('抖音号:demo' in q.text for q in view.tokens)
+                    if account!='demo' or not self_identity: raise RecapError('wrong_identity')
+                    if live and not any('已开播' in q.text for q in view.tokens): raise RecapError('live_status_unconfirmed')
             class Driver(GLMDesktop):
-                def observe(self,window,use_uia=False):
+                def observe(self,window,use_uia=False,*,ocr_optional=False):
                     tokens=scenario.tokens()
                     if scenario.stage=='filtered': tokens.append(Token('抖音号:demo',(100,60,200,72)))
-                    return View(tokens,scenario.image,scenario.get(window),(600,400),'fake',[])
+                    return View(tokens,scenario.image.read_bytes(),scenario.get(window),(600,400),'fake',[])
             driver=Driver(scenario,scenario,None,Path(folder)/'data/evidence',
                 'https://union.bytedance.com/open/portal/',vision=Vision())
             runner=Runner(Store(Path(folder)/'data'),driver)
             record=runner.start('glm-fake','demo',None,'test_simulated')
             self.assertEqual(record['status'],'waiting_for_stop',record)
-            self.assertIn(MODEL,record['binding_evidence']['locator'])
+            self.assertIn('visual',record['binding_evidence']['locator'])
             actions=list(scenario.inputs)
             self.assertEqual(runner.start('glm-fake','demo',None,'test_simulated'),record)
             self.assertEqual(scenario.inputs,actions)
             record=runner.stop('glm-fake','test_simulated')
             self.assertEqual(record['status'],'captured_locally',record)
             self.assertEqual(record['metrics'],{'累计观众':100,'新增粉丝':1,'评论人数':9,'送礼人数':2,'获得音浪':300})
+            self.assertEqual(record['normal_path_llm_calls'],0)
             actions=list(scenario.inputs)
             self.assertEqual(runner.stop('glm-fake','test_simulated'),record)
             self.assertEqual(scenario.inputs,actions)
+
+    def test_legacy_driver_binding_uses_local_steps_without_images(self):
+        sys.path.insert(0,str(ROOT.parent/'fixed-recap-prototype/tests'))
+        from test_fixed_path import Scenario
+        from desktop import View
+        from llm_desktop import LLMDesktop
+        with tempfile.TemporaryDirectory() as folder:
+            scenario=Scenario(folder); original_call=scenario.call
+            def call(tool,**args):
+                if tool=='ControlStatus': return {'content':[{'text':'{"state":"ai","generation":7}'}]}
+                return original_call(tool,**args)
+            scenario.call=call; scenario.note=lambda *args,**kwargs:None
+            class Driver(LLMDesktop):
+                def observe(self,window,use_uia=False):
+                    return View(scenario.tokens(),scenario.image.read_bytes(),scenario.get(window),(600,400),'fake',[])
+            driver=Driver(scenario,scenario,None,Path(folder)/'evidence',
+                          'https://union.bytedance.com/open/portal/',vision=Mock())
+            driver.target=Mock(side_effect=AssertionError('不得调用旧视觉导航'))
+            driver.save_minimal=Mock(side_effect=AssertionError('不得保存图片'))
+            binding=driver.bind('demo')
+            self.assertEqual(binding['douyin_account'],'demo')
+            self.assertEqual(binding['room_id'],'1234567890123456789')
+            driver.target.assert_not_called(); driver.save_minimal.assert_not_called()
+            self.assertNotIn('screenshot',binding)
 
 if __name__=='__main__': unittest.main()

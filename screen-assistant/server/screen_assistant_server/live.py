@@ -42,6 +42,12 @@ class SessionSignal(BaseModel):
     source: Literal["ios_app", "android_app"]
 
 
+class BackstageRecoveryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    expected_status: Literal["waiting_for_stop"]
+    expected_created_at_ms: int = Field(ge=0, le=2**63 - 1)
+
+
 BACKSTAGE_METRIC_KEYS = ("累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪")
 
 
@@ -631,6 +637,13 @@ async def get_backstage_task(task_id: str, request: Request,
                              token: str | None = Header(None, alias="X-Backstage-Worker-Token")):
     _authorize_backstage_worker(request, token)
     return await request.app.state.live.run("backstage_task", task_id)
+
+
+@router.post("/backstage/tasks/{task_id}/recover")
+async def recover_backstage_task(task_id: str, payload: BackstageRecoveryRequest, request: Request,
+                                  token: str | None = Header(None, alias="X-Backstage-Worker-Token")):
+    _authorize_backstage_worker(request, token)
+    return await request.app.state.live.run("recover_backstage_task", task_id, payload.expected_created_at_ms)
 
 
 @router.post("/{session_id}/backstage/result")

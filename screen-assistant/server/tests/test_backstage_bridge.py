@@ -599,6 +599,19 @@ def test_bridge_preserves_unknown_capture_time_for_empty_result():
     assert payload["missing_fields"]["累计观众"] == "未读取"
 
 
+@pytest.mark.parametrize("outcome", ["not_live", "account_not_found"])
+def test_bridge_preserves_confirmed_business_outcome_after_stop(outcome):
+    task = {"task_id": "t", "session_id": "s", "douyin_account": "a",
+            "stop_signal_received": True, "start_signal_source": "android_app",
+            "stop_signal_source": "android_app"}
+    record = {"status": "failed", "reason": outcome, "session_id": "s",
+              "douyin_account": "a", "metrics": None, "room_id": None,
+              "start_signal_source": "android_app", "stop_signal_source": "android_app"}
+    payload = BackstageBridge.result_payload(task, record)
+    assert set(payload["missing_fields"].values()) == {outcome}
+    assert all(value is None for value in payload["metrics"].values())
+
+
 def test_bridge_forwards_android_app_signal_source_without_ios_relabeling():
     task = {"task_id": "t", "session_id": "s", "douyin_account": "a",
             "start_signal_source": "android_app", "stop_signal_source": "android_app",
@@ -862,9 +875,12 @@ def test_worker_auth_http_error_is_fatal_not_a_poll_retry(monkeypatch):
     def forbidden(*_args, **_kwargs):
         raise HTTPError("http://localhost/claim", 403, "forbidden", {}, None)
 
-    monkeypatch.setattr("screen_assistant_server.backstage_bridge.urlopen", forbidden)
+    class Opener:
+        open = staticmethod(forbidden)
+    monkeypatch.setattr("screen_assistant_server.backstage_bridge.build_opener", lambda *_: Opener())
+    monkeypatch.setattr("screen_assistant_server.backstage_bridge.verify_ssh_tunnel", lambda *_: None)
     bridge = BackstageBridge(
-        BridgeConfig("http://localhost", "worker", "python", "recap.py"),
+        BridgeConfig("http://127.0.0.1:8000", "worker", "python", "recap.py"),
     )
     with pytest.raises(BackstageFatalError, match="403"):
         bridge.http("POST", "v1/live/sessions/backstage/tasks/claim")
@@ -981,6 +997,8 @@ def test_cli_process_uses_argument_list_and_never_receives_worker_token(monkeypa
         return FakeProcess()
 
     monkeypatch.setenv("BACKSTAGE_WORKER_TOKEN", "worker-secret")
+    monkeypatch.setenv("TIANYI_API_KEY", "fixture-model-key")
+    monkeypatch.setenv("BACKSTAGE_SDK_PYTHON", "fixture-sdk")
     monkeypatch.setenv("AO_SESSION_ID", "ao-session-test")
     monkeypatch.setattr("screen_assistant_server.backstage_bridge.subprocess.Popen", popen)
     bridge = BackstageBridge(config)
@@ -996,6 +1014,9 @@ def test_cli_process_uses_argument_list_and_never_receives_worker_token(monkeypa
     assert "--account=a;& arbitrary" in args
     assert kwargs.get("shell", False) is False
     assert "BACKSTAGE_WORKER_TOKEN" not in kwargs["env"]
+    assert kwargs["env"].get("TIANYI_API_KEY") == "fixture-model-key"
+    assert kwargs["env"].get("BACKSTAGE_SDK_PYTHON") == "fixture-sdk"
+    assert "fixture-model-key" not in args
     assert "AO_SESSION_ID" not in kwargs["env"]
     assert "worker-secret" not in args and "worker-secret" not in kwargs["env"].values()
 
@@ -1027,7 +1048,10 @@ def test_cli_timeout_terminates_its_process_tree_and_returns_needs_input(monkeyp
 
 
 def test_bridge_cli_timeout_config_is_bounded(monkeypatch):
-    monkeypatch.setenv("BACKSTAGE_SERVER_URL", "http://localhost")
+    monkeypatch.setenv("BACKSTAGE_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("BACKSTAGE_SSH_PID", "123")
+    monkeypatch.setenv("BACKSTAGE_SSH_CREATED_FILETIME", "456")
+    monkeypatch.setattr("screen_assistant_server.backstage_bridge.verify_ssh_tunnel", lambda *_: None)
     monkeypatch.setenv("BACKSTAGE_WORKER_TOKEN", "worker")
     monkeypatch.setenv("BACKSTAGE_CLI_PYTHON", "python")
     monkeypatch.setenv("BACKSTAGE_CLI_ENTRY", "recap.py")
