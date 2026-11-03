@@ -292,6 +292,17 @@ class BackstageBridge:
         return args
 
     def _cli(self, command: str, task: dict) -> CliInvocation:
+        if command == "start" and task.get("stop_signal_received") is True:
+            # 重启后只读原场记录；已结束且未绑定的任务绝不能重新导航到后来直播。
+            saved = self._cli("result", task)
+            record = self._record(saved)
+            if (saved.returncode == 0 and record is not None
+                    and self._record_problem(task, record, allow_missing_stop_source=True) is None):
+                status = record.get("status")
+                bound = status == "waiting_for_stop" and self._binding_evidence_problem(record) is None
+                if bound or status in {"captured_locally", "partial", "needs_input", "failed"}:
+                    return CliInvocation(saved.output, 2 if status in {"needs_input", "failed"} else 0)
+            return CliInvocation(None, None, "stopped_before_binding")
         entry = Path(self.config.cli_entry)
         # 仅传明确运行配置及视觉模型凭据，worker凭据不得传给CLI。
         allowed = {"SYSTEMROOT", "WINDIR", "PATH", "PATHEXT", "TEMP", "TMP",
@@ -630,6 +641,14 @@ class BackstageBridge:
             return True
 
         start_status = start_record.get("status") if start_record else None
+        if (task.get("stop_signal_received") is True and start.returncode == 0
+                and start_status in {"captured_locally", "partial"}):
+            try:
+                payload = self.result_payload(task, {"record": start_record})
+            except BackstageCliRecordError as exc:
+                payload = self._null_failure_payload(task, str(exc))
+            self._post_result(task, payload)
+            return True
         if start_record and start_status in {"needs_input", "failed"}:
             task = self._wait_for_app_stop(task, identity)
             start_reason = self._reason(start, "cli_start_failed")

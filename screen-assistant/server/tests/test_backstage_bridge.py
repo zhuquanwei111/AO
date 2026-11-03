@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import uuid
 from urllib.error import HTTPError
 
 import pytest
@@ -8,6 +9,14 @@ import pytest
 from screen_assistant_server.backstage_bridge import (
     BackstageBridge, BackstageFatalError, BridgeConfig, CliInvocation,
 )
+
+
+@pytest.fixture(autouse=True)
+def isolated_bridge_lock(monkeypatch):
+    from screen_assistant_server import backstage_bridge
+    original = backstage_bridge.bridge_instance_lock
+    name = 'ScreenAssistantBackstageFixture-' + uuid.uuid4().hex
+    monkeypatch.setattr(backstage_bridge, 'bridge_instance_lock', lambda: original(name))
 
 
 def accepted(payload):

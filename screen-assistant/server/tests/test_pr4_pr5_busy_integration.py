@@ -37,7 +37,7 @@ def test_busy_backstage_and_full_fusion_preserve_observation_and_claim(tmp_path,
                 assert (await client.post('/v1/live/sessions/backstage/tasks/claim', headers=worker)).json()['task']['task_id'] == task
                 second, h2, u2 = await session('second-account')
                 busy_start = await client.post(u2 + '/start', headers=h2)
-                assert busy_start.status_code == 200 and busy_start.json()['task_status'] == 'not_connected'
+                assert busy_start.status_code == 200 and busy_start.json()['task_status'] == 'waiting_for_stop'
                 third, h3, u3 = await session('third-account')
                 def comment(key):
                     return {'event_id': key, 'input_mode': 'live_observation', 'source': 'ios_replaykit_ocr',
@@ -54,7 +54,7 @@ def test_busy_backstage_and_full_fusion_preserve_observation_and_claim(tmp_path,
                         'SELECT COUNT(*) FROM live_observations WHERE session_id=?', (second['session_id'],)
                     ).fetchone()[0]
                     assert count == 1
-                    assert (await client.get(u2 + '/summary', headers=h2)).json()['backstage_recap']['status'] == 'not_connected'
+                    assert (await client.get(u2 + '/summary', headers=h2)).json()['backstage_recap']['status'] == 'waiting_for_stop'
                     assert (await client.post('/v1/live/sessions/backstage/tasks/claim', headers=worker)).json()['task']['task_id'] == task
                     assert (await client.post(u2 + '/stop', headers=h2)).json()['backstage_status'] == 'not_connected'
                 finally:

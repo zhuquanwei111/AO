@@ -296,11 +296,8 @@ class LiveStore:
             return {"status": "duplicate", "session_id": sid,
                     "task_id": existing["task_id"], "douyin_account": existing["douyin_account"],
                     "task_status": existing["status"], "signal_source": signal_source}
-        active = self.db.execute(
-            "SELECT 1 FROM live_backstage_tasks WHERE result_hash IS NULL AND status IN "
-            "('waiting_for_stop','capturing') LIMIT 1"
-        ).fetchone()
-        task_status = "not_connected" if active else "waiting_for_stop"
+        # 由现有单桥串行领取；上一场收尾不应让新任务永久失去执行机会。
+        task_status = "waiting_for_stop"
         task_id = uuid.uuid4().hex
         with self.db:
             self.db.execute(
@@ -730,7 +727,7 @@ class LiveStore:
                 SELECT t.*,s.stopped_at_ms AS session_stopped_at_ms
                 FROM live_backstage_tasks t JOIN live_sessions s USING(session_id)
                 WHERE t.result_hash IS NULL AND t.status IN ('waiting_for_stop','capturing')
-                ORDER BY t.created_at_ms LIMIT 1
+                ORDER BY t.created_at_ms,t.rowid LIMIT 1
             """).fetchone()
             if task is None:
                 return {"status": "idle", "task": None}
