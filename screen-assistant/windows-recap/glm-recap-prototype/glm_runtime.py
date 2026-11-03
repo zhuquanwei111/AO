@@ -89,7 +89,7 @@ class GLMRuntime:
         require_gate_a(self.gate)
         sdk_python = require_sdk_runtime()
         if self.calls >= 24 or time.monotonic() >= self.deadline:
-            raise RuntimeError('model_phase_budget_exhausted')
+            raise VisualRuntimeError('model_phase_budget_exhausted')
         job = {'image_base64': base64.b64encode(crop.image).decode('ascii'),
                'prompt': prompt, 'purpose': crop.purpose}
         canonical = json.dumps(job, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')

@@ -42,6 +42,7 @@ class PlatformOriginTests(unittest.TestCase):
     def test_url_already_visible_does_not_require_model_content_confirmation(self):
         view=fixtures.MemoryVisualTests().view([token('https://union.bytedance.com/any/page')])
         driver=object.__new__(GLMDesktop); driver.observe=Mock(return_value=view); driver.vision=Mock()
+        driver.guard=Mock(side_effect=lambda window=None:window); driver.mcp=Mock()
         self.assertIs(driver.wait_entry(view.window),view)
         self.assertIs(driver.confirm_portal(view.window),view)
         driver.vision.verify_portal.assert_not_called()
@@ -52,10 +53,12 @@ class PlatformOriginTests(unittest.TestCase):
         driver=object.__new__(GLMDesktop); driver.guard=Mock(); driver.mcp=Mock(); driver.probe=Mock()
         driver.probe.windows.return_value=[view.window]; driver.focus=Mock(return_value=view.window)
         driver.observe=Mock(return_value=view); driver.vision=Mock(); driver.key=Mock(); driver.type_replacement=Mock()
-        driver.target=Mock(side_effect=RecapError('fixture_following_navigation'))
+        driver.target=Mock()
+        driver.vision.next_search_action.side_effect=RecapError('fixture_following_navigation')
         with self.assertRaisesRegex(RecapError,'fixture_following_navigation'):
             driver.bind('123456')
-        driver.target.assert_called_once_with(view.window,'侧边导航主播管理的展开箭头')
+        driver.vision.next_search_action.assert_called_once_with(view,driver.guard)
+        driver.target.assert_not_called()
         driver.key.assert_not_called(); driver.type_replacement.assert_not_called()
         driver.vision.verify_portal.assert_not_called()
 

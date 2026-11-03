@@ -101,6 +101,9 @@ class GLMTests(unittest.TestCase):
                 return original_call(tool,**args)
             scenario.call=call; scenario.note=lambda *args,**kwargs:None
             class Vision:
+                def next_search_action(self,view,guard):
+                    found=self.locate(view,'主播列表下一步')
+                    return Token('search_field' if scenario.stage=='list' else 'navigation_entry',found.box,found.score,found.source)
                 def locate(self,view,goal,toolbar=False,**kwargs):
                     label={'home':'主播管理','management':'主播列表','list':'请输入主播昵称或抖音号',
                         'candidate':'抖音号:demo','filtered':'主播详情','detail':'进入直播间'}[scenario.stage]

@@ -43,6 +43,9 @@ class ContinuousFlowTests(unittest.TestCase):
                     return matches[0]
             pages = Pages(Path(folder))
             class Vision:
+                def next_search_action(self,image,guard):
+                    found=self.locate(image,'主播列表下一步')
+                    return Token('search_field' if pages.stage=='list' else 'navigation_entry',found.box,found.score,found.source)
                 def locate(self, image, goal, toolbar=False, **kwargs):
                     name = {'home': '主播管理', 'management': '主播列表',
                             'list': '请输入主播昵称或抖音号', 'candidate': '抖音号:' + pages.account,

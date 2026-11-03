@@ -126,9 +126,11 @@ def main():
             old=store.get(task)
             diagnostics=getattr(runtime,'diagnostics',None)
             selection=getattr(desktop,'window_selection_diagnostics',None)
+            navigation=getattr(desktop,'navigation_diagnostics',None)
             record=store.update(task,llm_runtime_invocations=old.get('llm_runtime_invocations',0)+runtime.calls,
                 visual_diagnostics=diagnostics if isinstance(diagnostics,list) else None,
                 window_selection_diagnostics=selection if isinstance(selection,list) else None,
+                navigation_diagnostics=navigation if isinstance(navigation,list) else None,
                 normal_path_llm_calls=(old['normal_path_llm_calls']+runtime.http_requests)
                     if old.get('normal_path_llm_calls') is not None and runtime.http_requests is not None else None,
                 model=MODEL if runtime.calls else old.get('model'),
