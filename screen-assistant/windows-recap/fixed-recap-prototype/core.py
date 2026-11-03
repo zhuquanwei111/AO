@@ -125,3 +125,39 @@ def metrics_from_tokens(tokens):
             missing[name] = reason
     return {'metrics':values, 'raw_displays':raws, 'approximate_metrics':approx,
             'missing_fields':list(missing), 'missing_reasons':missing}
+
+
+def summary_metrics(tokens):
+    """先确认同一可见汇总行，再复用原卡片配对；不从其他行补缺。"""
+    anchors=[]
+    for token in tokens:
+        text=compact(token.text)
+        if token.score<MIN_SCORE: continue
+        for name in METRICS:
+            suffix=text[len(name):].strip(':') if text.startswith(name) else None
+            if suffix is not None and (not suffix or parse_count(suffix)[0] is not None):
+                anchors.append((name,token))
+                break
+    groups={}
+    for _,anchor in anchors:
+        group=tuple(i for i,(_,token) in enumerate(anchors)
+                    if abs(token.y-anchor.y)<=max(anchor.h,token.h))
+        names=[anchors[i][0] for i in group]
+        if len(set(names))>=3:
+            groups[group]=names
+    if len(groups)!=1:
+        raise RecapError('summary_row_unconfirmed')
+    indexes,names=next(iter(groups.items()))
+    if len(names)!=len(set(names)):
+        raise RecapError('summary_row_ambiguous')
+    row=[anchors[i][1] for i in indexes]
+    ordered=sorted(row,key=lambda q:q.x)
+    if any(left.box[2]>right.box[0] for left,right in zip(ordered,ordered[1:])):
+        raise RecapError('summary_row_ambiguous')
+    height=max(q.h for q in row)
+    top=min(q.box[1] for q in row)-height*5
+    bottom=max(q.box[3] for q in row)
+    left=min(q.box[0]-q.w for q in row)
+    right=max(q.box[2]+q.w for q in row)
+    bounded=[q for q in tokens if left<=q.x<=right and top<=q.y<=bottom]
+    return metrics_from_tokens(bounded)

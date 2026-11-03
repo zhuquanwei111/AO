@@ -47,7 +47,7 @@ def main() -> int:
                 time.sleep(.05)
             if not server.started:
                 raise RuntimeError("隔离测试服务未启动")
-            command = [str(android / "gradlew.bat"), ":app:verifyLiveContract", "--console=plain",
+            command = [str(android / "gradlew.bat"), "--offline", ":app:verifyLiveContract", "--console=plain",
                        f"-PliveContractBase=http://127.0.0.1:{port}"]
             options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
             if os.name == "nt":

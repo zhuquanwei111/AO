@@ -54,16 +54,20 @@ final class PiPDisplayController: NSObject, ObservableObject {
     private var lastRenderedCGImage: CGImage?
     private var lastDisplayedText: String?
     private var lastDisplayedKind: DisplayKind?
+    private var liveContentActive = false
+    private var liveSessionActive = false
     private var isPlaying = true
 
     private enum DisplayKind: Equatable {
         case quickAnswer
         case operation
+        case connection
 
         var label: String {
             switch self {
             case .quickAnswer: return "问答"
             case .operation: return "运营"
+            case .connection: return "连接"
             }
         }
 
@@ -71,6 +75,7 @@ final class PiPDisplayController: NSObject, ObservableObject {
             switch self {
             case .quickAnswer: return .systemBlue
             case .operation: return .systemOrange
+            case .connection: return .systemYellow
             }
         }
     }
@@ -183,6 +188,7 @@ final class PiPDisplayController: NSObject, ObservableObject {
         ControlState.setUserWantsCapture(false)
         hostView.removeFromSuperview()
         pipController = nil
+        liveContentActive = false
         lastRenderedCGImage = nil
         lastDisplayedText = nil
         lastDisplayedKind = nil
@@ -238,9 +244,87 @@ final class PiPDisplayController: NSObject, ObservableObject {
         showContent(text, kind: .operation)
     }
 
+    /// 必须在主线程调用；仅表示选中并生成帧，不代表系统 PiP 已显示。
+    func showLiveFrame(_ items: [LivePromptDelivery.Item]) -> Bool {
+        guard canShowLiveFrame, !items.isEmpty else { return false }
+        var text = liveFrameText(items)
+        if !liveTextFits(text) {
+            let characters = Array(text)
+            var low = 0
+            var high = characters.count
+            while low < high {
+                let middle = (low + high + 1) / 2
+                if liveTextFits(String(characters.prefix(middle)) + "…") { low = middle }
+                else { high = middle - 1 }
+            }
+            text = String(characters.prefix(low)) + "…"
+        }
+        let image = renderReplyFrame(text, kind: .operation)
+        lastRenderedCGImage = image
+        lastDisplayedText = text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        lastDisplayedKind = .operation
+        liveContentActive = true
+        if isPlaying { enqueue(image) }
+        lastReplyAt = Date()
+        return true
+    }
+
+    func liveFrameFits(_ items: [LivePromptDelivery.Item]) -> Bool {
+        liveTextFits(liveFrameText(items))
+    }
+
+    var canShowLiveFrame: Bool {
+        state == .running && isPlaying && pipController?.isPictureInPictureActive == true
+    }
+    var hasLiveContent: Bool { liveContentActive }
+
+    /// 直播场次空闲时保留安静画面；连接诊断仍由主界面展示。
+    func setLiveSessionActive(_ active: Bool) {
+        liveSessionActive = active
+        guard active, !liveContentActive, pipController != nil else { return }
+        lastDisplayedText = nil
+        lastDisplayedKind = nil
+        lastRenderedCGImage = placeholderFrame()
+        if isPlaying, let image = lastRenderedCGImage { enqueue(image) }
+    }
+
+    func endLiveContent() {
+        guard liveContentActive else { return }
+        liveContentActive = false
+        lastDisplayedText = nil
+        lastDisplayedKind = nil
+        lastRenderedCGImage = placeholderFrame()
+        if isPlaying, let image = lastRenderedCGImage { enqueue(image) }
+    }
+
+    private func liveFrameText(_ items: [LivePromptDelivery.Item]) -> String {
+        items.map { PiPTextFormatter.plainText($0.text) }.joined(separator: "\n")
+    }
+
+    private func liveTextFits(_ text: String) -> Bool {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byWordWrapping
+        paragraph.lineSpacing = 4
+        let bounds = (text as NSString).boundingRect(
+            with: CGSize(width: 592, height: CGFloat.greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: UIFont.systemFont(ofSize: 26), .paragraphStyle: paragraph],
+            context: nil)
+        return ceil(bounds.height) <= 274
+    }
+
+    /// 只在用户已启动 PiP 时显示最近真实请求的服务状态；不尝试启动系统 PiP。
+    func showConnectionStatus(_ text: String) {
+        guard !liveSessionActive, !liveContentActive, pipController != nil,
+              state == .starting || state == .running || state == .suspended else { return }
+        showContent(text, kind: .connection)
+    }
+
     private func showContent(_ rawText: String, kind: DisplayKind) {
         DispatchQueue.main.async { [weak self] in
             guard let self, self.pipController != nil else { return }
+            guard !self.liveSessionActive || kind == .operation else { return }
+            guard !self.liveContentActive || kind == .operation else { return }
             let text = PiPTextFormatter.plainText(rawText)
             guard !text.isEmpty else { return }
             let comparisonText = text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
@@ -313,7 +397,7 @@ final class PiPDisplayController: NSObject, ObservableObject {
                 .font: UIFont.systemFont(ofSize: 24),
                 .foregroundColor: UIColor.white
             ]
-            ("屏识AI助手 · 等待识别结果…" as NSString)
+            ((liveSessionActive ? "屏识" : "屏识AI助手 · 等待识别结果…") as NSString)
                 .draw(at: CGPoint(x: 24, y: 24), withAttributes: attrs)
         }
         return uiImage.cgImage!
@@ -339,7 +423,12 @@ final class PiPDisplayController: NSObject, ObservableObject {
         let width = cgImage.width
         let height = cgImage.height
         var pixelBuffer: CVPixelBuffer?
-        let attrs: [CFString: Any] = [kCVPixelBufferCGImageCompatibilityKey: true]
+        // 复用独立交付的IOSurface缓冲，供系统视频显示层呈现。
+        let attrs: [CFString: Any] = [
+            kCVPixelBufferCGImageCompatibilityKey: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: true,
+            kCVPixelBufferIOSurfacePropertiesKey: [:] as [String: Any]
+        ]
         guard CVPixelBufferCreate(kCFAllocatorDefault, width, height,
                                   kCVPixelFormatType_32BGRA, attrs as CFDictionary,
                                   &pixelBuffer) == kCVReturnSuccess,

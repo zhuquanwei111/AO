@@ -6,8 +6,10 @@ import binascii
 import hashlib
 import hmac
 import json
+import logging
 import secrets
 import sqlite3
+import unicodedata
 import uuid
 from collections import Counter, deque
 from pathlib import Path
@@ -21,12 +23,62 @@ from .live_rules import (
 )
 from .live_fusion import (
     build_candidate, observation_source_allowed, online_count_details,
-    validate_observation_content,
+    validate_observation_content, comment_has_priority, comment_is_candidate, group_feedback,
+    COMMENT_REPLY_MAX_AGE_MS, COMMENT_REPLY_COOLDOWN_MS, GROUP_NOTICE_COOLDOWN_MS,
+)
+from .comment_reconstruction import reconstruct_comments
+
+logger = logging.getLogger("screen_assistant.app")
+
+COACHING_GLOBAL_COOLDOWN_MS = 30_000
+COACHING_TOPIC_COOLDOWN_MS = 90_000
+COACHING_LIFETIME_MS = 30_000
+COACHING_MIN_REMAINING_MS = 3_000
+COACHING_TOPICS = (
+    ("comment_coaching:continue", "如果想继续这个话题，可以接着聊一聊这条评论。"),
+    ("comment_coaching:invite", "可以顺着这条评论，邀请大家分享各自的看法。"),
+    ("comment_coaching:pace", "接住这条评论后，可以留一点时间等大家回应。"),
 )
 
 
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def fusion_topic_cooldown(candidate: dict) -> int:
+    if candidate.get("prompt_type") == "comment_reply":
+        return COMMENT_REPLY_COOLDOWN_MS
+    topic = candidate["topic"]
+    if topic in {item[0] for item in COACHING_TOPICS}:
+        return COACHING_TOPIC_COOLDOWN_MS
+    if topic == "person:head_down":
+        return 90_000
+    if (candidate["priority"] >= 100 or topic.startswith(("person", "quality:"))
+            or any(row["source"].startswith("fixture:") for row in candidate["observations"])):
+        return COOLDOWN_MS
+    return GROUP_NOTICE_COOLDOWN_MS
+
+
+def comment_reply_topic(source: str, nickname: str | None, text: str) -> str:
+    clean_text = "".join(unicodedata.normalize("NFKC", text).split()).casefold()
+    clean_name = ("".join(unicodedata.normalize("NFKC", nickname).split()).casefold()
+                  if nickname is not None else None)
+    return "comment_reply:" + digest(json.dumps([source, "comment_reply", clean_name, clean_text], ensure_ascii=True))
+
+
+def comment_record_priority(record: dict) -> bool:
+    """仅使用有本条来源证据的可用等级调整顺序。"""
+    statuses = record.get("field_status", {})
+    sources = record.get("field_sources", {})
+    ids = record.get("source_event_ids") or []
+
+    def level(name):
+        evidence = sources.get(name) or []
+        if statuses.get(name) != "usable" or not evidence or any(item not in ids for item in evidence):
+            return None
+        return record.get(name)
+
+    return comment_has_priority(level("consumption_level"), level("fan_level"))
 
 
 class LiveStore:
@@ -38,6 +90,14 @@ class LiveStore:
         self.clock = clock
         self.windows: dict[str, deque] = {}
         self.fusion_windows: dict[str, deque] = {}
+        self.comment_batches: dict[str, dict[tuple[str, str], dict]] = {}
+        self.comment_batch_sweeps: dict[str, int] = {}
+        self.comment_attempted: dict[str, set[str]] = {}
+        self.comment_attempt_counts: dict[str, dict[str, int]] = {}
+        self.comment_failed_epochs: dict[str, dict[str, int]] = {}
+        self.coaching_opportunities: dict[str, dict] = {}
+        self.coaching_discarded_until: dict[str, int] = {}
+        self.reply_context: dict[str, dict[str, tuple[int, dict]]] = {}
         self.db = sqlite3.connect(path, check_same_thread=False, timeout=0.5)
         self.db.row_factory = sqlite3.Row
         self.db.executescript("""
@@ -53,6 +113,11 @@ class LiveStore:
                 result TEXT NOT NULL,
                 PRIMARY KEY (session_id, event_hash),
                 UNIQUE (session_id, message_hash)
+            );
+            CREATE TABLE IF NOT EXISTS live_audio_fusion_status (
+                session_id TEXT PRIMARY KEY,
+                background_analysis_busy_count INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(session_id) REFERENCES live_sessions(session_id)
             );
             CREATE TABLE IF NOT EXISTS live_count_samples (
                 session_id TEXT NOT NULL, event_hash TEXT NOT NULL, source TEXT NOT NULL,
@@ -108,6 +173,10 @@ class LiveStore:
             )
         if "stop_signal_source" not in task_columns:
             self.db.execute("ALTER TABLE live_backstage_tasks ADD COLUMN stop_signal_source TEXT")
+        if "recovered_at_ms" not in task_columns:
+            self.db.execute("ALTER TABLE live_backstage_tasks ADD COLUMN recovered_at_ms INTEGER")
+        if "recovery_reason" not in task_columns:
+            self.db.execute("ALTER TABLE live_backstage_tasks ADD COLUMN recovery_reason TEXT")
         with self.db:
             self.db.execute(
                 "UPDATE live_backstage_tasks SET stop_signal_source=start_signal_source "
@@ -115,7 +184,40 @@ class LiveStore:
             )
 
     def close(self):
+        self.reply_context.clear()
+        self.coaching_opportunities.clear()
+        self.coaching_discarded_until.clear()
         self.db.close()
+
+    def _expire_reply_context(self, now: int) -> None:
+        # 按现有请求边界惰性回收；读取前严格检查提示到期时间。
+        for sid, contexts in list(self.reply_context.items()):
+            for prompt_id, (expires_at, _) in list(contexts.items()):
+                if now >= expires_at:
+                    del contexts[prompt_id]
+            if not contexts:
+                del self.reply_context[sid]
+
+    def _expire_comment_payloads(self, sid: str, now: int) -> None:
+        if now >= self.coaching_discarded_until.get(sid, 0):
+            self.coaching_discarded_until.pop(sid, None)
+        opportunity = self.coaching_opportunities.get(sid)
+        if opportunity is not None and now >= opportunity["deadline"]:
+            self.coaching_opportunities.pop(sid, None)
+        previous = self.comment_batch_sweeps.get(sid)
+        if previous is not None and now >= previous and now - previous < 1000:
+            return
+        self.comment_batch_sweeps[sid] = now
+        for batch in self.comment_batches.get(sid, {}).values():
+            retention_deadline = batch.get("reply_deadline", batch["deadline"])
+            if now > retention_deadline:
+                batch["rows"].clear()
+                batch["quality_gaps"].clear()
+                batch.pop("records", None)
+                batch.pop("reply_rows", None)
+                if not batch.get("expired") and not batch["complete"]:
+                    logger.info("live_comment_batch outcome=expired")
+                batch["expired"] = True
 
     def authorize(self, sid: str, token: str | None):
         row = self.db.execute(
@@ -148,6 +250,7 @@ class LiveStore:
             "session_id": sid, "session_token": token, "started_at_ms": now,
             "douyin_account": douyin_account, "backstage_task_id": None,
             "backstage_status": "not_started" if douyin_account else "not_configured",
+            "capabilities": {"observation_batch_metadata": True, "typed_prompts": True},
         }
 
     def _stored_app_source(self, sid: str, session) -> str:
@@ -193,22 +296,18 @@ class LiveStore:
             return {"status": "duplicate", "session_id": sid,
                     "task_id": existing["task_id"], "douyin_account": existing["douyin_account"],
                     "task_status": existing["status"], "signal_source": signal_source}
-        active = self.db.execute(
-            "SELECT 1 FROM live_backstage_tasks WHERE status IN "
-            "('waiting_for_stop','capturing','not_connected') LIMIT 1"
-        ).fetchone()
-        if active:
-            raise HTTPException(409, "a backstage recap task is already active")
+        # 由现有单桥串行领取；上一场收尾不应让新任务永久失去执行机会。
+        task_status = "waiting_for_stop"
         task_id = uuid.uuid4().hex
         with self.db:
             self.db.execute(
                 "INSERT INTO live_backstage_tasks "
                 "(task_id,session_id,douyin_account,status,created_at_ms,start_signal_source) "
-                "VALUES (?,?,?,'waiting_for_stop',?,?)",
-                (task_id, sid, account, self.clock(), signal_source),
+                "VALUES (?,?,?,?,?,?)",
+                (task_id, sid, account, task_status, self.clock(), signal_source),
             )
         return {"status": "started", "session_id": sid, "task_id": task_id,
-                "douyin_account": account, "task_status": "waiting_for_stop",
+                "douyin_account": account, "task_status": task_status,
                 "signal_source": signal_source}
 
     def description(self, sid: str, token: str | None) -> str:
@@ -250,6 +349,16 @@ class LiveStore:
                     )
         self.windows.pop(sid, None)
         self.fusion_windows.pop(sid, None)
+        batches = self.comment_batches.pop(sid, {})
+        self.comment_batch_sweeps.pop(sid, None)
+        self.comment_attempted.pop(sid, None)
+        self.comment_attempt_counts.pop(sid, None)
+        self.comment_failed_epochs.pop(sid, None)
+        self.coaching_opportunities.pop(sid, None)
+        self.coaching_discarded_until.pop(sid, None)
+        self.reply_context.pop(sid, None)
+        if any(not batch["complete"] for batch in batches.values()):
+            logger.info("live_comment_batch outcome=stopped_incomplete")
         task = self.db.execute(
             "SELECT task_id,status FROM live_backstage_tasks WHERE session_id=?", (sid,)
         ).fetchone()
@@ -262,6 +371,7 @@ class LiveStore:
 
     def add_observation(self, sid: str, token: str | None, body: dict, received_at_ms: int):
         session = self.authorize(sid, token)
+        self._expire_reply_context(received_at_ms)
         if session["stopped_at_ms"] is not None:
             raise HTTPException(409, "live session stopped")
         if not observation_source_allowed(body["kind"], body["source"],
@@ -330,7 +440,7 @@ class LiveStore:
             stable_id = content.get("platform_message_id")
             if stable_id:
                 message_hash = digest(json.dumps([body["source"], stable_id]))
-            elif body["source"] == "ios_replaykit_ocr":
+            elif body["source"] == "ios_replaykit_ocr" and not body.get("capture_batch_id"):
                 normalized = "".join(content["text"].split())
                 identity = content.get("author_id")
                 position = content.get("text_position")
@@ -348,8 +458,27 @@ class LiveStore:
             (sid, message_hash),
         ).fetchone():
             usable, reason, message_hash = False, "duplicate_message", None
+
+        batch = None
+        batch_count = body.get("capture_comment_count")
+        if body["kind"] == "comment" and batch_count is not None:
+            key = (body["source"], body["capture_batch_id"])
+            batch = self.comment_batches.get(sid, {}).get(key)
+            if batch is None:
+                batch = {"count": batch_count, "indices": {}, "rows": [], "quality_gaps": [],
+                         "deadline": min(effective, received_at_ms) + MAX_OBSERVATION_AGE_MS,
+                         "complete": False}
+            if batch["count"] != batch_count:
+                raise HTTPException(409, "capture batch count mismatch")
+            if body["line_index"] in batch["indices"] or batch["complete"]:
+                raise HTTPException(409, "capture batch index already used")
+            batch_deadline = min(batch["deadline"], effective + MAX_OBSERVATION_AGE_MS)
+            if received_at_ms > batch_deadline:
+                usable, reason = False, "batch_expired"
         if not usable:
             result["reason"] = reason or "unavailable"
+        elif batch is not None:
+            result["reason"] = "batch_incomplete"
         else:
             result["reason"] = "windowed"
 
@@ -377,6 +506,53 @@ class LiveStore:
                     json.dumps(content["text_position"], ensure_ascii=False) if content.get("text_position") else None,
                     json.dumps(content.get("ocr_lines", []), ensure_ascii=False), result["reason"],
                 ))
+        self._expire_comment_payloads(sid, received_at_ms)
+        if batch is not None:
+            self.comment_batches.setdefault(sid, {})[key] = batch
+            batch["deadline"] = batch_deadline
+            if received_at_ms > batch_deadline:
+                batch["rows"].clear()
+                if not batch.get("expired"):
+                    logger.info("live_comment_batch outcome=expired")
+                    batch["expired"] = True
+            batch["indices"][body["line_index"]] = event_hash
+            if (not usable or observed is None) and received_at_ms <= batch["deadline"]:
+                box = (body.get("content") or {}).get("text_position")
+                batch["quality_gaps"].append({"event_id": body["event_id"],
+                                              "text_position": dict(box) if box else None})
+            if usable:
+                item = dict(body)
+                item.update(received_at_ms=received_at_ms, effective_at_ms=effective,
+                            normalized_count=None)
+                batch["rows"].append(item)
+            if len(batch["indices"]) == batch["count"]:
+                batch["complete"] = True
+                rows = batch["rows"]
+                batch["rows"] = []
+                if rows and received_at_ms <= batch["deadline"]:
+                    observed_rows = [row for row in rows if row.get("observed_at_ms") is not None]
+                    batch["records"] = reconstruct_comments(
+                        observed_rows, batch_complete=True, quality_gaps=batch["quality_gaps"]
+                    )
+                    batch["reply_deadline"] = max(
+                        (record["first_observed_at_ms"] + COMMENT_REPLY_MAX_AGE_MS
+                         for record in batch["records"] if type(record.get("first_observed_at_ms")) is int),
+                        default=batch["deadline"],
+                    )
+                    logger.info("live_data stage=batch session=%s reason=complete received=%d usable=%d",
+                                sid[:8], len(batch["indices"]), sum(
+                                    record.get("field_status", {}).get("text") == "usable"
+                                    and record.get("boundary_status") == "locally_complete"
+                                    for record in batch["records"]))
+                    batch["reply_rows"] = rows
+                    window = self.fusion_windows.setdefault(sid, deque(maxlen=MAX_WINDOW_OBSERVATIONS))
+                    window.extend(rows)
+                    result["_batch_ready"] = True
+                    if usable:
+                        result["reason"] = "windowed"
+            logger.info("live_data stage=observation session=%s kind=%s reason=%s",
+                        sid[:8], body["kind"], result["reason"])
+            return result
         if usable:
             item = dict(body)
             item["received_at_ms"] = received_at_ms
@@ -389,10 +565,15 @@ class LiveStore:
                 (row for row in window if row["effective_at_ms"] >= cutoff),
                 maxlen=MAX_WINDOW_OBSERVATIONS,
             )
+        logger.info("live_data stage=observation session=%s kind=%s reason=%s",
+                    sid[:8], body["kind"], result["reason"])
         return result
 
     def session_summary(self, sid: str, token: str | None):
         session = self.authorize(sid, token)
+        audio_status = self.db.execute(
+            "SELECT background_analysis_busy_count FROM live_audio_fusion_status WHERE session_id=?", (sid,)
+        ).fetchone()
         rows = self.db.execute(
             "SELECT * FROM live_count_samples WHERE session_id=? ORDER BY source,effective_at_ms,received_at_ms",
             (sid,),
@@ -524,29 +705,77 @@ class LiveStore:
             "stopped_at_ms": session["stopped_at_ms"],
             "online_count": count_summary,
             "online_count_by_source": summaries,
+            "audio_fusion": {"background_analysis_busy_count":
+                             audio_status["background_analysis_busy_count"] if audio_status else 0},
             "backstage_recap": backstage,
         }
 
-    def claim_backstage_task(self):
-        task = self.db.execute("""
-            SELECT t.*,s.stopped_at_ms AS session_stopped_at_ms
-            FROM live_backstage_tasks t JOIN live_sessions s USING(session_id)
-            WHERE t.result_hash IS NULL AND t.status IN ('waiting_for_stop','capturing','not_connected')
-            ORDER BY t.created_at_ms LIMIT 1
-        """).fetchone()
-        if task is None:
-            return {"status": "idle", "task": None}
-        now = self.clock()
-        status = "capturing" if task["session_stopped_at_ms"] is not None else "waiting_for_stop"
+    def record_audio_fusion_busy(self, sid: str, token: str | None):
+        self.authorize(sid, token)
         with self.db:
+            self.db.execute("""
+                INSERT INTO live_audio_fusion_status (session_id, background_analysis_busy_count)
+                VALUES (?, 1)
+                ON CONFLICT(session_id) DO UPDATE SET background_analysis_busy_count =
+                    MIN(background_analysis_busy_count + 1, 9007199254740991)
+            """, (sid,))
+
+    def claim_backstage_task(self):
+        self.db.execute("BEGIN IMMEDIATE")
+        with self.db:
+            task = self.db.execute("""
+                SELECT t.*,s.stopped_at_ms AS session_stopped_at_ms
+                FROM live_backstage_tasks t JOIN live_sessions s USING(session_id)
+                WHERE t.result_hash IS NULL AND t.status IN ('waiting_for_stop','capturing')
+                ORDER BY t.created_at_ms,t.rowid LIMIT 1
+            """).fetchone()
+            if task is None:
+                return {"status": "idle", "task": None}
+            now = self.clock()
+            status = "capturing" if task["session_stopped_at_ms"] is not None else "waiting_for_stop"
             updated = self.db.execute(
                 "UPDATE live_backstage_tasks SET claimed_at_ms=COALESCE(claimed_at_ms,?),status=? "
-                "WHERE task_id=? AND result_hash IS NULL",
+                "WHERE task_id=? AND result_hash IS NULL AND status IN ('waiting_for_stop','capturing')",
                 (now, status, task["task_id"]),
             ).rowcount
         if not updated:
             return {"status": "idle", "task": None}
         return {"status": "claimed", "task": self.backstage_task(task["task_id"])["task"]}
+
+    def recover_backstage_task(self, task_id: str, expected_created_at_ms: int):
+        now = self.clock()
+        self.db.execute("BEGIN IMMEDIATE")
+        with self.db:
+            row = self.db.execute(
+                "SELECT created_at_ms,status,recovered_at_ms,recovery_reason,claimed_at_ms,received_at_ms,"
+                "result_hash,result_json FROM live_backstage_tasks WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise HTTPException(404, "backstage task not found")
+            if row["created_at_ms"] != expected_created_at_ms:
+                raise HTTPException(409, "backstage task changed")
+            if row["recovered_at_ms"] is not None and row["recovery_reason"] == "stale_unclaimed":
+                if (row["status"] != "not_connected" or row["claimed_at_ms"] is not None
+                        or row["received_at_ms"] is not None or row["result_hash"] is not None
+                        or row["result_json"] is not None):
+                    raise HTTPException(409, "recovered backstage task changed")
+                return {"status": "duplicate", "task_id": task_id, "recovered_at_ms": row["recovered_at_ms"]}
+            updated = self.db.execute("""
+                UPDATE live_backstage_tasks
+                SET status='not_connected', recovered_at_ms=?, recovery_reason='stale_unclaimed'
+                WHERE task_id=? AND created_at_ms=? AND created_at_ms<=?
+                  AND status='waiting_for_stop' AND claimed_at_ms IS NULL AND stopped_at_ms IS NULL
+                  AND stop_signal_source IS NULL AND start_signal_source IN ('ios_app','android_app')
+                  AND received_at_ms IS NULL AND result_hash IS NULL AND result_json IS NULL
+                  AND recovered_at_ms IS NULL AND recovery_reason IS NULL
+                  AND EXISTS (SELECT 1 FROM live_sessions s
+                              WHERE s.session_id=live_backstage_tasks.session_id AND s.stopped_at_ms IS NULL
+                                AND (s.app_source IS NULL OR s.app_source=live_backstage_tasks.start_signal_source))
+            """, (now, task_id, expected_created_at_ms, now - 86_400_000)).rowcount
+            if updated != 1:
+                raise HTTPException(409, "backstage task is not eligible for recovery")
+            return {"status": "recovered", "task_id": task_id, "recovered_at_ms": now}
 
     def backstage_task(self, task_id: str):
         task = self.db.execute("""
@@ -603,54 +832,309 @@ class LiveStore:
         return {"status": "accepted", "task_id": task["task_id"],
                 "result_status": payload["status"], "received_at_ms": received_at}
 
-    def fusion_candidate(self, sid: str, token: str | None):
+    def _coaching_candidate(self, sid: str, now: int, trigger_epoch: int):
+        opportunity = self.coaching_opportunities.get(sid)
+        if opportunity is None:
+            logger.debug("live_data stage=coaching session=%s reason=source_unavailable", sid[:8])
+            return None
+        if now >= opportunity["deadline"]:
+            self.coaching_opportunities.pop(sid, None)
+            return None
+        if opportunity["deadline"] - now < COACHING_MIN_REMAINING_MS:
+            self.coaching_opportunities.pop(sid, None)
+            self.coaching_discarded_until[sid] = opportunity["deadline"]
+            logger.info("live_data stage=filter session=%s type=operation_notice reason=insufficient_reading_time", sid[:8])
+            return None
+        if trigger_epoch <= max(opportunity["epoch"], opportunity.get("attempt_epoch", -1)):
+            logger.info("live_data stage=coaching session=%s reason=not_unlocked", sid[:8])
+            return None
+        hashes = [digest(topic) for topic, _ in COACHING_TOPICS]
+        recent = self.db.execute(
+            "SELECT topic_hash, MAX(generated_at_ms) AS last FROM live_events "
+            "WHERE session_id=? AND topic_hash IN (?,?,?) GROUP BY topic_hash", (sid, *hashes),
+        ).fetchall()
+        last_by_topic = {row["topic_hash"]: row["last"] for row in recent}
+        if last_by_topic and now - max(last_by_topic.values()) < COACHING_GLOBAL_COOLDOWN_MS:
+            logger.info("live_data stage=coaching session=%s reason=cooldown", sid[:8])
+            return None
+        higher = self.db.execute(
+            "SELECT 1 FROM live_events WHERE session_id=? AND generated_at_ms>? "
+            "AND json_extract(payload, '$.priority')>25 LIMIT 1", (sid, now - COOLDOWN_MS),
+        ).fetchone()
+        if higher:
+            return None
+        available = [(last_by_topic.get(digest(topic), -1), topic, suggestion)
+                     for topic, suggestion in COACHING_TOPICS
+                     if digest(topic) not in last_by_topic
+                     or now - last_by_topic[digest(topic)] >= COACHING_TOPIC_COOLDOWN_MS]
+        if not available:
+            logger.info("live_data stage=coaching session=%s reason=cooldown", sid[:8])
+            return None
+        source_event = None if opportunity.get("activity_sources") is not None else self.db.execute(
+            "SELECT generated_at_ms, json_extract(payload, '$.sources') AS sources, "
+            "json_extract(payload, '$.prompt_type') AS prompt_type "
+            "FROM live_events WHERE session_id=? AND seq=?",
+            (sid, opportunity["seq"]),
+        ).fetchone()
+        if opportunity.get("activity_sources") is not None:
+            sources = opportunity["activity_sources"]
+        else:
+            if (source_event is None or source_event["prompt_type"] != "comment_reply"
+                    or source_event["generated_at_ms"] != opportunity["trigger_at"]):
+                return None
+            sources = json.loads(source_event["sources"] or "[]")
+        selected = []
+        for source in sources:
+            if source.get("kind") != "comment":
+                return None
+            row = {key: source[key] for key in (
+                "kind", "source", "coverage", "reliability", "confidence", "observed_at_ms",
+                "started_at_ms", "ended_at_ms", "effective_at_ms", "received_at_ms"
+            ) if key in source}
+            row["content"] = {}
+            if source.get("text_position"):
+                row["content"]["text_position"] = dict(source["text_position"])
+            selected.append(row)
+        if not selected:
+            return None
+        _, topic, suggestion = min(available, key=lambda item: item[0])
+        return {"topic": topic, "priority": 25, "phenomenon": "基于可用评论的条件式话术训练",
+                "suggestion": suggestion, "training_trigger_at_ms": opportunity["trigger_at"],
+                "training_seq": opportunity["seq"], "model_text": None, "model_context": "",
+                "observations": selected, "prompt_type": "operation_notice"}
+
+    def fusion_candidate(self, sid: str, token: str | None, trigger_epoch: int = 0):
         session = self.authorize(sid, token)
         if session["stopped_at_ms"] is not None:
             return None
         now = self.clock()
         rows = [row for row in self.fusion_windows.get(sid, ())
                 if now - MAX_OBSERVATION_AGE_MS <= row["effective_at_ms"] <= now + FUSION_FUTURE_SKEW_MS]
-        candidate = build_candidate(rows)
+        # 带完整性门控的原始 OCR 项须先经评论重建，不能退回旧单句模型路径。
+        legacy_rows = [row for row in rows if not (
+            row["kind"] == "comment" and row.get("capture_comment_count") is not None
+        )]
+        candidate = build_candidate(legacy_rows)
+        by_event = {row["event_id"]: row for row in rows}
+        reply_by_event = {row["event_id"]: row for batch in self.comment_batches.get(sid, {}).values()
+                          if batch["complete"] and now <= batch.get("reply_deadline", batch["deadline"])
+                          for row in batch.get("reply_rows", [])}
+        attempted = self.comment_attempted.setdefault(sid, set())
+        counts = self.comment_attempt_counts.get(sid, {})
+        failed_epochs = self.comment_failed_epochs.get(sid, {})
+        training_candidate = self._coaching_candidate(sid, now, trigger_epoch)
+        opportunity = self.coaching_opportunities.get(sid)
+        prefer_training = bool(training_candidate and opportunity["replies_after"] >= 1
+                               and (candidate is None or candidate["priority"] <= 25))
+        comment_candidate = None
+        records = [record for batch in self.comment_batches.get(sid, {}).values()
+                   if batch["complete"] and now <= batch.get("reply_deadline", batch["deadline"])
+                   for record in batch.get("records", [])]
+        for record in sorted(records, key=lambda item: (
+                counts.get(item.get("comment_id"), 0), not comment_record_priority(item))):
+            status = record.get("field_status", {})
+            text = record.get("text")
+            comment_id = record.get("comment_id")
+            first = record.get("first_observed_at_ms")
+            if (status.get("text") != "usable" or record.get("boundary_status") != "locally_complete"
+                    or not isinstance(text, str) or not isinstance(comment_id, str)
+                    or comment_id in attempted or counts.get(comment_id, 0) >= 2
+                    or failed_epochs.get(comment_id, -1) >= trigger_epoch or type(first) is not int
+                    or not now - COMMENT_REPLY_MAX_AGE_MS <= first <= now + FUSION_FUTURE_SKEW_MS):
+                continue
+            ids = record.get("source_event_ids") or []
+            field_sources = record.get("field_sources") or {}
+            text_sources = field_sources.get("text") or []
+            if (not ids or not text_sources or any(event_id not in ids for event_id in text_sources)
+                    or any(event_id not in reply_by_event for event_id in ids)):
+                continue
+            selected = [reply_by_event[event_id] for event_id in ids]
+            if any(row["source"] != record.get("source") for row in selected):
+                continue
+            if (sid not in self.coaching_opportunities
+                    and now >= self.coaching_discarded_until.get(sid, 0)):
+                trigger_at = max(row["received_at_ms"] for row in selected)
+                if trigger_at <= now and now - trigger_at <= COACHING_LIFETIME_MS - COACHING_MIN_REMAINING_MS:
+                    source_keys = ("kind", "source", "coverage", "reliability", "confidence",
+                                   "observed_at_ms", "started_at_ms", "ended_at_ms",
+                                   "effective_at_ms", "received_at_ms")
+                    sources = [{key: row[key] for key in source_keys if key in row} for row in selected]
+                    self.coaching_opportunities[sid] = {
+                        "seq": "activity:" + digest("|".join(ids)), "trigger_at": trigger_at,
+                        "deadline": trigger_at + COACHING_LIFETIME_MS, "epoch": trigger_epoch,
+                        "replies_after": 0, "activity_sources": sources,
+                    }
+                    logger.info("live_data stage=coaching session=%s reason=opportunity_created", sid[:8])
+            def usable_field(name):
+                sources = field_sources.get(name) or []
+                return status.get(name) == "usable" and bool(sources) and all(source in ids for source in sources)
+            consumption = record.get("consumption_level") if usable_field("consumption_level") else None
+            fan = record.get("fan_level") if usable_field("fan_level") else None
+            if not comment_is_candidate(text, consumption_level=consumption, fan_level=fan):
+                logger.info("live_data stage=filter session=%s type=comment_reply reason=noise_or_level", sid[:8])
+                continue
+            nickname = record.get("nickname") if usable_field("nickname") else None
+            if not isinstance(nickname, str) or not nickname.strip():
+                nickname = None
+            topic = comment_reply_topic(record["source"], nickname, text)
+            last_reply = self.db.execute(
+                "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash=?",
+                (sid, digest(topic)),
+            ).fetchone()[0]
+            if last_reply is not None and now - last_reply < COMMENT_REPLY_COOLDOWN_MS:
+                logger.info("live_data stage=filter session=%s type=comment_reply reason=cooldown", sid[:8])
+                continue
+            comment_candidate = {
+                "topic": topic, "priority": 25, "phenomenon": "公屏评论",
+                "observations": selected, "suggestion": None, "model_text": text,
+                "prompt_type": "comment_reply", "priority_eligible": comment_has_priority(consumption, fan),
+                "first_observed_at_ms": first,
+                "reply_to": {"comment_id": comment_id, "nickname": nickname, "text": text},
+            }
+            break
+        if comment_candidate is not None and (candidate is None or candidate["priority"] <= 25):
+            candidate = comment_candidate
+        elif (not prefer_training and comment_candidate is None
+              and (candidate is None or candidate["priority"] < 25)):
+            grouped: dict[str, list[dict]] = {}
+            for batch in self.comment_batches.get(sid, {}).values():
+                if not batch["complete"] or now > batch["deadline"]:
+                    continue
+                for record in batch.get("records", []):
+                    status, fields = record.get("field_status", {}), record.get("field_sources", {})
+                    ids = record.get("source_event_ids") or []
+                    if (status.get("text") != "usable" or status.get("nickname") != "usable"
+                            or record.get("boundary_status") != "locally_complete" or not ids
+                            or any(event_id not in by_event for event_id in ids)
+                            or not fields.get("text") or not fields.get("nickname")
+                            or any(event_id not in ids for event_id in fields["text"] + fields["nickname"])
+                            or any(by_event[event_id]["source"] != record.get("source") for event_id in ids)):
+                        continue
+                    grouped.setdefault(record["source"], []).append(record)
+            for group_records in grouped.values():
+                group = group_feedback(group_records, now)
+                if not group:
+                    continue
+                normalized = "".join(unicodedata.normalize("NFKC", group[0]["text"]).split()).casefold()
+                topic = "group_feedback:" + digest(normalized)
+                last_group = self.db.execute(
+                    "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash=?",
+                    (sid, digest(topic)),
+                ).fetchone()[0]
+                group_cooldown = COOLDOWN_MS if group[0]["source"].startswith("fixture:") else GROUP_NOTICE_COOLDOWN_MS
+                if last_group is not None and now - last_group < group_cooldown:
+                    continue
+                event_ids = list(dict.fromkeys(event_id for item in group for event_id in item["source_event_ids"]))
+                candidate = {
+                    "topic": topic, "priority": 25, "phenomenon": "评论区集中反馈相同内容",
+                    "suggestion": "评论区集中反馈了相同内容，可以结合已知信息回应。",
+                    "model_text": None, "model_context": "", "observations": [by_event[event_id] for event_id in event_ids],
+                    "prompt_type": "operation_notice",
+                }
+                break
+        if prefer_training:
+            candidate = training_candidate
+        elif candidate is None:
+            candidate = training_candidate
         if candidate is None:
+            logger.info("live_data stage=candidate session=%s reason=quiet", sid[:8])
             return None
         topic_hash = digest(candidate["topic"])
         last_same_topic = self.db.execute(
             "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash=?",
             (sid, topic_hash),
         ).fetchone()[0]
-        topic_cooldown = 90_000 if candidate["topic"] == "person:head_down" else COOLDOWN_MS
+        topic_cooldown = fusion_topic_cooldown(candidate)
         if last_same_topic is not None and now - last_same_topic < topic_cooldown:
+            logger.info("live_data stage=filter session=%s type=%s reason=cooldown", sid[:8],
+                        candidate.get("prompt_type", "operation_notice"))
             return None
-        if candidate["priority"] < 100:
+        if candidate["priority"] < 100 and candidate.get("prompt_type") != "comment_reply":
             recent = self.db.execute(
                 "SELECT payload FROM live_events WHERE session_id=? AND generated_at_ms>?",
                 (sid, now - COOLDOWN_MS),
             ).fetchall()
             if any(json.loads(row["payload"]).get("priority", 0) > candidate["priority"]
                    for row in recent):
+                logger.info("live_data stage=filter session=%s type=%s reason=priority", sid[:8],
+                            candidate.get("prompt_type", "operation_notice"))
                 return None
         candidate["description"] = session["description"]
+        candidate.setdefault("prompt_type", "operation_notice")
+        if candidate.get("prompt_type") == "comment_reply":
+            attempted.add(candidate["reply_to"]["comment_id"])
+        elif candidate.get("training_seq") is not None:
+            self.coaching_opportunities[sid]["attempt_epoch"] = trigger_epoch
+        logger.info("live_data stage=candidate session=%s type=%s reason=selected", sid[:8], candidate["prompt_type"])
         return candidate
 
+    def finish_comment_attempt(self, sid: str, comment_id: str, trigger_epoch: int,
+                               model_called: bool, terminal: bool, latest_epoch: int | None = None) -> None:
+        """记录实际调用及其终态；瞬时失败只允许后续新触发重试。"""
+        if sid not in self.comment_attempted:
+            return
+        counts = self.comment_attempt_counts.setdefault(sid, {})
+        if model_called:
+            counts[comment_id] = counts.get(comment_id, 0) + 1
+            opportunity = self.coaching_opportunities.get(sid)
+            if opportunity is not None:
+                if trigger_epoch > opportunity["epoch"]:
+                    opportunity["replies_after"] = 1
+                if latest_epoch is not None and latest_epoch > trigger_epoch:
+                    opportunity["epoch"] = max(opportunity["epoch"], latest_epoch)
+        if terminal:
+            return
+        if counts.get(comment_id, 0) >= 2:
+            logger.info("live_comment outcome=attempts_exhausted")
+            return
+        self.comment_attempted[sid].discard(comment_id)
+        if model_called:
+            self.comment_failed_epochs.setdefault(sid, {})[comment_id] = trigger_epoch
+
     def save_fusion_candidate(self, sid: str, token: str | None,
-                              candidate: dict, suggestion: str):
+                              candidate: dict, suggestion: str, trigger_epoch: int = 0):
         session = self.authorize(sid, token)
         if session["stopped_at_ms"] is not None:
             raise HTTPException(409, "live session stopped")
         now = self.clock()
+        is_coaching = candidate["topic"] in {topic for topic, _ in COACHING_TOPICS}
+        if is_coaching:
+            trigger_at = candidate.get("training_trigger_at_ms")
+            opportunity = self.coaching_opportunities.get(sid)
+            if (opportunity is None or candidate.get("training_seq") != opportunity["seq"]
+                    or trigger_at != opportunity["trigger_at"]
+                    or trigger_epoch <= opportunity["epoch"]
+                    or not trigger_at <= now < opportunity["deadline"]):
+                return {"reason": "candidate_expired", "prompt_id": None}
+            if opportunity["deadline"] - now < COACHING_MIN_REMAINING_MS:
+                self.coaching_opportunities.pop(sid, None)
+                self.coaching_discarded_until[sid] = opportunity["deadline"]
+                logger.info("live_data stage=filter session=%s type=operation_notice reason=insufficient_reading_time", sid[:8])
+                return {"reason": "insufficient_reading_time", "prompt_id": None}
+            hashes = [digest(topic) for topic, _ in COACHING_TOPICS]
+            last_training = self.db.execute(
+                "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash IN (?,?,?)",
+                (sid, *hashes),
+            ).fetchone()[0]
+            if last_training is not None and now - last_training < COACHING_GLOBAL_COOLDOWN_MS:
+                return {"reason": "cooldown", "prompt_id": None}
         rows = candidate["observations"]
         latest = max(row["effective_at_ms"] for row in rows)
-        if now - latest > MAX_OBSERVATION_AGE_MS:
+        age_limit = COMMENT_REPLY_MAX_AGE_MS if candidate.get("prompt_type") == "comment_reply" else MAX_OBSERVATION_AGE_MS
+        if not is_coaching and now - latest > age_limit:
+            return {"reason": "candidate_expired", "prompt_id": None}
+        if (candidate.get("prompt_type") == "comment_reply"
+                and now - candidate["first_observed_at_ms"] > COMMENT_REPLY_MAX_AGE_MS):
             return {"reason": "candidate_expired", "prompt_id": None}
         topic_hash = digest(candidate["topic"])
         last = self.db.execute(
             "SELECT MAX(generated_at_ms) FROM live_events WHERE session_id=? AND topic_hash=?",
             (sid, topic_hash),
         ).fetchone()[0]
-        topic_cooldown = 90_000 if candidate["topic"] == "person:head_down" else COOLDOWN_MS
+        topic_cooldown = fusion_topic_cooldown(candidate)
         if last is not None and now-last < topic_cooldown:
             return {"reason": "cooldown", "prompt_id": None}
-        if candidate["priority"] < 100:
+        if candidate["priority"] < 100 and candidate.get("prompt_type") != "comment_reply":
             higher = self.db.execute(
                 "SELECT payload FROM live_events WHERE session_id=? AND generated_at_ms>?",
                 (sid, now-COOLDOWN_MS),
@@ -666,8 +1150,12 @@ class LiveStore:
             "SELECT COUNT(*) FROM live_events WHERE session_id=?", (sid,)
         ).fetchone()[0]
         if pending >= MAX_PENDING:
+            if is_coaching:
+                logger.info("live_data stage=coaching session=%s reason=pending_limit", sid[:8])
             return {"reason": "pending_limit", "prompt_id": None}
         if total >= MAX_EVENTS:
+            if is_coaching:
+                logger.info("live_data stage=coaching session=%s reason=event_limit", sid[:8])
             raise HTTPException(429, "live event limit reached")
 
         start_at = min(row.get("started_at_ms") or row["effective_at_ms"] for row in rows)
@@ -743,12 +1231,42 @@ class LiveStore:
             ),
             "sources": sources, "priority": candidate["priority"],
         }
+        if candidate.get("prompt_type") == "comment_reply":
+            event["prompt_type"] = "comment_reply"
+            event["reply_to"] = {"comment_id": candidate["reply_to"]["comment_id"]}
+        elif candidate.get("prompt_type") == "operation_notice":
+            event["prompt_type"] = "operation_notice"
         with self.db:
-            self.db.execute(
+            cursor = self.db.execute(
                 "INSERT INTO live_events (session_id,topic_hash,generated_at_ms,expires_at_ms,payload) VALUES (?,?,?,?,?)",
-                (sid, topic_hash, now, now + PROMPT_TTL_MS,
+                (sid, topic_hash, now, trigger_at + COACHING_LIFETIME_MS if is_coaching else now + PROMPT_TTL_MS,
                  json.dumps(event, ensure_ascii=False)),
             )
+        self._expire_reply_context(now)
+        if candidate.get("prompt_type") == "comment_reply":
+            opportunity = self.coaching_opportunities.get(sid)
+            if opportunity is not None and opportunity["deadline"] - now < COACHING_MIN_REMAINING_MS:
+                self.coaching_opportunities.pop(sid, None)
+                if now < opportunity["deadline"]:
+                    self.coaching_discarded_until[sid] = opportunity["deadline"]
+                logger.info("live_data stage=filter session=%s type=operation_notice reason=insufficient_reading_time", sid[:8])
+                opportunity = None
+            if (opportunity is None and now >= self.coaching_discarded_until.get(sid, 0)):
+                self.coaching_discarded_until.pop(sid, None)
+                self.coaching_opportunities[sid] = {
+                    "seq": cursor.lastrowid, "trigger_at": now,
+                    "deadline": now + COACHING_LIFETIME_MS, "epoch": trigger_epoch,
+                    "replies_after": 0,
+                }
+            elif opportunity is not None and trigger_epoch > opportunity["epoch"]:
+                opportunity["replies_after"] = min(1, opportunity["replies_after"] + 1)
+            self.reply_context.setdefault(sid, {})[event["prompt_id"]] = (
+                now + PROMPT_TTL_MS, dict(candidate["reply_to"])
+            )
+        elif is_coaching:
+            completed = self.coaching_opportunities.pop(sid, None)
+            if completed is not None:
+                self.coaching_discarded_until[sid] = completed["deadline"]
         return {"reason": "generated", "prompt_id": event["prompt_id"]}
 
     @staticmethod
@@ -775,6 +1293,8 @@ class LiveStore:
     @staticmethod
     def event(row):
         payload = json.loads(row["payload"])
+        # 无论载荷来自新旧版本，持久化引用都不得直接进入响应。
+        payload.pop("reply_to", None)
         payload.update(generated_at_ms=row["generated_at_ms"],
                        expires_at_ms=row["expires_at_ms"],
                        returned_at_ms=row["returned_at_ms"],
@@ -783,6 +1303,7 @@ class LiveStore:
 
     def events(self, sid: str, token: str | None, after: str = "", limit: int = 50):
         row = self.authorize(sid, token)
+        self._expire_reply_context(self.clock())
         seq = self.sequence(sid, after)
         records = self.db.execute(
             "SELECT * FROM live_events WHERE session_id=? AND seq>? ORDER BY seq LIMIT ?",
@@ -797,6 +1318,8 @@ class LiveStore:
     def prompts(self, sid: str, token: str | None, after: str):
         session = self.authorize(sid, token)
         seq, now = self.sequence(sid, after), self.clock()
+        self._expire_reply_context(now)
+        self._expire_comment_payloads(sid, now)
         stopped = session["stopped_at_ms"] is not None
         rows = [] if stopped else self.db.execute(
             "SELECT * FROM live_events WHERE session_id=? AND seq>? AND expires_at_ms>? ORDER BY seq LIMIT 50",
@@ -811,9 +1334,16 @@ class LiveStore:
         prompts = []
         for row in rows:
             event = self.event(row)
+            context = self.reply_context.get(sid, {}).get(event["prompt_id"])
+            if context is not None and now < context[0]:
+                event["reply_to"] = dict(context[1])
             if event["returned_at_ms"] is None:
                 event.update(returned_at_ms=now, delivery_state="returned_to_client")
             prompts.append(event)
+        if prompts:
+            logger.info("live_data stage=poll session=%s reason=returned reply=%d notice=%d", sid[:8],
+                        sum(event.get("prompt_type") == "comment_reply" for event in prompts),
+                        sum(event.get("prompt_type") == "operation_notice" for event in prompts))
         maximum = self.db.execute(
             "SELECT COALESCE(MAX(seq),0) FROM live_events WHERE session_id=?", (sid,)
         ).fetchone()[0]

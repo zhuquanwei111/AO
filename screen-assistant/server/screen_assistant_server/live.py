@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import re
 import sqlite3
 import time
@@ -11,7 +12,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Literal
 
-from fastapi import APIRouter, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .live_rules import (
@@ -22,11 +23,12 @@ from .live_store import LiveStore, digest
 from .model_client import ModelTimeoutError, ModelUnavailableError
 from .live_fusion import (
     Observation, ObservationSource, TEST_COMMENT_FIXTURE_SOURCES,
-    observation_source_allowed,
+    observation_source_allowed, COMMENT_REPLY_MAX_AGE_MS,
 )
 from .person_observation import PersonObservation as PersonObservationValue, PersonPolicy
 
 router = APIRouter(prefix="/v1/live/sessions", tags=["live-test-fixture"])
+logger = logging.getLogger("screen_assistant.app")
 
 
 class CreateSession(BaseModel):
@@ -38,6 +40,12 @@ class CreateSession(BaseModel):
 class SessionSignal(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     source: Literal["ios_app", "android_app"]
+
+
+class BackstageRecoveryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    expected_status: Literal["waiting_for_stop"]
+    expected_created_at_ms: int = Field(ge=0, le=2**63 - 1)
 
 
 BACKSTAGE_METRIC_KEYS = ("累计观众", "新增粉丝", "评论人数", "送礼人数", "获得音浪")
@@ -177,13 +185,114 @@ class PersonSessionState:
 
 
 class LiveService:
-    def __init__(self, path: str, clock):
+    def __init__(self, path: str, clock, *, concurrency: int = 2, queue_limit: int = 16):
         self.path, self.clock = path, clock
         self.store: LiveStore | None = None
         self.lock = asyncio.Lock()
-        self.fusion_lock = asyncio.Lock()
+        self.fusion_slots = asyncio.Semaphore(concurrency)
+        self.fusion_concurrency = concurrency
+        self.fusion_queue_limit = queue_limit
+        self.fusion_queue = deque()
+        self.fusion_queued = {}
+        self.fusion_active = {}
+        self.fusion_dirty = set()
+        self.fusion_trigger_epoch = {}
+        self.fusion_audio_pending = {}
+        self.fusion_stopping = set()
+        self.fusion_closed = False
         self.waiters: dict[str, set[asyncio.Future]] = {}
         self.person_states: dict[str, PersonSessionState] = {}
+
+    def schedule_fusion(self, sid, token, request):
+        if self.fusion_closed or sid in self.fusion_stopping:
+            return False
+        active = self.fusion_active.get(sid)
+        if active is not None and active.done():
+            self._fusion_done(sid, active)
+            active = None
+        if active is not None:
+            self.fusion_trigger_epoch[sid] = self.fusion_trigger_epoch.get(sid, 0) + 1
+            self.fusion_dirty.add(sid)
+            logger.info("live_fusion outcome=coalesced")
+            return True
+        if sid in self.fusion_queued:
+            self.fusion_trigger_epoch[sid] = self.fusion_trigger_epoch.get(sid, 0) + 1
+            logger.info("live_fusion outcome=coalesced")
+            return True
+        if len(self.fusion_active) >= self.fusion_concurrency and len(self.fusion_queue) >= self.fusion_queue_limit:
+            logger.info("live_fusion outcome=busy")
+            logger.info("live_data stage=scheduler session=%s outcome=scheduler_full", sid[:8])
+            return False
+        self.fusion_queued[sid] = (token, request)
+        self.fusion_trigger_epoch[sid] = self.fusion_trigger_epoch.get(sid, 0) + 1
+        self.fusion_queue.append(sid)
+        self._pump_fusion()
+        return True
+
+    def schedule_audio_fusion(self, sid, token, request):
+        scheduled = self.schedule_fusion(sid, token, request)
+        if scheduled:
+            # 每次有效音频触发使用新身份，旧执行不能清除随后到达的音频。
+            self.fusion_audio_pending[sid] = object()
+        return scheduled
+
+    def _pump_fusion(self):
+        while not self.fusion_closed and self.fusion_queue and len(self.fusion_active) < self.fusion_concurrency:
+            sid = self.fusion_queue.popleft()
+            token, request = self.fusion_queued.pop(sid)
+            task = asyncio.create_task(self._fusion_worker(sid, token, request))
+            self.fusion_active[sid] = task
+            task.add_done_callback(lambda task, sid=sid: self._fusion_done(sid, task))
+
+    def _fusion_done(self, sid, task):
+        if self.fusion_active.get(sid) is not task:
+            return
+        self.fusion_active.pop(sid, None)
+        self.fusion_dirty.discard(sid)
+        self.fusion_audio_pending.pop(sid, None)
+        self._pump_fusion()
+
+    async def _fusion_worker(self, sid, token, request):
+        try:
+            while True:
+                self.fusion_dirty.discard(sid)
+                if FUSION_SETTLE_MS:
+                    await asyncio.sleep(FUSION_SETTLE_MS / 1000)
+                audio_generation = self.fusion_audio_pending.get(sid)
+                try:
+                    await self.deliver_fusion(sid, token, request)
+                except Exception:
+                    logger.warning("live_fusion outcome=failed")
+                finally:
+                    if audio_generation is not None and self.fusion_audio_pending.get(sid) is audio_generation:
+                        self.fusion_audio_pending.pop(sid, None)
+                if sid not in self.fusion_dirty or sid in self.fusion_stopping:
+                    break
+        except asyncio.CancelledError:
+            logger.info("live_fusion outcome=cancelled")
+            raise
+
+    async def stop_fusion(self, sid):
+        self.fusion_dirty.discard(sid)
+        if sid in self.fusion_queued:
+            self.fusion_queued.pop(sid)
+            self.fusion_queue.remove(sid)
+        task = self.fusion_active.get(sid)
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.fusion_trigger_epoch.pop(sid, None)
+
+    async def close_fusion(self):
+        self.fusion_closed = True
+        self.fusion_queue.clear()
+        self.fusion_queued.clear()
+        self.fusion_audio_pending.clear()
+        tasks = list(self.fusion_active.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self.fusion_trigger_epoch.clear()
 
     def dispatch(self, method: str, *args):
         # 延迟初始化，使新存储不可写时不影响旧问答/健康检查的生命周期。
@@ -335,36 +444,103 @@ class LiveService:
                     del self.waiters[sid]
 
     async def deliver_fusion(self, sid: str, token: str | None, request: Request,
-                             *, urgent: bool = False):
+                             *, urgent: bool = False, allow_stopping: bool = False):
         async def deliver():
-            candidate = await self.run("fusion_candidate", sid, token)
+            epoch = self.fusion_trigger_epoch.get(sid, 0)
+            candidate = await self.run("fusion_candidate", sid, token, epoch)
             if candidate is None:
                 return {"reason": "quiet", "prompt_id": None}
-            suggestion = candidate["suggestion"]
-            if candidate["model_text"]:
-                cfg = request.app.state.settings
-                if not cfg.tianyi_api_key:
-                    return {"reason": "model_unavailable", "prompt_id": None}
-                try:
-                    source = ",".join(dict.fromkeys(
-                        row["source"] for row in candidate["observations"]
-                    ))
-                    observed_at = max(row["effective_at_ms"] for row in candidate["observations"])
-                    suggestion = await request.app.state.model.suggest_live(
-                        candidate["model_text"], candidate["description"], source,
-                        observed_at, context=candidate["model_context"],
-                    )
-                except (ModelTimeoutError, ModelUnavailableError):
-                    return {"reason": "model_unavailable", "prompt_id": None}
-                if not valid_operation_suggestion(suggestion):
-                    return {"reason": "model_output_invalid", "prompt_id": None}
-            elif not suggestion or len(suggestion) > 100 or "\n" in suggestion or "\r" in suggestion:
-                return {"reason": "candidate_invalid", "prompt_id": None}
-            return await self.run("save_fusion_candidate", sid, token, candidate, suggestion)
+            is_comment = candidate.get("prompt_type") == "comment_reply"
+            comment_id = candidate["reply_to"]["comment_id"] if is_comment else None
+            terminal = False
+            model_called = False
+            try:
+                suggestion = candidate["suggestion"]
+                if candidate["model_text"]:
+                    cfg = request.app.state.settings
+                    if not cfg.tianyi_api_key:
+                        logger.info("live_data stage=model session=%s type=%s reason=config_unavailable",
+                                    sid[:8], candidate.get("prompt_type"))
+                        return {"reason": "model_unavailable", "prompt_id": None}
+                    try:
+                        if is_comment:
+                            remaining_ms = COMMENT_REPLY_MAX_AGE_MS - (self.clock() - candidate["first_observed_at_ms"])
+                            if remaining_ms <= 0:
+                                terminal = True
+                                logger.info("live_data stage=model session=%s type=comment_reply reason=expired", sid[:8])
+                                return {"reason": "candidate_expired", "prompt_id": None}
+                            model_called = True
+                            logger.info("live_data stage=model session=%s type=comment_reply reason=attempt", sid[:8])
+                            suggestion = await asyncio.wait_for(
+                                request.app.state.model.reply_to_comment(
+                                    candidate["model_text"], nickname=candidate["reply_to"]["nickname"],
+                                    priority_eligible=candidate.get("priority_eligible", False),
+                                ), timeout=min(cfg.model_timeout_seconds, remaining_ms / 1000),
+                            )
+                        else:
+                            source = ",".join(dict.fromkeys(
+                                row["source"] for row in candidate["observations"]
+                            ))
+                            observed_at = max(row["effective_at_ms"] for row in candidate["observations"])
+                            suggestion = await asyncio.wait_for(
+                                request.app.state.model.suggest_live(
+                                    candidate["model_text"], candidate["description"], source,
+                                    observed_at, context=candidate["model_context"],
+                                ), timeout=cfg.model_timeout_seconds,
+                            )
+                    except (asyncio.TimeoutError, ModelTimeoutError):
+                        logger.info("live_fusion outcome=timeout")
+                        logger.info("live_data stage=model session=%s type=%s reason=timeout",
+                                    sid[:8], candidate.get("prompt_type"))
+                        return {"reason": "model_unavailable", "prompt_id": None}
+                    except ModelUnavailableError as exc:
+                        if is_comment and exc.error_code == "model_output_invalid":
+                            terminal = True
+                            logger.info("live_data stage=model session=%s type=comment_reply reason=invalid", sid[:8])
+                            return {"reason": "model_output_invalid", "prompt_id": None}
+                        logger.info("live_fusion outcome=model_unavailable")
+                        logger.info("live_data stage=model session=%s type=%s reason=unavailable",
+                                    sid[:8], candidate.get("prompt_type"))
+                        return {"reason": "model_unavailable", "prompt_id": None}
+                    if is_comment and suggestion is None:
+                        terminal = True
+                        logger.info("live_data stage=model session=%s type=comment_reply reason=quiet", sid[:8])
+                        return {"reason": "quiet", "prompt_id": None}
+                    if not is_comment and not valid_operation_suggestion(suggestion):
+                        return {"reason": "model_output_invalid", "prompt_id": None}
+                elif not suggestion or len(suggestion) > 100 or "\n" in suggestion or "\r" in suggestion:
+                    return {"reason": "candidate_invalid", "prompt_id": None}
+                async with self.lock:
+                    if self.fusion_closed or (sid in self.fusion_stopping and not allow_stopping):
+                        return {"reason": "cancelled", "prompt_id": None}
+                    result = await self.call("save_fusion_candidate", sid, token, candidate, suggestion,
+                                             self.fusion_trigger_epoch.get(sid, 0))
+                    if (candidate.get("training_seq") is not None and result.get("reason") == "generated"
+                            and sid in self.fusion_active and sid not in self.fusion_stopping):
+                        # 完成一次训练后继续处理已就绪的普通评论，失败不自旋。
+                        self.fusion_dirty.add(sid)
+                    if result.get("prompt_id"):
+                        for future in self.waiters.get(sid, ()):
+                            if not future.done():
+                                future.set_result(None)
+                    terminal = result.get("reason") in {
+                        "generated", "candidate_expired", "cooldown", "suppressed_by_priority"
+                    }
+                    logger.info("live_data stage=save session=%s type=%s reason=%s", sid[:8],
+                                candidate.get("prompt_type"), result.get("reason"))
+                    return result
+            finally:
+                if is_comment:
+                    await self.run("finish_comment_attempt", sid, comment_id, epoch, model_called, terminal,
+                                   self.fusion_trigger_epoch.get(sid, epoch))
+                    if terminal:
+                        if sid in self.fusion_active and sid not in self.fusion_stopping:
+                            # 同一有界执行槽继续处理已完成候选之后的其它评论。
+                            self.fusion_dirty.add(sid)
 
         if urgent:
             return await deliver()
-        async with self.fusion_lock:
+        async with self.fusion_slots:
             return await deliver()
 
 
@@ -410,17 +586,31 @@ async def stop_session(session_id: str, request: Request,
             raise HTTPException(409, "stop signal source does not match app session")
         stopped = row["stopped_at_ms"] is not None
     audio_result = None
+    if session_id in service.fusion_stopping:
+        raise HTTPException(409, "live session already stopping")
+    service.fusion_stopping.add(session_id)
+    pending_audio = service.fusion_audio_pending.pop(session_id, None) is not None
     if not stopped:
-        audio_result = await request.app.state.audio.finish_session(session_id, token)
-    request.app.state.audio.closing.add(session_id)
+        request.app.state.audio.begin_fusion_stop(session_id)
     try:
-        if audio_result and audio_result["transcript_count"]:
-            await service.deliver_fusion(session_id, token, request)
+        await service.stop_fusion(session_id)
+        if not stopped:
+            audio_result = await request.app.state.audio.finish_session(session_id, token)
+        request.app.state.audio.closing.add(session_id)
+        if not stopped and (pending_audio or request.app.state.audio.stop_transcripts.get(session_id)):
+            try:
+                await service.deliver_fusion(session_id, token, request, allow_stopping=True)
+            except HTTPException as error:
+                if error.status_code not in (429, 503):
+                    raise
+                logger.warning("live_fusion outcome=stop_candidate_failed status=%s", error.status_code)
         result = await service.run(
             "stop", session_id, token, payload.source if payload else None,
         )
     finally:
         request.app.state.audio.closing.discard(session_id)
+        request.app.state.audio.stop_transcripts.pop(session_id, None)
+        service.fusion_stopping.discard(session_id)
     if audio_result is not None and (audio_result["transcript_count"] or audio_result["incomplete"]):
         result["audio"] = audio_result
     return result
@@ -447,6 +637,13 @@ async def get_backstage_task(task_id: str, request: Request,
                              token: str | None = Header(None, alias="X-Backstage-Worker-Token")):
     _authorize_backstage_worker(request, token)
     return await request.app.state.live.run("backstage_task", task_id)
+
+
+@router.post("/backstage/tasks/{task_id}/recover")
+async def recover_backstage_task(task_id: str, payload: BackstageRecoveryRequest, request: Request,
+                                  token: str | None = Header(None, alias="X-Backstage-Worker-Token")):
+    _authorize_backstage_worker(request, token)
+    return await request.app.state.live.run("recover_backstage_task", task_id, payload.expected_created_at_ms)
 
 
 @router.post("/{session_id}/backstage/result")
@@ -501,10 +698,16 @@ async def add_comment(session_id: str, payload: CommentObservation, request: Req
 async def process_fusion_observation(service: LiveService, session_id: str,
                                      token: str | None, request: Request,
                                      result: dict, body: dict, *, urgent: bool):
-    if result.get("reason") != "windowed":
+    batch_ready = result.pop("_batch_ready", False)
+    if result.get("reason") != "windowed" and not batch_ready:
         return result
-    if not urgent and FUSION_SETTLE_MS:
-        await asyncio.sleep(FUSION_SETTLE_MS / 1000)
+    if not urgent:
+        scheduled = service.schedule_fusion(session_id, token, request)
+        if result.get("reason") == "windowed":
+            result.update(reason="scheduled" if scheduled else "analysis_busy", prompt_id=None)
+        logger.info("live_data stage=dispatch session=%s kind=%s reason=%s", session_id[:8],
+                    body["kind"], result.get("reason"))
+        return result
     delivered = await service.deliver_fusion(session_id, token, request, urgent=urgent)
     if delivered.get("reason") == "generated":
         result.update(delivered)
@@ -522,6 +725,10 @@ async def add_typed_observation(session_id: str, payload: Observation, request: 
                                 token: str | None = Header(None, alias="X-Live-Session-Token")):
     service = request.app.state.live
     body = payload.model_dump()
+    # 新字段缺省时保留旧版本的指纹输入，避免跨版本重试冲突。
+    for key in ("capture_batch_id", "line_index", "capture_comment_count"):
+        if key in body and body[key] is None:
+            del body[key]
     result = await service.run("add_observation", session_id, token, body, service.clock())
     return await process_fusion_observation(
         service, session_id, token, request, result, body,
@@ -563,8 +770,15 @@ async def add_signal(session_id: str, payload: PersonSignal, request: Request,
 
 
 @router.get("/{session_id}/prompts")
-async def poll_prompts(session_id: str, request: Request,
+async def poll_prompts(session_id: str, request: Request, response: Response,
                        after: str = Query("", max_length=128),
                        wait_ms: int = Query(0, ge=0, le=MAX_WAIT_MS),
                        token: str | None = Header(None, alias="X-Live-Session-Token")):
-    return await request.app.state.live.poll(session_id, token, after, wait_ms)
+    started_ns = time.monotonic_ns()
+    service = request.app.state.live
+    result = await service.poll(session_id, token, after, wait_ms)
+    finished_ns = time.monotonic_ns()
+    result["server_time_ms"] = service.clock()
+    result["server_processing_ms"] = (finished_ns - started_ns) // 1_000_000
+    response.headers["Cache-Control"] = "no-store"
+    return result

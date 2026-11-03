@@ -34,10 +34,11 @@ public final class LiveContractProbe {
                     .put("confidence",.9).put("content",new JSONObject().put("text","受控通知文字")
                             .put("region_confirmed",true).put("explicit_warning_confirmed",false));
             LiveClient.call(s,"observations",observation);
-            JSONObject prompts=LiveClient.poll(s,"");
+            // 普通JVM复用产品Remote的时钟注入入口；Android产品仍使用SystemClock。
+            JSONObject prompts=LiveClient.remote(args[0],"","",System::nanoTime).poll(s,"");
             assertFalse(prompts.getBoolean("stopped"));
             assertTrue(prompts.getJSONArray("prompts").length()>0);
-            JSONObject person=new JSONObject().put("source",LiveFrameAnalyzer.PERSON_SOURCE).put("coverage","sampled_person_roi")
+            JSONObject person=new JSONObject().put("source","android_vision_person").put("coverage","sampled_person_roi")
                     .put("segment_id","android-controlled").put("sequence",0).put("observed_at_ms",System.currentTimeMillis())
                     .put("uptime_ms",1000).put("quality","unknown");
             LiveClient.call(s,"person-observations",person);
@@ -51,7 +52,8 @@ public final class LiveContractProbe {
             assertEquals(stopped.getLong("stopped_at_ms"),LiveClient.stop(s).getLong("stopped_at_ms"));
             JSONObject summary=LiveClient.call(s,"summary",null);
             assertEquals("android-contract-fixture",summary.getJSONObject("backstage_recap").getString("douyin_account"));
-            assertTrue(RecapText.pending(summary));
+            assertEquals("not_connected",summary.getJSONObject("backstage_recap").getString("status"));
+            assertFalse(RecapText.pending(summary));
             assertEquals(123,summary.getJSONObject("online_count").getJSONObject("peak").getInt("nominal_value"));
             assertEquals(1,summary.getJSONObject("online_count").getJSONObject("coverage").getInt("valid_value_samples"));
             assertTrue(RecapText.backstage(summary.getJSONObject("backstage_recap")).contains("新增粉丝：未取得"));

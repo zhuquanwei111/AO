@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from screen_assistant_server.app import create_app
 from screen_assistant_server.config import Settings
+from test_live import wait_for_fusion
 
 
 class Clock:
@@ -68,7 +69,8 @@ def test_person_candidate_flows_through_m4_prompt_events_and_summary(tmp_path):
             assert response.status_code == 200, response.text
 
         result = response.json()
-        assert result["reason"] == "generated"
+        assert result["reason"] == "scheduled"
+        wait_for_fusion(client)
         page = client.get(url + "/prompts", headers=headers).json()
         assert len(page["prompts"]) == 1
         event = page["prompts"][0]
@@ -109,7 +111,8 @@ def test_android_person_adapter_reuses_m7_policy_and_preserves_source(tmp_path, 
                                  json=sample(seq, clock.now, 10_000 + seq * 3_000,
                                              people=0, source=person_source))
         assert result.status_code == 200
-        assert result.json()["reason"] == "generated"
+        assert result.json()["reason"] == "scheduled"
+        wait_for_fusion(client)
         events = client.get(url + "/events", headers=headers).json()["events"]
         assert len(events) == 1
         assert events[0]["sources"][0]["source"] == person_source
@@ -180,7 +183,8 @@ def test_legacy_head_down_and_new_person_candidate_share_cooldown(tmp_path):
             "signal": "head_down", "confidence": 0.8, "sample_count": 6,
             "started_at_ms": session["started_at_ms"], "observed_at_ms": clock.now,
         }
-        assert client.post(url + "/signals", headers=headers, json=legacy).json()["reason"] == "generated"
+        assert client.post(url + "/signals", headers=headers, json=legacy).json()["reason"] == "scheduled"
+        wait_for_fusion(client)
         # 70秒后新候选仍需服从旧head_down出口的90秒冷却。
         clock.now += 49_000
         sequence = 0
@@ -197,6 +201,7 @@ def test_legacy_head_down_and_new_person_candidate_share_cooldown(tmp_path):
                                     json=sample(sequence, clock.now, 100_000 + sequence * 3_000,
                                                 people=0))
         assert candidate.status_code == 200
-        assert candidate.json()["reason"] == "cooldown"
+        assert candidate.json()["reason"] == "scheduled"
+        wait_for_fusion(client)
         events = client.get(url + "/events", headers=headers).json()["events"]
         assert len(events) == 1 and events[0]["phenomenon"] == "画面中可见人物持续低头"
