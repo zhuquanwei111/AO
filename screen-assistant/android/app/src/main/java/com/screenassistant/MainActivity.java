@@ -91,6 +91,7 @@ public class MainActivity extends Activity {
         androidx.core.content.ContextCompat.registerReceiver(this, stateReceiver, f,
                 androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED);
         CaptureService.setAssistantUiVisible(true);
+        livePanel.resumePendingStop();
     }
 
     @Override protected void onStop() {

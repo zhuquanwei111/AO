@@ -97,6 +97,11 @@ public class RecapActivity extends Activity {
         JSONArray previousEvents=loadedEvents;
         io.execute(() -> {
             JSONObject result = null; JSONArray rows = null; String error = "";
+            try {
+                LiveConnection.retryPendingStop(Prefs.liveStore(this), LiveClient.remote("", "", ""),
+                        () -> CaptureService.uiVisible && CaptureService.phase == CaptureService.Phase.IDLE
+                                && !CaptureService.stopInProgress);
+            } catch (Exception ignored) { /* 保留同场待结束意图，由可见页面下次刷新重试。 */ }
             try { result = LiveClient.call(requested, "summary", null); }
             catch (Exception e) { error = RecapRequest.failure(e); }
             if (includeEvents) {
@@ -126,7 +131,7 @@ public class RecapActivity extends Activity {
                 if (eventRows != null) { loadedEvents=eventRows; events.setText(RecapPresentation.events(eventRows)); }
                 if (cached) session=null;
                 refreshStopStatus();
-                if (rounds < 120 && RecapText.shouldRefresh(data)) scheduleRefresh();
+                if (rounds < 120 && (Prefs.stopPending(this) || RecapText.shouldRefresh(data))) scheduleRefresh();
                 else if (data!=null && pending(data)) status.append("\n本轮自动刷新已暂停，点刷新或重开可继续。");
             });
         });
