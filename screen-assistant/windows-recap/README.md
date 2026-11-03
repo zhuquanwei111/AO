@@ -51,6 +51,10 @@ MCP 两份 requirements 只锁直接依赖；其传递依赖尚无完整锁，�
 
 截图经现有 Windows-MCP 返回后只通过进程管道驻留内存，RapidOCR 直接读取字节；原图和裁区不落盘。导航使用已确认的目标浏览器窗口图片；直播间身份与指标只使用经来源、窗口和范围检查的独立裁区，未找到合法裁区不得退回整窗。识别到登录/验证码、账号或场次歧义时停止。五项读取需先确认同场账号并要求至少三项高置信标签属于同一动态汇总行；缺项才尝试独立单项裁区，其他行不用于补缺。该保守约束可能拒绝真实布局或漏读字段，不等于真实平台可用；真实页面识别、Windows-MCP接线和端到端链路仍须独立验收。
 
+窗口遮挡检查按实际呈现区分：DWM 明确标为 cloaked 的窗口和系统明确报告整体透明度为零的分层窗口不构成图像覆盖。Windows-MCP 0.8.8 自身的控制提示及截图闪光由官方截图实现临时隐藏/撤除；仅当窗口类、分层/穿透/置顶/不激活样式、无 owner 和顶层身份均符合官方实现，且其进程属于本次仍存活 MCP 客户端的子树、创建时间顺序及复核一致时，才豁免矩形相交检查。其他进程的同名窗口、透明度未知、真实覆盖或枚举异常仍拒绝；用户接管、目标身份、窗口位置和输入落点检查继续生效。拒绝日志只记录截图/输入阶段、固定类别与必要句柄/样式，不记录窗口标题、页面或图片。
+
+实现依据：[Windows-MCP 0.8.8 截图实现](https://github.com/CursorTouch/Windows-MCP/blob/v0.8.8/src/windows_mcp/desktop/service.py)、[控制提示](https://github.com/CursorTouch/Windows-MCP/blob/v0.8.8/src/windows_mcp/desktop/control_overlay.py)、[微软 DWM 窗口属性](https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/ne-dwmapi-dwmwindowattribute)、[分层窗口透明度](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getlayeredwindowattributes)、[进程父子元数据](https://learn.microsoft.com/en-us/windows/win32/api/tlhelp32/ns-tlhelp32-processentry32w)。这些资料与离线回归证明适配办法，不代替本次真实平台、账号或五项验收。
+
 ## 许可与来源
 
 保留源清单提供的RapidOCR及模型许可材料。RapidOCR代码为Apache-2.0，随附模型许可另见`fixed-recap-prototype/rapidocr-MODEL_LICENSES.md`及`ocr-model-manifest.json`。锁定的Agents SDK与Python MCP SDK为MIT，Windows-MCP 0.8.8为MIT，分别见[OpenAI Agents SDK许可](https://github.com/openai/openai-agents-python/blob/main/LICENSE)、[Python MCP SDK许可](https://github.com/modelcontextprotocol/python-sdk/blob/main/LICENSE)和[Windows-MCP 0.8.8发行说明](https://pypi.org/project/windows-mcp/0.8.8/)。本目录不内嵌这些依赖包；两份直接依赖列表没有完整锁定全部传递依赖，安装方仍须随实际分发检查其许可。本目录仅包含客户端适配源码，不包含Windows-MCP二进制包、模型权重、API密钥、桌面截图或本地结果。

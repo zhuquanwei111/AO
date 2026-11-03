@@ -255,7 +255,7 @@ class Desktop:
         live=self.guard(window)
         region=live['rect']
         if not self.probe.contained(region): raise RecapError('window_outside_screen')
-        self.probe.ensure_unobstructed(live)
+        self.ensure_clear(live,'before_screenshot')
         if use_uia:
             reply=self.mcp.call('Snapshot',use_vision=True,use_dom=False,use_annotation=False,
                                 use_ui_tree=True,region=region)
@@ -263,7 +263,7 @@ class Desktop:
             reply=self.mcp.call('Screenshot',use_annotation=False,region=region)
         captured_at=now()  # 工具返回截图时，不把后续OCR结束时间冒作截图时间。
         self.guard(live)  # 在耗时OCR前记录本次截图正常取得的租约，并复核前台。
-        self.probe.ensure_unobstructed(live)
+        self.ensure_clear(live,'after_screenshot')
         text=check_reply(reply)
         images=[q['image_data'] for q in reply.get('content',[]) if 'image_data' in q]
         if len(images)!=1 or not isinstance(images[0],str): raise RecapError('screenshot_missing')
@@ -288,6 +288,20 @@ class Desktop:
             try: seeds=tuple(address_seed_candidates(text,live['title'],live['rect']))
             except RecapError as error: seed_error=error.reason
         return View(tokens,image,live,size,captured_at,uia,seeds,seed_error)
+
+    def ensure_clear(self,window,stage):
+        try: self.probe.ensure_unobstructed(window)
+        except RecapError as error:
+            if hasattr(self.mcp,'note'):
+                details=getattr(self.probe,'last_occlusion',{})
+                details=details if isinstance(details,dict) else {}
+                safe={key:details[key] for key in ('category','handle','cloaked','cloak_hresult','exstyle') if key in details}
+                self.mcp.note('window_guard_rejected',stage=stage,reason=error.reason,
+                              target_handle=window['handle'],**safe)
+            raise
+        excluded=getattr(self.probe,'occlusion_exclusions',{})
+        if isinstance(excluded,dict) and excluded and hasattr(self.mcp,'note'):
+            self.mcp.note('window_guard_clear',stage=stage,target_handle=window['handle'],exclusions=excluded)
 
     def wait(self,window,select,timeout=20,use_uia=True):
         began=time.monotonic(); deadline=began+timeout
@@ -327,9 +341,9 @@ class Desktop:
         point=view.point(token)
         x,y,r,b=current['rect']
         if not (x<point[0]<r and y<point[1]<b): raise RecapError('locator_outside_window')
-        self.probe.ensure_unobstructed(view.window)
+        self.ensure_clear(view.window,'before_click_hit_test')
         self.probe.ensure_point(view.window,point)
-        self.probe.ensure_unobstructed(view.window)
+        self.ensure_clear(view.window,'before_click')
         self.mcp.call('Click',loc=point,button='left',clicks=1)
 
     def key(self,window,key):
@@ -345,9 +359,9 @@ class Desktop:
             point=view.point(token)
             x,y,r,b=live['rect']
             if not (x<point[0]<r and y<point[1]<b): raise RecapError('locator_outside_window')
-            self.probe.ensure_unobstructed(view.window)
+            self.ensure_clear(view.window,'before_type_hit_test')
             self.probe.ensure_point(view.window,point)
-            self.probe.ensure_unobstructed(view.window)
+            self.ensure_clear(view.window,'before_type')
             self.mcp.call('Type',loc=point,text=chunk,clear=index==0,
                           caret_position='end',press_enter=index==len(chunks)-1)
 
@@ -358,9 +372,9 @@ class Desktop:
             if live['rect']!=view.window['rect']: raise RecapError('window_moved_before_action')
             point=view.point(token); x,y,r,b=live['rect']
             if not (x<point[0]<r and y<point[1]<b): raise RecapError('locator_outside_window')
-            self.probe.ensure_unobstructed(view.window)
+            self.ensure_clear(view.window,'before_account_hit_test')
             self.probe.ensure_point(view.window,point)
-            self.probe.ensure_unobstructed(view.window)
+            self.ensure_clear(view.window,'before_account_type')
             self.mcp.call('Type',loc=point,text=account[start:start+19],clear=index==0,
                           caret_position='end',press_enter=False)
 

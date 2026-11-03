@@ -112,7 +112,7 @@ def main():
                 require_sdk_runtime()
             except (ValueError, OSError):
                 raise RecapError('visual_runtime_unavailable') from None
-            desktop=GLMDesktop(mcp,Probe(),LocalOCR(args.models),store.root/(task+'-evidence'),
+            desktop=GLMDesktop(mcp,Probe(mcp=mcp),LocalOCR(args.models),store.root/(task+'-evidence'),
                 'https://union.bytedance.com/open/portal/index',vision=GLMVision(runtime))
             runner=Runner(StartedStore(store.root),desktop)
             record=runner.start(task,args.account,args.session_id,args.source) if args.command=='start' else runner.stop(task,args.source)
