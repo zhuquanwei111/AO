@@ -70,9 +70,32 @@ public final class Prefs {
 
     /** 私有SharedPreferences；同步落盘后才报告创建成功，避免进程退出丢凭证。 */
     public static synchronized boolean saveSession(Context c, LiveClient.Session session) {
-        try { return sp(c).edit().putString("live_session", session.json().toString())
-                .putBoolean("live_create_pending", false).commit(); }
+        try {
+            LiveClient.Session previous = getSession(c);
+            android.content.SharedPreferences.Editor editor = sp(c).edit();
+            if (previous != null && !RecapRequest.sameSession(previous,session)) {
+                if (!previous.stopped) return false;
+                editor.putString("pending_recaps", RecapHistory.remember(getRecapHistory(c), previous).toString());
+            }
+            return editor.putString("live_session", session.json().toString())
+                    .putBoolean("live_create_pending", false).commit();
+        }
         catch (org.json.JSONException e) { return false; }
+    }
+
+    static synchronized org.json.JSONArray getRecapHistory(Context c) {
+        try { return new org.json.JSONArray(sp(c).getString("pending_recaps", "[]")); }
+        catch (org.json.JSONException error) { return new org.json.JSONArray(); }
+    }
+    static synchronized java.util.List<LiveClient.Session> pendingRecaps(Context c) {
+        try { return RecapHistory.pending(getRecapHistory(c)); }
+        catch (org.json.JSONException error) { return java.util.Collections.emptyList(); }
+    }
+    static synchronized boolean cacheArchivedRecap(Context c, LiveClient.Session scene, org.json.JSONObject summary) {
+        try {
+            org.json.JSONArray history = RecapHistory.complete(getRecapHistory(c), scene, summary, null);
+            return sp(c).edit().putString("pending_recaps", history.toString()).commit();
+        } catch (org.json.JSONException error) { return false; }
     }
 
     static boolean createPending(Context c) { return sp(c).getBoolean("live_create_pending", false); }

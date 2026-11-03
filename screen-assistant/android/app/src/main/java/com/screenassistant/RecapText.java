@@ -8,7 +8,7 @@ final class RecapText {
     static String stopStatus(boolean hasSession, boolean stopped, boolean pending, boolean inFlight) {
         if (inFlight) return "本机采集已停止，正在确认场次结束。";
         if (pending) return hasSession
-                ? "本机采集已停止，场次结束尚未确认。请返回设置重试结束本场。"
+                ? "本机采集已停止，场次结束尚未确认。应用打开时会自动重试，请检查连接。"
                 : "场次结束尚未确认，本机未保存场次凭证，请核对服务端状态。";
         if (hasSession && stopped) return "本场已结束。";
         return "";
@@ -19,6 +19,9 @@ final class RecapText {
         if (recap==null) return false;
         String status=recap.optString("status");
         return status.equals("waiting_for_stop") || status.equals("capturing");
+    }
+    static boolean shouldRefresh(JSONObject summary) {
+        return summary == null || pending(summary);
     }
     static boolean terminal(JSONObject summary) {
         JSONObject recap=summary.optJSONObject("backstage_recap");

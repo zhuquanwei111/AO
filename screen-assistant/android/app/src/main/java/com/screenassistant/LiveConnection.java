@@ -12,7 +12,34 @@ import java.util.function.BooleanSupplier;
 final class LiveConnection {
     private static final Object RECOVERY_LOCK = new Object();
     private static int activeWorkers;
+    private static boolean stopRecoveryInFlight;
     private static final java.util.Set<LiveClient.Session> unpersistedTargets = new java.util.HashSet<>();
+
+    static boolean isRecoveringStop() {
+        synchronized (RECOVERY_LOCK) { return stopRecoveryInFlight; }
+    }
+
+    /** 正常重开页面时消费已保存的结束意图；只恢复原场，不创建场次。 */
+    static boolean retryPendingStop(Store store, Remote remote, BooleanSupplier idle) throws Exception {
+        return retryPendingStop(store, remote, idle, null);
+    }
+
+    static boolean retryPendingStop(Store store, Remote remote, BooleanSupplier idle,
+                                    LiveClient.Session expected) throws Exception {
+        LiveConnection cleanup;
+        synchronized (RECOVERY_LOCK) {
+            if (stopRecoveryInFlight || activeWorkers != 0 || !unpersistedTargets.isEmpty()
+                    || !idle.getAsBoolean() || !store.stopping()) return false;
+            LiveClient.Session target = store.get();
+            if (target == null || expected != null && !RecapRequest.sameSession(target, expected)) return false;
+            cleanup = new LiveConnection(store, remote, null);
+            cleanup.stopTarget = target;
+            cleanup.closed = true;
+            stopRecoveryInFlight = true;
+        }
+        try { cleanup.finishStop(); return true; }
+        finally { synchronized (RECOVERY_LOCK) { stopRecoveryInFlight = false; } }
+    }
 
     static void beginWorker() { synchronized (RECOVERY_LOCK) { activeWorkers++; } }
     static void endWorker() { synchronized (RECOVERY_LOCK) { activeWorkers--; } }
@@ -20,7 +47,7 @@ final class LiveConnection {
         synchronized (RECOVERY_LOCK) { return recoveryAllowed(store, idle); }
     }
     private static boolean recoveryAllowed(Store store, BooleanSupplier idle) {
-        return idle.getAsBoolean() && activeWorkers == 0 && unpersistedTargets.isEmpty()
+        return idle.getAsBoolean() && activeWorkers == 0 && !stopRecoveryInFlight && unpersistedTargets.isEmpty()
                 && store.get() == null && !store.stopping() && store.creating();
     }
     static boolean releaseUnknownCreate(Store store, boolean confirmed, BooleanSupplier idle) throws IOException {
@@ -262,23 +289,25 @@ final class LiveConnection {
         synchronized (this) { target = stopTarget != null ? stopTarget : store.get(); }
         if (target == null || target.stopped) {
             LiveClient.Session current = store.get();
-            if (current == null || current.stopped && (target == null || current.id.equals(target.id))) store.stopping(false);
+            if (current == null || current.stopped && (target == null || RecapRequest.sameSession(current, target))) store.stopping(false);
             return;
         }
         LiveClient.Session stored = store.get();
-        if (stored != null && stored.id.equals(target.id)) store.stopping(true);
+        if (RecapRequest.sameSession(stored, target)) store.stopping(true);
         // 创建后立即停止或/start响应丢失时，先幂等登记Android来源。
         // 复盘任务冲突不阻断stop；stop自己校验场次来源。
         try { remote.start(target); } catch (Exception ignored) { }
         remote.stop(target);
         synchronized (this) {
             LiveClient.Session current = store.get();
-            if (current != null && current.id.equals(target.id)) {
+            if (RecapRequest.sameSession(current, target)) {
                 store.save(target.asStopped());
             }
             // save(created) 失败时本地没有凭证；远端确认结束后清除仅用于防重建的标记。
-            store.creating(false);
-            store.stopping(false);
+            if (current == null || RecapRequest.sameSession(current, target)) {
+                store.creating(false);
+                store.stopping(false);
+            }
             if (stopTarget != null && stopTarget.id.equals(target.id)) stopTarget = null;
             if (session != null && session.id.equals(target.id)) session = target.asStopped();
             synchronized (RECOVERY_LOCK) { unpersistedTargets.remove(target); }
